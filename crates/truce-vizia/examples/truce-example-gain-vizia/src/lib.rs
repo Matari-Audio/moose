@@ -80,15 +80,8 @@ impl PurePluginLogic for GainVizia {
     }
 
     fn editor(params: Arc<GainParams>) -> Box<dyn Editor> {
-        // Resize stays off for vizia plugins until `vizia_baseview`
-        // upstream adds a window-event resize entry point. Today
-        // `ViziaEditor::set_size` records the new logical size but
-        // can't push it into the running vizia event loop, so a
-        // host calling `gui_set_size` updates the editor's reported
-        // size without a visual change. The other backends (egui,
-        // iced, slint, built-in) opt in; vizia follows once the
-        // upstream patch lands.
         ViziaEditor::new(params.clone(), (WINDOW_W, WINDOW_H), gain_view)
+            .resizable(true)
             .with_stylesheet(widgets::BASE_CSS)
             .with_font(JETBRAINS_MONO)
             .into_editor()

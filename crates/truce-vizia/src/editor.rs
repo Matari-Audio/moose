@@ -33,6 +33,15 @@ pub(crate) const JETBRAINS_MONO_FAMILY_CSS: &str = ":root { font-family: \"JetBr
 pub struct ViziaEditor<P: Params + ?Sized> {
     params: Arc<P>,
     size: (u32, u32),
+    /// The size the editor was built with. vizia's window keeps this
+    /// as its `inner_size`; every host resize is expressed as a
+    /// `user_scale` multiple of it (see [`ViziaEditor::push_scale`]),
+    /// which is what makes the whole tree scale proportionally
+    /// instead of re-laying out into a taller/wider box.
+    base_size: (u32, u32),
+    /// Whether the plugin opted into host-driven resize
+    /// (`.resizable(true)`), exposed via `Editor::can_resize`.
+    can_resize: bool,
     setup: SetupFn<P>,
     /// User-supplied stylesheets, applied in the order
     /// `with_stylesheet` was called. `ViziaEditor` adds nothing
@@ -44,12 +53,13 @@ pub struct ViziaEditor<P: Params + ?Sized> {
     /// Optional embedded font bytes. Most plugins pass
     /// `truce_font::JETBRAINS_MONO`.
     font: Option<&'static [u8]>,
-    /// Lower clamp retained from the builder. Currently unused for
-    /// host enforcement (vizia editors are fixed-size on every
-    /// platform - see [`Editor::can_resize`]); kept so the
-    /// `.min_size()` / `.max_size()` builders stay API-stable.
+    /// Lower clamp on host resize requests. Left at the `(1, 1)`
+    /// sentinel it defaults to 0.5x the base size for a resizable
+    /// editor - see [`Self::bounds`].
     min_size: (u32, u32),
-    /// Upper clamp retained from the builder. See [`Self::min_size`].
+    /// Upper clamp on host resize requests. Left at the
+    /// `(u32::MAX, u32::MAX)` sentinel it defaults to 3x the base
+    /// size for a resizable editor. See [`Self::bounds`].
     max_size: (u32, u32),
     /// Host content-scale factor (`Editor::set_scale_factor`); pins
     /// vizia's window scale policy in `open()`. `None` -> vizia's OS
@@ -108,6 +118,8 @@ impl<P: Params + 'static> ViziaEditor<P> {
         Self {
             params,
             size,
+            base_size: size,
+            can_resize: false,
             setup: Arc::new(setup),
             stylesheets: Vec::new(),
             font: None,
@@ -145,21 +157,24 @@ impl<P: Params + 'static> ViziaEditor<P> {
         self
     }
 
-    /// **Currently a no-op** — vizia editors are fixed-size on every
-    /// platform. `vizia_baseview` exposes no resize entry point we can
-    /// drive from `Editor::set_size`, so host/user resize can't be
-    /// followed; advertising it just lets the host grow the window while
-    /// vizia stays put, leaving uninitialised pixels in the exposed gap.
-    /// Kept (accepting and ignoring `value`) so existing plugin code and
-    /// the `.min_size()` / `.max_size()` builders stay API-stable; will
-    /// gain real behaviour if a `vizia_baseview` resize entry point lands.
+    /// Opt into host-driven resize. The editor keeps its base
+    /// aspect ratio and scales the whole view tree proportionally -
+    /// vizia is driven through `WindowEvent::SetUserScale`, which
+    /// rescales rather than re-lays-out, so a resizable vizia editor
+    /// is always the base layout at a different zoom. Non-uniform
+    /// (aspect-breaking) resize is not available.
+    ///
+    /// Unless `.min_size()` / `.max_size()` say otherwise, a
+    /// resizable editor accepts 0.5x .. 3x its base size.
     #[must_use]
-    pub fn resizable(self, _value: bool) -> Self {
+    pub fn resizable(mut self, value: bool) -> Self {
+        self.can_resize = value;
         self
     }
 
     /// Lower clamp on host-driven resize requests, in logical
-    /// points. Defaults to `(1, 1)`. Surfaced through
+    /// points. Defaults to 0.5x the base size for a resizable
+    /// editor, `(1, 1)` otherwise. Surfaced through
     /// `Editor::min_size` to CLAP `gui_get_resize_hints` and VST3
     /// `checkSizeConstraint`.
     #[must_use]
@@ -168,13 +183,90 @@ impl<P: Params + 'static> ViziaEditor<P> {
         self
     }
 
-    /// Upper clamp on host-driven resize requests. Defaults to
-    /// `(u32::MAX, u32::MAX)`. Surfaced through `Editor::max_size`.
+    /// Upper clamp on host-driven resize requests. Defaults to 3x
+    /// the base size for a resizable editor, `(u32::MAX, u32::MAX)`
+    /// otherwise. Surfaced through `Editor::max_size`.
     #[must_use]
     pub fn max_size(mut self, size: (u32, u32)) -> Self {
         self.max_size = size;
         self
     }
+
+    /// Effective clamps: the builder's values, with the untouched
+    /// sentinels replaced by 0.5x / 3x the base size for a resizable
+    /// editor. Resolved here rather than in the builders so the call
+    /// order (`.resizable().min_size()` vs the reverse) can't change
+    /// the result.
+    fn bounds(&self) -> ((u32, u32), (u32, u32)) {
+        if !self.can_resize {
+            return (self.min_size, self.max_size);
+        }
+        let min = if self.min_size == (1, 1) {
+            (self.base_size.0 / 2, self.base_size.1 / 2)
+        } else {
+            self.min_size
+        };
+        let max = if self.max_size == (u32::MAX, u32::MAX) {
+            (
+                self.base_size.0.saturating_mul(3),
+                self.base_size.1.saturating_mul(3),
+            )
+        } else {
+            self.max_size
+        };
+        (min, max)
+    }
+
+    /// Current size as a multiple of the base size - the zoom vizia
+    /// has to render at for the host's window to be filled.
+    fn size_scale(&self) -> f64 {
+        f64::from(self.size.0) / f64::from(self.base_size.0.max(1))
+    }
+
+    /// Push the live zoom into the open vizia window.
+    ///
+    /// Two independent factors multiply into one `SetUserScale`:
+    /// the host content-scale correction (`host / opened`, for a host
+    /// that reports its scale only after the window is up) and the
+    /// resize zoom (`size / base_size`). Both go through this one
+    /// function so a late scale report and a host resize can't
+    /// clobber each other. `last_user_scale` dedups, so a no-change
+    /// call emits nothing.
+    fn push_scale(&mut self) {
+        let host_correction = match (self.opened_scale, self.scale) {
+            (Some(opened), Some(host)) if opened > 0.0 => host / opened,
+            _ => 1.0,
+        };
+        let user_scale = host_correction * self.size_scale();
+        if (user_scale - self.last_user_scale).abs() <= 1.0e-3 {
+            return;
+        }
+        if let Ok(mut slot) = self.scale_proxy.lock()
+            && let Some(proxy) = slot.as_mut()
+            && proxy.emit(WindowEvent::SetUserScale(user_scale)).is_ok()
+        {
+            self.last_user_scale = user_scale;
+        }
+    }
+}
+
+/// Clamp a host resize request and snap it back onto `base`'s aspect
+/// ratio, driven by whichever axis the host grew the most (so a
+/// corner drag feels direct on both edges).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn snap_to_base(base: (u32, u32), min: (u32, u32), max: (u32, u32), req: (u32, u32)) -> (u32, u32) {
+    let bw = f64::from(base.0.max(1));
+    let bh = f64::from(base.1.max(1));
+    let zoom = (f64::from(req.0) / bw).max(f64::from(req.1) / bh);
+    let lo = (f64::from(min.0) / bw).max(f64::from(min.1) / bh);
+    let hi = (f64::from(max.0) / bw).min(f64::from(max.1) / bh);
+    // `hi.max(lo)` guards `clamp`'s min <= max precondition against a
+    // plugin whose declared max is below its min.
+    let zoom = zoom.clamp(lo, hi.max(lo));
+    (
+        ((bw * zoom).round() as u32).max(1),
+        ((bh * zoom).round() as u32).max(1),
+    )
 }
 
 impl<P: Params + 'static> Editor for ViziaEditor<P> {
@@ -183,45 +275,39 @@ impl<P: Params + 'static> Editor for ViziaEditor<P> {
     }
 
     fn can_resize(&self) -> bool {
-        // Fixed-size on every platform. `vizia_baseview` exposes no
-        // resize entry point, so `set_size` can't be applied; reporting
-        // resizable would let the host/WM grow the outer window while
-        // vizia stays put, leaving uninitialised pixels in the exposed
-        // gap. Reporting `false` makes every format pin the window
-        // instead (VST3 `canResize` -> 0, CLAP no resize hints,
-        // standalone `pin_size`).
-        false
+        self.can_resize
     }
 
     fn min_size(&self) -> (u32, u32) {
-        self.min_size
+        self.bounds().0
     }
 
     fn max_size(&self) -> (u32, u32) {
-        self.max_size
+        self.bounds().1
+    }
+
+    fn aspect_ratio(&self) -> Option<(u32, u32)> {
+        // Resize is proportional-only (see `push_scale`), so hand the
+        // base size to the host as the locked ratio: CLAP sets
+        // `preserve_aspect_ratio`, VST3 / the standalone WM constrain
+        // the drag, and we never get an off-ratio request to letterbox.
+        self.can_resize.then_some(self.base_size)
     }
 
     fn set_size(&mut self, w: u32, h: u32) -> bool {
-        if !self.can_resize() || w == 0 || h == 0 {
+        if !self.can_resize || w == 0 || h == 0 {
             return false;
         }
-        // Clamp to the plugin's declared bounds and record the new
-        // logical size so subsequent `Editor::size()` reads (and the
-        // standalone's outer-window snap) see honest values. The
-        // actual surface update arrives through the macOS autoresize
-        // cascade: when the parent `NSView` grows, baseview-truce's
-        // `setFrameSize:` override fires `Resized` and
-        // `vizia_baseview`'s existing handler reconfigures skia +
-        // calls `cx.set_window_size`. We accept the request (returning
-        // `true`) under all callers so the contract matches the other
-        // backends; a host that calls `gui_set_size` without also
-        // resizing the parent `NSView` will see this method succeed
-        // but won't see a visual change until the cascade arrives, or
-        // until a `vizia_baseview` upstream patch exposes a
-        // window-event resize entry point.
-        let w = w.clamp(self.min_size.0.max(1), self.max_size.0.max(1));
-        let h = h.clamp(self.min_size.1.max(1), self.max_size.1.max(1));
-        self.size = (w, h);
+        // Clamp to the plugin's declared bounds, snap back onto the
+        // base aspect, then express the result as a zoom on the base
+        // size and push it into the live window. `SetUserScale` is
+        // the one rescale entry point `vizia_baseview` offers for an
+        // open window (its `WindowScalePolicy` is frozen at open), and
+        // it resizes the child surface as part of the same call - so
+        // this is a real resize, not just bookkeeping.
+        let (min, max) = self.bounds();
+        self.size = snap_to_base(self.base_size, min, max, (w, h));
+        self.push_scale();
         true
     }
 
@@ -273,7 +359,7 @@ impl<P: Params + 'static> Editor for ViziaEditor<P> {
                 return;
             }
         }
-        let (lw, lh) = self.size;
+        let (lw, lh) = self.base_size;
         let setup = Arc::clone(&self.setup);
         let stylesheets = self.stylesheets.clone();
         let font = self.font;
@@ -287,7 +373,7 @@ impl<P: Params + 'static> Editor for ViziaEditor<P> {
         if let Ok(mut slot) = self.scale_proxy.lock() {
             *slot = None;
         }
-        self.last_user_scale = 1.0;
+        self.last_user_scale = self.size_scale();
         let scale_proxy = Arc::clone(&self.scale_proxy);
 
         // Capture the parent NSView pointer (macOS only) as `usize`
@@ -344,7 +430,11 @@ impl<P: Params + 'static> Editor for ViziaEditor<P> {
                 *slot = Some(cx.get_proxy());
             }
         })
-        .inner_size((lw, lh));
+        .inner_size((lw, lh))
+        // A host that restored a saved size called `set_size` before
+        // `open()`; vizia opens at `base_size * user_scale` so the
+        // first frame is already the right size, with no resize flash.
+        .user_scale_factor(self.size_scale());
 
         // Pin the window scale to the host's reported content scale when
         // we have one, rather than vizia's default `SystemScaleFactor`
@@ -464,24 +554,10 @@ impl<P: Params + 'static> Editor for ViziaEditor<P> {
         // `WindowScalePolicy` is frozen at open, so the only correction
         // path is `WindowEvent::SetUserScale(host / opened)`, which
         // re-DPIs the tree and resizes the child to fill the host frame.
-        // The common case (scale already correct at open) yields `1.0`
-        // and emits nothing.
-        let (Some(opened), Some(host)) = (self.opened_scale, self.scale) else {
-            return;
-        };
-        if opened <= 0.0 {
-            return;
-        }
-        let user_scale = host / opened;
-        if (user_scale - self.last_user_scale).abs() <= 1.0e-3 {
-            return;
-        }
-        if let Ok(mut slot) = self.scale_proxy.lock()
-            && let Some(proxy) = slot.as_mut()
-            && proxy.emit(WindowEvent::SetUserScale(user_scale)).is_ok()
-        {
-            self.last_user_scale = user_scale;
-        }
+        // The common case (scale already correct at open, no resize)
+        // yields `1.0` and emits nothing. `push_scale` folds this
+        // together with the resize zoom `set_size` asks for.
+        self.push_scale();
     }
 }
 
@@ -499,5 +575,29 @@ impl<P: Params + ?Sized> Drop for ViziaEditor<P> {
         if let Some(mut window) = self.window.take() {
             window.close();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snap_to_base;
+
+    #[test]
+    fn resize_requests_clamp_and_keep_the_base_aspect() {
+        let base = (176, 260);
+        let bounds = ((88, 130), (528, 780));
+        // Off-ratio request: the larger axis (width, 2x) wins.
+        assert_eq!(
+            snap_to_base(base, bounds.0, bounds.1, (352, 300)),
+            (352, 520)
+        );
+        // Below min and above max clamp to the bounds, still on-ratio.
+        assert_eq!(snap_to_base(base, bounds.0, bounds.1, (10, 10)), (88, 130));
+        assert_eq!(
+            snap_to_base(base, bounds.0, bounds.1, (9000, 9000)),
+            (528, 780)
+        );
+        // Inconsistent bounds (max < min) pin to min instead of panicking.
+        assert_eq!(snap_to_base(base, (176, 260), (10, 10), (400, 400)), base);
     }
 }
