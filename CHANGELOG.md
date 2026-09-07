@@ -6,6 +6,7 @@ Notable changes per release.
 
 Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `truce-egui` now uses egui and egui-wgpu 0.35, so plugins that name egui types in their editor code must also update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
 
+- `truce-vizia` builds against a vizia fork that fixes an infinite loop in `Context::modify_timer`, so starting a second timer in a vizia editor no longer hangs the UI thread at 100% CPU (upstream PR vizia/vizia#777).
 - vizia editors can opt into host resize with `ViziaEditor::resizable(true)`: the window keeps the editor's base aspect ratio and the whole view tree scales proportionally (0.5x..3x by default), driven through vizia's `SetUserScale`.
 - `truce-egui` shares BUFFR's egui 0.35 and wgpu 29 dependency graph, so native BUFFR editor code can move onto Truce without a second incompatible egui stack.
 - Plug-ins can inspect whether the preceding output-event block succeeded, overflowed staging, met a full host queue, used an unsupported carrier, or contained invalid data; MIDI and process-emitted parameter feedback reject known incomplete, failed, or unavailable blocks before delivery across CLAP, VST3, Audio Unit, AAX, LV2, VST2, standalone, and the offline driver.
