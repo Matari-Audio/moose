@@ -107,6 +107,14 @@ fn reopened_editor_keeps_the_host_scale() {
 
         // First open: the host sets the scale after `create`.
         assert!((gui.create.unwrap())(plugin, api, false));
+        // macOS refuses `set_scale` (Cocoa sizes are logical; AppKit owns
+        // the backing scale), so there is nothing to replay there.
+        if cfg!(target_os = "macos") {
+            assert!(!(gui.set_scale.unwrap())(plugin, 1.5));
+            (gui.destroy.unwrap())(plugin);
+            (vt.destroy.unwrap())(plugin);
+            return;
+        }
         assert!((gui.set_scale.unwrap())(plugin, 1.5));
         assert!((scale() - 1.5).abs() < 1e-9);
         (gui.destroy.unwrap())(plugin);
