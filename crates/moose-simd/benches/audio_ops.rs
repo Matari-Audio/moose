@@ -63,8 +63,8 @@ fn make_param() -> FloatParam {
         midi_map: None,
         midi_channel: None,
     };
-    let p = FloatParam::new(info, SmoothingStyle::Exponential(5.0));
-    p.smoother.set_sample_rate(SR);
+    let p = FloatParam::new(Box::leak(Box::new(info)), SmoothingStyle::Exponential(5.0));
+    p.set_sample_rate(SR);
     // Walk the smoother off the default so reads aren't all
     // returning the snap value.
     p.set_value(3.0);
@@ -573,7 +573,7 @@ fn simd_slow_gain_process(
 /// that path, not the slow path masquerading as fast.
 fn make_converged_param() -> FloatParam {
     let p = make_param();
-    p.smoother.snap(f64::from(p.value()));
+    p.snap_smoother();
     p
 }
 

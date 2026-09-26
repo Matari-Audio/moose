@@ -1789,7 +1789,7 @@ fn gen_param_info_literal(f: &ParamField) -> Option<proc_macro2::TokenStream> {
 /// caller drives this via `assign_param_ids` first, but a future
 /// refactor that calls `gen_field_constructor` out of order panics
 /// with a precise message rather than producing colliding id=0 params.
-fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
+fn gen_field_constructor(f: &ParamField, slot: usize) -> proc_macro2::TokenStream {
     let a = &f.attrs;
     let name = a.name.as_deref().unwrap_or("Unnamed");
 
@@ -1838,7 +1838,7 @@ fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
         return quote! { compile_error!(#msg) };
     }
 
-    let Some(info) = gen_param_info_literal(f) else {
+    if gen_param_info_literal(f).is_none() {
         // Validation block above already returned a `compile_error!`
         // for every shape that `gen_param_info_literal` rejects.
         // Surface a fallback diagnostic so a future divergence
@@ -1846,7 +1846,10 @@ fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
         // emitting bad code.
         let msg = format!("invalid `#[param]` attributes on field `{name}`");
         return quote! { compile_error!(#msg) };
-    };
+    }
+    // The metadata lives in the struct's static table (see `new()`);
+    // the param borrows its slot and carries only its id.
+    let info = quote! { &__MOOSE_PARAM_INFOS[#slot] };
 
     match f.kind {
         ParamKind::Float => {
@@ -2106,7 +2109,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = &f.ident;
-            quote! { self.#ident.info.clone() }
+            quote! { self.#ident.info() }
         })
         .collect();
 
@@ -2299,7 +2302,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                 ParamKind::Enum => quote! { f64::from(self.#ident.index()) },
             };
             quote! {
-                x if x == self.#ident.id() => Some(self.#ident.info.range.normalize(#plain_expr)),
+                x if x == self.#ident.id() => Some(self.#ident.range().normalize(#plain_expr)),
             }
         })
         .collect();
@@ -2353,7 +2356,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             };
             quote! {
                 x if x == self.#ident.id() => {
-                    let plain = self.#ident.info.range.denormalize(value);
+                    let plain = self.#ident.range().denormalize(value);
                     #commit;
                 }
             }
@@ -2398,7 +2401,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                     }
                     _ => quote! {
                         x if x == self.#ident.id() => {
-                            Some(::moose::params::format_param_value(&self.#ident.info, value))
+                            Some(::moose::params::format_param_value(self.#ident.static_info(), value))
                         }
                     },
                 }
@@ -2444,13 +2447,13 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                             .expect("ParamKind::Enum field must have enum_type populated");
                         quote! { |value| ::moose::params::EnumParam::<#enum_ty>::format_by_index(value) }
                     }
-                    _ => quote! { |value| ::moose::params::format_param_value(&self.#ident.info, value) },
+                    _ => quote! { |value| ::moose::params::format_param_value(self.#ident.static_info(), value) },
                 };
                 (format, true)
             };
             quote! {
                 x if x == self.#ident.id() => ::moose::params::parse_formatted_value(
-                    &self.#ident.info,
+                    self.#ident.static_info(),
                     text,
                     #format,
                     #lenient,
@@ -2482,7 +2485,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .filter(|f| f.kind == ParamKind::Float)
         .map(|f| {
             let ident = &f.ident;
-            quote! { self.#ident.smoother.snap(self.#ident.raw_target()); }
+            quote! { self.#ident.snap_smoother(); }
         })
         .collect();
 
@@ -2492,7 +2495,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .filter(|f| f.kind == ParamKind::Float)
         .map(|f| {
             let ident = &f.ident;
-            quote! { self.#ident.smoother.set_sample_rate(sample_rate); }
+            quote! { self.#ident.set_sample_rate(sample_rate); }
         })
         .collect();
 
@@ -2509,12 +2512,35 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let new_impl = if generate_new {
         let param_inits: Vec<_> = param_fields
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(slot, f)| {
                 let ident = &f.ident;
-                let constructor = gen_field_constructor(f);
+                let constructor = gen_field_constructor(f, slot);
                 quote! { #ident: #constructor }
             })
             .collect();
+
+        // One shared metadata table per struct type: every instance
+        // (including each `#[nested]` slot reusing the type) borrows its
+        // `ParamInfo` from here and carries only its own rebased id.
+        // `LazyLock` because `default` / `range` may be non-const
+        // expressions (`variant_count()`, a const path).
+        let info_table = if param_fields.is_empty() {
+            quote! {}
+        } else {
+            let table_len = param_fields.len();
+            let literals = param_fields.iter().map(|f| {
+                gen_param_info_literal(f).unwrap_or_else(|| {
+                    let msg = format!("invalid `#[param]` attributes on field `{}`", f.ident);
+                    quote! { compile_error!(#msg) }
+                })
+            });
+            quote! {
+                static __MOOSE_PARAM_INFOS: ::std::sync::LazyLock<
+                    [::moose::params::ParamInfo; #table_len],
+                > = ::std::sync::LazyLock::new(|| [#(#literals),*]);
+            }
+        };
 
         let nested_inits: Vec<_> = nested_fields
             .iter()
@@ -2578,6 +2604,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         quote! {
             impl #struct_name {
                 pub fn new() -> Self {
+                    #info_table
                     #me_binding = Self {
                         #(#param_inits,)*
                         #(#nested_inits,)*
@@ -2617,10 +2644,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         impl #struct_name {
             #[doc(hidden)]
             pub fn offset_ids(&mut self, id_base: u32) {
-                #(self.#own_param_idents.info.id = ::moose::params::rebase_nested_param_id(
-                    self.#own_param_idents.info.id,
-                    id_base,
-                );)*
+                #(self.#own_param_idents.offset_id(id_base);)*
                 #(self.#nested_idents.offset_ids(id_base);)*
             }
         }
