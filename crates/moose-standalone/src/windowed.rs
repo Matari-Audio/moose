@@ -15,11 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_queue::ArrayQueue;
 
-use baseview::{Event, EventStatus, Window, WindowHandler, WindowOpenOptions, WindowScalePolicy};
+use baseview::{Event, EventStatus, WindowContext, WindowSize};
 use keyboard_types::{Code, KeyState, Modifiers};
-#[cfg(target_os = "linux")]
-use raw_window_handle::HasRawDisplayHandle;
-use raw_window_handle::{HasRawWindowHandle, RawWindowHandle as RwhHandle};
+use moose_gui::window::EditorWindowHandler;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle as RwhHandle};
 
 use moose_core::editor::{ClosureBridge, Editor, PluginContext, RawWindowHandle};
 use moose_core::events::EventBody;
@@ -132,11 +131,15 @@ where
     // outer window within one frame.
     let pending_resize = Arc::new(AtomicU64::new(0));
 
-    let window_opts = WindowOpenOptions {
-        title: P::info().name.to_string(),
-        size: baseview::Size::new(f64::from(lw), f64::from(lh)),
-        scale: WindowScalePolicy::SystemScaleFactor,
-    };
+    // No scale override: the standalone owns a real top-level window and
+    // follows the desktop scale (Xft.dpi on Linux).
+    let window_settings = baseview::WindowSettings::new()
+        .with_title(P::info().name)
+        .with_size(baseview::dpi::LogicalSize::new(
+            f64::from(lw),
+            f64::from(lh),
+        ))
+        .with_resizable(editor_can_resize);
 
     let plugin = Arc::clone(&audio_handles.plugin);
     let pending = Arc::clone(&audio_handles.pending);
@@ -187,17 +190,23 @@ where
     // Owned copy for the `move` editor closure - `opts` is a borrow
     // that can't escape into it.
     let presets_dir = opts.presets_dir.clone();
-    Window::open_blocking(window_opts, move |window| {
-        let moose_parent = match window.raw_window_handle() {
-            RwhHandle::AppKit(h) => RawWindowHandle::AppKit(h.ns_view),
-            RwhHandle::Win32(h) => RawWindowHandle::Win32(h.hwnd),
+    // SAFETY: this is the standalone executable, not a plugin loaded into a
+    // host, so the process-wide window setup baseview skips for plugins
+    // (e.g. DPI awareness on Windows) is ours to do.
+    unsafe { baseview::assume_standalone_in_process() };
+    let window = moose_gui::window::open_window(window_settings, move |window| {
+        let moose_parent = match raw_window(window) {
+            Some(RwhHandle::AppKit(h)) => RawWindowHandle::AppKit(h.ns_view.as_ptr()),
+            Some(RwhHandle::Win32(h)) => {
+                RawWindowHandle::Win32(h.hwnd.get() as *mut std::ffi::c_void)
+            }
             // `h.window` is `c_ulong` - u64 on 64-bit Linux, u32 on
             // Windows. The match arm has to type-check on every
             // platform even though X11 only actually fires on Linux,
             // so widen explicitly. Identity on Linux/macOS, real
             // u32→u64 widening on Windows.
             #[allow(clippy::useless_conversion)]
-            RwhHandle::Xlib(h) => RawWindowHandle::X11(h.window.into()),
+            Some(RwhHandle::Xlib(h)) => RawWindowHandle::X11(h.window.into()),
             _ => panic!("unsupported raw-window-handle variant"),
         };
 
@@ -257,9 +266,9 @@ where
         // Must run BEFORE `editor.open()` below - the resize has to
         // settle before the editor's child window sizes itself.
         #[cfg(target_os = "windows")]
-        if let RwhHandle::Win32(h) = window.raw_window_handle() {
+        if let Some(hwnd) = win32_hwnd(window) {
             crate::menu_windows::install(
-                h.hwnd,
+                hwnd,
                 P::info().name,
                 is_effect,
                 channels,
@@ -281,7 +290,7 @@ where
                     // Resizable but maximize opted out: keep the resize
                     // border + minimize, drop only the maximize box so the
                     // window can't jump past the editor's max_size.
-                    crate::windowed_windows::disable_maximize(h.hwnd);
+                    crate::windowed_windows::disable_maximize(hwnd);
                 }
                 // Enforce the editor's min / max / aspect on the outer
                 // frame itself (WM_GETMINMAXINFO / WM_SIZING): backends
@@ -289,18 +298,18 @@ where
                 // iced / Slint letterbox instead of clamping) otherwise
                 // let the window shrink below min or grow past max.
                 let (emin, emax, easpect) = editor_limits;
-                crate::windowed_windows::install_size_limits(h.hwnd, emin, emax, easpect);
+                crate::windowed_windows::install_size_limits(hwnd, emin, emax, easpect);
             } else {
-                crate::windowed_windows::lock_window(h.hwnd);
+                crate::windowed_windows::lock_window(hwnd);
                 // The cleared sizing border only stops interactive
                 // resizes; programmatic `SetWindowPos` (scripting,
                 // automation tools) bypasses window styles. Pin via
                 // the min-max path too, at the editor's natural size.
-                crate::windowed_windows::install_size_limits(h.hwnd, (lw, lh), (lw, lh), None);
+                crate::windowed_windows::install_size_limits(hwnd, (lw, lh), (lw, lh), None);
             }
             // Title-bar / taskbar icon from the icon embedded in the
             // packaged .exe (no-op in un-packaged dev builds).
-            crate::windowed_windows::set_window_icon(h.hwnd);
+            crate::windowed_windows::set_window_icon(hwnd);
         }
 
         // Linux: when the editor doesn't opt into resize, X11 window
@@ -311,8 +320,8 @@ where
         // the `Resized` event flows back to `editor.set_size` via
         // `on_event` below.
         #[cfg(target_os = "linux")]
-        if !editor_can_resize && let RwhHandle::Xlib(h) = window.raw_window_handle() {
-            crate::windowed_x11::pin_size(window.raw_display_handle(), &h);
+        if !editor_can_resize && let Some((d, h)) = xlib(window) {
+            crate::windowed_x11::pin_size(d, &h);
         }
 
         // Linux: a resizable editor that opts out of maximize gets the
@@ -322,9 +331,9 @@ where
         #[cfg(target_os = "linux")]
         if editor_can_resize
             && !editor_can_maximize
-            && let RwhHandle::Xlib(h) = window.raw_window_handle()
+            && let Some((d, h)) = xlib(window)
         {
-            crate::windowed_x11::disable_maximize(window.raw_display_handle(), &h);
+            crate::windowed_x11::disable_maximize(d, &h);
         }
 
         // Linux: paint the outer window black so any area the editor
@@ -336,26 +345,21 @@ where
         // expose a margin. Set unconditionally - it's a one-time
         // persistent attribute the server fills from on every resize.
         #[cfg(target_os = "linux")]
-        if let RwhHandle::Xlib(h) = window.raw_window_handle() {
-            crate::windowed_x11::set_background_black(window.raw_display_handle(), &h);
+        if let Some((d, h)) = xlib(window) {
+            crate::windowed_x11::set_background_black(d, &h);
         }
 
-        // macOS: baseview-truce creates its NSWindow with `Titled |
-        // Closable | Miniaturizable` only - no resize affordance.
-        // When the editor opts into resize, OR in
-        // `NSWindowStyleMaskResizable` so the edge-drag behaviour
-        // becomes available. Use the rwh `ns_window` field
-        // directly: baseview calls `setContentView:` after the
-        // build closure runs, so `[ns_view window]` returns nil at
-        // this point - going via the populated `ns_window` slot
-        // avoids that timing trap.
+        // macOS: baseview sets the resizable style from
+        // `with_resizable`; re-assert it here (idempotent) alongside the
+        // zoom / content-limit tweaks. baseview installs its view as
+        // the window's content view before this build closure runs, so
+        // `[ns_view window]` is live here.
         #[cfg(target_os = "macos")]
-        if editor_can_resize && let RwhHandle::AppKit(h) = window.raw_window_handle() {
+        if editor_can_resize && let Some(h) = appkit(window) {
             // SAFETY: ns_window is a live NSWindow * baseview owns
-            // and has just finished initialising
-            // (`makeKeyAndOrderFront` ran before this closure).
-            // We're on the main thread - `open_blocking` only runs
-            // its builder on the thread that owns the event loop.
+            // and has just finished initialising. We're on the main
+            // thread - baseview runs the builder on the thread that
+            // owns the event loop.
             unsafe { crate::windowed_macos::make_resizable(h.ns_window) };
             // Strip zoom + native fullscreen when the editor opts out
             // of maximize, after the resizable bit is set (the zoom
@@ -383,7 +387,7 @@ where
         // every resize path clamps to the editor. Linux: `pin_size`;
         // Windows: `lock_window`.
         #[cfg(target_os = "macos")]
-        if !editor_can_resize && let RwhHandle::AppKit(h) = window.raw_window_handle() {
+        if !editor_can_resize && let Some(h) = appkit(window) {
             // SAFETY: live `ns_window`, main thread, baseview init done.
             unsafe { crate::windowed_macos::pin_content_size(h.ns_window, lw, lh) };
         }
@@ -394,11 +398,9 @@ where
             Arc::clone(&pending_state),
             Arc::clone(&pending_resize),
         );
-        // The standalone owns a real top-level window and should honor
-        // the desktop scale (Xft.dpi on Linux); plugins leave the default
-        // and drive scale from the host instead. See
-        // `moose_gui::platform::editor_window_scale`.
-        editor.set_uses_system_scale(true);
+        // No `set_scale_factor`: without a host scale the editor's child
+        // window follows the desktop scale on its own (see
+        // `moose_gui::platform::host_scale_override`).
         editor.open(moose_parent, ctx);
 
         // After `editor.open()` reparents baseview's child under the
@@ -406,15 +408,9 @@ where
         // AppKit keeps it centred (not stretched) when the NSWindow
         // grows past the editor; `on_frame`'s `layout_child_centered`
         // then drives its actual size. We pass `h.ns_view` (baseview's
-        // standalone view) rather than `h.ns_window`:
-        // `Window::open_blocking` doesn't run `setContentView:` on the
-        // NSWindow until *after* this build closure returns, so
-        // `[ns_window contentView]` here is the NSWindow's default
-        // vanilla view (with no subviews). baseview's view, however,
-        // is already the parent of the editor's child by the time
-        // `editor.open()` returns.
+        // content view, the editor child's parent).
         #[cfg(target_os = "macos")]
-        if editor_can_resize && let RwhHandle::AppKit(h) = window.raw_window_handle() {
+        if editor_can_resize && let Some(h) = appkit(window) {
             // SAFETY: `editor.open()` just finished embedding the
             // child view; we're on the main thread.
             unsafe { crate::windowed_macos::install_subview_centering(h.ns_view) };
@@ -446,8 +442,67 @@ where
         }
     });
 
+    match window {
+        Some(window) => {
+            if let Err(e) = window.run_until_closed() {
+                eprintln!("Error: window event loop failed: {e}");
+            }
+        }
+        None => eprintln!("Error: could not open the standalone window"),
+    }
+
     drop(audio_handles);
     vlog!("Goodbye!");
+}
+
+/// The outer window's raw handle, if it has one.
+fn raw_window(window: &WindowContext) -> Option<RwhHandle> {
+    window.window_handle().ok().map(|h| h.as_raw())
+}
+
+/// The outer window's HWND, in the pointer shape the Win32 helpers take.
+#[cfg(target_os = "windows")]
+fn win32_hwnd(window: &WindowContext) -> Option<*mut std::ffi::c_void> {
+    match raw_window(window)? {
+        RwhHandle::Win32(h) => Some(h.hwnd.get() as *mut std::ffi::c_void),
+        _ => None,
+    }
+}
+
+/// The outer window's `NSView` and its `NSWindow`.
+#[cfg(target_os = "macos")]
+struct AppKitHandles {
+    ns_view: *mut std::ffi::c_void,
+    ns_window: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+fn appkit(window: &WindowContext) -> Option<AppKitHandles> {
+    match raw_window(window)? {
+        RwhHandle::AppKit(h) => {
+            let ns_view = h.ns_view.as_ptr();
+            // SAFETY: `ns_view` is baseview's live content view and we're
+            // on the main thread (every caller runs on the event loop).
+            let ns_window = unsafe { crate::windowed_macos::window_of(ns_view) };
+            (!ns_window.is_null()).then_some(AppKitHandles { ns_view, ns_window })
+        }
+        _ => None,
+    }
+}
+
+/// The outer window's Xlib display and window handles.
+#[cfg(target_os = "linux")]
+fn xlib(
+    window: &WindowContext,
+) -> Option<(
+    raw_window_handle::RawDisplayHandle,
+    raw_window_handle::XlibWindowHandle,
+)> {
+    use raw_window_handle::HasDisplayHandle;
+    let RwhHandle::Xlib(h) = raw_window(window)? else {
+        return None;
+    };
+    Some((window.display_handle().ok()?.as_raw(), h))
 }
 
 struct StandaloneHandler<P: PluginExport + 'static>
@@ -537,30 +592,26 @@ where
 /// Every platform then goes through baseview's deferred resize, which
 /// is the only re-entrancy-safe way to resize from inside an event
 /// handler.
-fn resize_outer_window(window: &mut Window, w: u32, h: u32) {
+fn resize_outer_window(window: &WindowContext, w: u32, h: u32) {
     #[cfg(target_os = "windows")]
-    let h = h + if let RwhHandle::Win32(handle) = window.raw_window_handle() {
-        crate::windowed_windows::menu_reserve_logical(handle.hwnd)
-    } else {
-        0
-    };
-    window.resize(baseview::Size::new(f64::from(w), f64::from(h)));
+    let h = h + win32_hwnd(window).map_or(0, crate::windowed_windows::menu_reserve_logical);
+    if let Err(e) = window.resize(baseview::dpi::LogicalSize::new(f64::from(w), f64::from(h))) {
+        vlog!("outer window resize to {w}x{h} failed: {e}");
+    }
 }
 
-impl<P: PluginExport + 'static> WindowHandler for StandaloneHandler<P>
+impl<P: PluginExport + 'static> EditorWindowHandler for StandaloneHandler<P>
 where
     P::Params: 'static,
 {
-    fn on_frame(&mut self, window: &mut Window) {
+    fn on_frame(&mut self, window: &WindowContext) {
         // Editor drives its own frame loop inside its child window;
         // the standalone outer handler does two things here:
         //  (1) honour pending resize requests posted by the editor
         //      through the `request_resize` closure;
         //  (2) poll the OS window size and forward user-driven
-        //      edge drags to `editor.set_size`. baseview-truce
-        //      0.1.1-truce.6 only emits `WindowEvent::Resized` for
-        //      DPI changes, never for user drags, so detection
-        //      lives here.
+        //      edge drags to `editor.set_size`. `resized` normally
+        //      covers these; the poll (macOS) catches any it missed.
         let packed = self.pending_resize.swap(0, Ordering::Acquire);
         if packed != 0 {
             let (w, h) = unpack_size(packed);
@@ -579,7 +630,7 @@ where
         // macOS: forward OS-driven resizes the editor missed and re-pin
         // the child view's frame every frame.
         #[cfg(target_os = "macos")]
-        if let RwhHandle::AppKit(h) = window.raw_window_handle()
+        if let Some(h) = appkit(window)
             && let Some(os_size) =
                 unsafe { crate::windowed_macos::content_logical_size(h.ns_window) }
             && os_size.0 > 0
@@ -655,9 +706,128 @@ where
         // it each frame is cheap.
         #[cfg(target_os = "linux")]
         if self.editor.can_resize()
-            && let RwhHandle::Xlib(h) = window.raw_window_handle()
+            && let Some((d, h)) = xlib(window)
         {
-            crate::windowed_x11::center_child(window.raw_display_handle(), &h);
+            crate::windowed_x11::center_child(d, &h);
+        }
+    }
+
+    fn resized(&mut self, window: &WindowContext, size: WindowSize) {
+        // OS-driven resize (user dragged the window edge): forward to
+        // the editor so the child surface follows the outer frame.
+        // `current_size` suppresses the round-trip when the resize
+        // originated from our own `request_resize` path - in that
+        // case `on_frame` already called `editor.set_size`.
+        let phys = size.physical;
+        let scale = size.scale_factor;
+        // Hand the editor's logical min/max bounds and cell-step
+        // increment to the X11 WM as physical-pixel size hints so
+        // it clamps interactive edge-drags to the editor's bounds
+        // and snaps them to whole cells itself. This replaces the
+        // old client-side snap-back (removed below for Linux) that
+        // ran away by fighting the WM's resize grab. The bounds /
+        // increment are logical and the hints physical, so
+        // recompute whenever the backing scale moves;
+        // `size_hints_scale` gates the redundant calls.
+        // `scale` is written verbatim from `size.scale_factor`, never
+        // through accumulating arithmetic, so bit-equality is the
+        // right gate - an epsilon check would miss a legitimate
+        // host scale change. Same rationale as
+        // `EditorScale::take_change`.
+        #[cfg(target_os = "linux")]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::float_cmp
+        )]
+        if self.editor.can_resize()
+            && scale > 0.0
+            && scale != self.size_hints_scale
+            && let Some((d, h)) = xlib(window)
+        {
+            let to_phys = |v: u32| -> u32 {
+                // `u32::MAX` is the trait's "unbounded" sentinel;
+                // map it to 0 so `set_resize_hints` omits the cap
+                // on that axis instead of overflowing the multiply.
+                if v == u32::MAX {
+                    0
+                } else {
+                    (f64::from(v) * scale).round() as u32
+                }
+            };
+            let (min_w, min_h) = self.editor.min_size();
+            let (max_w, max_h) = self.editor.max_size();
+            let (inc_w, inc_h) = self.editor.size_increment().unwrap_or((0, 0));
+            crate::windowed_x11::set_resize_hints(
+                d,
+                &h,
+                to_phys(min_w),
+                to_phys(min_h),
+                to_phys(max_w),
+                to_phys(max_h),
+                to_phys(inc_w),
+                to_phys(inc_h),
+                // Ratio is scale-independent - hand the raw editor
+                // pair to the WM so it constrains the drag itself
+                // instead of letting egui / iced / Slint letterbox.
+                self.editor.aspect_ratio(),
+            );
+            self.size_hints_scale = scale;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (lw, lh) = if scale > 0.0 {
+            (
+                (f64::from(phys.width) / scale).round() as u32,
+                (f64::from(phys.height) / scale).round() as u32,
+            )
+        } else {
+            (phys.width, phys.height)
+        };
+        if (lw, lh) != self.current_size && lw > 0 && lh > 0 {
+            self.current_size = (lw, lh);
+            let accepted = self.editor.set_size(lw, lh);
+            // macOS reconciles the child frame each frame off this.
+            #[cfg(target_os = "macos")]
+            {
+                self.editor_reports_size = accepted;
+            }
+            // Snap the outer standalone window to the editor's
+            // post-clamp / post-snap size. moose-gui's
+            // `BuiltinEditor` clamps to `min_cols` / `max_cols`,
+            // so when the user drags past the editor's bounds
+            // the editor stops growing but without this snap
+            // the outer NSWindow would keep going - leaving
+            // empty space around a clamped editor. egui / iced
+            // / slint take the new size verbatim, so the snap
+            // is a no-op for them. Vizia's `set_size` returns
+            // `false`; we leave the outer alone in that case
+            // so the autoresize cascade still works.
+            //
+            // NOT on Linux/X11: issuing `configure_window` from
+            // inside the handling of the window's own
+            // `ConfigureNotify` fights the WM's interactive
+            // resize grab. The grid snaps to whole columns on
+            // nearly every drag tick, so `(ew, eh) != (lw, lh)`
+            // is true almost always and the echo fires
+            // continuously; grab-rebaselining WMs (mutter, kwin)
+            // fold each injected size into the grab and the
+            // window runs away ("huge while dragging"). macOS
+            // already lives with `set_size`-only here (the child
+            // follows via `NSViewWidthSizable` autoresize); on
+            // Linux the editor's own `on_frame` resizes the child
+            // surface to the snapped size, so it still follows -
+            // we just let the WM own the outer frame during the
+            // drag and accept a thin margin at the clamp bounds.
+            #[cfg(not(target_os = "linux"))]
+            if accepted {
+                let (ew, eh) = self.editor.size();
+                if (ew, eh) != (lw, lh) && ew > 0 && eh > 0 {
+                    self.current_size = (ew, eh);
+                    resize_outer_window(window, ew, eh);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            let _ = accepted;
         }
     }
 
@@ -665,126 +835,7 @@ where
     // (see comment block below) so the rationale doesn't get orphaned
     // from the API name; hence the function-level allow.
     #[allow(clippy::items_after_statements)]
-    fn on_event(&mut self, window: &mut Window, event: Event) -> EventStatus {
-        // OS-driven resize (user dragged the window edge): forward to
-        // the editor so the child surface follows the outer frame.
-        // `current_size` suppresses the round-trip when the resize
-        // originated from our own `request_resize` path - in that
-        // case `on_frame` already called `editor.set_size`.
-        if let Event::Window(baseview::WindowEvent::Resized(info)) = &event {
-            let phys = info.physical_size();
-            let scale = info.scale();
-            // Hand the editor's logical min/max bounds and cell-step
-            // increment to the X11 WM as physical-pixel size hints so
-            // it clamps interactive edge-drags to the editor's bounds
-            // and snaps them to whole cells itself. This replaces the
-            // old client-side snap-back (removed below for Linux) that
-            // ran away by fighting the WM's resize grab. The bounds /
-            // increment are logical and the hints physical, so
-            // recompute whenever the backing scale moves;
-            // `size_hints_scale` gates the redundant calls.
-            // `scale` is written verbatim from `info.scale()`, never
-            // through accumulating arithmetic, so bit-equality is the
-            // right gate - an epsilon check would miss a legitimate
-            // host scale change. Same rationale as
-            // `EditorScale::take_change`.
-            #[cfg(target_os = "linux")]
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::float_cmp
-            )]
-            if self.editor.can_resize()
-                && scale > 0.0
-                && scale != self.size_hints_scale
-                && let RwhHandle::Xlib(h) = window.raw_window_handle()
-            {
-                let to_phys = |v: u32| -> u32 {
-                    // `u32::MAX` is the trait's "unbounded" sentinel;
-                    // map it to 0 so `set_resize_hints` omits the cap
-                    // on that axis instead of overflowing the multiply.
-                    if v == u32::MAX {
-                        0
-                    } else {
-                        (f64::from(v) * scale).round() as u32
-                    }
-                };
-                let (min_w, min_h) = self.editor.min_size();
-                let (max_w, max_h) = self.editor.max_size();
-                let (inc_w, inc_h) = self.editor.size_increment().unwrap_or((0, 0));
-                crate::windowed_x11::set_resize_hints(
-                    window.raw_display_handle(),
-                    &h,
-                    to_phys(min_w),
-                    to_phys(min_h),
-                    to_phys(max_w),
-                    to_phys(max_h),
-                    to_phys(inc_w),
-                    to_phys(inc_h),
-                    // Ratio is scale-independent - hand the raw editor
-                    // pair to the WM so it constrains the drag itself
-                    // instead of letting egui / iced / Slint letterbox.
-                    self.editor.aspect_ratio(),
-                );
-                self.size_hints_scale = scale;
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let (lw, lh) = if scale > 0.0 {
-                (
-                    (f64::from(phys.width) / scale).round() as u32,
-                    (f64::from(phys.height) / scale).round() as u32,
-                )
-            } else {
-                (phys.width, phys.height)
-            };
-            if (lw, lh) != self.current_size && lw > 0 && lh > 0 {
-                self.current_size = (lw, lh);
-                let accepted = self.editor.set_size(lw, lh);
-                // macOS reconciles the child frame each frame off this.
-                #[cfg(target_os = "macos")]
-                {
-                    self.editor_reports_size = accepted;
-                }
-                // Snap the outer standalone window to the editor's
-                // post-clamp / post-snap size. moose-gui's
-                // `BuiltinEditor` clamps to `min_cols` / `max_cols`,
-                // so when the user drags past the editor's bounds
-                // the editor stops growing but without this snap
-                // the outer NSWindow would keep going - leaving
-                // empty space around a clamped editor. egui / iced
-                // / slint take the new size verbatim, so the snap
-                // is a no-op for them. Vizia's `set_size` returns
-                // `false`; we leave the outer alone in that case
-                // so the autoresize cascade still works.
-                //
-                // NOT on Linux/X11: issuing `configure_window` from
-                // inside the handling of the window's own
-                // `ConfigureNotify` fights the WM's interactive
-                // resize grab. The grid snaps to whole columns on
-                // nearly every drag tick, so `(ew, eh) != (lw, lh)`
-                // is true almost always and the echo fires
-                // continuously; grab-rebaselining WMs (mutter, kwin)
-                // fold each injected size into the grab and the
-                // window runs away ("huge while dragging"). macOS
-                // already lives with `set_size`-only here (the child
-                // follows via `NSViewWidthSizable` autoresize); on
-                // Linux the editor's own `on_frame` resizes the child
-                // surface to the snapped size, so it still follows -
-                // we just let the WM own the outer frame during the
-                // drag and accept a thin margin at the clamp bounds.
-                #[cfg(not(target_os = "linux"))]
-                if accepted {
-                    let (ew, eh) = self.editor.size();
-                    if (ew, eh) != (lw, lh) && ew > 0 && eh > 0 {
-                        self.current_size = (ew, eh);
-                        resize_outer_window(window, ew, eh);
-                    }
-                }
-                #[cfg(target_os = "linux")]
-                let _ = accepted;
-            }
-        }
-
+    fn on_event(&mut self, _window: &WindowContext, event: Event) -> EventStatus {
         // On Linux X11 + NVIDIA, letting baseview unwind the parent
         // window normally crashes inside `XCloseDisplay` - the
         // driver's Xlib extension cleanup callback segfaults during

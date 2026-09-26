@@ -137,7 +137,9 @@ IDs refer to Matari's internal fork inventory.
   hot reload and RT-safe continuations; A17 `ProcessContext::bus_routing`;
   A20 egui key capture, native file drop and Linux file dialog, with
   baseview pinned to `DerpcatMusic/baseview@15cf1fe` (X01, X11
-  autorepeat normalization). The AU/AAX/LV2 halves of A06, A07, A11,
+  autorepeat normalization; since replaced by the in-tree
+  `crates/moose-baseview`, upstream baseview 0.3.4 plus the ports listed
+  in its README). The AU/AAX/LV2 halves of A06, A07, A11,
   A18 and A19 went away with those formats; A21/A22 (vizia) went away
   with vizia.
 - **B01** CLAP requests `CLAP_PARAM_RESCAN_VALUES` after state and preset
