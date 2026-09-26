@@ -35,6 +35,15 @@ struct NsRect {
     size: NsSize,
 }
 
+/// The `NSView` behind an `AppKit` window handle.
+#[cfg(target_os = "macos")]
+fn ns_view(window: &impl HasWindowHandle) -> Option<*mut std::ffi::c_void> {
+    match window.window_handle().ok()?.as_raw() {
+        raw_window_handle::RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
+        _ => None,
+    }
+}
+
 /// Re-anchor the editor's `NSView` to the **top** of its superview
 /// in unflipped Cocoa coordinates.
 ///
@@ -51,15 +60,6 @@ struct NsRect {
 ///
 /// Call this on macOS each frame (e.g. from `WindowHandler::on_frame`)
 /// so the child's origin tracks its size. No-op on non-macOS.
-/// The `NSView` behind an AppKit window handle.
-#[cfg(target_os = "macos")]
-fn ns_view(window: &impl HasWindowHandle) -> Option<*mut std::ffi::c_void> {
-    match window.window_handle().ok()?.as_raw() {
-        raw_window_handle::RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
-        _ => None,
-    }
-}
-
 #[cfg(target_os = "macos")]
 pub fn reanchor_to_superview_top(window: &impl HasWindowHandle) {
     use objc::{msg_send, sel, sel_impl};
