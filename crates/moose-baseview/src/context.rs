@@ -63,7 +63,8 @@ impl WindowContext {
     ///
     /// Same as [`Window::set_scale_factor_override`](crate::Window::set_scale_factor_override).
     pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<(), Error> {
-        self.inner.set_scale_factor_override(crate::settings::sanitize_scale_factor(scale_factor))?;
+        self.inner
+            .set_scale_factor_override(crate::settings::sanitize_scale_factor(scale_factor))?;
         Ok(())
     }
 

@@ -64,6 +64,12 @@ pub unsafe fn create_view_class<V: ViewImpl>() -> &'static AnyClass {
             sel!(viewWillMoveToWindow:),
             view_will_move_to_window::<V> as extern "C-unwind" fn(_, _, _) -> _,
         );
+        // MOOSE: a plugin view is often created before the host puts it in a
+        // window, so its first backing scale is a guess. Re-read it on entry.
+        class.add_method(
+            sel!(viewDidMoveToWindow),
+            view_did_move_to_window::<V> as extern "C-unwind" fn(_, _) -> _,
+        );
         class.add_method(sel!(hitTest:), hit_test::<V> as extern "C-unwind" fn(_, _, _) -> _);
         class.add_method(
             sel!(updateTrackingAreas),
@@ -205,6 +211,14 @@ extern "C-unwind" fn view_will_move_to_window<V: ViewImpl>(
 ) {
     let Some(inner) = this.inner_ref() else { return };
     V::view_will_move_to_window(inner, new_window);
+}
+
+extern "C-unwind" fn view_did_move_to_window<V: ViewImpl>(this: &View<V>, _self: Sel) {
+    let Some(inner) = this.inner_ref() else { return };
+    if this.window().is_some() {
+        // The logical size is unchanged, so the host needs no resize request.
+        V::view_did_change_backing_properties(inner, false);
+    }
 }
 
 extern "C-unwind" fn update_tracking_areas<V: ViewImpl>(this: &View<V>, _self: Sel) {

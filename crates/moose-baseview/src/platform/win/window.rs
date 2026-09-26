@@ -24,8 +24,8 @@ use crate::window::WindowInitializer;
 use crate::wrappers::win32::cursor::SystemCursor;
 use crate::wrappers::win32::window::*;
 use crate::wrappers::win32::{
-    ole_initialize, ole_uninitialize, run_thread_message_loop_until, Dpi, DpiAwarenessGuard, LibraryModule, Rect,
-    WindowStyle,
+    ole_initialize, ole_uninitialize, run_thread_message_loop_until, Dpi, DpiAwarenessGuard,
+    LibraryModule, Rect, WindowStyle,
 };
 use crate::{Event, MouseButton, MouseEvent, ScrollDelta, WindowEvent, WindowSize};
 
@@ -672,7 +672,8 @@ unsafe fn wnd_proc_inner(
 
             if changed {
                 let handler = window_bv.handler.get()?;
-                let new_size = WindowSize::from_physical(new_size, window_state.shared.scale_factor());
+                let new_size =
+                    WindowSize::from_physical(new_size, window_state.shared.scale_factor());
 
                 if let Err(e) = handler.resized(new_size) {
                     warn!("Window Handler failed to resize: {}", e);
@@ -718,9 +719,8 @@ unsafe fn wnd_proc_inner(
                 return Some(0);
             }
 
-            window_bv.handle_event(Event::Window(WindowEvent::ScaleFactorChanged(
-                dpi.scale_factor(),
-            )));
+            window_bv
+                .handle_event(Event::Window(WindowEvent::ScaleFactorChanged(dpi.scale_factor())));
 
             if shared.scale_factor_override.get().is_none() {
                 let new_size = shared

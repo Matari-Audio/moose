@@ -140,7 +140,8 @@ impl Window {
     /// On macOS this is a no-op.
     #[inline]
     pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<(), Error> {
-        self.inner.set_scale_factor_override(crate::settings::sanitize_scale_factor(scale_factor))?;
+        self.inner
+            .set_scale_factor_override(crate::settings::sanitize_scale_factor(scale_factor))?;
         Ok(())
     }
 
