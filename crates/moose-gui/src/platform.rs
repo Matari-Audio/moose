@@ -540,7 +540,7 @@ pub fn editor_instance_descriptor() -> wgpu::InstanceDescriptor {
 ///
 /// baseview and wgpu both speak raw-window-handle 0.6, so this is a
 /// straight hand-off, except on Windows, where the surface is created from
-/// the HWND (see [`create_wgpu_surface_from_hwnd`]).
+/// the HWND (see `create_wgpu_surface_from_hwnd`, Windows-only).
 ///
 /// # Safety
 /// The window must outlive the returned surface.
