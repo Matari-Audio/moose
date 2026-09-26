@@ -300,7 +300,7 @@ struct ClapPluginData<P: PluginExport> {
     ///   and want logical points anyway). HiDPI-aware hosts call
     ///   `set_scale` before `gui_get_size`.
     ///
-    /// f64 bits; GUI-thread-only, but atomic so `gui_get_size`, `set_scale`,
+    /// f64 bits, `0` until the host calls `set_scale`; GUI-thread-only, but atomic so `gui_get_size`, `set_scale`,
     /// and the `gui_create` resize closure reach it through the shared
     /// `&ClapPluginData` without a `&mut *ctx` - and so it stays outside the
     /// `gui` cell, which the resize closure would otherwise re-enter.
@@ -378,8 +378,18 @@ struct ClapGui {
 }
 
 impl<P: PluginExport> ClapPluginData<P> {
+    /// The host's scale, `1.0` until it calls `gui.set_scale`.
     fn host_scale(&self) -> f64 {
-        f64::from_bits(self.host_scale.load(Ordering::Relaxed))
+        self.reported_host_scale().unwrap_or(1.0)
+    }
+
+    /// The last scale the host passed to `gui.set_scale`, if it ever did.
+    /// Bits `0` (`+0.0`, which `gui_set_scale` rejects) mean "never".
+    fn reported_host_scale(&self) -> Option<f64> {
+        match self.host_scale.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f64::from_bits(bits)),
+        }
     }
 
     fn set_host_scale(&self, scale: f64) {
@@ -4232,6 +4242,14 @@ unsafe extern "C" fn gui_create<P: PluginExport>(
         // the GUI never stalls the audio thread (and `--shell` rebuilds
         // from the reloaded dylib).
         gui.editor = (data.editor_builder)(data.params_arc.clone());
+        // Each `create` builds a fresh editor, but the host's scale lives
+        // on the instance and outlives `destroy`. A host that sets it only
+        // once, or calls `set_scale` before `create`, would leave the new
+        // editor at 1.0 inside the host-scaled frame `gui_get_size`
+        // reports, so replay it. VST3's `cb_gui_open` does the same.
+        if let (Some(scale), Some(editor)) = (data.reported_host_scale(), gui.editor.as_mut()) {
+            editor.set_scale_factor(scale);
+        }
         gui.gui_created = gui.editor.is_some();
         gui.gui_created
     })
@@ -5095,7 +5113,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
             needs_rescan: Arc::new(AtomicBool::new(false)),
             transport_slot: TransportSlot::new(),
-            host_scale: AtomicU64::new(1.0f64.to_bits()),
+            host_scale: AtomicU64::new(0),
             pending_resize: AtomicU64::new(0),
             extensions: Extensions::<P>::new(),
             audio: PluginCell::new(ClapAudio {
