@@ -10,7 +10,7 @@
 # gate each test on the allocation count directly, so no mode needs setting.
 #
 # Only the DSP-distinct examples carry the check. The GUI-backend variants
-# (gain-egui / -iced / -vizia / -gpu, gui-zoo-*) share their `process`
+# (gain-egui*, gui-zoo-*) share their `process`
 # byte-for-byte with their base example, so re-checking them adds build
 # cost with no new coverage.
 

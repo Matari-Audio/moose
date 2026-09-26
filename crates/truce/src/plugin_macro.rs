@@ -24,7 +24,7 @@
 /// | Features                    | Result                                      |
 /// |-----------------------------|---------------------------------------------|
 /// | none                        | `cargo check` / test-only logic dylib       |
-/// | one or more of `clap`, `vst3`, `vst2`, `lv2`, `aax`, `au` | multi-format cdylib that exports every enabled format from one binary |
+/// | one or more of `clap`, `vst3` | multi-format cdylib that exports every enabled format from one binary |
 /// | `shell` only                | shell-mode loader (logic dylib loaded at runtime) |
 /// | `shell` + format(s)         | shell-mode cdylib that re-exports the loaded logic to the enabled formats |
 ///
@@ -54,9 +54,9 @@
 ///
 /// Zero code changes. Same `truce::plugin!` macro.
 /// Both `logic:` and `params:` are required. `params:` names the
-/// `#[derive(Params)]` struct; the LV2 TTL renderer is a proc-macro and
-/// can only find that struct's metadata by its literal name at
-/// expansion time, so it must be spelled out here.
+/// `#[derive(Params)]` struct; the param-index sidecar emitter is a
+/// proc-macro and can only find that struct's metadata by its literal
+/// name at expansion time, so it must be spelled out here.
 #[macro_export]
 macro_rules! plugin {
     (
@@ -81,10 +81,11 @@ macro_rules! plugin {
 #[macro_export]
 macro_rules! __plugin_impl {
     ($logic:ty, $params:ty, $(tasks: [$($task:ty),+],)?) => {
-        // Compile-time LV2 TTL emission. Walks the params type's
-        // sidecar tree (written by `derive(Params)`) and produces
-        // `manifest.ttl` / `plugin.ttl` next to it. cargo-truce's
-        // stage_lv2 reads those files at package time - no dlopen.
+        // Compile-time param sidecar emission. Walks the params type's
+        // sidecar tree (written by `derive(Params)`) under
+        // `target/lv2-meta/`; cargo-truce's preset pipeline reads
+        // `param_index.toml` from there. (The LV2 TTL output it also
+        // writes is unused since LV2 was removed.)
         $crate::__reexport::__truce_lv2_emit_root!($params);
 
         // Always export the PluginLogic for dylib use (shell-mode or
@@ -236,7 +237,7 @@ macro_rules! __plugin_impl {
         // `#[allow(unexpected_cfgs)]` covers every cfg-feature gate
         // below. Without this, downstream crates that don't declare
         // every truce format as a Cargo feature (e.g. analyzers that
-        // ship without LV2) emit `unexpected_cfgs` warnings at the
+        // ship without VST3) emit `unexpected_cfgs` warnings at the
         // `truce::plugin!` invocation site. Per-item `#[allow]`
         // doesn't suppress it because the lint is attributed to the
         // macro invocation, not the cfg attribute. Symbols emitted
@@ -251,18 +252,6 @@ macro_rules! __plugin_impl {
 
             #[cfg(feature = "vst3")]
             ::truce_vst3::export_vst3!(__HotShellWrapper);
-
-            #[cfg(feature = "vst2")]
-            ::truce_vst2::export_vst2!(__HotShellWrapper);
-
-            #[cfg(feature = "lv2")]
-            ::truce_lv2::export_lv2!(__HotShellWrapper);
-
-            #[cfg(feature = "aax")]
-            ::truce_aax::export_aax!(__HotShellWrapper);
-
-            #[cfg(feature = "au")]
-            ::truce_au::export_au!(__HotShellWrapper);
         }
     };
 }

@@ -6,7 +6,7 @@ Host-side platform helpers shared by truce GUI backends.
 
 Small helper crate shared by the GUI backends that embed a child view
 (wgpu- or CALayer-backed) into a DAW-provided parent window. It exists so
-each backend (`truce-gui`, `truce-egui`, `truce-iced`, `truce-vizia`) does not
+each backend (`truce-gui`, `truce-egui`) does not
 re-implement the same host-window quirks. No rendering, no widgets.
 
 The re-anchoring helpers are macOS-only: on Linux and Windows the host

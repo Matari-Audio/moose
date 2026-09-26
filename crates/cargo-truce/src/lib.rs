@@ -13,7 +13,6 @@ mod format;
 mod install_scope;
 pub(crate) mod preset_codec;
 pub mod scaffold;
-mod templates;
 mod util;
 
 pub use error::CargoTruceError;
@@ -24,29 +23,20 @@ pub use error::CargoTruceError;
 // or a `PkgFormat` re-export - `windows.rs` reaches `super::PkgFormat`
 // like its siblings.
 
-// Crate-root re-export of the AAX template builder, used by the
-// Windows packager. Cfg-gated so it isn't dead on macOS / Linux.
-#[cfg(target_os = "windows")]
-pub(crate) use commands::install::aax::build_aax_template;
 #[cfg(target_os = "macos")]
 pub(crate) use config::installer_identity;
 pub(crate) use config::{
     Config, PluginDef, application_identity, deployment_target, load_config, read_build_env,
-    resolve_aax_sdk_path,
-};
-#[cfg(target_os = "macos")]
-pub(crate) use config::{
-    ios_appex_provisioning_profile, ios_application_identity, ios_provisioning_profile, ios_team_id,
 };
 #[cfg(any(target_os = "macos", test))]
 pub(crate) use util::tmp_verify;
 pub(crate) use util::{
-    apply_extra_features, cargo_build, cargo_build_debug, check_cmd, codesign_bundle,
-    confirm_prompt, detect_default_features, find_on_path, is_debug_profile, log_output, log_skip,
+    apply_extra_features, cargo_build, cargo_build_debug, check_cmd, confirm_prompt,
+    detect_default_features, find_on_path, is_debug_profile, log_output,
     namespaced_nonformat_defaults, parse_extra_features, project_root, read_standalone_bin_name,
-    release_lib, set_build_profile, set_debug_profile, set_extra_features, set_no_default_features,
-    set_target_cpu, tag_fail, tag_ok, tag_warn, take_outputs, take_skipped,
-    verify_shell_profile_declared, vprintln,
+    set_build_profile, set_debug_profile, set_extra_features, set_no_default_features,
+    set_target_cpu, tag_fail, tag_ok, tag_warn, take_outputs, verify_shell_profile_declared,
+    vprintln,
 };
 // `run_sudo` shells out to `/usr/bin/sudo`, which only exists on macOS in
 // our supported targets. Windows admin elevation is per-process (UAC, not
@@ -54,23 +44,16 @@ pub(crate) use util::{
 // no meaningful implementation off macOS - the cfg gate forces callers to
 // stay platform-aware rather than silently spawning a missing binary.
 #[cfg(target_os = "macos")]
-pub(crate) use util::run_sudo;
-// `tmp_dir` is the raw escape hatch - used by `reset_au` (macOS only)
-// to walk every subdir under `tmp/`. Most callers pick the typed
-// helper that matches their purpose (`tmp_manifests`, `tmp_lv2`, …).
+pub(crate) use util::codesign_bundle;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use util::release_lib;
 #[cfg(target_os = "macos")]
-pub(crate) use util::tmp_dir;
+pub(crate) use util::run_sudo;
 // `tmp_manifests` is used on both macOS (codesign / AU / VST plist
 // scratch) and Windows (Azure signing metadata). Not used on Linux
 // since the tarball pipeline doesn't shell out to platform tools.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) use util::tmp_manifests;
-// `tmp_lv2` is consumed only by `install_lv2`'s macOS sudo-stage
-// path - Windows/Linux installers write straight into the destination
-// without staging, since neither needs the per-command privilege
-// escalation that drives the macOS detour.
-#[cfg(target_os = "macos")]
-pub(crate) use util::tmp_lv2;
 
 // `read_workspace_version` is consumed by all three packagers
 // (macOS / Windows / Linux tarball), so it stays unconditional.
@@ -94,9 +77,9 @@ pub(crate) use util::tag_info;
 // Linux ships plugins via distro tooling rather than the bundled
 // `package` flow, so these symbols are absent there.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) use util::{rustup_has_target, tmp_aax_template};
+pub(crate) use util::rustup_has_target;
 
-// macOS-only: codesign / lipo / notary / AAX PACE-sign pipeline. The
+// macOS-only: codesign / lipo / notary pipeline. The
 // `MacosPackagingConfig` / `copy_dir_recursive` re-exports land here
 // too - only `commands::package::{macos, stage}` consume them, and
 // both are macOS-gated.
@@ -104,19 +87,17 @@ pub(crate) use util::{rustup_has_target, tmp_aax_template};
 pub(crate) use config::MacosPackagingConfig;
 #[cfg(target_os = "macos")]
 pub(crate) use util::{
-    CLAP_EXPORTS, MacArch, VST2_EXPORTS, VST3_EXPORTS, cargo_build_for_arch,
-    cargo_build_multi_arch, cargo_build_multi_arch_with_profile, copy_dir_recursive,
-    extract_team_id, is_production_identity, link_macos_bundle, lipo_into, locate_wraptool_macos,
-    missing_staticlib_error, pace_sign_aax_macos, run_codesign, run_silent, tmp_au_v3,
+    CLAP_EXPORTS, MacArch, VST3_EXPORTS, cargo_build_multi_arch,
+    cargo_build_multi_arch_with_profile, copy_dir_recursive, link_macos_bundle, lipo_into,
+    missing_staticlib_error,
 };
 
-// Windows-only: VS / MSVC / cmake / ninja discovery + Program Files
-// path helpers, used by `commands::{doctor, install, install::aax}`
-// and `commands::package::windows`.
+// Windows-only: VS / MSVC discovery + Program Files path helpers,
+// used by `commands::{doctor, install}` and `commands::package::windows`.
 #[cfg(target_os = "windows")]
 pub(crate) use util::{
-    cargo_rustc_bin, common_program_files, locate_cmake, locate_msvc_cl, locate_ninja,
-    locate_vcvars64, locate_vcvarsall, program_files, tmp_scripts, vs_install_paths, which_exe,
+    cargo_rustc_bin, common_program_files, locate_msvc_cl, locate_vcvarsall, tmp_scripts,
+    vs_install_paths, which_exe,
 };
 
 use std::process::ExitCode;
@@ -154,12 +135,9 @@ pub fn run(args: &[String]) -> ExitCode {
         "run" => commands::run::cmd_run(&args[1..]),
         "screenshot" => commands::screenshot::cmd_screenshot(&args[1..]),
         "status" => commands::status::cmd_status(&args[1..]),
-        "reset-au" => commands::reset_au::cmd_reset_au(&args[1..]),
-        "reset-aax" => commands::reset_aax::cmd_reset_aax(&args[1..]),
         "validate" => commands::validate::cmd_validate(&args[1..]),
         "preset" => commands::preset::cmd_preset(&args[1..]),
         "doctor" => commands::doctor::cmd_doctor(&args[1..]),
-        "log-stream-au" => commands::log_stream_au::cmd_log_stream_au(&args[1..]),
         other => Err(format!("unknown command: {other:?}").into()),
     };
 

@@ -56,15 +56,3 @@ pub(crate) fn require_local_appdata() -> Result<PathBuf, crate::CargoTruceError>
         .map(PathBuf::from)
         .ok_or_else(|| "LOCALAPPDATA env var not set".into())
 }
-
-/// Windows `APPDATA` (`%APPDATA%`, e.g.
-/// `C:\Users\alice\AppData\Roaming`) - used as the user-scope LV2
-/// install root on Windows. Distinct from `LOCALAPPDATA`: roaming
-/// data follows the user across machines via Active Directory,
-/// matching the LV2 convention of bundle-relative resources.
-#[cfg(target_os = "windows")]
-pub(crate) fn require_appdata() -> Result<PathBuf, crate::CargoTruceError> {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "APPDATA env var not set".into())
-}

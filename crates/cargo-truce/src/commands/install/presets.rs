@@ -11,11 +11,6 @@
 //!   provider declares this directory to the host.
 //! - VST3: `.vstpreset` files under `Contents/Resources/Presets/`,
 //!   the location hosts scan for in-bundle factory presets.
-//! - AU v2: `.aupreset` plists under the OS preset location
-//!   (`[~]/Library/Audio/Presets/<Vendor>/<Plugin>/`), which Logic
-//!   and `GarageBand` walk.
-//! - LV2: `pset:Preset` TTL files inside the `.lv2` bundle plus the
-//!   `manifest.ttl` entries pointing at them.
 //!
 //! The state-envelope hash is derived from the same
 //! `truce_build::plugin_id` string `truce::plugin_info!()` bakes into
@@ -32,10 +27,7 @@ use crate::{run_sudo, tmp_manifests};
 #[cfg(target_os = "macos")]
 use std::ffi::OsStr;
 
-// The `.aupreset` emitters only run from the macOS-gated AU install.
 use crate::preset_codec::vstpreset_bytes;
-#[cfg(target_os = "macos")]
-use crate::preset_codec::{aupreset_xml, fourcc_int};
 use truce_utils::preset::{PRESET_FILE_EXT, PresetMeta, write_preset_file};
 use truce_utils::{safe_filename, state};
 
@@ -47,12 +39,6 @@ pub(crate) struct EmittablePreset {
     blob: Vec<u8>,
     /// Source file stem; per-format files reuse it.
     stem: String,
-    /// Per-control-port plain values `(lv2:symbol, value)` decoded from
-    /// `blob`, for the LV2 preset's `pset:value` entries. Empty when
-    /// the `symbols.toml` sidecar is missing (plugin not rebuilt since
-    /// this landed) or the blob can't be decoded; the LV2 preset then
-    /// falls back to `state:state` only.
-    lv2_ports: Vec<(String, f64)>,
 }
 
 impl EmittablePreset {
@@ -157,8 +143,6 @@ pub(crate) fn load_factory_presets(
         .join(&p.crate_name);
     let annotations = truce_build::presets::read_param_annotations(&sidecar_dir);
     let names = truce_build::presets::ParamNameMap::from_annotations(&annotations);
-    // `id -> lv2:symbol` for the LV2 preset's `pset:value` port entries.
-    let symbols = truce_build::presets::read_param_symbols(&sidecar_dir);
     let authored = truce_build::presets::read_presets_dir(&dir, true, Some(&names))?;
     if authored.is_empty() {
         return Ok(None);
@@ -167,24 +151,10 @@ pub(crate) fn load_factory_presets(
     let hash = state::hash_plugin_id(&truce_build::plugin_id(&config.vendor.id, &p.bundle_id));
     let presets = authored
         .into_iter()
-        .map(|a| {
-            let blob = a.state_blob(hash);
-            // Decode the envelope's plain param values and pair each
-            // with its control-port symbol. `state:state` still carries
-            // the full envelope; this is the redundant port-value path
-            // that port-based hosts (REAPER) apply through.
-            let lv2_ports = state::deserialize_state(&blob, hash).map_or_else(Vec::new, |s| {
-                s.params
-                    .iter()
-                    .filter_map(|(id, v)| symbols.get(id).map(|sym| (sym.clone(), *v)))
-                    .collect()
-            });
-            EmittablePreset {
-                blob,
-                meta: a.meta,
-                stem: a.stem,
-                lv2_ports,
-            }
+        .map(|a| EmittablePreset {
+            blob: a.state_blob(hash),
+            meta: a.meta,
+            stem: a.stem,
         })
         .collect();
     Ok(Some(FactoryPresets { presets }))
@@ -328,8 +298,7 @@ fn standalone_factory_root(exec_path: &Path) -> PathBuf {
 /// Emit `.vstpreset` files into the OS preset location hosts scan.
 /// The VST3 spec defines no in-bundle preset location; the scanned
 /// roots are the per-OS directories [`vst3_presets_root`] resolves.
-/// On macOS that tree is shared with `.aupreset` files and host-saved
-/// user presets, so emission overwrites its own files and never wipes
+/// On macOS that tree is shared with host-saved user presets, so emission overwrites its own files and never wipes
 /// the directory. Hosts match presets to the plugin via the class ID
 /// in the file header; the vendor / plugin directory names follow the
 /// reported factory vendor and display name for the spec-defined walk.
@@ -442,105 +411,4 @@ pub(crate) fn resolved_name<'a>(name_override: Option<&'a str>, name: &'a str) -
         Some(n) if !n.is_empty() => n,
         _ => name,
     }
-}
-
-/// Emit `.aupreset` plists into the AU preset location
-/// (`[~]/Library/Audio/Presets/<Vendor>/<Plugin>/`), which Logic and
-/// `GarageBand` walk on AU instantiation. macOS-only, like the AU
-/// install itself.
-#[cfg(target_os = "macos")]
-pub(crate) fn emit_au_presets(
-    fp: &FactoryPresets,
-    p: &PluginDef,
-    config: &Config,
-    scope: InstallScope,
-) -> Res {
-    let presets_root = match scope {
-        InstallScope::User => {
-            let Some(home) = crate::dirs::home_dir() else {
-                return Err("cannot resolve home directory for AU presets".into());
-            };
-            home.join("Library/Audio/Presets")
-        }
-        InstallScope::System => PathBuf::from("/Library/Audio/Presets"),
-    };
-    let dest_root = presets_root
-        .join(safe_filename(&config.vendor.name))
-        .join(safe_filename(resolved_name(p.au_name.as_deref(), &p.name)));
-
-    let au_type = fourcc_int(p.resolved_au_type())?;
-    let subtype = fourcc_int(p.resolved_fourcc())?;
-    let manufacturer = fourcc_int(&config.vendor.au_manufacturer)?;
-
-    let files: Vec<_> = fp
-        .presets
-        .iter()
-        .map(|pr| {
-            (
-                pr.display_rel_path("aupreset"),
-                aupreset_xml(au_type, subtype, manufacturer, &pr.meta.name, &pr.blob).into_bytes(),
-            )
-        })
-        .collect();
-    // Hosts save user presets into the same directory tree - never
-    // wipe it, only overwrite our own files.
-    write_tree(
-        &files,
-        &dest_root,
-        false,
-        scope.needs_sudo(),
-        &format!("{}-au", p.bundle_id),
-    )?;
-    crate::log_output(format!(
-        "      {} factory presets -> {}",
-        files.len(),
-        dest_root.display()
-    ));
-    Ok(())
-}
-
-/// Emit LV2 preset TTLs into a staged / installed `.lv2` bundle:
-/// one `presets/<stem>.ttl` per preset plus the `manifest.ttl`
-/// entries referencing them. Runs against the writable bundle (the
-/// staging dir on macOS system scope), so no sudo handling here.
-pub(crate) fn emit_lv2_presets(fp: &FactoryPresets, bundle: &Path, plugin_uri: &str) -> Res {
-    let presets_dir = bundle.join("presets");
-    fs_ctx::create_dir_all(&presets_dir)?;
-
-    let mut manifest_additions = String::from(truce_build::lv2::PRESET_MANIFEST_PREFIXES);
-    for pr in &fp.presets {
-        let file_name = format!("{}.ttl", safe_filename(&pr.stem));
-        let label = if pr.meta.category.is_empty() {
-            pr.meta.name.clone()
-        } else {
-            // LV2 hosts show a flat label list; keep the category
-            // visible the way subdirectories do it elsewhere.
-            format!("{}/{}", pr.meta.category, pr.meta.name)
-        };
-        let ttl = truce_build::lv2::render_preset_ttl(
-            plugin_uri,
-            &pr.meta.uuid,
-            &label,
-            &pr.blob,
-            &pr.lv2_ports,
-        );
-        fs_ctx::write(presets_dir.join(&file_name), &ttl)?;
-        manifest_additions.push_str(&truce_build::lv2::render_preset_manifest_entry(
-            plugin_uri,
-            &pr.meta.uuid,
-            &format!("presets/{file_name}"),
-        ));
-    }
-
-    let manifest_path = bundle.join("manifest.ttl");
-    let mut manifest = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
-    manifest.push_str(&manifest_additions);
-    fs_ctx::write(&manifest_path, &manifest)?;
-    crate::log_output(format!(
-        "      {} factory presets -> {}",
-        fp.presets.len(),
-        presets_dir.display()
-    ));
-    Ok(())
 }

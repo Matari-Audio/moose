@@ -28,10 +28,9 @@ concurrency:
 # location with a pre-seeded *user* preset to prove the VST3 merge
 # never wipes a user's own presets.
 #
-# AAX and AU v3 are skipped via `--formats clap,vst3,vst2,standalone{,au2,lv2}`:
-# AAX needs the Avid SDK + PACE eden, AU v3 needs a real Developer ID
-# for the appex extension sandbox to load. `standalone` is included so
-# the standalone factory-preset packaging is exercised on every OS.
+# Every OS packages `--formats clap,vst3,standalone`. `standalone` is
+# included so the standalone factory-preset packaging is exercised on
+# every OS.
 jobs:
   macos:
     name: package (macos-14)
@@ -53,8 +52,8 @@ jobs:
       # account + an app-specific password / notary keychain profile,
       # neither of which is wired up in CI. The pkg still gets a
       # codesign pass against the ad-hoc identity (`-`).
-      - name: cargo truce package --formats clap,vst3,vst2,au2,standalone --no-notarize
-        run: ./target/debug/cargo-truce package --formats clap,vst3,vst2,au2,standalone --no-notarize -p truce-example-synth
+      - name: cargo truce package --formats clap,vst3,standalone --no-notarize
+        run: ./target/debug/cargo-truce package --formats clap,vst3,standalone --no-notarize -p truce-example-synth
 
       - name: Verify .pkg produced
         run: |
@@ -63,7 +62,7 @@ jobs:
           test -f target/dist/truce-example-synth-*-macos.pkg
 
       # The synth ships factory presets; assert the .pkg carries them
-      # (CLAP/AU in-bundle + the dedicated VST3-Presets component).
+      # (CLAP in-bundle + the dedicated VST3-Presets component).
       - name: Verify presets in the .pkg
         run: bash scripts/ci/verify-package-presets.sh macos
 
@@ -102,8 +101,8 @@ jobs:
       - name: Build cargo-truce
         run: cargo build -p cargo-truce
 
-      - name: cargo truce package --formats clap,vst3,vst2,lv2,standalone
-        run: ./target/debug/cargo-truce package --formats clap,vst3,vst2,lv2,standalone -p truce-example-synth
+      - name: cargo truce package --formats clap,vst3,standalone
+        run: ./target/debug/cargo-truce package --formats clap,vst3,standalone -p truce-example-synth
 
       - name: Verify tarball produced
         run: |
@@ -111,7 +110,7 @@ jobs:
           ls -la target/dist/
           test -f target/dist/truce-example-synth-*-linux-*.tar.gz
 
-      # Assert the tarball carries CLAP/LV2/VST3 presets, then install
+      # Assert the tarball carries CLAP/VST3 presets, then install
       # into a throwaway HOME with a pre-seeded user preset to prove the
       # VST3 merge never wipes a user's own presets.
       - name: Verify presets in the tarball
@@ -151,9 +150,9 @@ jobs:
       # No Authenticode signing: TRUCE_CERT_SHA1 / TRUCE_PFX_PATH /
       # TRUCE_AZURE_ACCOUNT are unset, so `sign_files` short-circuits.
       # The installer comes out unsigned but valid.
-      - name: cargo truce package --formats clap,vst3,vst2,standalone
+      - name: cargo truce package --formats clap,vst3,standalone
         shell: bash
-        run: ./target/debug/cargo-truce.exe package --formats clap,vst3,vst2,standalone -p truce-example-synth
+        run: ./target/debug/cargo-truce.exe package --formats clap,vst3,standalone -p truce-example-synth
 
       - name: Verify installer produced
         shell: bash

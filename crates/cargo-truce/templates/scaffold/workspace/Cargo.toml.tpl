@@ -32,20 +32,6 @@ truce-standalone = \{ git = "https://github.com/truce-audio/truce", tag = "{tag}
 {{- endif }}
 clap-sys = "0.5"
 
-# Uncomment to opt in. After uncommenting here, add the matching
-# feature + optional dep to each plugin's Cargo.toml.
-{{ if use_registry -}}
-# truce-lv2 = \{ version = "{version}" }
-# truce-au  = \{ version = "{version}" }
-# truce-aax = \{ version = "{version}" }
-# truce-vst2 = \{ version = "{version}" }
-{{- else -}}
-# truce-lv2 = \{ git = "https://github.com/truce-audio/truce", tag = "{tag}" }
-# truce-au  = \{ git = "https://github.com/truce-audio/truce", tag = "{tag}" }
-# truce-aax = \{ git = "https://github.com/truce-audio/truce", tag = "{tag}" }
-# truce-vst2 = \{ git = "https://github.com/truce-audio/truce", tag = "{tag}" }
-{{- endif }}
-
 # Custom profile for `cargo truce install --shell`. The shell-mode
 # build lands at `target/shell/lib<crate>.dylib`, independent of
 # `target/release/` and `target/debug/`. Cargo profiles are workspace-

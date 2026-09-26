@@ -43,7 +43,7 @@ case "$OS" in
     for bom in "$exp"/x/*.pkg/Bom; do
       files+=$'\n'"$(lsbom -s "$bom" 2>/dev/null || true)"
     done
-    grep -q '\.trucepreset$' <<<"$files" || fail "no .trucepreset in CLAP/AU payload"
+    grep -q '\.trucepreset$' <<<"$files" || fail "no .trucepreset in CLAP payload"
     n=$(grep -c '\.vstpreset$' <<<"$files" || true)
     [ "$n" -eq "$EXPECT_VST3" ] || fail "expected $EXPECT_VST3 .vstpreset, found $n"
     ls "$exp"/x/*VST3-Presets.pkg >/dev/null 2>&1 || fail "no VST3-Presets component in .pkg"
@@ -51,7 +51,7 @@ case "$OS" in
     # `Contents/Resources/Presets/` (the path the installed app resolves).
     grep -qE '\.app/Contents/Resources/Presets/.*\.trucepreset' <<<"$files" \
       || fail "no standalone .app presets in .pkg"
-    pass "macOS .pkg carries CLAP/AU + $n VST3 + standalone presets (component present)"
+    pass "macOS .pkg carries CLAP + $n VST3 + standalone presets (component present)"
     ;;
 
   linux)
@@ -59,11 +59,10 @@ case "$OS" in
       || fail "no tarball in $DIST"
     list=$(tar tzf "$tar")
     grep -q "clap/$PLUGIN.presets/.*\.trucepreset" <<<"$list" || fail "no CLAP presets in tarball"
-    grep -q 'lv2/.*\.lv2/presets/.*\.ttl'          <<<"$list" || fail "no LV2 preset TTLs in tarball"
     grep -q "vst3-presets/$VENDOR/$PLUGIN/.*\.vstpreset" <<<"$list" || fail "no VST3 presets in tarball"
     grep -q "standalone/$STANDALONE_BIN.presets/.*\.trucepreset" <<<"$list" \
       || fail "no standalone presets in tarball"
-    pass "Linux tarball carries CLAP + LV2 + VST3 + standalone presets"
+    pass "Linux tarball carries CLAP + VST3 + standalone presets"
 
     # Layer B: install into a throwaway HOME with a pre-seeded user
     # preset to prove the VST3 merge never wipes the user's own files.

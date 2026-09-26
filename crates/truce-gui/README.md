@@ -13,7 +13,7 @@ opt into GPU rendering (wgpu) with the `gpu` feature.
 Windowing is handled through baseview. In CPU mode the tiny-skia pixmap
 is uploaded to a wgpu surface each frame for compositing; in GPU mode
 `GpuEditor` renders the widgets directly through wgpu. All supported
-formats (CLAP, VST3, VST2, AU, LV2, AAX, standalone) use the same path.
+formats (CLAP, VST3, standalone) use the same path.
 
 `truce-gui` orchestrates the two `RenderBackend` implementations into
 editor types. The renderers themselves live in sibling crates, so a
@@ -27,7 +27,7 @@ plugin only compiles the one it uses:
 The lightweight trait + data surface (`GridLayout`, `RenderBackend`,
 `WidgetType`, `Theme`, ...) lives in
 [`truce-gui-types`](../truce-gui-types) so alt-GUI backends
-(`truce-egui` / `truce-iced` / `truce-slint`) and plugin authors using a
+(`truce-egui`) and plugin authors using a
 custom editor don't transitively pull in the rasterization + windowing
 stack.
 

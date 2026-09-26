@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 # Run `cargo clippy --fix --allow-dirty --all-features --all-targets`
-# followed by `cargo fmt` in the main workspace and every truce sub-
-# workspace. The verification gate before declaring a change done.
-#
-# Sub-workspaces (each with its own Cargo.toml):
-#   crates/truce-slint
-#   crates/truce-vizia
-#   crates/truce-gpu-examples
+# followed by `cargo fmt` in every workspace listed by
+# truce-workspaces.sh. The verification gate before declaring a change
+# done.
 #
 # Sequential (not parallel) so stdout / stderr interleave cleanly.
 
@@ -24,12 +20,14 @@ if command -v cargo.exe >/dev/null 2>&1; then
     cargo="cargo.exe"
 fi
 
-workspaces=(
-    "$root_dir"
-    "$root_dir/crates/truce-slint"
-    "$root_dir/crates/truce-vizia"
-    "$root_dir/crates/truce-gpu-examples"
-)
+# shellcheck source=truce-workspaces.sh
+source "$script_dir/truce-workspaces.sh"
+
+# `mapfile` is bash 4+; build by hand for macOS's stock bash 3.2.
+workspaces=()
+while IFS= read -r ws_path; do
+    workspaces+=("$ws_path")
+done < <(truce_workspaces "$root_dir")
 
 overall_status=0
 for ws in "${workspaces[@]}"; do

@@ -44,15 +44,6 @@ impl PluginKind {
         }
     }
 
-    #[must_use]
-    pub fn au_tag(self) -> &'static str {
-        match self {
-            Self::Instrument => "Synthesizer",
-            Self::Midi => "MIDI",
-            Self::Effect => "Effects",
-        }
-    }
-
     /// Default VST3 secondary subcategory baked into the scaffolded
     /// `truce.toml`. Without it, hosts like Cubase bucket the plug-in
     /// under "Other". The user is expected to tighten this to the

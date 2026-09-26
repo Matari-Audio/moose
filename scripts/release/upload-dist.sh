@@ -35,15 +35,10 @@
 #     the same name; safe to re-run after re-packaging.
 #   - Other OSes' uploads are untouched.
 #
-# Sub-workspaces:
-#   The slint / vizia / gpu-examples sub-workspaces have their own
-#   `truce.toml` (see scripts/recursive-cargo-truce.sh); `cargo truce
-#   package` run inside one writes artifacts to that workspace's own
-#   dist dir, not the root's. This script asks cargo for each
-#   workspace's real target dir (so `CARGO_TARGET_DIR` and a
-#   `.cargo/config.toml` `target-dir` are honored, not assumed to be
-#   `<ws>/target`) and scans every one, so a single
-#   `recursive-cargo-truce.sh package` run uploads all of them.
+# Target dir:
+#   This script asks cargo for the workspace's real target dir (so
+#   `CARGO_TARGET_DIR` and a `.cargo/config.toml` `target-dir` are
+#   honored, not assumed to be `<ws>/target`).
 #
 # Pre-reqs:
 #   - The GitHub release `vX.Y.Z` already exists (run
@@ -112,16 +107,11 @@ workspace_dist_dir() {
     fi
 }
 
-# Workspace roots to scan: the root plus each self-contained sub-
-# workspace (slint / vizia / gpu-examples), each with its own
-# `truce.toml`. Keep in sync with scripts/recursive-cargo-truce.sh.
-# A dist dir that doesn't exist (sub-workspace not packaged on this run
-# / platform) contributes nothing under `nullglob` rather than erroring.
+# Workspace roots to scan. Keep in sync with scripts/truce-workspaces.sh.
+# A dist dir that doesn't exist (workspace not packaged on this run /
+# platform) contributes nothing under `nullglob` rather than erroring.
 WORKSPACES=(
     "."
-    "crates/truce-slint"
-    "crates/truce-vizia"
-    "crates/truce-gpu-examples"
 )
 
 DIST_DIRS=()

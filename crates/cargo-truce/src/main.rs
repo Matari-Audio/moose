@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     // same name instead of panicking. Required when multiple plugin
     // dylibs (each containing its own copy of raw-window-metal's
     // "RawWindowMetalLayer" subclass) load into the same host process
-    // - e.g. Pro Tools loading two AAX plugins built with truce. See
+    // - e.g. a host loading two plugins built with truce. See
     // raw-window-metal issue #29 and the `UNSAFE_OBJC2_ALLOW_CLASS_OVERRIDE`
     // check in objc2's src/__macro_helpers/define_class.rs. The env
     // var is read at compile time by objc2; setting it here means
@@ -52,9 +52,7 @@ fn main() -> ExitCode {
         },
         // Build/install commands - forwarded to the engine in lib.rs.
         "install" | "build" | "package" | "uninstall" | "run" | "screenshot" | "status"
-        | "reset-au" | "reset-aax" | "validate" | "doctor" | "log-stream-au" | "preset" => {
-            cargo_truce::run(&args)
-        }
+        | "validate" | "doctor" | "preset" => cargo_truce::run(&args),
 
         "help" | "--help" | "-h" => {
             print_help();
@@ -103,7 +101,7 @@ Scaffold:
         --type:<plugin>=<kind>      Per-plugin type override (effect, instrument, midi)
 
 Build / Install / Package:
-  install [--clap] [--vst3] [--vst2] [--lv2] [--au2] [--au3] [--aax] [--user|--system] [--shell] [--debug] [--no-build] [-p <crate>] [--target-cpu <value>]
+  install [--clap] [--vst3] [--user|--system] [--shell] [--debug] [--no-build] [-p <crate>] [--target-cpu <value>]
       Build and install plugins into the host's plug-in directories.
       Defaults to release because installing usually means audio-
       testing in a DAW - release avoids surprise CPU spikes from
@@ -113,25 +111,15 @@ Build / Install / Package:
       and wiring checks).
 
       Defaults to whichever formats are in the plugin's Cargo.toml
-      default features (typically clap + vst3). VST2, LV2, AU, and AAX
-      are opt-in and must be enabled explicitly via these flags or by
-      adding them to the plugin's default features.
+      default features (typically clap + vst3).
 
       Per-format scope is per-user by default on every platform; pass
       `--system` to install into the shared system directories (sudo
-      / admin required). AAX and AU v3 are always system-scope, and
-      `--user` for these formats falls back silently with a one-line
-      note.
+      / admin required).
       --clap         CLAP only (no sudo)
       --vst3         VST3 only
-      --vst2         VST2 only (legacy format)
-      --lv2          LV2 only
-      --au2          AU v2 only (.component, macOS only)
-      --au3          AU v3 only (.appex, requires Xcode, macOS only)
-      --aax          AAX only (requires pre-built template)
       --user         Install into the per-user directories (default).
-                     No sudo / admin needed for CLAP, VST3, VST2 (macOS),
-                     LV2, and AU v2.
+                     No sudo / admin needed.
       --system       Install into the system-wide directories. Requires
                      sudo on macOS, admin on Windows.
       --shell        Build dynamic shells (loaded by the DAW) + per-
@@ -154,7 +142,7 @@ Build / Install / Package:
                      See `cargo truce build --help` for the full
                      description and per-value caveats.
 
-  build [--clap] [--vst3] [--vst2] [--lv2] [--au2] [--au3] [--aax] [-p <crate>] [--shell] [--debug] [--target-cpu <value>]
+  build [--clap] [--vst3] [-p <crate>] [--shell] [--debug] [--target-cpu <value>]
       Build per-format bundles into target/bundles/ without installing.
       Defaults to release; pass `--debug` for the cargo dev profile
       when iterating on layout, packaging, or format-wrapper wiring.
@@ -163,11 +151,6 @@ Build / Install / Package:
       format in the project's default Cargo features is built.
       --clap         CLAP only
       --vst3         VST3 only
-      --vst2         VST2 only
-      --lv2          LV2 only
-      --au2          AU v2 only (.component, macOS only)
-      --au3          AU v3 only (.appex inside .app, macOS only)
-      --aax          AAX only (requires pre-built SDK + template)
       -p <crate>     Build only the plugin with this cargo crate name
       --shell        Build dynamic shells (custom `[profile.shell]`,
                      `target/shell/`) plus the per-plugin logic dylibs
@@ -192,11 +175,7 @@ Build / Install / Package:
                    Installer.app destination page or the Inno Setup
                    \"Choose installation mode\" page (default).
       --user       Hard-lock to user-scope. CLAP/VST3 land in user
-                   paths with no admin prompt. AAX, AU v3, and
-                   Windows VST2 are kept and installed to the system
-                   path (one admin prompt at install time on Windows;
-                   on macOS the whole pkg widens to system-domain
-                   when AAX/AU v3 are present).
+                   paths with no admin prompt.
       --system     Hard-lock to system paths (today's behavior).
 
       Set `[packaging] preferred_scope = \"user\" | \"system\" | \"ask\"`
@@ -213,11 +192,10 @@ Build / Install / Package:
       a DAW); release otherwise. `--target-cpu` mirrors `build`'s flag
       (x86_64 defaults to x86-64-v3).
 
-  uninstall [--clap] [--vst3] [--vst2] [--au2] [--au3] [--aax] [--user|--system] [-p <crate>] [-n <name>] [--stale] [--dry-run] [--yes]
+  uninstall [--clap] [--vst3] [--standalone] [--user|--system] [-p <crate>] [-n <name>] [--stale] [--dry-run] [--yes]
       Uninstall plugin bundles for this project.
       Default: all formats, all plugins, both user + system scopes.
-      Asks for confirmation. AAX and AU v3 are always system-scope -
-      `--user` skips them with the same one-line note as install.
+      Asks for confirmation.
       -p <crate>   Filter by cargo crate name (e.g. -p truce-example-gain)
       -n <name>    Filter by display name (e.g. -n 'Truce Gain')
       --user       Only uninstall bundles in the per-user directories
@@ -235,13 +213,10 @@ Presets:
       for the full surface.
 
 Validation / Inspection:
-  validate [--auval] [--auval3] [--pluginval] [--clap] [--vst2] [--all] [-p <crate>]
+  validate [--pluginval] [--clap] [--all] [-p <crate>]
       Run validation tools on installed plugins.
-      --auval      AU v2 validation only (macOS)
-      --auval3     AU v3 validation only (macOS)
       --pluginval  VST3 validation via pluginval
       --clap       CLAP validation via clap-validator
-      --vst2       VST2 dlopen + AEffect probe (macOS-only smoke binary)
       --all        Run all available validators (default)
       -p <crate>   Validate only the plugin with this cargo crate name
 
@@ -251,31 +226,12 @@ Validation / Inspection:
       plugin in truce.toml. Default name is <bundle_id>_screenshot.
 
   status
-      Scan installed plugin bundles (filesystem-only; for an AU
-      registry check use `cargo truce validate --auval`).
+      Scan installed plugin bundles (macOS, filesystem-only).
 
   doctor
       Check development environment and installed plugins.
 
-Maintenance:
-  reset-au [--yes]
-      macOS-only. Flush Audio Unit caches and restart `pkd` /
-      `AudioComponentRegistrar`. Use when AU bundles are stuck
-      serving stale binaries. CLAP / VST3 / VST2 / LV2 unaffected.
-      --yes        Skip confirmation prompt
-
-  reset-aax [--yes]
-      macOS-only. Wipe this vendor's entries from the Pro Tools AAX
-      cache (`/Users/Shared/Pro Tools/AAXPlugInCache`). Pro Tools
-      re-scans AAX plugins on next launch.
-      --yes        Skip confirmation prompt
-
-  log-stream-au
-      macOS-only. Tail AU v3 appex logs live (`os_log` output from the
-      Swift wrapper, subsystem `com.truce.au3`). Forward-only - for
-      historical entries use `log show --last <duration>` directly.
-      Press Ctrl-C to stop.
-
+Other:
   help
       Show this message.
 
@@ -504,7 +460,7 @@ fn scaffold_single(scaffolder: &Scaffolder, parsed: NewArgs, features: FeatureSe
     eprintln!("  cargo truce doctor               # check environment");
     eprintln!();
     eprintln!("Edit src/lib.rs to add your DSP.");
-    eprintln!("Edit truce.toml to configure vendor info and AU metadata.");
+    eprintln!("Edit truce.toml to configure vendor info.");
     eprintln!("Edit .cargo/config.toml to set signing identities and SDK paths.");
     eprintln!();
     if cfg!(target_os = "windows") {
@@ -595,7 +551,7 @@ fn scaffold_workspace(scaffolder: &Scaffolder, parsed: NewArgs, features: Featur
     eprintln!("  cargo truce doctor               # check environment");
     eprintln!();
     eprintln!("Edit plugins/*/src/lib.rs to add your DSP.");
-    eprintln!("Edit truce.toml to configure vendor info and AU metadata.");
+    eprintln!("Edit truce.toml to configure vendor info.");
     eprintln!("Edit .cargo/config.toml to set signing identities and SDK paths.");
     eprintln!();
     if cfg!(target_os = "windows") {

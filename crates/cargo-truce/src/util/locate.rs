@@ -1,8 +1,6 @@
 //! `which`-style PATH walker plus Windows-side toolchain discovery for
-//! `cmake.exe`, `ninja.exe`, `cl.exe`, and `vcvars64.bat`. Used by
-//! `cargo truce doctor` (to surface tool availability) and the AAX
-//! Windows builder (to drive a Developer-Command-Prompt-equivalent
-//! environment from outside one).
+//! `cl.exe` and `vcvarsall.bat`. Used by `cargo truce doctor` and the
+//! Windows cargo builds.
 
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
@@ -52,51 +50,6 @@ pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
             if candidate.is_file() {
                 return Some(candidate);
             }
-        }
-    }
-    None
-}
-
-/// Locate `cmake.exe`. Tries `%PATH%` first, then the `CMake` that ships with
-/// Visual Studio's "C++ `CMake` tools" component, then the standalone installer
-/// default. Returns `None` if none are present.
-#[cfg(target_os = "windows")]
-pub(crate) fn locate_cmake() -> Option<PathBuf> {
-    if let Some(p) = which_exe("cmake.exe") {
-        return Some(p);
-    }
-    for vs_install in vs_install_paths() {
-        let bundled =
-            vs_install.join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe");
-        if bundled.is_file() {
-            return Some(bundled);
-        }
-    }
-    for c in [
-        r"C:\Program Files\CMake\bin\cmake.exe",
-        r"C:\Program Files (x86)\CMake\bin\cmake.exe",
-    ] {
-        let p = PathBuf::from(c);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Locate `ninja.exe`. Same strategy as cmake - the VS `CMake` component bundles
-/// Ninja next to it, so that's the most common path on machines that have VS
-/// with "C++ `CMake` tools" installed.
-#[cfg(target_os = "windows")]
-pub(crate) fn locate_ninja() -> Option<PathBuf> {
-    if let Some(p) = which_exe("ninja.exe") {
-        return Some(p);
-    }
-    for vs_install in vs_install_paths() {
-        let bundled =
-            vs_install.join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe");
-        if bundled.is_file() {
-            return Some(bundled);
         }
     }
     None
@@ -158,39 +111,6 @@ pub(crate) fn vs_install_paths() -> Vec<PathBuf> {
             .collect(),
         _ => Vec::new(),
     }
-}
-
-/// Locate `vcvars64.bat` via `vswhere.exe`. Returns `None` if VS isn't
-/// installed with the C++ tools component.
-#[cfg(target_os = "windows")]
-pub(crate) fn locate_vcvars64() -> Option<PathBuf> {
-    let vswhere =
-        PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
-    if !vswhere.exists() {
-        return None;
-    }
-    let out = Command::new(&vswhere)
-        .args([
-            "-latest",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-property",
-            "installationPath",
-            "-format",
-            "value",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let install = String::from_utf8(out.stdout).ok()?;
-    let install = install.trim();
-    if install.is_empty() {
-        return None;
-    }
-    let vcvars = PathBuf::from(install).join(r"VC\Auxiliary\Build\vcvars64.bat");
-    vcvars.exists().then_some(vcvars)
 }
 
 /// Locate `vcvarsall.bat` - the multi-arch entry point that accepts an

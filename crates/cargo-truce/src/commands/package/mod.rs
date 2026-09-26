@@ -158,11 +158,6 @@ pub(crate) fn extract_suite_selection(
 pub(crate) enum PkgFormat {
     Clap,
     Vst3,
-    Vst2,
-    Lv2,
-    Au2,
-    Au3,
-    Aax,
     /// Standalone host application built from the plugin's
     /// `[features].standalone`. Installs to `/Applications/` on macOS,
     /// `%PROGRAMFILES%\<Vendor>\<Plugin>\` on Windows, `/usr/bin/` (or
@@ -177,11 +172,6 @@ impl std::str::FromStr for PkgFormat {
         match s {
             "clap" => Ok(PkgFormat::Clap),
             "vst3" => Ok(PkgFormat::Vst3),
-            "vst2" => Ok(PkgFormat::Vst2),
-            "lv2" => Ok(PkgFormat::Lv2),
-            "au2" => Ok(PkgFormat::Au2),
-            "au3" => Ok(PkgFormat::Au3),
-            "aax" => Ok(PkgFormat::Aax),
             "standalone" => Ok(PkgFormat::Standalone),
             other => Err(format!("unknown format: {other}").into()),
         }
@@ -206,7 +196,7 @@ struct PkgFormatMeta {
     choice_description: &'static str,
 }
 
-const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 8] = [
+const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 3] = [
     (
         PkgFormat::Clap,
         PkgFormatMeta {
@@ -216,7 +206,7 @@ const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 8] = [
             install_location: "/Library/Audio/Plug-Ins/CLAP/",
             // macOS CLAP is a loadable bundle (`Contents/MacOS/<name>`
             // + `Info.plist`) - pkgbuild gets the same component-plist
-            // treatment as VST3 / AU so the installer pins it to the
+            // treatment as VST3 so the installer pins it to the
             // declared install_location and upgrades by bundle ID.
             is_native_bundle: true,
             choice_description: "For Reaper, Bitwig",
@@ -231,68 +221,6 @@ const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 8] = [
             install_location: "/Library/Audio/Plug-Ins/VST3/",
             is_native_bundle: true,
             choice_description: "For Ableton, FL Studio, Reaper, Cubase",
-        },
-    ),
-    (
-        PkgFormat::Vst2,
-        PkgFormatMeta {
-            label: "VST2",
-            pkg_id_suffix: "vst2",
-            extension: "vst",
-            install_location: "/Library/Audio/Plug-Ins/VST/",
-            is_native_bundle: false,
-            choice_description: "Legacy - for hosts without VST3 support",
-        },
-    ),
-    (
-        PkgFormat::Lv2,
-        PkgFormatMeta {
-            label: "LV2",
-            pkg_id_suffix: "lv2",
-            extension: "lv2",
-            // macOS LV2 plugins live alongside the other formats in
-            // the Audio Plug-Ins root; the bundle itself is a
-            // directory with the `.lv2` extension. Reaper, Ardour,
-            // Bitwig pick them up from here.
-            install_location: "/Library/Audio/Plug-Ins/LV2/",
-            // LV2 bundles are plain directories (not macOS-style
-            // bundle blobs with `Info.plist`) - `pkgbuild` should
-            // recurse into them like any other folder of files.
-            is_native_bundle: false,
-            choice_description: "For Ardour, Bitwig, Reaper, and Linux DAWs",
-        },
-    ),
-    (
-        PkgFormat::Au2,
-        PkgFormatMeta {
-            label: "AU2",
-            pkg_id_suffix: "au2",
-            extension: "component",
-            install_location: "/Library/Audio/Plug-Ins/Components/",
-            is_native_bundle: true,
-            choice_description: "For Logic Pro, GarageBand, Ableton",
-        },
-    ),
-    (
-        PkgFormat::Au3,
-        PkgFormatMeta {
-            label: "AU3",
-            pkg_id_suffix: "au3",
-            extension: "app",
-            install_location: "/Applications/",
-            is_native_bundle: true,
-            choice_description: "Audio Unit v3 (appex)",
-        },
-    ),
-    (
-        PkgFormat::Aax,
-        PkgFormatMeta {
-            label: "AAX",
-            pkg_id_suffix: "aax",
-            extension: "aaxplugin",
-            install_location: "/Library/Application Support/Avid/Audio/Plug-Ins/",
-            is_native_bundle: false,
-            choice_description: "For Pro Tools",
         },
     ),
     (
@@ -357,21 +285,11 @@ impl PkgFormat {
     /// Bundle directory name for a given plugin.
     pub(crate) fn bundle_name(&self, plugin: &PluginDef) -> String {
         match self {
-            PkgFormat::Au3 => format!("{}.app", plugin.au3_app_name()),
             // Plain `<Plugin>.app` so Spotlight / Launch Services index
             // it as a regular application. The historical
             // `<Plugin>.standalone.app` extension confused some indexing
             // paths and the bundle would not appear in Spotlight search.
-            // AU v3 resolves to the same `<Plugin>.app` (its app *is* the
-            // standalone host with the appex), so `resolve_formats` drops
-            // the separate Standalone format whenever AU v3 is present -
-            // they never coexist at this path.
             PkgFormat::Standalone => format!("{}.app", plugin.file_stem()),
-            // LV2 bundle names follow the spec's lowercase-hyphenated
-            // convention (the same slug `derive(Params)` bakes into
-            // `manifest.ttl` / `plugin.ttl`). Anything else and hosts
-            // can't resolve the bundle from the TTL's binary URI.
-            PkgFormat::Lv2 => format!("{}.lv2", stage::lv2_slug(&plugin.name)),
             _ => format!("{}.{}", plugin.file_stem(), self.extension()),
         }
     }
@@ -381,20 +299,14 @@ impl PkgFormat {
     }
 
     /// True for formats whose install destination can't be redirected
-    /// into the user's home - AAX lives under
-    /// `/Library/Application Support/Avid/...` where Pro Tools scans,
-    /// AU v3 needs `/Applications/` for `LaunchServices` to register
-    /// the appex, and a standalone `.app` belongs in `/Applications/`
-    /// to show up in Launchpad. When the user picks "Install for me
-    /// only" but selects one of these, the installer escalates
+    /// into the user's home - a standalone `.app` belongs in
+    /// `/Applications/` to show up in Launchpad. When the user picks
+    /// "Install for me only" but selects one of these, the installer escalates
     /// (`auth="Root"` on the corresponding `<pkg-ref>`) so the
     /// component still lands in the right place rather than failing
     /// with a permission-denied shove.
     pub(crate) fn is_system_only_on_macos(&self) -> bool {
-        matches!(
-            self,
-            PkgFormat::Aax | PkgFormat::Au3 | PkgFormat::Standalone
-        )
+        matches!(self, PkgFormat::Standalone)
     }
 }
 
@@ -411,28 +323,13 @@ pub(crate) fn cmd_package(args: &[String]) -> Res {
         return Ok(());
     }
     // Pull `--features` out first and set the invocation global, so it
-    // reaches every build the fan-out spawns (iOS, per-OS, universal)
+    // reaches every build the fan-out spawns (per-OS, universal)
     // via `apply_extra_features` without each per-OS parser handling it.
     let (user_features, no_default_features, args) = extract_features_arg(args)?;
     crate::set_extra_features(user_features);
     // `--no-default-features` opts out of re-adding each plugin's
     // non-format default features (e.g. `ara`) to the per-format builds.
     crate::set_no_default_features(no_default_features);
-    // iOS short-circuit: AU v3 inside an `.ipa` is the only viable
-    // iOS distribution shape and doesn't share any of the macOS /
-    // Windows / Linux packaging pipeline (no productbuild, no Inno
-    // Setup, no tarball). Handle it as a thin pass-through before
-    // the platform dispatch.
-    if args.iter().any(|a| a == "--ios") {
-        #[cfg(target_os = "macos")]
-        {
-            return package_ios(&args);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            return Err("--ios packaging requires macOS (Xcode-only).".into());
-        }
-    }
     let (selection, args) = extract_suite_selection(&args)?;
     // Fail loudly on an unknown `--suite <name>` rather than silently
     // building only the per-plugin installers. Only load config when a
@@ -454,67 +351,12 @@ pub(crate) fn cmd_package(args: &[String]) -> Res {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn package_ios(args: &[String]) -> Res {
-    use crate::commands::install::au_ios;
-    let mut plugin_filter: Option<&str> = None;
-    let mut xcframework_only = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--ios" => {}
-            "--xcframework" => xcframework_only = true,
-            "-p" => {
-                i += 1;
-                plugin_filter = args.get(i).map(String::as_str);
-                if plugin_filter.is_none() {
-                    return Err("-p needs a plugin name".into());
-                }
-            }
-            other => return Err(format!("Unknown flag for --ios packaging: {other}").into()),
-        }
-        i += 1;
-    }
-    let root = crate::project_root();
-    let config = crate::load_config()?;
-    let plugins: Vec<&crate::PluginDef> = if let Some(s) = plugin_filter {
-        let p = config
-            .plugin
-            .iter()
-            .find(|p| p.crate_name == s || p.bundle_id == s)
-            .ok_or_else(|| -> crate::CargoTruceError {
-                format!("No plugin with crate name or bundle id '{s}'.").into()
-            })?;
-        vec![p]
-    } else {
-        config.plugin.iter().collect()
-    };
-
-    // Print each "Packaged: ..." line as the plugin finishes rather
-    // than batching them at the end - gives the user feedback during
-    // multi-plugin runs (each ipa is minutes of cargo build), and
-    // avoids any flush race between the final eprintln batch and
-    // process exit.
-    for p in plugins {
-        let path = if xcframework_only {
-            au_ios::build_xcframework(&root, p)?
-        } else {
-            au_ios::package_ipa(&root, p)?
-        };
-        eprintln!("Packaged: {}", path.display());
-    }
-    if !xcframework_only && let Some(team) = crate::ios_team_id() {
-        eprintln!("Signed for team {team}.");
-    }
-    Ok(())
-}
-
 fn print_help() {
     eprintln!(
         "\
 Usage: cargo truce package [-p <crate>] [--suite <name>] \
 [--no-suite|--no-per-plugin] [--formats <list>] \
-[--user|--system|--ask] [--no-notarize] [--no-sign|--no-pace-sign] \
+[--user|--system|--ask] [--no-notarize] \
 [--host-only|--universal]
 
 Build, sign, and package plugins into installers. Per-plugin dist
@@ -538,7 +380,7 @@ Selection (composable):
 
 Format selection:
   --formats <list>     Comma-separated subset
-                       (clap,vst3,vst2,au2,au3,aax,standalone).
+                       (clap,vst3,standalone).
                        Default: every format in the plugin's
                        `[features].default`.
   --features <list>    Extra Cargo features for the plugin crate,
@@ -552,16 +394,12 @@ Format selection:
 Install scope (where the resulting installer puts files at the end user's machine):
   --ask                End user picks at install time. Default.
   --user               User-scope. CLAP/VST3 land in user paths with no
-                       admin prompt. System-only formats (AAX, AU v3, Windows
-                       VST2) stay system-scope; the user sees one admin prompt.
+                       admin prompt.
   --system             Hard-lock to system paths.
   Override the default project-wide via `[packaging] preferred_scope` in truce.toml.
 
 Signing / notarization (macOS / Windows):
   --no-notarize        Skip macOS notarization (still codesigns).
-  --no-pace-sign       Skip PACE (AAX) signing - useful for non-Pro Tools
-                       sanity checks. Apple codesign always runs on macOS.
-  --no-sign            Synonym for --no-pace-sign on macOS.
 
 Build target (macOS):
   --host-only          Single-arch build of the host. Default is universal.

@@ -27,7 +27,7 @@ cargo truce install --clap         # single format only
 cargo truce build                  # bundle into target/bundles/ without installing
 cargo truce package                # build a signed .pkg / .exe in target/dist/
 cargo truce uninstall              # remove installed plugins (mirrors install scope flags)
-cargo truce validate               # run auval (AU) + pluginval (VST3) + clap-validator
+cargo truce validate               # run pluginval (VST3) + clap-validator
 cargo truce doctor                 # check toolchain, SDKs, signing certs, install paths
 cargo truce run                    # build and launch standalone
 cargo truce screenshot             # render every plugin's GUI to target/screenshots/
@@ -36,8 +36,7 @@ cargo truce status                 # show installed plugin versions
 
 ## Supported formats
 
-CLAP, VST3, VST2, LV2, Audio Unit v2 + v3 (macOS), and AAX (Pro Tools,
-macOS / Windows).
+CLAP, VST3, and standalone on macOS, Windows, and Linux.
 
 ## Library API
 

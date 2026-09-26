@@ -9,7 +9,7 @@ authors implement, covering both audio-thread DSP and main-thread
 GUI. The crate is intentionally light: it depends on `truce-core`,
 `truce-gui-types` (data + render-trait surface only), and
 `truce-params`. No tiny-skia, no baseview, no fonts. Plugin
-authors using a custom editor (egui, iced, slint, raw window
+authors using a custom editor (egui, raw window
 handle) end up with this crate in their dep tree but never pull in
 the built-in editor's heavy stack.
 

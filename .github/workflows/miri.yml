@@ -2,7 +2,7 @@ name: Miri
 
 # UB detection on the pure-Rust core: the buffer transmutes, the
 # mediation lock, the state/UMP parsers. FFI surfaces (shims, GUI,
-# cpal) can't run under Miri; pluginval/auval remain their harness.
+# cpal) can't run under Miri; pluginval/clap-validator remain their harness.
 on:
   push:
     branches: [main]

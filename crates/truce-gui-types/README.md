@@ -23,8 +23,8 @@ truce-gui-types     <- this crate - light data + traits
    |
 truce-plugin        <- PluginLogic / PluginLogic64 / PluginLogicCore
    |       \
-truce-gui   truce-egui / truce-iced / truce-slint  <- alt GUI backends
-(BuiltinEditor,   each depends on truce-gui-types but not truce-gui
+truce-gui   truce-egui  <- alt GUI backend
+(BuiltinEditor,   depends on truce-gui-types but not truce-gui
  baseview)
    |       \
 truce-cpu  truce-gpu  <- RenderBackend impls, pulled by truce-gui's
@@ -32,7 +32,7 @@ truce-cpu  truce-gpu  <- RenderBackend impls, pulled by truce-gui's
  skrifa)
 ```
 
-A slint-only plugin's dep tree contains `truce-plugin ->
+An egui-only plugin's dep tree contains `truce-plugin ->
 truce-gui-types -> truce-core` - `tiny-skia`, `baseview`,
 `skrifa`, `truce-font` don't appear unless the plugin also
 depends on `truce-gui`.

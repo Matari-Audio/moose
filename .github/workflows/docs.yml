@@ -53,28 +53,6 @@ jobs:
       - name: cargo doc
         run: cargo doc --workspace --no-deps
 
-      # truce-slint sub-workspace (skia-bindings `links` collision -
-      # see crates/truce-slint/Cargo.toml). Render its docs into the
-      # same target/doc tree so the published rustdoc still links
-      # cross-crate.
-      - name: cargo doc (truce-slint sub-workspace)
-        run: cargo doc --manifest-path crates/truce-slint/Cargo.toml --workspace --no-deps --target-dir target
-
-      # truce-vizia sub-workspace (vizia's hard-pinned baseview rev +
-      # cargo's cross-name `[patch]` rule, see
-      # crates/truce-vizia/Cargo.toml). Same target dir for cross-crate
-      # linking. `RUSTDOCFLAGS: -D warnings` (workflow-wide) covers
-      # rustdoc lints here too.
-      - name: cargo doc (truce-vizia sub-workspace)
-        run: cargo doc --manifest-path crates/truce-vizia/Cargo.toml --workspace --no-deps --target-dir target
-
-      # truce-gpu-examples sub-workspace (split out so its
-      # `truce-gui/gpu` feature request can't unify across the parent
-      # workspace and flip CPU screenshot tests to GPU - see
-      # crates/truce-gpu-examples/Cargo.toml).
-      - name: cargo doc (truce-gpu-examples sub-workspace)
-        run: cargo doc --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace --no-deps --target-dir target
-
       - name: redirect index.html → truce
         if: github.event_name != 'pull_request'
         run: echo '<meta http-equiv="refresh" content="0; url=truce/">' > target/doc/index.html

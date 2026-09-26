@@ -5,7 +5,7 @@ edition = "2024"
 # The Truce License (LicenseRef-TruceLicense-1.0), same as the
 # workspace - dual Apache-2.0 / MIT plus the framework rider in LICENSE.
 license.workspace = true
-description = "Build tool for truce audio plugins (CLAP, VST3, VST2, LV2, AU v2, AU v3, AAX, and a standalone host binary)"
+description = "Build tool for truce audio plugins (CLAP, VST3, and a standalone host binary)"
 repository = "https://github.com/truce-audio/truce"
 keywords = ["audio", "plugin", "vst", "clap", "midi"]
 categories = [
@@ -34,7 +34,6 @@ tinytemplate = "1.2"
 # its FFI-side encode path; keeping versions aligned avoids
 # transitive duplication when both are in a workspace build.
 png = "0.18"
-truce-shim-types = { workspace = true }
 truce-build = { workspace = true }
 truce-utils = { workspace = true }
 base64 = { workspace = true }
@@ -45,16 +44,6 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dependencies.libloading]
 version = "0.9"
-
-# AAX bridge header (`truce_aax_bridge.h`) + ABI version live in
-# the tiny `truce-aax-bridge` contract crate - depending on it
-# (rather than on the full `truce-aax` cdylib) keeps the CLI's
-# transitive graph from picking up `truce-core` / `truce-params` /
-# `crossbeam-queue` just to read a static string. Same pattern as
-# `truce-shim-types` for the AU v3 header. AAX is only packaged
-# on macOS / Windows, so the dep is gated to those targets.
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-truce-aax-bridge = { workspace = true }
 
 # Post-link icon embed for the standalone host .exe lives in
 # `windows_manifest::embed_icon` and calls `BeginUpdateResource` /

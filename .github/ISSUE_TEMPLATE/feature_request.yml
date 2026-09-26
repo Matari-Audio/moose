@@ -42,7 +42,7 @@ body:
       description: Which part of truce does this touch?
       options:
         - cargo truce CLI (build / install / package / validate / ...)
-        - A plugin format (CLAP / VST3 / VST2 / LV2 / AU / AAX)
+        - A plugin format (CLAP / VST3 / standalone)
         - Parameters / state
         - GUI / editor backend
         - Presets

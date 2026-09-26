@@ -3,7 +3,7 @@
 # This file is tracked. It carries project-level facts only: vendor info,
 # plugin definitions, suite definitions, packaging metadata.
 #
-# Per-developer build environment (signing identities, AAX SDK path,
+# Per-developer build environment (signing identities,
 # notarization Apple ID / team ID, Authenticode certs) lives in the
 # local `.cargo/config.toml` (gitignored), not here. See
 # https://truce.audio/ for the complete list of env vars truce reads.
@@ -11,7 +11,6 @@
 #   # .cargo/config.toml
 #   [env]
 #   TRUCE_SIGNING_IDENTITY = "Developer ID Application: Name (TEAMID)"
-#   AAX_SDK_PATH           = "/path/to/aax-sdk-2-9-0"
 [vendor]
 name = "Truce"
 id = "com.truce"
@@ -30,65 +29,29 @@ installer_icon = "static/truce-minimal.ico"
 welcome_bmp = "static/truce-welcome.bmp"
 
 # Each [[plugin]] entry defines a plugin to build and install.
-# The crate must support --features au (or whichever formats you declare).
 # `cargo truce new <name>` scaffolds a new plugin under plugins/<name>/;
 # the first-party examples in this repo live under examples/ for
 # historical reasons.
 #
 # Per-format display-name overrides (all optional) let a plugin show
 # under a different name in specific host browsers. Useful mostly
-# when AU v2 and v3 are installed side-by-side, or during beta/alpha
-# parallel ships. When a field is absent the format falls back to
+# during beta/alpha parallel ships. When a field is absent the format falls back to
 # `name` above.
 #
 #   clap_name = "..."
 #   vst3_name = "..."
 #   # Optional exact 16-byte VST3 class ID; 32 hex characters.
 #   vst3_class_id = "00112233445566778899aabbccddeeff"
-#   vst2_name = "..."
-#   au_name   = "..."
-#   au3_name  = "..."
-#   aax_name  = "..."
-#   lv2_name  = "..."
 #
-# Per-plugin iOS overrides:
-#
-#   ios_icon_set            = ".appiconset directory"
-#   ios_minimum_os_version  = "16.0"
-#   ios_url                 = "https://example.com/this-plugin"
-#                             # iOS container "About" link-out;
-#                             # falls back to [vendor].url
-#   ios_orientations        = ["portrait", "landscape-left",
-#                              "landscape-right"]
-#                             # First entry is the launch orientation.
-#                             # Default if unset: above three.
-#                             # In landscape, the container chrome
-#                             # (title, status, Play button) hides
-#                             # behind a hamburger overlay top-right
-#                             # so the editor fills the screen.
-#   ios_scale_editor_to_fit = false
-#                             # Opt out of the default shrink-to-fit
-#                             # of an oversize editor into the
-#                             # container's hero region. Default
-#                             # `true`; never up-scales above 1.0.
-#                             # Set `false` for plug-ins whose editor
-#                             # is already iPhone-sized.
-
 [[plugin]]
 name = "Truce Gain"
 bundle_id = "gain"
 crate = "truce-example-gain"
 category = "effect"
 fourcc = "TGan"
-au3_subtype = "TGn3"
-au_tag = "Effects"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Gain (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-ios_url = "https://truce.audio/"
 
 # Gain demonstrating the experimental (not recommended) zero-copy
 # in-place buffer path. See examples/truce-example-gain-inplace/src/lib.rs.
@@ -98,15 +61,9 @@ bundle_id = "gain-inplace"
 crate = "truce-example-gain-inplace"
 category = "effect"
 fourcc = "TGnP"
-au3_subtype = "TGP3"
-au_tag = "Effects"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Gain In-Place (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-ios_url = "https://truce.audio/"
 
 [[plugin]]
 name = "Truce Gain SIMD"
@@ -114,14 +71,9 @@ bundle_id = "gain-simd"
 crate = "truce-example-block-gain"
 category = "effect"
 fourcc = "TBGl"
-au3_subtype = "TBGl"
-au_tag = "Effects"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Gain SIMD (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Saturate"
@@ -129,14 +81,9 @@ bundle_id = "saturate"
 crate = "truce-example-block-saturate"
 category = "effect"
 fourcc = "TSat"
-au3_subtype = "TSa3"
-au_tag = "Effects"
-aax_category = "Harmonic"
 vst3_subcategory = "Distortion"
-au3_name = "Truce Saturate (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Dry/Wet"
@@ -144,14 +91,9 @@ bundle_id = "drywet"
 crate = "truce-example-block-drywet"
 category = "effect"
 fourcc = "TDrw"
-au3_subtype = "TDw3"
-au_tag = "Effects"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Dry/Wet (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Gate"
@@ -159,14 +101,9 @@ bundle_id = "gate"
 crate = "truce-example-block-gate"
 category = "effect"
 fourcc = "TGat"
-au3_subtype = "TGa3"
-au_tag = "Dynamics"
-aax_category = "Dynamics"
 vst3_subcategory = "Dynamics"
-au3_name = "Truce Gate (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Widen"
@@ -174,14 +111,9 @@ bundle_id = "widen"
 crate = "truce-example-block-widen"
 category = "effect"
 fourcc = "TWid"
-au3_subtype = "TWi3"
-au_tag = "Effects"
-aax_category = "Effect"
 vst3_subcategory = "Spatial"
-au3_name = "Truce Widen (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce 5.1 Meter"
@@ -189,14 +121,9 @@ bundle_id = "surround-meter"
 crate = "truce-example-block-surround-meter"
 category = "effect"
 fourcc = "T51m"
-au3_subtype = "T513"
-au_tag = "Effects"
-aax_category = "Effect"
 vst3_subcategory = "Analyzer"
-au3_name = "Truce 5.1 Meter (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Sidechain"
@@ -204,9 +131,7 @@ bundle_id = "sidechain"
 crate = "truce-example-sidechain"
 category = "effect"
 fourcc = "TScm"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Sidechain (AUv3)"
 
 [[plugin]]
 name = "Truce Synth"
@@ -216,17 +141,13 @@ category = "instrument"
 description = """
 A subtractive monosynth built on the truce framework: saw / square \
 / triangle / sine oscillators, a resonant low-pass filter, and an \
-ADSR envelope, hosted as a sandboxed AUv3 instrument. Drop it onto \
+ADSR envelope. Drop it onto \
 your DAW's instrument track to play melodies, basslines, or pads.
 """
 fourcc = "TSyn"
-au3_subtype = "TSn3"
-au_tag = "Synthesizer"
 vst3_subcategory = "Synth"
-au3_name = "Truce Synth (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce EQ"
@@ -234,14 +155,9 @@ bundle_id = "eq"
 crate = "truce-example-eq"
 category = "effect"
 fourcc = "TEq3"
-au3_subtype = "TEq4"
-au_tag = "EQ"
-aax_category = "EQ"
 vst3_subcategory = "EQ"
-au3_name = "Truce EQ (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Stereo Utility"
@@ -249,14 +165,9 @@ bundle_id = "stereo-utility"
 crate = "truce-example-stereo-utility"
 category = "effect"
 fourcc = "TSut"
-au3_subtype = "TSu3"
-au_tag = "Effects"
-aax_category = "Effect"
 vst3_subcategory = "Tools"
-au3_name = "Truce Stereo Utility (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Transpose"
@@ -264,17 +175,8 @@ bundle_id = "transpose"
 crate = "truce-example-transpose"
 category = "midi"
 fourcc = "TTrn"
-au3_subtype = "TTr3"
-au_tag = "MIDI"
-# `aax_category` is unset: NoteEffect plugins are pinned to
-# AAX_ePlugInCategory_MIDIEffect by truce-aax so they show up in Pro
-# Tools' MIDI plug-ins menu regardless of this field.
-au3_name = "Truce Transpose (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-ios_orientations = ["landscape-left", "landscape-right"]
-ios_scale_editor_to_fit = false
 
 [[plugin]]
 name = "Truce Gain Egui"
@@ -282,14 +184,9 @@ bundle_id = "gain-egui"
 crate = "truce-example-gain-egui"
 category = "effect"
 fourcc = "TGeg"
-au3_subtype = "TGe3"
-au_tag = "Effects"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Gain Egui (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Gain Egui Aspect"
@@ -297,14 +194,9 @@ bundle_id = "gain-egui-aspect"
 crate = "truce-example-gain-egui-aspect"
 category = "effect"
 fourcc = "TGeA"
-au3_subtype = "TeA3"
-au_tag = "Effects"
-aax_category = "Dynamics"
 vst3_subcategory = "Tools"
-au3_name = "Truce Gain Egui Aspect (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Arpeggio"
@@ -312,28 +204,8 @@ bundle_id = "arpeggio"
 crate = "truce-example-arpeggio"
 category = "midi"
 fourcc = "TArp"
-au3_subtype = "TAr3"
-au_tag = "MIDI"
-# See note on transpose above re: AAX MIDI category override.
-au3_name = "Truce Arpeggio (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-
-[[plugin]]
-name = "Truce Gain Iced"
-bundle_id = "gain-iced"
-crate = "truce-example-gain-iced"
-category = "effect"
-fourcc = "TGic"
-au3_subtype = "TGi3"
-au_tag = "Effects"
-aax_category = "Dynamics"
-vst3_subcategory = "Tools"
-au3_name = "Truce Gain Iced (AUv3)"
-windows_icon = "static/truce-minimal.ico"
-macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Tremolo"
@@ -341,14 +213,9 @@ bundle_id = "tremolo"
 crate = "truce-example-tremolo"
 category = "effect"
 fourcc = "TTrM"
-au3_subtype = "TTM3"
-au_tag = "Effects"
-aax_category = "Modulation"
 vst3_subcategory = "Modulation"
-au3_name = "Truce Tremolo (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce State"
@@ -356,15 +223,9 @@ bundle_id = "state"
 crate = "truce-example-state"
 category = "effect"
 fourcc = "TStt"
-au3_subtype = "TSt3"
-au_tag = "Effects"
-aax_category = "Other"
 vst3_subcategory = "Tools"
-au3_name = "Truce State (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-ios_orientations = ["landscape-left", "landscape-right"]
 
 [[plugin]]
 name = "Truce Fundsp Reverb (Worker)"
@@ -372,14 +233,9 @@ bundle_id = "fundsp-reverb-worker"
 crate = "truce-example-fundsp-reverb-worker"
 category = "effect"
 fourcc = "TFwR"
-au3_subtype = "TFw3"
-au_tag = "Reverb"
-aax_category = "Reverb"
 vst3_subcategory = "Reverb"
-au3_name = "Truce Fundsp Reverb Worker (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Fundsp Reverb (Simple)"
@@ -387,14 +243,9 @@ bundle_id = "fundsp-reverb-simple"
 crate = "truce-example-fundsp-reverb-simple"
 category = "effect"
 fourcc = "TFsR"
-au3_subtype = "TFs3"
-au_tag = "Reverb"
-aax_category = "Reverb"
 vst3_subcategory = "Reverb"
-au3_name = "Truce Fundsp Reverb Simple (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce GUI Zoo"
@@ -402,13 +253,9 @@ bundle_id = "gui-zoo"
 crate = "truce-example-gui-zoo"
 category = "effect"
 fourcc = "TZoo"
-au3_subtype = "TZo3"
-au_tag = "Effects"
 vst3_subcategory = "Tools"
-au3_name = "Truce GUI Zoo (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce GUI Zoo (egui)"
@@ -416,27 +263,9 @@ bundle_id = "gui-zoo-egui"
 crate = "truce-example-gui-zoo-egui"
 category = "effect"
 fourcc = "TZeg"
-au3_subtype = "TZe3"
-au_tag = "Effects"
 vst3_subcategory = "Tools"
-au3_name = "Truce GUI Zoo egui (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-
-[[plugin]]
-name = "Truce GUI Zoo (iced)"
-bundle_id = "gui-zoo-iced"
-crate = "truce-example-gui-zoo-iced"
-category = "effect"
-fourcc = "TZic"
-au3_subtype = "TZi3"
-au_tag = "Effects"
-vst3_subcategory = "Tools"
-au3_name = "Truce GUI Zoo iced (AUv3)"
-windows_icon = "static/truce-minimal.ico"
-macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Bitcrusher (dasp)"
@@ -444,14 +273,9 @@ bundle_id = "dasp-bitcrusher"
 crate = "truce-example-dasp-bitcrusher"
 category = "effect"
 fourcc = "TBcr"
-au3_subtype = "TBc3"
-au_tag = "Effects"
-aax_category = "Harmonic"
 vst3_subcategory = "Distortion"
-au3_name = "Truce Bitcrusher (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 # MIDI-capability demos. These exercise plugin-to-host MIDI output and
 # the `midi_input` / `midi_output` capability flags.
@@ -463,13 +287,8 @@ crate = "truce-example-envelope"
 category = "effect"
 midi_output = true
 fourcc = "TEnv"
-au3_subtype = "TEn3"
-au_tag = "MIDI"
-aax_category = "Effect"
-au3_name = "Truce Envelope (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Chord"
@@ -478,13 +297,9 @@ crate = "truce-example-chord"
 category = "instrument"
 midi_output = true
 fourcc = "TChd"
-au3_subtype = "TCh3"
-au_tag = "Synthesizer"
 vst3_subcategory = "Synth"
-au3_name = "Truce Chord (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce CC Filter"
@@ -493,14 +308,9 @@ crate = "truce-example-cc-filter"
 category = "effect"
 midi_input = true
 fourcc = "TCcf"
-au3_subtype = "TCf3"
-au_tag = "Effects"
-aax_category = "EQ"
 vst3_subcategory = "Filter"
-au3_name = "Truce CC Filter (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Channel Spread"
@@ -508,17 +318,12 @@ bundle_id = "chan-spread"
 crate = "truce-example-mpe-spreader"
 category = "midi"
 # Fans notes across channels and adds per-note expression. Pure MIDI 2.0
-# (2.0 in and out) so the whole AU v3 chain speaks one protocol - the
+# (2.0 in and out) so the whole chain speaks one protocol - the
 # spreader handles both 1.0 and 2.0 note input and always emits 2.0.
 midi2 = true
 fourcc = "TMpe"
-au3_subtype = "TMp3"
-au_tag = "MIDI"
-# See note on transpose above re: AAX MIDI category override.
-au3_name = "Truce Channel Spread (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce SysEx Echo"
@@ -526,16 +331,11 @@ bundle_id = "sysex-echo"
 crate = "truce-example-sysex-echo"
 category = "midi"
 # 2.0 output so the echo exercises SysEx-over-UMP (SysEx-7 packet
-# chains) on AU v3; input stays 1.0.
+# chains); input stays 1.0.
 midi2_output = true
 fourcc = "TSxe"
-au3_subtype = "TSx3"
-au_tag = "MIDI"
-# See note on transpose above re: AAX MIDI category override.
-au3_name = "Truce SysEx Echo (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce MPE Synth"
@@ -547,13 +347,9 @@ crate = "truce-example-mpe-synth"
 category = "instrument"
 midi2 = true
 fourcc = "TMps"
-au3_subtype = "TMs3"
-au_tag = "Synthesizer"
 vst3_subcategory = "Instrument|Synth"
-au3_name = "Truce MPE Synth (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 [[plugin]]
 name = "Truce Multiport"
@@ -566,36 +362,9 @@ crate = "truce-example-multiport"
 category = "instrument"
 midi_input_ports = 2
 fourcc = "TMlt"
-au3_subtype = "TMl3"
-au_tag = "Synthesizer"
 vst3_subcategory = "Instrument|Synth"
-au3_name = "Truce Multiport (AUv3)"
 windows_icon = "static/truce-minimal.ico"
 macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
-
-[[plugin]]
-name = "Truce MIDI Inspector"
-bundle_id = "midi-inspector"
-crate = "truce-example-midi-inspector"
-# Audio effect with a stereo passthrough that also monitors + forwards
-# MIDI (AU `aumf` MusicEffect). The audio I/O lets it load as an insert
-# in hosts that don't host MIDI-only plug-ins (Ableton, Reaper); a pure
-# MIDI processor (`category = "midi"` -> `aumi`) is invisible there.
-category = "effect"
-midi_input = true
-midi_output = true
-# Opt into MIDI 2.0 so the host delivers native 2.0 (NoteOn2, PerNoteCC,
-# ...) for the inspector to display at full resolution.
-midi2 = true
-fourcc = "TMin"
-au3_subtype = "TMi3"
-au_tag = "Effects"
-vst3_subcategory = "Tools"
-au3_name = "Truce MIDI Inspector (AUv3)"
-windows_icon = "static/truce-minimal.ico"
-macos_icon = "static/truce-minimal.icns"
-ios_icon_set = "static/truce-minimal.appiconset"
 
 # Suite installer wrapping every example above. `cargo truce package`
 # (no flags) produces both per-plugin installers and this suite installer.

@@ -6,14 +6,12 @@ use super::PkgFormat;
 use crate::commands::install::presets;
 #[cfg(target_os = "macos")]
 use crate::install_scope::PkgScope;
-#[cfg(target_os = "macos")]
-use crate::pace_sign_aax_macos;
 // Every `xml_escape` call site here is a macOS plist writer.
 #[cfg(target_os = "macos")]
 use crate::preset_codec::xml_escape;
-use crate::{Config, PluginDef, Res, codesign_bundle};
+use crate::{Config, PluginDef, Res};
 #[cfg(target_os = "macos")]
-use crate::{MacosPackagingConfig, copy_dir_recursive};
+use crate::{MacosPackagingConfig, codesign_bundle};
 #[cfg(target_os = "macos")]
 use std::fmt::Write;
 use std::fs;
@@ -22,110 +20,6 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-
-/// Slug a plugin's display name into a lowercase, hyphenated, ASCII-safe
-/// identifier suitable for LV2 bundle / file / IRI use. Thin re-export
-/// of [`truce_utils::slugify`]; kept under the `package::stage` module
-/// path because every cargo-truce caller already imports from here.
-pub(crate) fn lv2_slug(name: &str) -> String {
-    truce_utils::slugify(name)
-}
-
-/// Stage an LV2 bundle into `staging/{slug}.lv2/`. Copies the built
-/// shared library plus the proc-macro-emitted `manifest.ttl` /
-/// `plugin.ttl` sidecars (written by truce-derive's `derive(Params)`
-/// during the cdylib's compile). No dlopen - the binary doesn't have
-/// to load on this host, so cross-arch builds Just Work.
-///
-/// On macOS, the inner `.so` is a Mach-O and gets signed with the
-/// caller's identity via `codesign_bundle` - same Developer-ID +
-/// hardened-runtime + secure-timestamp treatment as CLAP / VST3.
-/// Without that step, Apple's notarization-readiness check flags the
-/// LV2 binary as ad-hoc-signed and refuses to submit.
-///
-/// `target` selects which `target/<triple>/release/` directory to
-/// read the built dylib from. `None` reads from the default
-/// `target/release/` (host build). On non-macOS hosts `identity` is
-/// unused (`codesign_bundle` is a no-op there).
-pub(crate) fn stage_lv2(
-    root: &Path,
-    p: &PluginDef,
-    staging: &Path,
-    identity: &str,
-    target: Option<&str>,
-) -> Res {
-    let built = crate::release_lib_for_target(root, &format!("{}_lv2", p.dylib_stem()), target);
-    if !built.exists() {
-        return Err(format!("Missing: {}", built.display()).into());
-    }
-
-    let target_dir = truce_build::target_dir(root);
-    let sidecar_dir = target_dir.join("lv2-meta").join(&p.crate_name);
-    let manifest_ttl = sidecar_dir.join("manifest.ttl");
-    let plugin_ttl = sidecar_dir.join("plugin.ttl");
-    if !manifest_ttl.exists() || !plugin_ttl.exists() {
-        return Err(format!(
-            "no LV2 metadata sidecar at {} for {}. \
-             `derive(Params)` writes this during the cdylib's compile; \
-             missing it means either the params struct uses `#[nested]` \
-             (unsupported for the compile-time TTL path) or the plugin \
-             crate isn't listed under `[[plugin]]` in truce.toml.",
-            sidecar_dir.display(),
-            p.name,
-        )
-        .into());
-    }
-
-    let slug = lv2_slug(&p.name);
-    let bundle = staging.join(format!("{slug}.lv2"));
-    let _ = fs::remove_dir_all(&bundle);
-    fs::create_dir_all(&bundle)?;
-
-    let bin_ext = if cfg!(target_os = "windows") {
-        "dll"
-    } else {
-        "so"
-    };
-    let bin_name = format!("{slug}.{bin_ext}");
-    let bin_path = bundle.join(&bin_name);
-    fs::copy(&built, &bin_path)?;
-    fs::copy(&manifest_ttl, bundle.join("manifest.ttl"))?;
-    fs::copy(&plugin_ttl, bundle.join("plugin.ttl"))?;
-
-    // Sign the inner Mach-O directly rather than passing the bundle
-    // dir. An LV2 "bundle" is just a directory of files, not a real
-    // macOS bundle (no `Contents/Info.plist`) - codesign refuses to
-    // seal directories it doesn't recognise, but the Mach-O itself
-    // signs fine and that's the only file Apple's notary actually
-    // inspects.
-    codesign_bundle(&bin_path.to_string_lossy(), identity, false)?;
-    Ok(())
-}
-
-/// Package wrapper: stage the LV2 bundle, then append its factory
-/// preset TTLs + `manifest.ttl` entries. `stage_lv2` itself stays
-/// preset-free because `install` emits LV2 presets onto its own copy
-/// (a double-emit would duplicate manifest entries); only packaging
-/// layers them in here. The TTLs sit outside the signed inner Mach-O,
-/// so emitting after staging is safe.
-#[cfg(target_os = "macos")]
-pub(crate) fn stage_lv2_packaged(
-    root: &Path,
-    p: &PluginDef,
-    config: &Config,
-    staging: &Path,
-    identity: &str,
-    target: Option<&str>,
-) -> Res {
-    stage_lv2(root, p, staging, identity, target)?;
-    if let Some(fp) = presets::load_factory_presets(root, p, config)? {
-        let bundle = staging.join(format!("{}.lv2", lv2_slug(&p.name)));
-        let uri =
-            truce_build::lv2::plugin_uri(config.vendor.url.as_deref().unwrap_or(""), &p.bundle_id);
-        presets::emit_lv2_presets(&fp, &bundle, &uri)?;
-    }
-    Ok(())
-}
 
 /// Build a standalone pkg component for an out-of-bundle preset
 /// payload: stage `payload` (relative path -> bytes) under a private
@@ -427,264 +321,6 @@ fn vst3_inner_extension(triple: &str) -> &'static str {
     }
 }
 
-/// Stage a VST2 build artifact into the staging directory and return
-/// the staged path. macOS produces a `.vst` directory bundle (with
-/// `Contents/MacOS/X` + Info.plist + codesign); Linux / Windows just
-/// copy the bare `.so` / `.dll` since neither platform uses a bundle
-/// layout for VST2.
-///
-/// `target` selects which `target/<triple>/release/` to read the
-/// dylib from; `None` reads from `target/release/` (host build).
-pub(crate) fn stage_vst2(
-    root: &Path,
-    p: &PluginDef,
-    config: &Config,
-    staging: &Path,
-    target: Option<&str>,
-) -> Result<std::path::PathBuf, crate::CargoTruceError> {
-    let _ = config; // only used on macOS
-    #[cfg(not(target_os = "macos"))]
-    let dylib = crate::release_lib_for_target(root, &format!("{}_vst2", p.dylib_stem()), target);
-    #[cfg(target_os = "macos")]
-    let dylib = {
-        let _ = target;
-        crate::release_bundle_bin(root, &p.dylib_stem(), "_vst2")
-    };
-    if !dylib.exists() {
-        return Err(format!("Missing: {}", dylib.display()).into());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let dst = staging.join(format!("{}.so", p.file_stem()));
-        fs::copy(&dylib, &dst)?;
-        Ok(dst)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let dst = staging.join(format!("{}.dll", p.file_stem()));
-        fs::copy(&dylib, &dst)?;
-        Ok(dst)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let bundle = staging.join(format!("{}.vst", p.file_stem()));
-        let macos_dir = bundle.join("Contents/MacOS");
-        fs::create_dir_all(&macos_dir)?;
-        let exec_name = p.file_stem();
-        fs::copy(&dylib, macos_dir.join(&exec_name))?;
-
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>{exec_name}</string>
-    <key>CFBundleIdentifier</key>
-    <string>{vendor_id}.{bundle_id}.vst2</string>
-    <key>CFBundleName</key>
-    <string>{display_name}</string>
-    <key>CFBundlePackageType</key>
-    <string>BNDL</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-</dict>
-</plist>"#,
-            display_name = xml_escape(&p.name),
-            bundle_id = p.bundle_id,
-            vendor_id = xml_escape(&config.vendor.id),
-            exec_name = xml_escape(&exec_name),
-        );
-        fs::write(bundle.join("Contents/Info.plist"), &plist)?;
-        fs::write(bundle.join("Contents/PkgInfo"), "BNDL????")?;
-        codesign_bundle(
-            bundle.to_str().unwrap(),
-            &crate::application_identity(),
-            false,
-        )?;
-        Ok(bundle)
-    }
-}
-
-/// Stage an AU v2 bundle (`.component` directory) into the staging
-/// directory. Audio Unit is macOS-only.
-#[cfg(target_os = "macos")]
-pub(crate) fn stage_au2(root: &Path, p: &PluginDef, config: &Config, staging: &Path) -> Res {
-    let dylib =
-        truce_build::target_dir(root).join(format!("release/lib{}_au.dylib", p.dylib_stem()));
-    if !dylib.exists() {
-        return Err(format!("Missing: {}", dylib.display()).into());
-    }
-    let bundle = staging.join(format!("{}.component", p.file_stem()));
-    let macos_dir = bundle.join("Contents/MacOS");
-    fs::create_dir_all(&macos_dir)?;
-    let exec_name = p.file_stem();
-    fs::copy(&dylib, macos_dir.join(&exec_name))?;
-
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>{exec_name}</string>
-    <key>CFBundleIdentifier</key>
-    <string>{vendor_id}.{bundle_id}.component</string>
-    <key>CFBundleName</key>
-    <string>{display_name}</string>
-    <key>CFBundlePackageType</key>
-    <string>BNDL</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>AudioComponents</key>
-    <array>
-        <dict>
-            <key>type</key>
-            <string>{au_type}</string>
-            <key>subtype</key>
-            <string>{au_subtype}</string>
-            <key>manufacturer</key>
-            <string>{au_mfr}</string>
-            <key>name</key>
-            <string>{vendor}: {display_name}</string>
-            <key>description</key>
-            <string>{display_name}</string>
-            <key>version</key>
-            <integer>65536</integer>
-            <key>factoryFunction</key>
-            <string>TruceAUFactory</string>
-            <key>sandboxSafe</key>
-            <true/>
-            <key>tags</key>
-            <array>
-                <string>{au_tag}</string>
-            </array>
-        </dict>
-    </array>
-</dict>
-</plist>"#,
-        display_name = xml_escape(&p.name),
-        bundle_id = p.bundle_id,
-        vendor_id = xml_escape(&config.vendor.id),
-        vendor = xml_escape(&config.vendor.name),
-        au_type = xml_escape(p.resolved_au_type()),
-        au_subtype = xml_escape(p.resolved_fourcc()),
-        au_mfr = xml_escape(&config.vendor.au_manufacturer),
-        au_tag = xml_escape(&p.au_tag),
-        exec_name = xml_escape(&exec_name),
-    );
-    fs::write(bundle.join("Contents/Info.plist"), &plist)?;
-    // The shim's kAudioUnitProperty_FactoryPresets handler enumerates
-    // these from the sealed bundle - emit before codesign.
-    if let Some(fp) = presets::load_factory_presets(root, p, config)? {
-        presets::emit_trucepreset_tree(
-            &fp,
-            &bundle.join("Contents/Resources/Presets"),
-            false,
-            &format!("{}-au-bundle", p.bundle_id),
-        )?;
-    }
-    codesign_bundle(
-        bundle.to_str().unwrap(),
-        &crate::application_identity(),
-        false,
-    )?;
-    Ok(())
-}
-
-/// Stage an AAX bundle into the staging directory.
-///
-/// `universal_mac` controls whether the AAX C++ template (the wrapper binary
-/// Pro Tools launches) is built fat - the Rust cdylib in Resources/ is
-/// already lipo'd universal when the caller passes `universal_mac = true`.
-/// Stage an AAX bundle into the packaging staging tree.
-///
-/// Reads from `target/bundles/{Plugin}.aaxplugin/` - the fully-
-/// assembled + Apple-signed output of
-/// [`emit_aax_bundle`](crate::commands::install::aax::emit_aax_bundle).
-/// PACE-signs the staged copy in place (PACE wraps the Apple
-/// signature, and pkgbuild reads the staging tree directly so the
-/// order is safe).
-#[cfg(target_os = "macos")]
-pub(crate) fn stage_aax(
-    root: &Path,
-    p: &PluginDef,
-    _config: &Config,
-    staging: &Path,
-    _universal_mac: bool,
-    no_pace_sign: bool,
-) -> Res {
-    let bundle_name = format!("{}.aaxplugin", p.file_stem());
-    let built = truce_build::target_dir(root)
-        .join("bundles")
-        .join(&bundle_name);
-    if !built.exists() {
-        return Err(format!(
-            "AAX bundle missing at {}. Call `emit_aax_bundle` from the package driver before staging.",
-            built.display()
-        )
-        .into());
-    }
-
-    let dst = staging.join(&bundle_name);
-    let _ = fs::remove_dir_all(&dst);
-    crate::util::copy_dir_recursive(&built, &dst)?;
-
-    if !no_pace_sign {
-        pace_sign_aax_macos(&dst)?;
-    }
-    Ok(())
-}
-
-/// Stage an AU v3 `.app` bundle into the staging directory for pkgbuild.
-///
-/// Reads from `target/bundles/{Plugin}.app/` - the fully-signed output
-/// of `emit_au_v3_bundle` - and copies it into the staging tree.
-/// The bundle is already signed + has its embedded framework, so this
-/// is a pure copy.
-#[cfg(target_os = "macos")]
-pub(crate) fn stage_au3(root: &Path, p: &PluginDef, _config: &Config, staging: &Path) -> Res {
-    let app_name = format!("{}.app", p.au3_app_name());
-    let built_app = truce_build::target_dir(root)
-        .join("bundles")
-        .join(&app_name);
-    if !built_app.exists() {
-        return Err(format!(
-            "AU v3 bundle missing at {}. Run `cargo truce build --au3 -p {}` first.",
-            built_app.display(),
-            p.bundle_id,
-        )
-        .into());
-    }
-
-    let dst = staging.join(&app_name);
-    // May be root-owned from a previous install-based run. Best-effort
-    // `rm -rf` covers that case; surface a pointed error if it still
-    // fails so the user knows exactly which command to run by hand.
-    if dst.exists() && fs::remove_dir_all(&dst).is_err() {
-        let status = Command::new("rm")
-            .args(["-rf", dst.to_str().unwrap()])
-            .status();
-        if dst.exists() {
-            return Err(format!(
-                "could not remove stale staging dir {} \
-                 (rm exit: {status:?}). \
-                 This is usually root-owned leftovers from an earlier \
-                 `cargo truce install`. Run:\n    \
-                 sudo rm -rf {}",
-                dst.display(),
-                dst.display(),
-            )
-            .into());
-        }
-    }
-    copy_dir_recursive(&built_app, &dst)?;
-    Ok(())
-}
-
 /// Stage the standalone host as a `.app` bundle inside the packaging
 /// staging tree. Reads the per-arch standalone binaries built by
 /// `build_and_lipo_standalone`, lipo-merges (or copies, single-arch)
@@ -860,7 +496,6 @@ pub(crate) fn generate_distribution_xml(
     version: &str,
     resources: Option<&MacosPackagingConfig>,
     scope: PkgScope,
-    au3_is_standalone_host: bool,
 ) -> String {
     let mut choices_outline = String::new();
     let mut choices = String::new();
@@ -870,22 +505,10 @@ pub(crate) fn generate_distribution_xml(
         let id = fmt.pkg_id_suffix();
         let pkg_id = format!("{vendor_id}.{bundle_id}.{id}");
         let label = fmt.label();
-        // AU v3's app *is* the standalone host when the plugin ships a
-        // standalone bin (we drop the separate Standalone format then), so
-        // surface that the one app does both. `label` stays the format
-        // label for the component filename; only the choice text changes.
-        let (title, desc): (&str, &str) = if *fmt == PkgFormat::Au3 && au3_is_standalone_host {
-            ("AU3 + Standalone", "Audio Unit v3 (appex) + standalone app")
-        } else {
-            (label, fmt.choice_description())
-        };
+        let (title, desc): (&str, &str) = (label, fmt.choice_description());
         let component_file = format!("{plugin_name}-{label}.pkg");
 
-        // Every format ships checked by default. Pro Tools users
-        // expect AAX to be there without hunting through Customize,
-        // and a PACE/iLok-signed build won't reach `--formats aax`
-        // unless the developer set it up - at which point shipping
-        // it pre-checked is the expected behaviour.
+        // Every format ships checked by default.
         let enabled_attr = "";
 
         // Per-choice auth override. pkgbuild stamps every component
@@ -895,11 +518,11 @@ pub(crate) fn generate_distribution_xml(
         // `root:wheel` even when "Install for me only" relocated the
         // destination to the user's home, and fails with EACCES.
         //
-        // - `--user` (explicit): user-viable formats (CLAP, VST3,
-        //   LV2, AU v2) override to `auth="None"` so the relocated
+        // - `--user` (explicit): user-viable formats (CLAP, VST3)
+        //   override to `auth="None"` so the relocated
         //   `~/Library/Audio/Plug-Ins/...` install runs as the
-        //   current user with no chown. System-only formats (AAX,
-        //   AU v3, standalone) keep `auth="Root"` so they escalate
+        //   current user with no chown. System-only formats
+        //   (standalone) keep `auth="Root"` so they escalate
         //   for `/Library/...` / `/Applications/`.
         // - `--ask` (default): leave user-viable formats at the
         //   component default - the user might pick "System" at
@@ -996,12 +619,7 @@ pub(crate) fn generate_distribution_xml(
 /// that removes any existing bundle at the destination before shove
 /// runs - without this, a stale leftover (especially one owned by
 /// root from a prior admin install) blocks the new payload with
-/// `Permission denied` during the relink step. AU v2 additionally
-/// gets a `postinstall` that clears the AU cache so Logic / Garage-
-/// Band re-scan and pick up the new bundle; AU v3 gets one that
-/// registers its app-extension with `pluginkit` (see
-/// [`AU3_REGISTER_POSTINSTALL`]) - without it the component lists in
-/// hosts but won't open.
+/// `Permission denied` during the relink step.
 ///
 /// The preinstall reads `$2` (the resolved install destination -
 /// already accounts for `enable_currentUserHome` relocation) and
@@ -1012,83 +630,11 @@ pub(crate) fn generate_distribution_xml(
 /// leftovers and fails loudly with an actionable message otherwise
 /// (so the developer doing `cargo truce package --user` after a
 /// `--system` round sees what to clean up).
-/// AU v3 postinstall: schedule a deferred, one-shot registration of the
-/// app-extensions with `pluginkit`.
-///
-/// Registering inline from the postinstall does not work: pkg scripts run
-/// as root in the installer sandbox, but the installer re-touches every app
-/// bundle as its final step (after all postinstalls), which makes `pkd`
-/// drop any registration made earlier in the run. A `LaunchAgent` would run
-/// late enough but trips the macOS "Background Items Added" notification,
-/// which has no place in a plugin installer. A backgrounded child of the
-/// postinstall (`nohup ... &`) doesn't survive - the installer kills the
-/// sandbox process tree on teardown.
-///
-/// So hand the one-shot to the user's `launchd` via `launchctl submit` (a
-/// transient job - no plist in a monitored folder, so no notification;
-/// launchd-owned, so it outlives the installer). The job waits until the
-/// app bundles stop changing (finalization done), then registers every AU
-/// v3 appex in `/Applications` and refreshes the AU cache. Each AU v3
-/// component re-submits, replacing any prior submission, so the last one
-/// runs after the whole install settles; the postinstall returns at once so
-/// the install never blocks. No console user (CI / SSH / login window) ->
-/// skip.
-#[cfg(target_os = "macos")]
-const AU3_REGISTER_POSTINSTALL: &str = r#"#!/bin/bash
-set -u
-uid=$(stat -f %u /dev/console 2>/dev/null || true)
-user=$(stat -f %Su /dev/console 2>/dev/null || true)
-if [ -z "${uid:-}" ] || [ "$user" = "root" ]; then
-    exit 0
-fi
-DIR="/Library/Application Support/Truce"
-SCRIPT="$DIR/au3-register.sh"
-mkdir -p "$DIR"
-cat > "$SCRIPT" <<'EOF'
-#!/bin/bash
-# Deferred AU v3 registration: launchd runs this once in the user's GUI
-# session. Registration made during the install is wiped by the installer's
-# final bundle touch, so wait until the bundles stop changing, then register
-# every AU v3 appex and refresh the AU cache.
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-prev=""
-stable=0
-for i in $(seq 1 60); do
-    cur=$(ls -dlT /Applications/*.app 2>/dev/null | md5)
-    if [ "$cur" = "$prev" ]; then
-        stable=$((stable + 1))
-    else
-        stable=0
-    fi
-    if [ "$stable" -ge 3 ]; then
-        break
-    fi
-    prev="$cur"
-    sleep 2
-done
-for ax in /Applications/*.app/Contents/PlugIns/AUExt.appex; do
-    if [ -d "$ax" ]; then
-        pluginkit -a "$ax" >/dev/null 2>&1
-    fi
-done
-killall -9 AudioComponentRegistrar 2>/dev/null || true
-launchctl remove com.truce.au3-register 2>/dev/null || true
-exit 0
-EOF
-chmod 755 "$SCRIPT"
-# Submit to the user's launchd. `remove` first so a re-submit replaces the
-# prior one; the last component's job is the one that runs to completion.
-launchctl asuser "$uid" sudo -u "$user" launchctl remove com.truce.au3-register 2>/dev/null || true
-launchctl asuser "$uid" sudo -u "$user" launchctl submit -l com.truce.au3-register -- /bin/bash "$SCRIPT"
-exit 0
-"#;
-
 #[cfg(target_os = "macos")]
 pub(crate) fn write_format_scripts(
     staging: &Path,
     fmt: &PkgFormat,
     bundle_name: &str,
-    appex_id: Option<&str>,
 ) -> std::result::Result<PathBuf, crate::CargoTruceError> {
     let scripts_dir = staging.join(format!("{}_scripts", fmt.pkg_id_suffix()));
     let _ = fs::remove_dir_all(&scripts_dir);
@@ -1124,35 +670,6 @@ pub(crate) fn write_format_scripts(
     Command::new("chmod")
         .args(["+x", preinstall.to_str().unwrap()])
         .status()?;
-
-    if *fmt == PkgFormat::Au2 {
-        let postinstall = scripts_dir.join("postinstall");
-        fs::write(
-            &postinstall,
-            "#!/bin/bash\n\
-             killall -9 AudioComponentRegistrar 2>/dev/null || true\n\
-             rm -rf ~/Library/Caches/AudioUnitCache/ 2>/dev/null || true\n\
-             rm -f ~/Library/Preferences/com.apple.audio.InfoHelper.plist 2>/dev/null || true\n\
-             exit 0\n",
-        )?;
-        Command::new("chmod")
-            .args(["+x", postinstall.to_str().unwrap()])
-            .status()?;
-    }
-
-    // AU v3 is an app-extension: dropping the `.app` into `/Applications`
-    // isn't enough, the appex has to be registered with `pluginkit` or
-    // hosts get a component that lists but won't open. The postinstall
-    // schedules a deferred one-shot that does this in the user's GUI
-    // session, since registering inline from the root sandbox doesn't
-    // survive the installer's final bundle touch.
-    if *fmt == PkgFormat::Au3 && appex_id.is_some() {
-        let postinstall = scripts_dir.join("postinstall");
-        fs::write(&postinstall, AU3_REGISTER_POSTINSTALL)?;
-        Command::new("chmod")
-            .args(["+x", postinstall.to_str().unwrap()])
-            .status()?;
-    }
 
     Ok(scripts_dir)
 }

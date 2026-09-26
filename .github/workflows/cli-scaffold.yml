@@ -233,10 +233,7 @@ jobs:
       # `--no-notarize` on macOS skips the Apple notarization round-trip
       # (no credentials in CI). Windows package goes through Inno Setup
       # installed above. `--formats` is constrained to CLAP + VST3 -
-      # the scaffold templates only enable those by default; LV2 / AU /
-      # AAX are commented-out opt-ins in the generated Cargo.toml, so
-      # asking for them here errors with "package does not contain this
-      # feature".
+      # the plugin formats the scaffold templates enable by default.
       - name: cargo truce package
         shell: bash
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}

@@ -20,7 +20,7 @@ concurrency:
 # runs `cargo truce validate` against the freshly installed bundles -
 # validate needs the plugin in the host's scan path, so the order is
 # fixed (install first, validate second). The three OS jobs run in
-# parallel; AAX and AU v3 are skipped (no SDK / no Developer ID in CI).
+# parallel.
 jobs:
   macos:
     name: install + validate (macos-14)
@@ -69,50 +69,29 @@ jobs:
       - name: Pre-flight - validators present
         run: |
           command -v clap-validator
-          command -v auval
           test -x /Applications/pluginval.app/Contents/MacOS/pluginval
 
-      # AU v2 must land in the system Components dir (auval only scans
-      # there). CI macOS runners have passwordless sudo, so --system is
-      # fine. CLAP / VST3 / VST2 / LV2 piggyback on the same install
-      # call so we exercise every macOS bundle format in one shot.
-      - name: cargo truce install --system --clap --vst3 --vst2 --au2 --lv2
-        run: sudo ./target/debug/cargo-truce install --system --clap --vst3 --vst2 --au2 --lv2 -p truce-example-gain
+      # System scope: CI macOS runners have passwordless sudo, so
+      # --system exercises the /Library/Audio/Plug-Ins/ install path.
+      - name: cargo truce install --system --clap --vst3
+        run: sudo ./target/debug/cargo-truce install --system --clap --vst3 -p truce-example-gain
 
       - name: Verify installed bundle filetypes
         run: |
           set -e
-          # CLAP / VST3 / VST2 bundle binaries must be MH_BUNDLE.
-          # AU v2's .component stays MH_DYLIB (loader is happy with it).
-          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3" "VST/Truce Gain.vst" "Components/Truce Gain.component"; do
+          # CLAP / VST3 bundle binaries must be MH_BUNDLE.
+          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3"; do
             otool -hv "/Library/Audio/Plug-Ins/$fmt/Contents/MacOS/Truce Gain" | tee /tmp/hdr.txt
-            if [ "$fmt" = "Components/Truce Gain.component" ]; then
-              grep -q "DYLIB" /tmp/hdr.txt || { echo "::error::$fmt expected MH_DYLIB"; exit 1; }
-            else
-              grep -q "BUNDLE" /tmp/hdr.txt || { echo "::error::$fmt expected MH_BUNDLE"; exit 1; }
-            fi
+            grep -q "BUNDLE" /tmp/hdr.txt || { echo "::error::$fmt expected MH_BUNDLE"; exit 1; }
           done
 
       - name: cargo truce status
         run: ./target/debug/cargo-truce status
 
-      # On a fresh CI runner, AudioComponentRegistrar hasn't scanned
-      # /Library/Audio/Plug-Ins/Components/ since we just wrote our
-      # .component there. Force the daemon to restart + re-scan, then
-      # give launchd a beat to respawn it before auval queries the
-      # registry. Without this, auval -v fails with
-      # `ERROR: Cannot get Component's Name strings` + `didn't find
-      # the component`.
-      - name: cargo truce reset-au --yes
-        run: ./target/debug/cargo-truce reset-au --yes
-
-      - name: Wait for AudioComponentRegistrar to re-scan
-        run: sleep 5
-
-      - name: cargo truce validate --clap --pluginval --auval
+      - name: cargo truce validate --clap --pluginval
         run: |
           set -e -o pipefail
-          ./target/debug/cargo-truce validate --clap --pluginval --auval -p truce-example-gain 2>&1 | tee validate.log
+          ./target/debug/cargo-truce validate --clap --pluginval -p truce-example-gain 2>&1 | tee validate.log
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step - failing"
             exit 1
@@ -128,7 +107,7 @@ jobs:
       - name: Verify nothing left behind
         run: |
           set -e
-          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3" "VST/Truce Gain.vst" "Components/Truce Gain.component" "LV2/truce-gain.lv2"; do
+          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3"; do
             if [ -e "/Library/Audio/Plug-Ins/$fmt" ]; then
               echo "::error::uninstall left $fmt behind"
               exit 1
@@ -202,15 +181,14 @@ jobs:
           command -v clap-validator
           command -v pluginval
 
-      - name: cargo truce install --clap --vst3 --lv2
-        run: ./target/debug/cargo-truce install --user --clap --vst3 --lv2 -p truce-example-gain
+      - name: cargo truce install --clap --vst3
+        run: ./target/debug/cargo-truce install --user --clap --vst3 -p truce-example-gain
 
       - name: Verify installed bundles
         run: |
           set -e
           ls -la "$HOME/.clap/"
           ls -la "$HOME/.vst3/"
-          ls -la "$HOME/.lv2/"
 
       - name: cargo truce validate --clap --pluginval
         run: |
@@ -227,7 +205,7 @@ jobs:
       - name: Verify nothing left behind
         run: |
           set -e
-          for fmt in ".clap/Truce Gain.clap" ".vst3/Truce Gain.vst3" ".lv2/truce-gain.lv2"; do
+          for fmt in ".clap/Truce Gain.clap" ".vst3/Truce Gain.vst3"; do
             if [ -e "$HOME/$fmt" ]; then
               echo "::error::uninstall left $fmt behind"
               exit 1

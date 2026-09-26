@@ -10,7 +10,6 @@ bundle_id = "{p.bundle_id}"
 crate = "{p.crate_name}"
 category = "{p.category}"
 fourcc = "{p.fourcc}"
-au_tag = "{p.au_tag}"
 # VST3 secondary subcategory — drives the Cubase plugin submenu.
 # Tighten to your effect kind: "Delay", "Distortion", "Dynamics",
 # "EQ", "Filter", "Mastering", "Modulation", "Pitch Shift",

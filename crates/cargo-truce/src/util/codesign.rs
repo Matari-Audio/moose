@@ -1,8 +1,6 @@
 //! macOS code-signing helpers: `codesign_bundle` (inside-out signing
 //! across every Mach-O in a bundle), `verify_signed_for_notarization`
-//! (mirrors Apple's notarization-server checks locally), and PACE /
-//! wraptool signing for AAX. Cross-platform stubs short-circuit on
-//! Linux / Windows so callers can invoke unconditionally.
+//! (mirrors Apple's notarization-server checks locally). macOS-only.
 
 #[cfg(target_os = "macos")]
 use std::ffi::OsStr;
@@ -71,19 +69,8 @@ pub(crate) fn write_entitlements_plist() -> PathBuf {
 /// types, leaving inner dylibs with their linker-applied ad-hoc
 /// signature and breaking notarization. Apple has been deprecating
 /// `--deep` for years anyway; enumerate ourselves to be sure.
-// On non-macOS targets the body is a no-op `Ok(())` so all three
-// args are unused - silence the warnings only on those targets.
-// `unnecessary_wraps` likewise fires only off-macOS where the body
-// can't actually fail; the `Result` return is required by the
-// cross-platform staging callers.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(unused_variables, clippy::unnecessary_wraps)
-)]
+#[cfg(target_os = "macos")]
 pub(crate) fn codesign_bundle(bundle: &str, identity: &str, use_sudo: bool) -> crate::Res {
-    // macOS-only: `codesign` is an Apple tool, and the entitlements plist
-    // we write is consumed only by it. On Linux / Windows this is a no-op
-    // so the cross-platform `stage_*` helpers can call us unconditionally.
     #[cfg(target_os = "macos")]
     {
         let production = is_production_identity(identity);
@@ -294,100 +281,4 @@ fn check_mach_o_signing(path: &Path) -> Result<Vec<String>, crate::CargoTruceErr
     }
 
     Ok(issues)
-}
-
-/// PACE / iLok wraptool, the canonical macOS install path. Eden 5 ships under
-/// `Versions/5/`; `Current` is a stable symlink Eden maintains across version
-/// bumps. Users who symlinked `wraptool` onto `$PATH` are picked up first.
-#[cfg(target_os = "macos")]
-pub(crate) fn locate_wraptool_macos() -> Option<PathBuf> {
-    if let Ok(p) = which_unix("wraptool") {
-        return Some(p);
-    }
-    for canonical in [
-        "/Applications/PACEAntiPiracy/Eden/Fusion/Current/bin/wraptool",
-        "/Applications/PACEAntiPiracy/Eden/Fusion/Versions/5/bin/wraptool",
-    ] {
-        let p = PathBuf::from(canonical);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-// Only `locate_wraptool_macos` calls this; gating to macOS keeps Linux
-// from warning on the otherwise-cross-platform Unix `PATH` walker.
-#[cfg(target_os = "macos")]
-pub(crate) fn which_unix(name: &str) -> std::result::Result<PathBuf, std::io::Error> {
-    let path = std::env::var_os("PATH")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "PATH not set"))?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        name.to_string(),
-    ))
-}
-
-/// PACE-sign an AAX bundle on macOS. No-ops cleanly when wraptool isn't
-/// installed or `PACE_ACCOUNT` / `PACE_SIGN_ID` aren't set - Pro Tools
-/// Developer loads unsigned AAX, retail rejects with `-14013` → `-7054`.
-///
-/// Must run **after** Apple codesign on the bundle: PACE wraps the binary
-/// and `--dsigharden` re-signs with hardened-runtime + secure timestamp,
-/// which is what notarization wants. Apple-signing afterwards would be
-/// detected as PACE tampering at load time.
-///
-/// Must be the **last** step that touches the bundle: the signed
-/// bundle contains a symlink that `cp -r` (and most copy helpers
-/// without `-H`) silently turn into a regular file, which breaks the
-/// digital seal at load time.
-#[cfg(target_os = "macos")]
-pub(crate) fn pace_sign_aax_macos(bundle: &Path) -> crate::Res {
-    let Some(wraptool) = locate_wraptool_macos() else {
-        eprintln!(
-            "    wraptool not found - AAX bundle is unsigned for PACE. \
-             Pro Tools Developer will load it; retail Pro Tools won't."
-        );
-        return Ok(());
-    };
-    let Ok(account) = std::env::var("PACE_ACCOUNT") else {
-        eprintln!("    PACE_ACCOUNT not set - skipping PACE signing.");
-        return Ok(());
-    };
-    let Ok(signid) = std::env::var("PACE_SIGN_ID") else {
-        eprintln!("    PACE_SIGN_ID not set - skipping PACE signing.");
-        return Ok(());
-    };
-
-    eprintln!("    wraptool: PACE-signing {}", bundle.display());
-    let bundle_str = bundle
-        .to_str()
-        .ok_or("AAX bundle path is not valid UTF-8")?;
-    let status = Command::new(&wraptool)
-        .args([
-            "sign",
-            "--account",
-            &account,
-            "--signid",
-            &signid,
-            "--allowsigningservice",
-            "--dsigharden",
-            "--dsig1-compat",
-            "off",
-            "--in",
-            bundle_str,
-            "--out",
-            bundle_str,
-        ])
-        .status()?;
-    if !status.success() {
-        return Err("wraptool failed".into());
-    }
-    Ok(())
 }

@@ -1,11 +1,5 @@
-# cargo-deny policy for the main workspace and the truce-slint /
-# truce-gpu-examples sub-workspaces, applied via `cargo deny check
-# --config <this file>` (see scripts/supply-chain.sh). The truce-vizia
-# sub-workspace uses its own crates/truce-vizia/deny.toml because it is
-# the only workspace pulling git-sourced deps - keeping the git
-# allowance out of here bounds its blast radius to that one workspace.
-# cargo-deny has no config inheritance, so vizia's file repeats the
-# license/advisory policy below.
+# cargo-deny policy for the workspace, applied via `cargo deny check
+# --config <this file>` (see scripts/supply-chain.sh).
 
 [advisories]
 # Unmaintained transitive crate with no published vulnerability. Not a
@@ -13,11 +7,6 @@
 # bumps. Tracked here so a *new* advisory still fails the gate.
 ignore = [
     "RUSTSEC-2024-0436", # paste - unmaintained (proc-macro, deep transitive)
-    # ttf-parser - unmaintained, no vulnerability and no upgrade exists
-    # (the crate is abandoned). Rides in via fontdb <- the iced text
-    # stack (truce-iced); the built-in font stack moved to skrifa and
-    # no longer pulls it.
-    "RUSTSEC-2026-0192",
     # quick-xml 0.39 DoS advisories (quadratic duplicate-attribute check;
     # unbounded NsReader namespace allocation). Rides in via plist <-
     # cargo-truce, which never hits either affected path: plist parses
@@ -28,13 +17,6 @@ ignore = [
     # plist release moves to quick-xml >= 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # rustybuzz - unmaintained, no vulnerability and no upgrade exists.
-    # A text-shaping crate used only for SVG text rendering, riding in via
-    # slint <- i-slint-core <- resvg 0.46 <- usvg <- rustybuzz. resvg 0.46
-    # pins rustybuzz; the `harfrust` migration lives in a newer resvg that
-    # slint hasn't adopted, so there's no upgrade from here. Only truce-slint
-    # pulls it. Drop when slint moves to a harfrust-based resvg.
-    "RUSTSEC-2026-0206",
 ]
 
 [licenses]
@@ -56,13 +38,6 @@ allow = [
     "Zlib",
     "OFL-1.1",         # epaint_default_fonts embeds OFL fonts (AND clause)
     "Ubuntu-font-1.0", # epaint_default_fonts embeds the Ubuntu font (AND clause)
-    # libfuzzer-sys is `(MIT OR Apache-2.0) AND NCSA`; it rides in via
-    # rav1e <- ravif <- image (iced's image widget). NCSA is the permissive
-    # University of Illinois/NCSA license (OSI-approved, FSF Free).
-    "NCSA",
-    # slint is tri-licensed (GPL-3.0 OR royalty-free OR commercial); we
-    # consume it under the royalty-free terms, so GPL-3.0 stays out.
-    "LicenseRef-Slint-Royalty-free-2.0",
     # truce's own crates: the dual MIT/Apache grant plus the framework
     # rider, carried as a custom SPDX identifier (see LICENSE).
     "LicenseRef-TruceLicense-1.0",
@@ -76,7 +51,7 @@ multiple-versions = "warn"
 
 [sources]
 unknown-registry = "deny"
-# No git-sourced deps in these workspaces; any git source is unexpected.
-# The truce-vizia workspace, which does pull git forks, allow-lists them
-# in its own deny.toml.
+# The only git-sourced dep is the pinned baseview fork (see the root
+# Cargo.toml); any other git source is unexpected.
 unknown-git = "deny"
+allow-git = ["https://github.com/DerpcatMusic/baseview.git"]

@@ -3,24 +3,16 @@
 //!
 //! Both commands run an identical sequence for every selected format:
 //!
-//! 1. Skip on unsupported platforms (AU is macOS-only, AAX is macOS /
-//!    Windows) with a single `log_skip` line.
-//! 2. For AAX, gate on a configured SDK path (project-wide check, not
-//!    per-plugin - emit one skip line and bypass the cargo build loop
-//!    when missing).
-//! 3. One `cargo build -p a -p b -p c …` per format batch with the
+//! 1. One `cargo build -p a -p b -p c …` per format batch with the
 //!    format's feature set. No per-plugin env vars: per-format display
-//!    names travel with `PluginInfo` (baked by `truce::plugin_info!`)
-//!    and AU class names are registered at runtime via `objc2`.
-//! 4. Copy the produced `lib<stem>.<dylib-ext>` to a format-suffixed
-//!    path (`<stem>_clap`, `<stem>_vst3`, …) so the next format build
+//!    names travel with `PluginInfo` (baked by `truce::plugin_info!`).
+//! 2. Copy the produced `lib<stem>.<dylib-ext>` to a format-suffixed
+//!    path (`<stem>_clap`, `<stem>_vst3`) so the next format build
 //!    doesn't overwrite the previous one (every plugin's cdylib lands
 //!    at the same canonical cargo path).
-//! 5. For AAX, also call `emit_aax_bundle` to assemble the `.aaxplugin`
-//!    that the install / package paths consume.
 
 use crate::util::fs_ctx;
-use crate::{Config, PluginDef, Res, cargo_build, release_lib_for_target};
+use crate::{PluginDef, Res, cargo_build, release_lib_for_target};
 use std::path::Path;
 use truce_utils::shell_sidecar::sidecar_path;
 
@@ -31,10 +23,6 @@ use truce_utils::shell_sidecar::sidecar_path;
 pub(crate) enum BuildFormat {
     Clap,
     Vst3,
-    Vst2,
-    Lv2,
-    Au2,
-    Aax,
 }
 
 impl BuildFormat {
@@ -43,10 +31,6 @@ impl BuildFormat {
         match self {
             BuildFormat::Clap => "clap",
             BuildFormat::Vst3 => "vst3",
-            BuildFormat::Vst2 => "vst2",
-            BuildFormat::Lv2 => "lv2",
-            BuildFormat::Au2 => "au",
-            BuildFormat::Aax => "aax",
         }
     }
 
@@ -55,10 +39,6 @@ impl BuildFormat {
         match self {
             BuildFormat::Clap => "CLAP",
             BuildFormat::Vst3 => "VST3",
-            BuildFormat::Vst2 => "VST2",
-            BuildFormat::Lv2 => "LV2",
-            BuildFormat::Au2 => "AU v2",
-            BuildFormat::Aax => "AAX",
         }
     }
 
@@ -69,51 +49,13 @@ impl BuildFormat {
         match self {
             BuildFormat::Clap => "_clap",
             BuildFormat::Vst3 => "_vst3",
-            BuildFormat::Vst2 => "_vst2",
-            BuildFormat::Lv2 => "_lv2",
-            BuildFormat::Au2 => "_au",
-            BuildFormat::Aax => "_aax",
         }
-    }
-}
-
-/// Returns a skip-reason string if AAX cannot be built on this host -
-/// either the platform isn't supported (Linux) or the SDK isn't
-/// configured (mac/Windows without `AAX_SDK_PATH` set in
-/// `.cargo/config.toml`'s `[env]` table or the shell env). `None`
-/// means AAX is buildable.
-// On Linux this always returns `Some(...)` (AAX isn't supported), but
-// callers consume an `Option<String>` so they can render "skipped"
-// uniformly across platforms.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "windows")),
-    allow(clippy::unnecessary_wraps)
-)]
-fn aax_skip_reason(_config: &Config) -> Option<String> {
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Some("AAX: not supported on this platform. Use macOS or Windows to build AAX.".to_string())
-    }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        if crate::resolve_aax_sdk_path().is_some() {
-            return None;
-        }
-        Some("AAX: SDK not configured. Set AAX_SDK_PATH in .cargo/config.toml [env].".to_string())
     }
 }
 
 /// Build cdylibs for one format across `plugins`. Centralizes the
-/// per-format banner, env-var assembly, cargo build, copy-to-suffix,
-/// and (for AAX) `emit_aax_bundle` step that `cargo truce build` and
-/// `cargo truce install` both used to inline six times each.
-///
-/// Platform gates:
-/// - `Au2`: macOS only. Other platforms emit `crate::log_skip` and
-///   return `Ok(())` so callers don't need cfg blocks at the call site.
-/// - `Aax`: macOS / Windows only. Linux emits `log_skip`.
-/// - `Aax` SDK: macOS / Windows with no SDK configured emits one
-///   project-wide `log_skip` and skips the build loop entirely.
+/// per-format banner, cargo build, and copy-to-suffix step that
+/// `cargo truce build` and `cargo truce install` share.
 ///
 /// `extra_features` are appended to the format's own feature (used by
 /// shell-mode builds to add `"shell"`); empty otherwise.
@@ -126,33 +68,10 @@ pub(crate) fn build_format_dylibs(
     format: BuildFormat,
     plugins: &[&PluginDef],
     extra_features: &[&str],
-    config: &Config,
     root: &Path,
     deployment_target: &str,
     target: Option<&str>,
 ) -> Res {
-    // Platform / SDK gates first - every gate emits a single skip line
-    // and exits cleanly, so the caller's "if format_selected { build }"
-    // doesn't need its own cfg arms.
-    match format {
-        BuildFormat::Au2 => {
-            #[cfg(not(target_os = "macos"))]
-            {
-                crate::log_skip(
-                    "AU v2: not supported on this platform. Audio Unit is macOS-only.".to_string(),
-                );
-                return Ok(());
-            }
-        }
-        BuildFormat::Aax => {
-            if let Some(reason) = aax_skip_reason(config) {
-                crate::log_skip(reason);
-                return Ok(());
-            }
-        }
-        _ => {}
-    }
-
     // Build banner. Shell-mode label gets the extra-feature list
     // parenthesised (e.g. "Building CLAP (shell)...").
     if extra_features.is_empty() {
@@ -175,54 +94,25 @@ pub(crate) fn build_format_dylibs(
         feats.join(",")
     };
 
-    // AU v2 needs a per-plugin `TRUCE_AU_PLUGIN_ID` env so each
-    // dylib's cocoa-view class lands in `__objc_classlist` under a
-    // unique name. Hosts load every `.component` into one process;
-    // libobjc dedupes classes by name and `[NSBundle classNamed:]`
-    // returns nil on the loser's bundle - host then thinks the
-    // plugin has no GUI. Splitting AU2 into one cargo invocation per
-    // plugin is the cost of correctness here; truce-au's tiny C/ObjC
-    // shim recompiles per plugin but the leaf cdylib link cost
-    // dominates anyway.
-    let batched = format != BuildFormat::Au2;
-    if batched {
-        let env_pairs: &[(&str, &str)] = &[];
-        let mut cargo_args: Vec<String> = Vec::with_capacity(plugins.len() * 2 + 5);
-        for p in plugins {
-            cargo_args.push("-p".into());
-            cargo_args.push(p.crate_name.clone());
-        }
-        cargo_args.push("--no-default-features".into());
-        cargo_args.push("--features".into());
-        let names: Vec<&str> = plugins.iter().map(|p| p.crate_name.as_str()).collect();
-        cargo_args.push(features_with(&names));
-        if let Some(t) = target {
-            cargo_args.push("--target".into());
-            cargo_args.push(t.into());
-        }
-        let cargo_arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
-        cargo_build(env_pairs, &cargo_arg_refs, deployment_target)?;
-    } else {
-        for p in plugins {
-            let env_pairs: &[(&str, &str)] = &[("TRUCE_AU_PLUGIN_ID", p.bundle_id.as_str())];
-            let mut cargo_args: Vec<String> = Vec::with_capacity(7);
-            cargo_args.push("-p".into());
-            cargo_args.push(p.crate_name.clone());
-            cargo_args.push("--no-default-features".into());
-            cargo_args.push("--features".into());
-            cargo_args.push(features_with(&[p.crate_name.as_str()]));
-            if let Some(t) = target {
-                cargo_args.push("--target".into());
-                cargo_args.push(t.into());
-            }
-            let cargo_arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
-            cargo_build(env_pairs, &cargo_arg_refs, deployment_target)?;
-        }
+    let env_pairs: &[(&str, &str)] = &[];
+    let mut cargo_args: Vec<String> = Vec::with_capacity(plugins.len() * 2 + 5);
+    for p in plugins {
+        cargo_args.push("-p".into());
+        cargo_args.push(p.crate_name.clone());
     }
+    cargo_args.push("--no-default-features".into());
+    cargo_args.push("--features".into());
+    let names: Vec<&str> = plugins.iter().map(|p| p.crate_name.as_str()).collect();
+    cargo_args.push(features_with(&names));
+    if let Some(t) = target {
+        cargo_args.push("--target".into());
+        cargo_args.push(t.into());
+    }
+    let cargo_arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
+    cargo_build(env_pairs, &cargo_arg_refs, deployment_target)?;
 
     // Post-build per-plugin staging: copy the produced `.dylib` to
-    // its format-suffixed name and (for AAX) assemble the
-    // `.aaxplugin` bundle. Cheap I/O, kept as a separate pass so
+    // its format-suffixed name. Cheap I/O, kept as a separate pass so
     // the cargo invocation above doesn't have to know about it.
     for p in plugins {
         let src = release_lib_for_target(root, &p.dylib_stem(), target);
@@ -243,27 +133,13 @@ pub(crate) fn build_format_dylibs(
         // which CFBundle rejects on the JUCE-hosted VST3 path. Run
         // `clang -bundle` against the matching Rust `staticlib` to
         // produce a real MH_BUNDLE at the canonical bundle-bin path
-        // that stage / install steps read from. AU2 / AAX keep the
-        // cdylib (their loaders are happy with MH_DYLIB).
+        // that stage / install steps read from.
         // Only for a macOS *target* - cross-compiling to Windows / Linux
         // keeps the cdylib, and `clang -bundle` can't relink a foreign-arch
         // static archive anyway.
         #[cfg(target_os = "macos")]
-        if matches!(
-            format,
-            BuildFormat::Clap | BuildFormat::Vst3 | BuildFormat::Vst2
-        ) && crate::target_os_of(target.unwrap_or_else(|| truce_build::host_triple())) == "macos"
-        {
+        if crate::target_os_of(target.unwrap_or_else(|| truce_build::host_triple())) == "macos" {
             link_macos_bundle_for_plugin(root, p, format, target)?;
-        }
-
-        // AAX additionally assembles the `.aaxplugin` bundle in
-        // `target/bundles/` here - both install (which then copies the
-        // bundle to /Library/...) and build (which leaves it in
-        // `target/bundles/`) want the bundle assembled.
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if format == BuildFormat::Aax {
-            crate::commands::install::aax::emit_aax_bundle(root, p, config, false)?;
         }
     }
 
@@ -420,8 +296,6 @@ fn link_macos_bundle_for_plugin(
     let exports = match format {
         BuildFormat::Clap => crate::CLAP_EXPORTS,
         BuildFormat::Vst3 => crate::VST3_EXPORTS,
-        BuildFormat::Vst2 => crate::VST2_EXPORTS,
-        _ => unreachable!("caller gates on bundle formats"),
     };
 
     let out = crate::release_bundle_bin(root, &p.dylib_stem(), format.dylib_suffix());

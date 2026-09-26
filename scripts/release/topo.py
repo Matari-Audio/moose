@@ -9,10 +9,9 @@
 # its dependents.
 #
 # Output is TSV `<crate>\t<workspace_dir>` where `<workspace_dir>` is
-# `.` for crates in the main workspace and the sub-workspace's path
-# (e.g. `crates/truce-slint`) for crates in slint / vizia. release.sh
-# `cd`s into that dir before `cargo publish -p <crate>` so the right
-# Cargo.lock and `[workspace]` context are picked up.
+# `.` (the main workspace). release.sh `cd`s into that dir before
+# `cargo publish -p <crate>` so the right Cargo.lock and `[workspace]`
+# context are picked up.
 #
 # Invoked by release.sh; runnable standalone for debugging the order.
 
@@ -103,10 +102,6 @@ main_order = topo_sort(main_pkgs)
 # fail loudly if a transitive dep didn't make it onto the registry.
 forced_order = [
     "truce-simd",
-    "truce-vst2",
-    "truce-lv2",
-    "truce-aax",
-    "truce-au",
     "truce-standalone",
     "truce-clap",
     "truce-vst3",
@@ -124,43 +119,8 @@ if missing_forced:
 main_order = [n for n in main_order if n not in forced_order] + forced_order
 
 # ---------------------------------------------------------------------------
-# Sub-workspaces (truce-slint, truce-vizia, truce-gpu-examples)
-#
-# Each sub-workspace declares its own `[workspace]`, so the main
-# `cargo metadata` doesn't see them. Iterate explicitly. Their lib
-# crates depend on main-workspace crates (truce-core, truce-params,
-# truce-gui, truce-font), so they come last in the global order —
-# every dep is already on the registry by then.
-# ---------------------------------------------------------------------------
-
-SUB_WORKSPACES = [
-    "crates/truce-slint",
-    # `crates/truce-vizia` is deliberately omitted: vizia upstream
-    # hasn't tagged a release that ships the `baseview` feature, so
-    # `truce-vizia`'s Cargo.toml pins it via `{ git = "...", rev = "..." }`
-    # with no `version = "..."` shadow. crates.io's publish gate
-    # rejects git-only deps without a version requirement, and adding
-    # one would point downstream consumers at the registry vizia
-    # (baseview-less, won't compile). Plugins that want vizia pull
-    # `truce-vizia` from this repo via `git = "..."` for now; revisit
-    # when vizia upstream tags a baseview-bearing release.
-    #
-    # `crates/truce-gpu-examples` is also omitted: its top-level
-    # workspace is virtual (no library to publish) and its only
-    # member is an internal example crate (`publish = false`).
-]
-
-sub_lines = []
-for sub in SUB_WORKSPACES:
-    sub_pkgs = workspace_members(manifest_path=f"{sub}/Cargo.toml")
-    for name in topo_sort(sub_pkgs):
-        sub_lines.append((name, sub))
-
-# ---------------------------------------------------------------------------
 # Emit
 # ---------------------------------------------------------------------------
 
 for name in main_order:
     print(f"{name}\t.")
-for name, sub in sub_lines:
-    print(f"{name}\t{sub}")

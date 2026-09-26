@@ -6,17 +6,12 @@ members = [
     "crates/truce-params",
     "crates/truce-clap",
     "crates/truce-vst3",
-    "crates/truce-au",
     "crates/truce-standalone",
     "crates/truce-driver",
     "crates/truce-gui",
     "crates/truce-gui-types",
     "crates/truce-gui-utils",
     "crates/truce-plugin",
-    "crates/truce-vst2",
-    "crates/truce-lv2",
-    "crates/truce-aax",
-    "crates/truce-aax-bridge",
     "crates/truce-test",
     "crates/truce-build",
     "crates/truce-loader",
@@ -30,8 +25,6 @@ members = [
     "crates/truce-cpu",
     "crates/truce-gpu",
     "crates/truce-egui",
-    "crates/truce-iced",
-    "crates/truce-shim-types",
     "crates/truce-simd",
     "crates/truce-font",
     "crates/truce-utils",
@@ -53,12 +46,10 @@ members = [
     "examples/truce-example-gain-egui-aspect",
     "examples/truce-example-tremolo",
     "examples/truce-example-state",
-    "examples/truce-example-gain-iced",
     "examples/truce-example-fundsp-reverb-worker",
     "examples/truce-example-fundsp-reverb-simple",
     "examples/truce-example-gui-zoo",
     "examples/truce-example-gui-zoo-egui",
-    "examples/truce-example-gui-zoo-iced",
     "examples/truce-example-dasp-bitcrusher",
     "examples/truce-example-envelope",
     "examples/truce-example-chord",
@@ -67,7 +58,6 @@ members = [
     "examples/truce-example-sysex-echo",
     "examples/truce-example-mpe-synth",
     "examples/truce-example-multiport",
-    "examples/truce-example-midi-inspector",
 ]
 
 [workspace.package]
@@ -84,7 +74,7 @@ description = "Build audio plugins in Rust. One codebase, every format."
 repository = "https://github.com/truce-audio/truce"
 homepage = "https://github.com/truce-audio/truce"
 categories = ["multimedia::audio", "development-tools::cargo-plugins"]
-keywords = ["audio", "plugin", "vst", "clap", "daw", "aax", "sfx", "effects", "cubase", "protools", "ableton"]
+keywords = ["audio", "plugin", "vst3", "clap", "daw"]
 readme = "README.md"
 
 # Workspace-wide lint config. Crates opt in with `lints.workspace = true`.
@@ -107,8 +97,7 @@ pedantic = { level = "warn", priority = -1 }
 # of these in one pass with a global sed on the version string.
 [workspace.dependencies]
 # `default-features = false` at the workspace so individual examples
-# can override per-format gating without iOS pulling `truce/clap`
-# transitively. The macOS / Windows / Linux examples each
+# can override per-format gating. The examples each
 # explicitly enable `truce/<format>` in their own `[features]` block
 # (`clap = ["…", "truce/clap"]`).
 truce = { version = "7.0.0", path = "crates/truce", default-features = false }
@@ -116,34 +105,27 @@ truce-core = { version = "7.0.0", path = "crates/truce-core" }
 truce-params = { version = "7.0.0", path = "crates/truce-params" }
 truce-clap = { version = "7.0.0", path = "crates/truce-clap" }
 truce-vst3 = { version = "7.0.0", path = "crates/truce-vst3" }
-truce-au = { version = "7.0.0", path = "crates/truce-au" }
 truce-standalone = { version = "7.0.0", path = "crates/truce-standalone" }
 truce-driver = { version = "7.0.0", path = "crates/truce-driver" }
 # `default-features = false` at the workspace so members pick a
 # renderer feature (`cpu` / `gpu`) explicitly - lets one example
 # (truce-example-eq) opt into `gpu` while the rest use `cpu`, and
-# lets the renderer crates (truce-egui / -iced / -slint) build
+# lets the renderer crate (truce-egui) build
 # truce-gui featureless for its types-only surface. External users
 # adding `truce-gui = "x"` still get the `cpu` default.
 truce-gui = { version = "7.0.0", path = "crates/truce-gui", default-features = false }
 truce-gui-types = { version = "7.0.0", path = "crates/truce-gui-types" }
 truce-gui-utils = { version = "7.0.0", path = "crates/truce-gui-utils" }
 truce-plugin = { version = "7.0.0", path = "crates/truce-plugin" }
-truce-vst2 = { version = "7.0.0", path = "crates/truce-vst2" }
-truce-lv2 = { version = "7.0.0", path = "crates/truce-lv2" }
-truce-aax = { version = "7.0.0", path = "crates/truce-aax" }
-truce-aax-bridge = { version = "7.0.0", path = "crates/truce-aax-bridge" }
 truce-test = { version = "7.0.0", path = "crates/truce-test" }
 truce-loader = { version = "7.0.0", path = "crates/truce-loader" }
 truce-derive = { version = "7.0.0", path = "crates/truce-derive" }
 truce-cpu = { version = "7.0.0", path = "crates/truce-cpu" }
 truce-gpu = { version = "7.0.0", path = "crates/truce-gpu" }
 truce-egui = { version = "7.0.0", path = "crates/truce-egui" }
-truce-iced = { version = "7.0.0", path = "crates/truce-iced" }
 truce-simd = { version = "7.0.0", path = "crates/truce-simd" }
 truce-font = { version = "7.0.0", path = "crates/truce-font" }
 truce-build = { version = "7.0.0", path = "crates/truce-build" }
-truce-shim-types = { version = "7.0.0", path = "crates/truce-shim-types" }
 truce-utils = { version = "7.0.0", path = "crates/truce-utils" }
 
 # Common third-party deps consumed by multiple workspace crates.
@@ -153,7 +135,7 @@ truce-utils = { version = "7.0.0", path = "crates/truce-utils" }
 # onto incompatible wgpu major versions.
 thiserror = "2"
 toml = "1"
-# Plist `<data>` payloads, LV2 `xsd:base64Binary` literals, and the
+# Plist `<data>` payloads and the
 # `.preset` TOML `extra` field. Build-time crates only - truce-utils
 # and the runtime wrappers stay base64-free.
 base64 = "0.22"
@@ -165,18 +147,13 @@ base64 = "0.22"
 # `truce-gpu/Cargo.toml`, then unified across the workspace.
 wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 
-# The owned fork carries the AAX / Pro Tools close-path fix
+# The owned fork carries the Pro Tools close-path fix
 # (responder / tracking-area / layer-contents cleanup) and X11 repeat
 # normalization for stable host key ownership. Pin the reviewed revision
 # until the next `baseview-truce` release; the `package =` rename keeps every
 # `use baseview::*` in the GUI crates compiling unchanged. GUI crates
 # consume this via `baseview = { workspace = true }` so the registry
 # pin lives in exactly one place.
-#
-# Vizia's git-pinned baseview rev lives outside this workspace in
-# `crates/truce-vizia/` (its own Cargo workspace). Whatever patch
-# wiring vizia ends up needing belongs there, not here - keeping the
-# parent lockfile + iOS bake free of the vizia mess.
 baseview = { package = "baseview-truce", git = "https://github.com/DerpcatMusic/baseview.git", rev = "15cf1fe518e7ad53ec0c7d1fd98fbbd9091a0866" }
 
 # Custom profile for shell-mode (hot-reload) builds. `cargo truce

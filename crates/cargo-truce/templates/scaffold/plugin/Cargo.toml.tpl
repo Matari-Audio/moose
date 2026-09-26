@@ -16,22 +16,7 @@ name = "{crate_name}-standalone"
 path = "src/main.rs"
 required-features = ["standalone"]
 {{ endif }}
-{{ if is_workspace -}}
-# Scaffolded default: {default_label}. To add LV2 / AU / AAX / VST2,
-# uncomment the matching line in the root `Cargo.toml`'s
-# `[workspace.dependencies]`, then add the feature + optional dep
-# below (e.g. `lv2 = ["dep:truce-lv2"]` +
-# `truce-lv2 = \{ workspace = true, optional = true }`).
-{{- else -}}
-# Scaffolded default: {default_label}. To add LV2 / AU / AAX / VST2,
-# add the matching feature + optional dep below (e.g.
-# `lv2 = ["dep:truce-lv2"]` +
-{{ if use_registry -}}
-# `truce-lv2 = \{ version = "{version}", optional = true }`).
-{{- else -}}
-# `truce-lv2 = \{ git = "https://github.com/truce-audio/truce", tag = "{tag}", optional = true }`).
-{{- endif }}
-{{- endif }}
+# Scaffolded default: {default_label}.
 # Each format feature gates the matching wrapper crate as an optional
 # dep.
 [features]
@@ -51,8 +36,8 @@ rt-paranoid = ["truce/rt-paranoid"]
 truce = \{ {dep_args | unescaped} }
 # Lightweight types for layout / theme / widget descriptions.
 truce-gui-types = \{ {dep_args | unescaped} }
-# Built-in renderer. Plugins that supply their own editor (egui /
-# iced / slint) can drop this dep.
+# Built-in renderer. Plugins that supply their own editor (egui)
+# can drop this dep.
 truce-gui = \{ {dep_args | unescaped} }
 truce-clap = \{ {dep_args | unescaped}, optional = true }
 truce-vst3 = \{ {dep_args | unescaped}, optional = true }

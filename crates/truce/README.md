@@ -42,16 +42,8 @@ so `&mut AudioBuffer` resolves to the prelude's chosen precision
 |---------|-------------|
 | `clap` (default) | Enable CLAP format export |
 | `vst3` | Enable VST3 format export |
-| `vst2` | Enable VST2 format export (legacy - see `Cargo.toml` note) |
-| `lv2` | Enable LV2 format export |
 | `shell` | Build a dynamic shell that dlopens a hot-reloadable logic dylib (turns on `truce-loader/shell`) |
 | `hot-debug` | Verbose hot-reload diagnostics |
-
-AU and AAX live in their own optional `truce-au` / `truce-aax` deps
-(macOS-only AU; macOS/Windows AAX with the SDK + PACE wraptool). User
-plugins gate them behind their own `au` / `aax` features rather than
-through the facade. See `examples/truce-example-gain/Cargo.toml` for
-the conventional pattern.
 
 ## Usage
 
@@ -106,7 +98,7 @@ impl PurePluginLogic for MyPlugin {
 
     fn editor(params: Arc<MyParams>) -> Box<dyn Editor> {
         // Built-in widgets from a GridLayout. See the GUI guide for
-        // framework backends (egui / iced / slint) and custom editors.
+        // framework backends (egui) and custom editors.
         GridLayout::build(vec![widgets(vec![knob(P::Gain, "Gain")])])
             .into_editor(&params)
     }

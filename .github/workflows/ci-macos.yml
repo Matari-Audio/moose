@@ -25,10 +25,10 @@ jobs:
 
       # The runner image ships several Xcode versions plus simulator
       # runtimes (~40 GB) this job never touches, and the workspace's
-      # debug target alone peaks past the runner's free space once the
-      # sub-workspace targets pile on. Reclaim up front; the parallel
-      # `rm` of the unused Xcodes takes a couple of minutes and pays
-      # for itself the first time the job doesn't die on ENOSPC.
+      # debug target can peak past the runner's free space. Reclaim
+      # up front; the parallel `rm` of the unused Xcodes takes a couple
+      # of minutes and pays for itself the first time the job doesn't
+      # die on ENOSPC.
       - name: Free runner disk
         run: |
           df -h /
@@ -76,47 +76,6 @@ jobs:
         run: cargo test --workspace --exclude truce-example-eq -- gui_screenshot
       - name: screenshot tests (gpu)
         run: cargo test -p truce-example-eq -- gui_screenshot
-
-      # truce-slint and truce-vizia each live in their own Cargo
-      # sub-workspace (see their respective `crates/<name>/Cargo.toml`
-      # headers for the rationale - skia-bindings `links` collision
-      # for slint, vizia's hard-pinned baseview rev for vizia). The
-      # parent `--workspace` doesn't reach into either, so mirror the
-      # gates here against each sub-workspace's own manifest.
-      - name: clippy (truce-slint sub-workspace)
-        run: cargo clippy --manifest-path crates/truce-slint/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: build (truce-slint sub-workspace)
-        run: cargo build --manifest-path crates/truce-slint/Cargo.toml --workspace --all-targets
-      - name: test (truce-slint sub-workspace)
-        run: cargo test --manifest-path crates/truce-slint/Cargo.toml --workspace -- --skip gui_screenshot
-      - name: screenshot tests (truce-slint sub-workspace)
-        run: cargo test --manifest-path crates/truce-slint/Cargo.toml --workspace -- gui_screenshot
-      # Each sub-workspace builds into its own `crates/<x>/target`,
-      # which rust-cache doesn't persist (root `target` only) - so
-      # dropping it after its gates costs nothing next run and keeps
-      # the job's peak disk to one sub-workspace target at a time.
-      - name: reclaim disk (truce-slint target)
-        run: rm -rf crates/truce-slint/target && df -h /
-      - name: clippy (truce-vizia sub-workspace)
-        run: cargo clippy --manifest-path crates/truce-vizia/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: build (truce-vizia sub-workspace)
-        run: cargo build --manifest-path crates/truce-vizia/Cargo.toml --workspace --all-targets
-      - name: test (truce-vizia sub-workspace)
-        run: cargo test --manifest-path crates/truce-vizia/Cargo.toml --workspace -- --skip gui_screenshot
-      - name: screenshot tests (truce-vizia sub-workspace)
-        run: cargo test --manifest-path crates/truce-vizia/Cargo.toml --workspace -- gui_screenshot
-      - name: reclaim disk (truce-vizia target)
-        run: rm -rf crates/truce-vizia/target && df -h /
-      - name: clippy (truce-gpu-examples sub-workspace)
-        run: cargo clippy --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: build (truce-gpu-examples sub-workspace)
-        run: cargo build --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace --all-targets
-      - name: test (truce-gpu-examples sub-workspace)
-        run: cargo test --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace -- --skip gui_screenshot
-      - name: screenshot tests (truce-gpu-examples sub-workspace)
-        run: cargo test --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace -- gui_screenshot
-      - name: reclaim disk (truce-gpu-examples target)
-        run: rm -rf crates/truce-gpu-examples/target && df -h /
 
       # Ratio-based regression guard: gain_simd_fast must run at
       # least 5x faster than the naive gain shape on the same
@@ -202,110 +161,3 @@ jobs:
           cache-bin: false
       - name: windowed hitTest smoke
         run: ./scripts/gui-window-test.sh
-
-  # Sub-workspace install + validate + package round-trip for slint
-  # and vizia. Split out from `test` because skia-bindings + vizia
-  # compile times push the job toward the 30-minute GHA soft cap and
-  # the heavyweight dep stack shouldn't block the fast gate.
-  # Mirrors the bake-screenshots split.
-  sub-workspaces:
-    name: macos-latest (sub-workspaces)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Same disk reclaim as the `test` job: the slint + vizia target
-      # dirs are the heaviest in the repo (skia-bindings), and the
-      # runner image's spare Xcodes/simulators are dead weight here.
-      - name: Free runner disk
-        run: |
-          df -h /
-          sudo xcrun simctl runtime delete all 2>/dev/null || true
-          keep="$(xcode-select -p)"; keep="${keep%/Contents/Developer}"
-          for x in /Applications/Xcode*.app; do
-            [ "$(readlink -f "$x")" = "$(readlink -f "$keep")" ] || sudo rm -rf "$x" &
-          done
-          wait
-          df -h /
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-sub-workspaces
-          cache-bin: false
-
-      - name: Cache pluginval
-        id: cache-pluginval
-        uses: actions/cache@v4
-        with:
-          path: /Applications/pluginval.app
-          key: pluginval-macos-1.0.4
-
-      - name: Download pluginval
-        if: steps.cache-pluginval.outputs.cache-hit != 'true'
-        run: |
-          curl -fsSL -o /tmp/pluginval.zip \
-            https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip
-          unzip -oq /tmp/pluginval.zip -d /Applications/
-
-      - name: Cache clap-validator
-        id: cache-clap-validator
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/clap-validator
-          key: clap-validator-macos-2026-05-09
-
-      - name: Install clap-validator
-        if: steps.cache-clap-validator.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/free-audio/clap-validator clap-validator
-
-      - name: Pre-flight — validators present
-        run: |
-          command -v clap-validator
-          test -x /Applications/pluginval.app/Contents/MacOS/pluginval
-
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
-
-      # Package uses `--no-sign` (no PACE) + `--no-notarize` (skip
-      # Apple notarization) because CI has no Developer ID; Apple
-      # codesign still runs ad-hoc against the default
-      # `TRUCE_SIGNING_IDENTITY` of `-`.
-      # Each sub-workspace runs install → validate → package as one
-      # block, then drops its private target dir before the next
-      # begins - rust-cache persists the root target only, so the
-      # deletion costs nothing next run, and the job's peak disk stays
-      # at one skia-heavy sub-workspace target at a time.
-      - name: Install + validate + package (truce-slint sub-workspace)
-        run: |
-          set -e -o pipefail
-          cd crates/truce-slint
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" install --user --clap --vst3 -p truce-example-gain-slint
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" validate --clap --pluginval -p truce-example-gain-slint 2>&1 | tee validate-slint.log
-          if grep -E "SKIP|not found" validate-slint.log >/dev/null; then
-            echo "::error::slint validate skipped a step — failing"
-            exit 1
-          fi
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" package -p truce-example-gain-slint --formats clap,vst3 --no-sign --no-notarize
-
-      - name: reclaim disk (truce-slint target)
-        run: rm -rf crates/truce-slint/target && df -h /
-
-      # `--skip-gui-tests` mirrors the Linux + Windows vizia steps:
-      # baseview's macOS path (`baseview/src/macos/window.rs:412`)
-      # creates an `NSOpenGLContext`, and pluginval's "Open editor
-      # whilst processing" test fails with `CreationFailed(())` on
-      # the headless macos-latest runner. slint passes because it
-      # doesn't go through baseview's GL path.
-      - name: Install + validate + package (truce-vizia sub-workspace)
-        run: |
-          set -e -o pipefail
-          cd crates/truce-vizia
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" install --user --clap --vst3 -p truce-example-gain-vizia
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" validate --clap --pluginval --skip-gui-tests -p truce-example-gain-vizia 2>&1 | tee validate-vizia.log
-          if grep -E "SKIP|not found" validate-vizia.log >/dev/null; then
-            echo "::error::vizia validate skipped a step — failing"
-            exit 1
-          fi
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" package -p truce-example-gain-vizia --formats clap,vst3 --no-sign --no-notarize

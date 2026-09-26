@@ -43,8 +43,7 @@ pub(crate) struct PluginScaffoldingContext {
     /// Plain semver version (e.g. `0.48.7`). Used by the registry
     /// dep form when `use_registry` is true.
     pub version: String,
-    /// Toggles the dep style emitted by the per-plugin Cargo.toml's
-    /// commented LV2/AU/AAX hints. Mirrors the same flag on
+    /// Toggles the dep style emitted by the per-plugin Cargo.toml. Mirrors the same flag on
     /// `WorkspaceContext` so workspace + plugin templates stay in
     /// sync.
     pub use_registry: bool,
@@ -173,7 +172,6 @@ pub(crate) struct TruceTomlPlugin {
     pub crate_name: String,
     pub category: &'static str,
     pub fourcc: String,
-    pub au_tag: &'static str,
     pub vst3_subcategory: &'static str,
 }
 
@@ -206,7 +204,6 @@ impl TruceTomlContext {
                     crate_name,
                     category: p.kind.category(),
                     fourcc: fourcc_map[&p.name].clone(),
-                    au_tag: p.kind.au_tag(),
                     vst3_subcategory: p.kind.vst3_subcategory(),
                 }
             })

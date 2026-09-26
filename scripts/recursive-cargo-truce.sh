@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Thin wrapper over recursive-cargo.sh that runs `cargo truce <args>` in
-# the main workspace and in every truce sub-workspace. See
+# every workspace listed by truce-workspaces.sh. See
 # recursive-cargo.sh for the workspace list, color handling, and
 # [OK]/[SKIP]/[FAIL] semantics. truce reports a plugin that lives in a
 # different workspace as "No plugin with crate name", which we add to the
@@ -19,12 +19,7 @@ if [[ $# -eq 0 ]]; then
     cat >&2 <<EOF
 usage: $(basename "$0") <cargo-truce-args>
 
-Runs 'cargo truce <args>' in the main workspace and in each sub-workspace.
-
-Sub-workspaces:
-  crates/truce-slint
-  crates/truce-vizia
-  crates/truce-gpu-examples
+Runs 'cargo truce <args>' in every workspace listed by truce-workspaces.sh.
 EOF
     exit 64
 fi

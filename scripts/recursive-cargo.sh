@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
-# Run `cargo <args>` in the main workspace and in every sub-workspace
-# (currently `crates/truce-vizia`, `crates/truce-slint`, and
-# `crates/truce-gpu-examples`). Each sub-workspace is its own Cargo
-# workspace: vizia / slint pin incompatible skia-bindings revs and can't
-# share a workspace with the main truce build; truce-gpu-examples is
-# split out because its `truce-gui/gpu` feature request would unify
-# across the parent workspace and silently flip every CPU screenshot
-# test to the GPU renderer.
+# Run `cargo <args>` in every workspace listed by truce-workspaces.sh
+# (currently just the main workspace).
 #
 # Usage: recursive-cargo.sh <cargo-args>
 # Examples:
@@ -14,7 +8,7 @@
 #   recursive-cargo.sh test
 #   recursive-cargo.sh clippy --all-targets
 #
-# A `-p` for a package a given sub-workspace doesn't contain makes cargo
+# A `-p` for a package a given workspace doesn't contain makes cargo
 # exit non-zero with a "no matching packages" message. Since each plugin
 # lives in exactly one workspace, that miss is expected - the script
 # reports it as [SKIP] and does NOT fail the overall run. Callers that
@@ -33,8 +27,7 @@ source "$script_dir/truce-workspaces.sh"
 # Pick the cargo binary. On Windows the truce build must use the
 # Windows toolchain, so prefer `cargo.exe` whenever it's on PATH -
 # including under WSL, where bare `cargo` is the Linux toolchain that
-# can't build the Windows plug-ins (and where slint's deps need
-# fontconfig/pkg-config that aren't installed). `cargo.exe` only
+# can't build the Windows plug-ins. `cargo.exe` only
 # exists on Windows / WSL / Git Bash, so this is a no-op on native
 # Linux/macOS. Override explicitly with `CARGO=...`.
 if [[ -n "${CARGO:-}" ]]; then
@@ -63,17 +56,12 @@ if [[ $# -eq 0 ]]; then
     cat >&2 <<EOF
 usage: $(basename "$0") <cargo-args>
 
-Runs 'cargo <args>' in the main workspace and in each sub-workspace.
-
-Sub-workspaces:
-  crates/truce-slint
-  crates/truce-vizia
-  crates/truce-gpu-examples
+Runs 'cargo <args>' in every workspace listed by truce-workspaces.sh.
 EOF
     exit 64
 fi
 
-# Packages absent from a sub-workspace are an expected miss; cargo phrases
+# Packages absent from a workspace are an expected miss; cargo phrases
 # it as "no matching packages" or "did not match any packages" depending
 # on the subcommand. Callers can add their own subcommand-specific miss
 # message to the alternation.
@@ -96,7 +84,7 @@ for ws in "${workspaces[@]}"; do
     [[ -z "$label" ]] && label="(main)"
     printf '\n=== %s %s [%s] ===\n' "$cargo_bin" "$*" "$label"
     # `tee` to a temp file so output still streams live while we
-    # inspect it for the "package not in this sub-workspace" miss.
+    # inspect it for the "package not in this workspace" miss.
     # `PIPESTATUS[0]` is cargo's exit code, not tee's.
     tmp="$(mktemp)"
     ( cd "$ws" && "$cargo_bin" "$@" ) 2>&1 | tee "$tmp"

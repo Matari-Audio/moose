@@ -3,13 +3,11 @@
 //! Rust's `cdylib` link path produces `MH_DYLIB`, which `CFBundle`'s
 //! loader (every JUCE-hosted VST3 host, pluginval, `DawDreamer`)
 //! rejects. The cleanest fix is to skip the cdylib for macOS bundle
-//! formats (VST3, CLAP, VST2) and instead link a Rust `staticlib`
+//! formats (VST3, CLAP) and instead link a Rust `staticlib`
 //! through `clang -bundle` to produce a real `MH_BUNDLE`.
 //!
-//! AU v2 / AAX / Linux / Windows continue to use the cdylib path:
-//! AU's component loader and AAX's `dlopen`-from-C++ shim are happy
-//! with `MH_DYLIB`, and ELF / PE don't carry the bundle vs dylib
-//! distinction.
+//! Linux / Windows continue to use the cdylib path: ELF / PE don't
+//! carry the bundle vs dylib distinction.
 
 #![cfg(target_os = "macos")]
 
@@ -37,11 +35,6 @@ pub(crate) const VST3_EXPORTS: &[&str] = &[
     "_bundleExit",
 ];
 
-/// Symbols a VST2 bundle must export. `VSTPluginMain` is the modern
-/// entry; `main_macho` is the legacy alias older Steinberg hosts
-/// probe.
-pub(crate) const VST2_EXPORTS: &[&str] = &["_VSTPluginMain", "_main_macho"];
-
 /// Single source of truth for the "no staticlib emitted" error.
 ///
 /// Plugins scaffolded before 0.44.0 ship `crate-type = ["cdylib",
@@ -57,7 +50,7 @@ pub(crate) fn missing_staticlib_error(staticlib_path: &Path) -> String {
            {path}\n\
          but cargo didn't emit one.\n\
          \n\
-         Starting with truce 0.44.0, macOS bundle formats (CLAP / VST3 / VST2) \
+         Starting with truce 0.44.0, macOS bundle formats (CLAP / VST3) \
          are linked from `lib<stem>.a` via `clang -bundle`. Plugins scaffolded \
          before 0.44.0 only declared `[\"cdylib\", \"rlib\"]` and need to add \
          `\"staticlib\"` to the `crate-type` array in their plugin crate's \
@@ -198,7 +191,7 @@ fn clang_bundle_single(
         "-Wl,-undefined,dynamic_lookup",
         // Pull every object from the archive so format-specific
         // entry points (declared with `#[no_mangle]` deep inside
-        // truce-{clap,vst3,vst2}) aren't dead-stripped before we get
+        // truce-{clap,vst3}) aren't dead-stripped before we get
         // a chance to mark them exported below.
         "-Wl,-all_load",
     ]);
@@ -217,7 +210,7 @@ fn clang_bundle_single(
     // `-dead_strip` removes everything not reachable from the
     // `-exported_symbol` roots. Without this the bundle ships every
     // monomorphization and dep the staticlib brought in - roughly
-    // double the size of the equivalent cdylib (AU2 / AAX), whose
+    // double the size of the equivalent cdylib, whose
     // rustc-driven link gets `-dead_strip` for free on apple-darwin.
     cmd.arg("-Wl,-dead_strip");
     cmd.arg(staticlib);

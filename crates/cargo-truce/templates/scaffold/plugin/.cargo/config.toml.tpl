@@ -19,10 +19,6 @@
 # TEAM_ID               = "ABCDEFG123"
 # APP_SPECIFIC_PASSWORD = "xxxx-xxxx-xxxx-xxxx"
 
-# --- AAX SDK (macOS and Windows) ---
-# AAX_SDK_PATH = "/path/to/aax-sdk-2-9-0"
-# AAX_SDK_PATH = 'C:\Users\you\aax-sdk-2-9-0'
-
 # --- Windows Authenticode signing ---
 # Pick ONE of: Azure Trusted Signing, cert thumbprint, or .pfx file.
 #

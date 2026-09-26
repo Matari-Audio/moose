@@ -3,10 +3,8 @@
 //! Every plug-in install path flows through [`InstallScope`]; the
 //! developer picks scope via `--user` / `--system` on
 //! `cargo truce install`, with `--ask` added for `cargo truce
-//! package` ([`PkgScope`]). Three formats with platform-specific
-//! constraints silently fall back to system scope when `--user`
-//! isn't reliably supported (AAX, AU v3, Windows VST2). See
-//! [`effective_scope`] for the fallback policy.
+//! package` ([`PkgScope`]). See [`effective_scope`] for the
+//! per-format default.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -100,13 +98,8 @@ impl PkgScope {
 /// `requested` is the raw CLI choice: `Some` when the developer
 /// passed `--user` / `--system`, `None` when they passed neither.
 ///
-/// Two policies layered together:
-/// - **Hard upgrade** - AAX, AU v3, and (on Windows) VST2 are
-///   system-only. An explicit `--user` is downgraded to System with
-///   a note (printed once per `cargo truce` invocation via
-///   [`note_once`]).
-/// - **Default selection** - when `requested` is `None`, picks the
-///   per-(format, OS) default. Most combinations default to User to
+/// An explicit choice always wins. When `requested` is `None`, picks
+/// the per-(format, OS) default. Most combinations default to User to
 ///   keep the dev loop password-free; the exception is VST3 on
 ///   Windows, which defaults to System because that's the directory
 ///   every commercial host scans by convention (the per-user
@@ -116,28 +109,6 @@ pub(crate) fn effective_scope(
     format: Format,
     requested: Option<InstallScope>,
 ) -> (InstallScope, Option<&'static str>) {
-    // Hard upgrades come first - they override both an explicit
-    // `--user` and the per-format default.
-    let hard_upgrade: Option<&'static str> = match format {
-        Format::Aax => Some("AAX is system-only; ignoring --user"),
-        Format::Au3 => Some("AU v3 is system-only; ignoring --user"),
-        Format::Vst2 if cfg!(target_os = "windows") => {
-            Some("VST2 on Windows is system-only; ignoring --user")
-        }
-        _ => None,
-    };
-    if let Some(msg) = hard_upgrade {
-        // Note only fires when the user *asked* for User and got
-        // overridden; staying silent when they passed --system or
-        // nothing keeps the install log uncluttered.
-        let note = if requested == Some(InstallScope::User) {
-            Some(msg)
-        } else {
-            None
-        };
-        return (InstallScope::System, note);
-    }
-
     if let Some(s) = requested {
         return (s, None);
     }
@@ -203,11 +174,6 @@ fn local_appdata() -> PathBuf {
     crate::dirs::require_local_appdata().expect("LOCALAPPDATA required")
 }
 
-#[cfg(target_os = "windows")]
-fn appdata() -> PathBuf {
-    crate::dirs::require_appdata().expect("APPDATA required")
-}
-
 #[cfg(target_os = "macos")]
 impl InstallScope {
     pub(crate) fn clap_dir(self) -> PathBuf {
@@ -220,24 +186,6 @@ impl InstallScope {
         match self {
             Self::User => home().join("Library/Audio/Plug-Ins/VST3"),
             Self::System => PathBuf::from("/Library/Audio/Plug-Ins/VST3"),
-        }
-    }
-    pub(crate) fn vst2_dir(self) -> PathBuf {
-        match self {
-            Self::User => home().join("Library/Audio/Plug-Ins/VST"),
-            Self::System => PathBuf::from("/Library/Audio/Plug-Ins/VST"),
-        }
-    }
-    pub(crate) fn lv2_dir(self) -> PathBuf {
-        match self {
-            Self::User => home().join("Library/Audio/Plug-Ins/LV2"),
-            Self::System => PathBuf::from("/Library/Audio/Plug-Ins/LV2"),
-        }
-    }
-    pub(crate) fn au_v2_dir(self) -> PathBuf {
-        match self {
-            Self::User => home().join("Library/Audio/Plug-Ins/Components"),
-            Self::System => PathBuf::from("/Library/Audio/Plug-Ins/Components"),
         }
     }
     /// Directory the packager drops `<Plugin>.app` into for the
@@ -266,23 +214,6 @@ impl InstallScope {
             Self::System => crate::common_program_files().join("VST3"),
         }
     }
-    // `self` is unused - Windows VST2 has no per-scope split. Kept on
-    // `&self` for shape-symmetry with `clap_dir` / `vst3_dir` / `lv2_dir`
-    // so callers don't need a special case for VST2.
-    #[allow(clippy::unused_self)]
-    pub(crate) fn vst2_dir(self) -> PathBuf {
-        // Windows VST2 falls back to system in `effective_scope` -
-        // keep the user arm wired to the system path so an unfiltered
-        // `--user` invocation still resolves to a real directory if
-        // something bypasses `effective_scope`.
-        crate::program_files().join("Steinberg").join("VstPlugins")
-    }
-    pub(crate) fn lv2_dir(self) -> PathBuf {
-        match self {
-            Self::User => appdata().join("LV2"),
-            Self::System => crate::common_program_files().join("LV2"),
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -298,13 +229,5 @@ impl InstallScope {
     pub(crate) fn vst3_dir(self) -> PathBuf {
         let _ = self;
         home().join(".vst3")
-    }
-    pub(crate) fn vst2_dir(self) -> PathBuf {
-        let _ = self;
-        home().join(".vst")
-    }
-    pub(crate) fn lv2_dir(self) -> PathBuf {
-        let _ = self;
-        home().join(".lv2")
     }
 }

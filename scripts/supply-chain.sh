@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # Supply-chain audit for the whole workspace tree: runs `cargo audit`
 # (RustSec advisory scan) and `cargo deny check` (advisories + licenses +
-# bans + sources) in the main workspace and every sub-workspace.
+# bans + sources) in the main workspace (and fuzz/ when checked out).
 #
 # Usage: supply-chain.sh
 #
 # Requires `cargo audit` (cargo-audit) and `cargo deny` (cargo-deny) on
 # PATH. Exits non-zero if either tool fails in any workspace.
 #
-# cargo deny uses a per-workspace policy: most workspaces share the root
-# deny.toml, but truce-vizia - the only one pulling git-sourced deps -
-# gets crates/truce-vizia/deny.toml so its git allow-list doesn't leak
-# into the others. cargo audit needs no config (it scans Cargo.lock) and
+# cargo deny uses the root deny.toml for every workspace. cargo audit needs no config (it scans Cargo.lock) and
 # exits non-zero only on a real vulnerability; unmaintained-crate notices
 # stay exit 0.
 set -uo pipefail
@@ -63,14 +60,6 @@ ws_label() {
     printf '%s' "$l"
 }
 
-# Most workspaces share the root policy; truce-vizia carries its own.
-deny_config_for() {
-    case "$1" in
-        */crates/truce-vizia) printf '%s' "$1/deny.toml" ;;
-        *) printf '%s' "$root_dir/deny.toml" ;;
-    esac
-}
-
 report() {
     local label="$1" rc="$2"
     if [[ $rc -eq 0 ]]; then
@@ -105,7 +94,7 @@ done < <(audit_workspaces "$root_dir")
 printf '\n########## cargo deny check ##########\n'
 while IFS= read -r ws; do
     label="$(ws_label "$ws")"
-    cfg="$(deny_config_for "$ws")"
+    cfg="$root_dir/deny.toml"
     printf '\n=== cargo deny check [%s] (%s) ===\n' "$label" "${cfg#"$root_dir"/}"
     ( cd "$ws" && run_deny "$cfg" )
     report "$label" "$?"

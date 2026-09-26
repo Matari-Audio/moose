@@ -119,13 +119,7 @@ mod tests {
     /// count covers frees as well as allocations, then restore the setting.
     /// Gated like its only callers, the per-format wrapper-glue tests
     /// below.
-    #[cfg(any(
-        feature = "vst2",
-        feature = "clap",
-        feature = "vst3",
-        feature = "au",
-        feature = "aax"
-    ))]
+    #[cfg(any(feature = "clap", feature = "vst3"))]
     fn wrapper_glue_violations(smoke: impl FnOnce() -> u32) -> u32 {
         let prev = truce::rt::check_dealloc();
         truce::rt::set_check_dealloc(true);
@@ -152,21 +146,6 @@ mod tests {
         });
     }
 
-    /// The VST2 wrapper's per-block glue (host-event conversion,
-    /// transport, `process`, output encode, snapshot publish) is
-    /// allocation-free on the audio thread. Drives the real
-    /// `process_block` callback under the checker, not just the plugin.
-    /// Compiled only with `vst2` on, which `rt-paranoid` pulls in.
-    #[cfg(feature = "vst2")]
-    #[test]
-    fn vst2_wrapper_glue_is_allocation_free() {
-        assert_eq!(
-            wrapper_glue_violations(truce_vst2::rt_paranoid_smoke::<Plugin>),
-            0,
-            "the VST2 wrapper's per-block glue must not allocate or free on the audio thread"
-        );
-    }
-
     /// The CLAP wrapper's per-block glue (host-event conversion,
     /// transport, `process`, output narrow, snapshot publish) is
     /// allocation-free on the audio thread. Drives the real `process`
@@ -189,26 +168,6 @@ mod tests {
             wrapper_glue_violations(truce_vst3::rt_paranoid_smoke::<Plugin>),
             0,
             "the VST3 wrapper's per-block glue must not allocate or free on the audio thread"
-        );
-    }
-
-    #[cfg(feature = "au")]
-    #[test]
-    fn au_wrapper_glue_is_allocation_free() {
-        assert_eq!(
-            wrapper_glue_violations(truce_au::rt_paranoid_smoke::<Plugin>),
-            0,
-            "the AU wrapper's per-block glue must not allocate or free on the audio thread"
-        );
-    }
-
-    #[cfg(feature = "aax")]
-    #[test]
-    fn aax_wrapper_glue_is_allocation_free() {
-        assert_eq!(
-            wrapper_glue_violations(truce_aax::rt_paranoid_smoke::<Plugin>),
-            0,
-            "the AAX wrapper's per-block glue must not allocate or free on the audio thread"
         );
     }
 

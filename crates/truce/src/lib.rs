@@ -7,8 +7,7 @@ pub use truce_core as core;
 pub use truce_core::rt;
 pub use truce_derive::{ParamEnum, Params, State};
 // `truce` is renderer-agnostic - it no longer re-exports `truce-gui`.
-// Plugins pick a renderer crate (truce-gui, truce-egui, truce-iced,
-// truce-slint) directly in their Cargo.toml and use it inside their
+// Plugins pick a renderer crate (truce-gui, truce-egui) directly in their Cargo.toml and use it inside their
 // `PluginLogic::editor()` impl. The prelude below sources GUI types
 // from the lightweight `truce-gui-types` so layout / interaction /
 // theme remain available without dragging tiny-skia + baseview + wgpu.

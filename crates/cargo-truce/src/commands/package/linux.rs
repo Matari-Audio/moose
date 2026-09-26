@@ -39,11 +39,11 @@ pub(crate) fn cmd_package_linux(args: &[String], selection: &SuiteSelection) -> 
     while i < args.len() {
         match args[i].as_str() {
             // Empty string: arg-split residue. `--no-sign` /
-            // `--no-pace-sign` / `--no-notarize`: macOS-only flags
+            // `--no-notarize`: macOS-only flags
             // accepted silently here so cross-platform CI matrices
             // can pass the same `--no-sign --no-notarize` to every
             // OS without per-platform branches.
-            "" | "--no-sign" | "--no-pace-sign" | "--no-notarize" => {}
+            "" | "--no-sign" | "--no-notarize" => {}
             "--no-build" => no_build = true,
             "--target" => {
                 i += 1;
@@ -394,7 +394,7 @@ struct PluginSummary {
     /// Bundle directory/file names that the script needs to know about,
     /// e.g. `["My Gain.clap", "My Gain.vst3"]`. Each entry's `format`
     /// names the format-grouped directory in the tarball
-    /// (`clap/`, `vst3/`, `lv2/`, `vst/`).
+    /// (`clap/`, `vst3/`).
     bundles: Vec<BundleEntry>,
     /// Standalone executable name relative to the tarball's
     /// `standalone/` directory, if any.
@@ -417,7 +417,7 @@ struct PluginSummary {
 
 struct BundleEntry {
     /// Format slug for install path AND for the format-grouped
-    /// directory in the tarball: `"clap"`, `"vst3"`, `"lv2"`, `"vst"`.
+    /// directory in the tarball: `"clap"` or `"vst3"`.
     format: &'static str,
     /// Filename inside the tarball's `<format>/` directory.
     name: String,
@@ -442,17 +442,14 @@ fn stage_plugin_payload(
     let mut bundles = Vec::new();
 
     // Tarball layout mirrors the Linux install destinations: bundles
-    // get grouped by format (`clap/`, `vst3/`, `lv2/`, `vst/`) at the
+    // get grouped by format (`clap/`, `vst3/`) at the
     // tarball root rather than nested under `plugins/<bundle_id>/`.
     // This makes `tar xf … -C ~/.config/...` viable as a manual
     // alternative to `install.sh` and keeps install.sh's per-plugin
     // case bodies short (one path component to copy from).
     for entry in manifest.bundles_for_plugin(&plugin.crate_name) {
         let Some(slug) = linux_install_slug(&entry.format) else {
-            // AU2/AU3/AAX would never appear in a host-Linux manifest
-            // because they're macOS-only; if one slips in via a copied
-            // target/ from another host, the host_triple check above
-            // already rejected it. Skip defensively here.
+            // Unknown format slug in the manifest; skip defensively.
             continue;
         };
         let src = bundles_dir.join(&entry.filename);
@@ -482,7 +479,7 @@ fn stage_plugin_payload(
 
     // Factory presets, emitted at stage time (the build manifest only
     // tracks the bundles themselves). CLAP gets a `<stem>.presets/`
-    // sibling, LV2 presets go inside the staged bundle, and VST3
+    // sibling and VST3
     // presets stage as a loose tree install.sh merges into the shared
     // `~/.vst3/presets` folder.
     let mut clap_presets = None;
@@ -499,13 +496,6 @@ fn stage_plugin_payload(
                         &format!("{}-clap", plugin.bundle_id),
                     )?;
                     clap_presets = Some(format!("clap/{dir}"));
-                }
-                "lv2" => {
-                    let uri = truce_build::lv2::plugin_uri(
-                        config.vendor.url.as_deref().unwrap_or(""),
-                        &plugin.bundle_id,
-                    );
-                    presets::emit_lv2_presets(&fp, &staging.join("lv2").join(&b.name), &uri)?;
                 }
                 "vst3" => {
                     let payload = presets::vst3_preset_payload(&fp, plugin, config);
@@ -572,33 +562,21 @@ fn stage_plugin_payload(
 
 /// Map a `PkgFormat` to its `cargo truce build` flag, or `None` for
 /// formats that aren't a build target (the standalone host binary
-/// is staged by `cargo truce run`, not `build`). `Au2`/`Au3`/`Aax`
-/// map to their build flags even though those formats are no-ops on
-/// Linux; `cargo truce build` already emits a single skip line and
-/// returns cleanly, so passing them is harmless.
+/// is staged by `cargo truce run`, not `build`).
 fn build_flag_for_format(f: &PkgFormat) -> Option<&'static str> {
     match f {
         PkgFormat::Clap => Some("--clap"),
         PkgFormat::Vst3 => Some("--vst3"),
-        PkgFormat::Vst2 => Some("--vst2"),
-        PkgFormat::Lv2 => Some("--lv2"),
-        PkgFormat::Au2 => Some("--au2"),
-        PkgFormat::Au3 => Some("--au3"),
-        PkgFormat::Aax => Some("--aax"),
         PkgFormat::Standalone => None,
     }
 }
 
-/// Map a manifest format slug (`"vst2"`, `"clap"`, …) to the install
-/// path slug used by `install.sh`'s `dest_dir()` (`"vst"`, `"clap"`,
-/// …). Returns `None` for formats that don't have a Linux install
-/// path (AU, AAX).
+/// Map a manifest format slug to the install path slug used by
+/// `install.sh`'s `dest_dir()`. Returns `None` for unknown formats.
 fn linux_install_slug(format: &str) -> Option<&'static str> {
     match format {
         "clap" => Some("clap"),
         "vst3" => Some("vst3"),
-        "vst2" => Some("vst"),
-        "lv2" => Some("lv2"),
         _ => None,
     }
 }
