@@ -286,6 +286,13 @@ impl EditorScale {
         self.host_set.load(Ordering::Relaxed).then(|| self.get())
     }
 
+    /// [`moose_core::editor::Editor::window_scale`] for an editor whose
+    /// window is `open`: the current scale, except on macOS.
+    #[must_use]
+    pub fn window_scale(&self, open: bool) -> Option<f64> {
+        (open && !cfg!(target_os = "macos")).then(|| self.get())
+    }
+
     /// Read the current scale.
     #[must_use]
     pub fn get(&self) -> f64 {
@@ -627,6 +634,18 @@ mod tests {
             assert_eq!(scale.host_override(), Some(1.25));
             assert_eq!(scale.get(), 1.25);
         }
+    }
+
+    #[test]
+    fn window_scale_only_while_open_off_macos() {
+        let scale = EditorScale::new(1.5);
+        assert_eq!(scale.window_scale(false), None);
+        let expected = if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(1.5)
+        };
+        assert_eq!(scale.window_scale(true), expected);
     }
 
     #[test]

@@ -198,19 +198,22 @@ pub trait Editor: Send {
     /// multiply `size()` by (which caused double-scaling on macOS VST3).
     fn set_scale_factor(&mut self, _factor: f64) {}
 
-    /// Opt the editor into honoring the desktop (system) scale.
+    /// The scale the open editor window renders at, where hosts size the
+    /// plugin view in physical pixels (Windows, Linux).
     ///
-    /// The standalone app calls this with `true` before [`open`] because
-    /// it owns a real top-level window that should match the desktop
-    /// (`Xft.dpi` on Linux). Plugin formats leave the default: an
-    /// embedded editor drives its Linux scale from the host's
-    /// content-scale callback (default 1.0) instead of the desktop,
-    /// since a non-DPI-aware host (e.g. Bitwig on X11) runs at 1x
-    /// regardless of desktop scaling and would otherwise get a
-    /// double-sized window. No-op on macOS/Windows, where the OS
-    /// reports a reliable per-window scale.
-    ///
-    /// [`open`]: Editor::open
+    /// Wrappers use it to convert between the host's physical pixels and
+    /// [`size`](Editor::size) only while the host has not announced a
+    /// content scale, so the reported size matches the child window the
+    /// editor actually created (e.g. at the monitor DPI or `Xft.dpi`).
+    /// Must be `None` on macOS (logical `AppKit` coordinates), when closed,
+    /// or when unknown.
+    fn window_scale(&self) -> Option<f64> {
+        None
+    }
+
+    /// No-op, kept for source compatibility. Editors follow the host's
+    /// content scale when it sends one and the OS scale otherwise, so the
+    /// standalone no longer needs to opt in.
     fn set_uses_system_scale(&mut self, _yes: bool) {}
 
     /// Plugin state was restored (preset recall, undo, session load).
@@ -317,6 +320,10 @@ impl Editor for TaskBoundEditor {
 
     fn set_scale_factor(&mut self, factor: f64) {
         self.editor.set_scale_factor(factor);
+    }
+
+    fn window_scale(&self) -> Option<f64> {
+        self.editor.window_scale()
     }
 
     fn set_uses_system_scale(&mut self, yes: bool) {

@@ -376,6 +376,10 @@ impl<P: Params + 'static> Editor for GpuEditor<P> {
         self.window = window;
     }
 
+    fn window_scale(&self) -> Option<f64> {
+        self.scale.window_scale(self.window.is_some())
+    }
+
     fn set_scale_factor(&mut self, factor: f64) {
         // Write to the shared cell; the baseview handler picks up the
         // change on its next frame and reconfigures the wgpu surface
