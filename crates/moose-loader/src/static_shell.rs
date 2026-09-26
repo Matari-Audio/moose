@@ -32,8 +32,10 @@ use moose_plugin::PluginLogicCore;
 pub struct StaticShell<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample = f32> {
     pub params: Arc<P>,
     /// The user's mutable DSP state, owned by the shell (not the
-    /// descriptor `L`). Built once via `L::init(&params)`.
-    state: L::DspState,
+    /// descriptor `L`). Built once via `L::init(&params)`. Boxed so a
+    /// large DSP state (delay lines, FFT tables) doesn't ride the stack
+    /// every time the shell itself is moved into the wrapper.
+    state: Box<L::DspState>,
     meters: Arc<MeterStore>,
     /// Lock-free publish slot for `snapshot_into`-based state save.
     snapshots: Arc<SnapshotSlot>,
@@ -101,7 +103,7 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         let snapshots = SnapshotSlot::with_capacity(L::snapshot_prealloc_hint());
         let init_ctx =
             InitContext::new(tasks.clone()).with_snapshot(SnapshotPublisher::new(&snapshots));
-        let state = L::init(&params, &init_ctx);
+        let state = Box::new(L::init(&params, &init_ctx));
         Self {
             params,
             state,
