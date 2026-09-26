@@ -60,7 +60,7 @@ jobs:
         run: |
           tag=$(git ls-remote --tags --sort='-v:refname' \
                   https://github.com/Matari-Audio/moose \
-                  | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+                  | { grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
                   | head -1 \
                   | sed 's|refs/tags/||')
           # No MOOSE release yet: nothing to be backwards-compatible
