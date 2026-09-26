@@ -28,8 +28,11 @@ pub use window::*;
 #[allow(unused, reason = "Some platforms may not use all exports from this mod")]
 pub(crate) use tracing::*;
 
+mod pin;
 mod utils;
 pub(crate) mod wrappers;
+
+pub use pin::pin_current_image_for_detached_work;
 
 /// Assumes the current baseview library is the only one running in this process.
 ///

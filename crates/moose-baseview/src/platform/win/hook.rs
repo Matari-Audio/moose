@@ -1,7 +1,7 @@
 #![expect(clippy::unwrap_used, reason = "To be refactored later")]
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::c_int,
     ptr,
     sync::{LazyLock, RwLock},
@@ -11,7 +11,8 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, POINT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::WindowsAndMessaging::{
-        CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, MSG, PM_REMOVE,
+        CallNextHookEx, GetParent, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, MSG,
+        PM_REMOVE,
         WH_GETMESSAGE, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
         WM_USER,
     },
@@ -30,7 +31,34 @@ pub(crate) struct KeyboardHookHandle(HWNDWrapper);
 #[derive(Default)]
 struct KeyboardHookState {
     hook: Option<HHOOK>,
-    open_windows: HashSet<HWNDWrapper>,
+    open_windows: HashMap<HWNDWrapper, KeyboardOwnership>,
+}
+
+/// MOOSE (KURV K23): per-window keyboard ownership.
+///
+/// Upstream always steals every key addressed to a baseview window from the host, so DAW
+/// shortcuts and the host's typing keyboard stop working while the editor has focus. With
+/// `capture` off, key messages are retargeted to the parent HWND and stay in the host's own
+/// message pump (with their scan code, repeat count and layout intact).
+struct KeyboardOwnership {
+    capture: bool,
+    /// Whether the key-down for a scan code was captured, so its repeats and its key-up go
+    /// to the same owner even if `capture` changes while the key is held.
+    held: [Option<bool>; 512],
+}
+
+impl KeyboardOwnership {
+    fn new() -> Self {
+        // Upstream behaviour by default: capture everything.
+        Self { capture: true, held: [None; 512] }
+    }
+}
+
+pub(crate) fn set_keyboard_capture(hwnd: HWND, capture: bool) {
+    let mut state = HOOK_STATE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(owner) = state.open_windows.get_mut(&HWNDWrapper(hwnd)) {
+        owner.capture = capture;
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
@@ -52,12 +80,12 @@ impl Drop for KeyboardHookHandle {
 
 // initialize keyboard hook
 // some DAWs (particularly Ableton) intercept incoming keyboard messages,
-// but we're naughty so we intercept them right back
+// but we're naughty so we intercept them right back (while the window wants the keyboard)
 pub(crate) fn init_keyboard_hook(hwnd: HWND) -> KeyboardHookHandle {
     let state = &mut *HOOK_STATE.write().unwrap();
 
     // register hwnd to global window set
-    state.open_windows.insert(HWNDWrapper(hwnd));
+    state.open_windows.insert(HWNDWrapper(hwnd), KeyboardOwnership::new());
 
     if state.hook.is_some() {
         // keyboard hook already exists, just return handle
@@ -120,7 +148,7 @@ unsafe extern "system" fn keyboard_hook_callback(
 // check if `msg` is a keyboard message addressed to a window
 // in KeyboardHookState::open_windows, and intercept it if so
 unsafe fn offer_message_to_baseview(msg: *mut MSG) -> bool {
-    let msg = &*msg;
+    let msg = &mut *msg;
 
     // if this isn't a keyboard message, ignore it
     match msg.message {
@@ -129,12 +157,44 @@ unsafe fn offer_message_to_baseview(msg: *mut MSG) -> bool {
         _ => return false,
     }
 
-    // check if this is one of our windows. if so, intercept it
-    if HOOK_STATE.read().unwrap().open_windows.contains(&HWNDWrapper(msg.hwnd)) {
-        let _ = wnd_proc::<BaseviewWindow>(msg.hwnd, msg.message, msg.wParam, msg.lParam);
+    // Scan code plus the extended-key bit: 9 bits, fits `held`.
+    let scan = (msg.lParam as usize >> 16) & 0x1ff;
+    let target = HWNDWrapper(msg.hwnd);
 
-        return true;
+    let mut state = HOOK_STATE.write().unwrap_or_else(|e| e.into_inner());
+    if !state.open_windows.contains_key(&target) {
+        // A key-up can land on the host window when focus moved there while the key was
+        // held (e.g. after `set_keyboard_capture(false)`). Forget the held state so the
+        // next press of that key is routed fresh, and let the host have the message.
+        if matches!(msg.message, WM_KEYUP | WM_SYSKEYUP) {
+            for (window, owner) in state.open_windows.iter_mut() {
+                if GetParent(window.0) == msg.hwnd {
+                    owner.held[scan] = None;
+                }
+            }
+        }
+        return false;
+    }
+    let Some(owner) = state.open_windows.get_mut(&target) else { return false };
+
+    let capture = match msg.message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => *owner.held[scan].get_or_insert(owner.capture),
+        WM_KEYUP | WM_SYSKEYUP => owner.held[scan].take().unwrap_or(owner.capture),
+        _ => owner.held[scan].unwrap_or(owner.capture),
+    };
+    // wnd_proc may change focus or close the window, which takes this lock again.
+    drop(state);
+
+    if !capture {
+        let parent = GetParent(msg.hwnd);
+        if !parent.is_null() {
+            // Leave the real message in the host's pump, addressed to the host window.
+            msg.hwnd = parent;
+            return false;
+        }
     }
 
-    false
+    let _ = wnd_proc::<BaseviewWindow>(msg.hwnd, msg.message, msg.wParam, msg.lParam);
+
+    true
 }

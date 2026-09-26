@@ -144,6 +144,14 @@ impl Window {
         Ok(())
     }
 
+    /// MOOSE addition: tells baseview whether the window wants the keyboard right now.
+    ///
+    /// See [`WindowContext::set_keyboard_capture`].
+    #[inline]
+    pub fn set_keyboard_capture(&self, capture: bool) {
+        self.inner.set_keyboard_capture(capture)
+    }
+
     /// Closes and destroys the window.
     ///
     /// This releases all resources the window uses.

@@ -103,6 +103,10 @@ impl WindowState {
         Ok(())
     }
 
+    pub fn set_keyboard_capture(&self, capture: bool) {
+        set_keyboard_capture(self.hwnd, capture);
+    }
+
     pub fn set_mouse_cursor(&self, mouse_cursor: MouseCursor) -> Result<(), super::PlatformError> {
         self.cursor_icon.set(mouse_cursor);
         if let Ok(cursor) = SystemCursor::load(mouse_cursor) {
@@ -225,5 +229,19 @@ struct Guard<'a>(&'a Cell<bool>);
 impl<'a> Drop for Guard<'a> {
     fn drop(&mut self) {
         self.0.set(false);
+    }
+}
+
+/// Updates the keyboard hook right away and moves focus asynchronously (a synchronous
+/// `SetFocus` would re-enter the window handler from inside its own callback).
+pub(crate) fn set_keyboard_capture(hwnd: HWnd, capture: bool) {
+    super::hook::set_keyboard_capture(hwnd.as_raw(), capture);
+    unsafe {
+        PostMessageW(
+            hwnd.as_raw(),
+            crate::platform::win::window::BV_KEYBOARD_CAPTURE_FOCUS,
+            usize::from(capture),
+            0,
+        );
     }
 }

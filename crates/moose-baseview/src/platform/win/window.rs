@@ -11,6 +11,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use windows_sys::Win32::Foundation::POINT;
 
 pub(crate) const BV_WINDOW_MUST_CLOSE: u32 = WM_USER + 1;
+/// MOOSE: posted by `set_keyboard_capture` to move focus outside of handler callbacks.
+pub(crate) const BV_KEYBOARD_CAPTURE_FOCUS: u32 = WM_USER + 2;
 
 use super::drop_target::DropTarget;
 use super::*;
@@ -135,6 +137,12 @@ impl WindowHandle {
     pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
         self.state.scale_factor_override.set(scale_factor);
         Ok(())
+    }
+
+    pub fn set_keyboard_capture(&self, capture: bool) {
+        if let Some(hwnd) = self.hwnd.get() {
+            super::window_state::set_keyboard_capture(hwnd, capture);
+        }
     }
 
     pub fn set_parent(&self, new_parent: ParentWindowHandle) -> Result<()> {
@@ -781,6 +789,20 @@ unsafe fn wnd_proc_inner(
         }
         // NOTE: `WM_NCDESTROY` is handled in the outer function because this deallocates the window
         //        state
+        BV_KEYBOARD_CAPTURE_FOCUS => {
+            let focused = HWnd::get_focused_window() == window.as_raw();
+            if wparam != 0 {
+                if !focused {
+                    let _ = window.set_focus();
+                }
+            } else if focused {
+                let parent = GetParent(window.as_raw());
+                if !parent.is_null() {
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(parent);
+                }
+            }
+            Some(0)
+        }
         BV_WINDOW_MUST_CLOSE => {
             let _ = window.destroy();
             Some(0)

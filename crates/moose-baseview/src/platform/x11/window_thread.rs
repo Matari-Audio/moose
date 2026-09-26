@@ -173,6 +173,10 @@ impl WindowThreadHandle {
         self.request(WindowThreadRequest::SuggestScaleFactor(scale_factor))
     }
 
+    pub fn set_keyboard_capture(&self, _capture: bool) {
+        // No-op: ignored key events already propagate to the host on this platform.
+    }
+
     pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
         self.request(WindowThreadRequest::SetScaleFactorOverride(scale_factor))
     }

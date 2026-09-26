@@ -136,6 +136,10 @@ impl WindowHandle {
         Ok(())
     }
 
+    pub fn set_keyboard_capture(&self, _capture: bool) {
+        // No-op: ignored key events already propagate to the host on this platform.
+    }
+
     pub fn set_scale_factor_override(&self, _scale_factor: Option<f64>) -> Result<()> {
         // No-op on macOS: coordinates are logical and the backing scale is authoritative.
         Ok(())

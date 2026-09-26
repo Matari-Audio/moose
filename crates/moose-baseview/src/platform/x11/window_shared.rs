@@ -241,6 +241,10 @@ impl WindowInner {
         Ok(())
     }
 
+    pub fn set_keyboard_capture(&self, _capture: bool) {
+        // No-op: ignored key events already propagate to the host on this platform.
+    }
+
     pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
         self.scaling_factor.set_override(scale_factor);
         self.main_thread_shared.set_scaling_factor(self.scaling_factor.get());

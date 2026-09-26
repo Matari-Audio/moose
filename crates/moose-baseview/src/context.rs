@@ -67,6 +67,25 @@ impl WindowContext {
         Ok(())
     }
 
+    /// MOOSE addition: tells baseview whether the window wants the keyboard right now,
+    /// e.g. `true` while a text field is being edited and `false` otherwise.
+    ///
+    /// # Platform compatibility notes
+    ///
+    /// On Windows, baseview installs a message hook that takes key messages away from the
+    /// host before it can turn them into shortcuts. With capture on (the default, and
+    /// upstream's only behaviour) every key goes to the window. With capture off, keys are
+    /// left to the host (retargeted to the parent window), so DAW shortcuts and the host's
+    /// typing keyboard keep working. A key that was pressed while captured keeps going to the
+    /// same owner until it is released. Turning capture on also focuses the window; turning
+    /// it off gives focus back to the parent if this window had it.
+    ///
+    /// On macOS and X11 this is a no-op: returning [`EventStatus::Ignored`](crate::EventStatus)
+    /// from the keyboard handler already hands the key to the host.
+    pub fn set_keyboard_capture(&self, capture: bool) {
+        self.inner.set_keyboard_capture(capture)
+    }
+
     /// Returns the current size of this window.
     pub fn size(&self) -> WindowSize {
         self.inner.size()
