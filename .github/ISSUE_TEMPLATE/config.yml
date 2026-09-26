@@ -7,4 +7,4 @@ contact_links:
     about: Guides, format and feature reference, and examples. Check here before filing.
   - name: API reference (rustdoc)
     url: https://truce-audio.github.io/truce/
-    about: Type-level docs for the truce crates.
+    about: Type-level docs for the moose crates.

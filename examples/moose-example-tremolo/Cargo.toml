@@ -1,0 +1,46 @@
+[package]
+name = "moose-example-tremolo"
+# Internal-only - workspace demonstrations not for crates.io.
+publish = false
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "moose-example-tremolo-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["clap", "vst3"]
+clap = ["dep:moose-clap", "dep:clap-sys"]
+vst3 = ["dep:moose-vst3"]
+standalone = ["dep:moose-standalone"]
+shell = ["moose/shell"]
+rt-paranoid = ["moose/rt-paranoid"]
+
+[dependencies]
+moose = { workspace = true }
+moose-core = { workspace = true }
+moose-params = { workspace = true }
+moose-clap = { workspace = true, optional = true }
+moose-vst3 = { workspace = true, optional = true }
+clap-sys = { version = "0.5", optional = true }
+moose-standalone = { workspace = true, features = ["gui"], optional = true }
+moose-font = { workspace = true }
+moose-loader = { workspace = true }
+moose-egui = { workspace = true }
+egui = "0.35"
+
+
+[dev-dependencies]
+moose-test = { workspace = true }
+
+[lints]
+workspace = true

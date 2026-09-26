@@ -1,0 +1,59 @@
+[package]
+name = "moose-gpu"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "GPU rendering backend (wgpu) for moose plugins"
+
+[dependencies]
+moose-core = { workspace = true }
+moose-font = { workspace = true, features = ["raster"] }
+moose-gui-types = { workspace = true }
+moose-params = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+lyon_tessellation = "1"
+raw-window-handle = "0.5"
+log = "0.4"
+
+# baseview is the macOS/Windows/Linux windowing layer; iOS embeds
+# wgpu surfaces directly in a UIView attached to the AUv3 view
+# controller, so the baseview-bound editor here is gated off the
+# iOS build. `moose-gpu` only uses baseview indirectly through
+# `WgpuBackend::from_window` (a baseview::Window parameter).
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+baseview = { workspace = true }
+
+# wgpu backend features, gated per OS so the macOS / Windows builds
+# don't drag in the Linux Vulkan + GLES stacks (and vice versa).
+# Cargo unifies the feature set across the dep graph in a workspace
+# build, so most downstream wgpu users (moose-gui, moose-egui,
+# moose-slint, etc.) inherit the right backend without restating
+# it. The exception is `cargo publish --verify`, which compiles a
+# single crate against its declared deps only — sibling crates'
+# feature unification doesn't apply. Any crate whose source
+# references a backend-gated symbol (e.g. `SurfaceTargetUnsafe::
+# CoreAnimationLayer`) needs to declare the backend feature on its
+# own dep line; see `moose-egui/Cargo.toml` for the pattern.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+[features]
+default = []
+hot-debug = []
+
+[lints]
+workspace = true

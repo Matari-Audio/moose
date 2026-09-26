@@ -1,5 +1,5 @@
 /target
-# Local checkout of https://github.com/truce-audio/truce-fuzz-tests
+# Local checkout of https://github.com/Matari-Audio/moose-fuzz-tests
 # (CI checks it out here too; its ../crates path deps need this spot).
 /fuzz/
 crates/*/target

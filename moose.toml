@@ -1,0 +1,385 @@
+# moose plugin project configuration
+#
+# This file is tracked. It carries project-level facts only: vendor info,
+# plugin definitions, suite definitions, packaging metadata.
+#
+# Per-developer build environment (signing identities,
+# notarization Apple ID / team ID, Authenticode certs) lives in the
+# local `.cargo/config.toml` (gitignored), not here. See
+# https://truce.audio/ for the complete list of env vars moose reads.
+#
+#   # .cargo/config.toml
+#   [env]
+#   MOOSE_SIGNING_IDENTITY = "Developer ID Application: Name (TEAMID)"
+[vendor]
+name = "Moose"
+id = "com.moose"
+url = "https://github.com/Matari-Audio/moose"
+au_manufacturer = "Trce"
+
+# Notarizing can be enabled after creating a MOOSE_NOTARY:
+#   xcrun notarytool store-credentials MOOSE_NOTARY
+#
+[macos.packaging]
+notarize = true
+welcome_html = "static/moose-welcome.html"
+
+[windows.packaging]
+installer_icon = "static/moose-minimal.ico"
+welcome_bmp = "static/moose-welcome.bmp"
+
+# Each [[plugin]] entry defines a plugin to build and install.
+# `cargo moose new <name>` scaffolds a new plugin under plugins/<name>/;
+# the first-party examples in this repo live under examples/ for
+# historical reasons.
+#
+# Per-format display-name overrides (all optional) let a plugin show
+# under a different name in specific host browsers. Useful mostly
+# during beta/alpha parallel ships. When a field is absent the format falls back to
+# `name` above.
+#
+#   clap_name = "..."
+#   vst3_name = "..."
+#   # Optional exact 16-byte VST3 class ID; 32 hex characters.
+#   vst3_class_id = "00112233445566778899aabbccddeeff"
+#
+[[plugin]]
+name = "Moose Gain"
+bundle_id = "gain"
+crate = "moose-example-gain"
+category = "effect"
+fourcc = "TGan"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+# Gain demonstrating the experimental (not recommended) zero-copy
+# in-place buffer path. See examples/moose-example-gain-inplace/src/lib.rs.
+[[plugin]]
+name = "Moose Gain In-Place"
+bundle_id = "gain-inplace"
+crate = "moose-example-gain-inplace"
+category = "effect"
+fourcc = "TGnP"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Gain SIMD"
+bundle_id = "gain-simd"
+crate = "moose-example-block-gain"
+category = "effect"
+fourcc = "TBGl"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Saturate"
+bundle_id = "saturate"
+crate = "moose-example-block-saturate"
+category = "effect"
+fourcc = "TSat"
+vst3_subcategory = "Distortion"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Dry/Wet"
+bundle_id = "drywet"
+crate = "moose-example-block-drywet"
+category = "effect"
+fourcc = "TDrw"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Gate"
+bundle_id = "gate"
+crate = "moose-example-block-gate"
+category = "effect"
+fourcc = "TGat"
+vst3_subcategory = "Dynamics"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Widen"
+bundle_id = "widen"
+crate = "moose-example-block-widen"
+category = "effect"
+fourcc = "TWid"
+vst3_subcategory = "Spatial"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose 5.1 Meter"
+bundle_id = "surround-meter"
+crate = "moose-example-block-surround-meter"
+category = "effect"
+fourcc = "T51m"
+vst3_subcategory = "Analyzer"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Sidechain"
+bundle_id = "sidechain"
+crate = "moose-example-sidechain"
+category = "effect"
+fourcc = "TScm"
+vst3_subcategory = "Tools"
+
+[[plugin]]
+name = "Moose Synth"
+bundle_id = "synth"
+crate = "moose-example-synth"
+category = "instrument"
+description = """
+A subtractive monosynth built on the moose framework: saw / square \
+/ triangle / sine oscillators, a resonant low-pass filter, and an \
+ADSR envelope. Drop it onto \
+your DAW's instrument track to play melodies, basslines, or pads.
+"""
+fourcc = "TSyn"
+vst3_subcategory = "Synth"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose EQ"
+bundle_id = "eq"
+crate = "moose-example-eq"
+category = "effect"
+fourcc = "TEq3"
+vst3_subcategory = "EQ"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Stereo Utility"
+bundle_id = "stereo-utility"
+crate = "moose-example-stereo-utility"
+category = "effect"
+fourcc = "TSut"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Transpose"
+bundle_id = "transpose"
+crate = "moose-example-transpose"
+category = "midi"
+fourcc = "TTrn"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Gain Egui"
+bundle_id = "gain-egui"
+crate = "moose-example-gain-egui"
+category = "effect"
+fourcc = "TGeg"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Gain Egui Aspect"
+bundle_id = "gain-egui-aspect"
+crate = "moose-example-gain-egui-aspect"
+category = "effect"
+fourcc = "TGeA"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Arpeggio"
+bundle_id = "arpeggio"
+crate = "moose-example-arpeggio"
+category = "midi"
+fourcc = "TArp"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Tremolo"
+bundle_id = "tremolo"
+crate = "moose-example-tremolo"
+category = "effect"
+fourcc = "TTrM"
+vst3_subcategory = "Modulation"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose State"
+bundle_id = "state"
+crate = "moose-example-state"
+category = "effect"
+fourcc = "TStt"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Fundsp Reverb (Worker)"
+bundle_id = "fundsp-reverb-worker"
+crate = "moose-example-fundsp-reverb-worker"
+category = "effect"
+fourcc = "TFwR"
+vst3_subcategory = "Reverb"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Fundsp Reverb (Simple)"
+bundle_id = "fundsp-reverb-simple"
+crate = "moose-example-fundsp-reverb-simple"
+category = "effect"
+fourcc = "TFsR"
+vst3_subcategory = "Reverb"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose GUI Zoo"
+bundle_id = "gui-zoo"
+crate = "moose-example-gui-zoo"
+category = "effect"
+fourcc = "TZoo"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose GUI Zoo (egui)"
+bundle_id = "gui-zoo-egui"
+crate = "moose-example-gui-zoo-egui"
+category = "effect"
+fourcc = "TZeg"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Bitcrusher (dasp)"
+bundle_id = "dasp-bitcrusher"
+crate = "moose-example-dasp-bitcrusher"
+category = "effect"
+fourcc = "TBcr"
+vst3_subcategory = "Distortion"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+# MIDI-capability demos. These exercise plugin-to-host MIDI output and
+# the `midi_input` / `midi_output` capability flags.
+
+[[plugin]]
+name = "Moose Envelope"
+bundle_id = "envelope"
+crate = "moose-example-envelope"
+category = "effect"
+midi_output = true
+fourcc = "TEnv"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Chord"
+bundle_id = "chord"
+crate = "moose-example-chord"
+category = "instrument"
+midi_output = true
+fourcc = "TChd"
+vst3_subcategory = "Synth"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose CC Filter"
+bundle_id = "cc-filter"
+crate = "moose-example-cc-filter"
+category = "effect"
+midi_input = true
+fourcc = "TCcf"
+vst3_subcategory = "Filter"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Channel Spread"
+bundle_id = "chan-spread"
+crate = "moose-example-mpe-spreader"
+category = "midi"
+# Fans notes across channels and adds per-note expression. Pure MIDI 2.0
+# (2.0 in and out) so the whole chain speaks one protocol - the
+# spreader handles both 1.0 and 2.0 note input and always emits 2.0.
+midi2 = true
+fourcc = "TMpe"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose SysEx Echo"
+bundle_id = "sysex-echo"
+crate = "moose-example-sysex-echo"
+category = "midi"
+# 2.0 output so the echo exercises SysEx-over-UMP (SysEx-7 packet
+# chains); input stays 1.0.
+midi2_output = true
+fourcc = "TSxe"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose MPE Synth"
+bundle_id = "mpe-synth"
+crate = "moose-example-mpe-synth"
+# Per-note-expressive instrument (MIDI in, audio out). `midi2 = true` makes
+# the host deliver native MIDI 2.0, so per-note pitch bend / brightness land
+# at 32-bit resolution; channel -> stereo pan.
+category = "instrument"
+midi2 = true
+fourcc = "TMps"
+vst3_subcategory = "Instrument|Synth"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
+name = "Moose Multiport"
+bundle_id = "multiport"
+crate = "moose-example-multiport"
+# Multi-port MIDI *input* demo: two input ports, each a distinct patch.
+# Route a separate track to each port (the Kontakt / VEP paradigm) and both
+# play from one instance. VST3 event buses / CLAP note ports carry the port;
+# other formats clamp to one port and play patch 0.
+category = "instrument"
+midi_input_ports = 2
+fourcc = "TMlt"
+vst3_subcategory = "Instrument|Synth"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+# Suite installer wrapping every example above. `cargo moose package`
+# (no flags) produces both per-plugin installers and this suite installer.
+# Pass `--no-per-plugin` for suite-only output, `--no-suite` to drop it.
+# Omitting `plugins` / `exclude_plugins` includes every `[[plugin]]`
+# defined above; omitting `formats` falls back to each plugin's declared
+# default features.
+[[suite]]
+name = "Moose Examples"
+bundle_id = "moose-examples"
+
+# Small two-plugin subset for exercising a subset install without
+# packaging every example.
+[[suite]]
+name = "Moose Examples Subset"
+bundle_id = "moose-examples-subset"
+plugins = ["synth", "gain-egui-aspect"]
+

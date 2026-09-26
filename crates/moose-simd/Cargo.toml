@@ -1,0 +1,31 @@
+[package]
+name = "moose-simd"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Portable SIMD primitives + block-rate audio ops for moose plugins."
+
+[features]
+default = ["wide-backend"]
+# Stable Rust SIMD via the `wide` crate. Tracks the same f32x4 /
+# f32x8 / f64x2 / f64x4 vocabulary as `core::simd`; will swap when
+# portable-simd stabilizes.
+wide-backend = ["dep:wide"]
+
+[dependencies]
+wide = { version = "0.7", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+moose-params = { workspace = true }
+moose-core = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "audio_ops"
+harness = false

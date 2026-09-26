@@ -1,0 +1,49 @@
+[package]
+name = "moose-loader"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hot-reloadable plugin logic for moose (native ABI, dylib loading)"
+
+[dependencies]
+log = "0.4"
+# Already in the workspace dep graph via image / png; pulled as a
+# direct dep so the file-fingerprint path uses the SIMD-accelerated
+# implementation (~30× faster than a hand-rolled table-free CRC32).
+crc32fast = "1.5"
+moose-core = { workspace = true }
+moose-params = { workspace = true }
+# `moose-gui-types` is the type surface (layout / interaction /
+# render / theme / widgets) the canary fingerprint inspects across
+# the dylib boundary.
+moose-gui-types = { workspace = true }
+# `moose-plugin` carries the `PluginLogicCore` blanket and the
+# `PluginLogic` / `PluginLogic64` leaf traits the macro-generated
+# wrappers reference. Always required.
+moose-plugin = { workspace = true }
+
+[dependencies.libloading]
+version = "0.9"
+optional = true
+
+[dependencies.parking_lot]
+version = "0.12"
+optional = true
+
+# Integration tests live in the sibling `moose-loader-tests` crate.
+# They need the umbrella `moose` (because `#[derive(Params)]` /
+# `#[derive(State)]` expand to `::moose::params::*` / `::moose::core::*`
+# paths), and `moose` already depends on us for the
+# `moose::plugin!` macro's HotShell wiring. Holding those tests in
+# a separate crate keeps the dev edge from forming a `moose <->
+# moose-loader` cycle in cargo metadata.
+
+[features]
+default = []
+shell = ["dep:libloading", "dep:parking_lot"]
+hot-debug = []
+
+[lints]
+workspace = true

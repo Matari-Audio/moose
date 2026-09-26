@@ -1,0 +1,110 @@
+# moose
+
+Main entry point for the moose audio plugin framework.
+
+## Overview
+
+`moose` is the only dependency most plugin authors need. It re-exports
+`moose-core` (traits and types), `moose-params` (parameter system), and the
+proc macros from `moose-derive` (`Params`, `ParamEnum`, `State` at the
+crate root, plus `plugin_info!()` via the preludes), giving you a single
+import path for everything.
+
+## Key re-exports
+
+- `PluginExport`, `Editor`, `EventList`, `ProcessContext`, `ProcessStatus`
+  and the rest of the core runtime types from moose-core, via the
+  preludes (`AudioBuffer` is a per-prelude precision-pinned type alias
+  rather than a plain re-export)
+- `FloatParam`, `IntParam`, `BoolParam`, `EnumParam`, `Smoother` from moose-params
+- `FloatParamReadF32` / `FloatParamReadF64` extension traits, bringing `param.read()` into scope at the prelude's precision
+- `#[derive(Params)]`, `#[derive(ParamEnum)]`, `#[derive(State)]` from moose-derive (at the crate root); `plugin_info!()` is available via the preludes
+- `PluginLogic` from moose-plugin (the user-facing leaf trait. `PluginLogic` for `f32`, `PluginLogic64` for `f64`; the prelude aliases the right one as `PluginLogic`)
+- The `moose::plugin!` macro generates all the format-export glue from one declaration
+
+## Preludes
+
+Four flavors, each pinning a different precision combination:
+
+| Prelude | Audio buffer | `param.read()` returns | When to pick |
+|---|---|---|---|
+| `prelude` / `prelude32` | `f32` | `f32` | Default - host wire is `f32` everywhere |
+| `prelude64m` | `f32` | `f64` | Stable `f64` intermediate math, narrow on buffer write |
+| `prelude64` | `f64` | `f64` | Wrapper widens host `f32` -> plugin `f64` once per block |
+
+Each prelude also defines `pub type AudioBuffer<'a, S = Sample> = ...`,
+so `&mut AudioBuffer` resolves to the prelude's chosen precision
+(and `&mut AudioBuffer<f32>` still works as an explicit override).
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| `clap` (default) | Enable CLAP format export |
+| `vst3` | Enable VST3 format export |
+| `shell` | Build a dynamic shell that dlopens a hot-reloadable logic dylib (turns on `moose-loader/shell`) |
+| `hot-debug` | Verbose hot-reload diagnostics |
+
+## Usage
+
+```toml
+[dependencies]
+moose = { version = "7.0", features = ["clap"] }
+```
+
+(Cargo's caret resolver expands `"7.0"` to `>=7.0.0, <8.0.0`, so
+you'll pick up every `7.0.x` patch release without re-editing. To
+track an unreleased checkout, swap the line for
+`moose = { git = "https://github.com/Matari-Audio/moose", branch = "main", features = ["clap"] }`.
+Or just run `cargo moose new` and let the scaffolder write the
+right pin for you.)
+
+```rust
+use moose::prelude::*;
+// Built-in widget toolkit. `GridLayout` + the `knob` / `widgets` /
+// `meter` / `xy_pad` constructors live in `moose-gui-types::layout`;
+// `IntoLayoutEditor` is the trait that turns a `GridLayout` into a
+// `Box<dyn Editor>` via the default renderer (`moose-cpu`).
+use moose_gui::IntoLayoutEditor;
+use moose_gui_types::layout::{GridLayout, knob, widgets};
+
+// Alias the derive-generated param-id enum so widget constructors
+// can use `P::Gain` instead of `MyParamsParamId::Gain`.
+use MyParamsParamId as P;
+
+#[derive(Params)]
+pub struct MyParams {
+    #[param(name = "Gain", range = "linear(-60, 6)", unit = "dB")]
+    pub gain: FloatParam,
+}
+
+// No per-instance DSP state, so `PurePluginLogic` - a plugin with
+// filter memory / phase / voices implements `PluginLogic` with a
+// `type DspState` instead.
+pub struct MyPlugin;
+
+impl PurePluginLogic for MyPlugin {
+    type Params = MyParams;
+
+    fn process(
+        params: &MyParams,
+        buffer: &mut AudioBuffer,
+        _events: &EventList,
+        _context: &mut ProcessContext,
+    ) -> ProcessStatus {
+        // ...
+        ProcessStatus::Normal
+    }
+
+    fn editor(params: Arc<MyParams>) -> Box<dyn Editor> {
+        // Built-in widgets from a GridLayout. See the GUI guide for
+        // framework backends (egui) and custom editors.
+        GridLayout::build(vec![widgets(vec![knob(P::Gain, "Gain")])])
+            .into_editor(&params)
+    }
+}
+
+moose::plugin! { logic: MyPlugin, params: MyParams }
+```
+
+Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).

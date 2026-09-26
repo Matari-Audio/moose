@@ -9,10 +9,10 @@ name: Bake screenshots
 # artifact, replace the references, commit. Drift only re-appears if
 # GHA upgrades the runner image.
 #
-# The render scale is fixed at `truce_core::screenshot::DEFAULT_SCREENSHOT_SCALE`
+# The render scale is fixed at `moose_core::screenshot::DEFAULT_SCREENSHOT_SCALE`
 # (currently 2.0) regardless of the runner's reported display DPI.
 # Tests that opt into a custom scale via `ScreenshotTest::scale` need
-# a separate manual bake — `cargo run -p cargo-truce -- screenshot
+# a separate manual bake — `cargo run -p cargo-moose -- screenshot
 # --scale <x> --out …` — since this workflow doesn't enumerate per-test
 # overrides.
 
@@ -20,9 +20,9 @@ on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: "Platforms to bake (any combination of linux,macos,windows,ios)"
+        description: "Platforms to bake (any combination of linux,macos,windows)"
         type: string
-        default: "linux,macos,windows,ios"
+        default: "linux,macos,windows"
         required: false
   # Run on every PR so reviewers can grab the just-rendered PNGs as
   # an artifact — useful for intentional GUI changes (preview the
@@ -38,83 +38,40 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Pinned iPhone family + iOS runtime so the baked iOS PNGs are
-  # reproducible across runner-image bumps. MUST MATCH `ci-ios.yml`'s
-  # identical block, otherwise the screenshot tests there will fail
-  # against the just-baked baselines. The "Boot iOS Simulator" step
-  # below fails loudly if either pin is no longer available on the
-  # current runner, which is the signal to bump both files in lockstep
-  # and re-bake.
-  IOS_SIM_DEVICE: "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"
-  IOS_SIM_RUNTIME: "com.apple.CoreSimulator.SimRuntime.iOS-26-2"
-  # Keep this list in sync with truce.toml's [[plugin]] entries that
+  # Keep this list in sync with moose.toml's [[plugin]] entries that
   # have screenshot tests under examples/<crate>/src/lib.rs. The
-  # `_linux` / `_macos` / `_windows` / `_default_ios` / `_container_ios`
-  # suffix on the output filename matches the convention enforced by
-  # each example's `gui_screenshot_<os>` test (linux/macos/windows) or
-  # the `cargo truce screenshot --ios [--crop-mode container]` pipeline.
-  # The iced examples (`gain-iced`, `gui-zoo-iced`)
-  # render on iOS via truce-iced's CAMetalLayer host, so they're built
-  # for iOS below; like most examples they stay build-only here (the
-  # curated capture subset further down is unchanged).
-  # `cargo truce screenshot --ios` locks
-  # `UISupportedInterfaceOrientations` in the temporary container's
-  # Info.plist to a single canonical orientation (the plugin's first
-  # listed, defaulting to portrait), which forces iOS to rotate the
-  # sim when the container launches. Loop order doesn't affect the
-  # captured dimensions — kept transpose at the end as a secondary
-  # safeguard. The desktop bake jobs don't care about order.
+  # `_linux` / `_macos` / `_windows` suffix on the output filename
+  # matches the convention enforced by each example's
+  # `gui_screenshot_<os>` test.
   EXAMPLE_CRATES: >-
-    truce-example-gain
-    truce-example-block-gain
-    truce-example-synth
-    truce-example-eq
-    truce-example-stereo-utility
-    truce-example-block-saturate
-    truce-example-block-drywet
-    truce-example-block-gate
-    truce-example-block-widen
-    truce-example-block-surround-meter
-    truce-example-gain-egui
-    truce-example-gain-egui-aspect
-    truce-example-arpeggio
-    truce-example-gain-iced
-    truce-example-tremolo
-    truce-example-state
-    truce-example-fundsp-reverb-worker
-    truce-example-fundsp-reverb-simple
-    truce-example-transpose
-    truce-example-gui-zoo
-    truce-example-gui-zoo-egui
-    truce-example-gui-zoo-iced
-    truce-example-dasp-bitcrusher
-    truce-example-envelope
-    truce-example-chord
-    truce-example-cc-filter
-    truce-example-mpe-spreader
-    truce-example-sysex-echo
-    truce-example-mpe-synth
-    truce-example-multiport
-    truce-example-midi-inspector
-  # Slint + vizia examples live in their own Cargo sub-workspaces
-  # under `crates/<name>/` (skia-bindings `links` collision for slint;
-  # vizia's hard-pinned baseview rev for vizia - see the respective
-  # `crates/<name>/Cargo.toml` headers). They're baked with
-  # `cargo-truce` invoked from inside the sub-workspace directory so
-  # its truce.toml + Cargo.toml resolve the plugin entries.
-  SLINT_CRATES: >-
-    truce-example-gain-slint
-    truce-example-gui-zoo-slint
-  VIZIA_CRATES: >-
-    truce-example-gain-vizia
-    truce-example-gui-zoo-vizia
-  # truce-gpu-examples sub-workspace exists so the GPU example's
-  # `truce-gui/gpu` feature request can't unify across the parent
-  # workspace and silently flip every CPU screenshot baseline to
-  # the GPU renderer. iOS bake is skipped: the example crate is
-  # desktop-only.
-  GPU_EXAMPLES_CRATES: >-
-    truce-example-gui-zoo-gpu
+    moose-example-gain
+    moose-example-block-gain
+    moose-example-synth
+    moose-example-eq
+    moose-example-stereo-utility
+    moose-example-block-saturate
+    moose-example-block-drywet
+    moose-example-block-gate
+    moose-example-block-widen
+    moose-example-block-surround-meter
+    moose-example-gain-egui
+    moose-example-gain-egui-aspect
+    moose-example-arpeggio
+    moose-example-tremolo
+    moose-example-state
+    moose-example-fundsp-reverb-worker
+    moose-example-fundsp-reverb-simple
+    moose-example-transpose
+    moose-example-gui-zoo
+    moose-example-gui-zoo-egui
+    moose-example-dasp-bitcrusher
+    moose-example-envelope
+    moose-example-chord
+    moose-example-cc-filter
+    moose-example-mpe-spreader
+    moose-example-sysex-echo
+    moose-example-mpe-synth
+    moose-example-multiport
 
 jobs:
   linux:
@@ -149,60 +106,18 @@ jobs:
             libasound2-dev libjack-jackd2-dev \
             libfontconfig1-dev libfreetype-dev
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose --release
 
       - name: Bake screenshots
         run: |
           set -euo pipefail
           for crate in $EXAMPLE_CRATES; do
-            short="${crate#truce-example-}"
+            short="${crate#moose-example-}"
             short="${short//-/_}"
             out="examples/${crate}/screenshots/${short}_default_linux.png"
             echo "::group::Baking $out"
-            ./target/release/cargo-truce screenshot -p "$crate" --out "$out"
-            echo "::endgroup::"
-          done
-
-      - name: Bake slint screenshots (sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-slint
-          for crate in $SLINT_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            out="examples/${crate}/screenshots/${short}_default_linux.png"
-            echo "::group::Baking crates/truce-slint/$out"
-            "$CARGO_TRUCE" screenshot -p "$crate" --out "$out"
-            echo "::endgroup::"
-          done
-
-      - name: Bake vizia screenshots (sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-vizia
-          for crate in $VIZIA_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            out="examples/${crate}/screenshots/${short}_default_linux.png"
-            echo "::group::Baking crates/truce-vizia/$out"
-            "$CARGO_TRUCE" screenshot -p "$crate" --out "$out"
-            echo "::endgroup::"
-          done
-
-      - name: Bake gpu-examples screenshots (sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-gpu-examples
-          for crate in $GPU_EXAMPLES_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            out="${crate}/screenshots/${short}_default_linux.png"
-            echo "::group::Baking crates/truce-gpu-examples/$out"
-            "$CARGO_TRUCE" screenshot -p "$crate" --out "$out"
+            ./target/release/cargo-moose screenshot -p "$crate" --out "$out"
             echo "::endgroup::"
           done
 
@@ -211,9 +126,6 @@ jobs:
           name: baked-screenshots-linux
           path: |
             examples/*/screenshots/*_linux.png
-            crates/truce-slint/examples/*/screenshots/*_linux.png
-            crates/truce-vizia/examples/*/screenshots/*_linux.png
-            crates/truce-gpu-examples/*/screenshots/*_linux.png
           if-no-files-found: error
           retention-days: 30
 
@@ -248,60 +160,18 @@ jobs:
           key: bake-macos-14
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose --release
 
       - name: Bake screenshots
         run: |
           set -euo pipefail
           for crate in $EXAMPLE_CRATES; do
-            short="${crate#truce-example-}"
+            short="${crate#moose-example-}"
             short="${short//-/_}"
             out="examples/${crate}/screenshots/${short}_default_macos.png"
             echo "::group::Baking $out"
-            ./target/release/cargo-truce screenshot -p "$crate" --out "$out"
-            echo "::endgroup::"
-          done
-
-      - name: Bake slint screenshots (sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-slint
-          for crate in $SLINT_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            out="examples/${crate}/screenshots/${short}_default_macos.png"
-            echo "::group::Baking crates/truce-slint/$out"
-            "$CARGO_TRUCE" screenshot -p "$crate" --out "$out"
-            echo "::endgroup::"
-          done
-
-      - name: Bake vizia screenshots (sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-vizia
-          for crate in $VIZIA_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            out="examples/${crate}/screenshots/${short}_default_macos.png"
-            echo "::group::Baking crates/truce-vizia/$out"
-            "$CARGO_TRUCE" screenshot -p "$crate" --out "$out"
-            echo "::endgroup::"
-          done
-
-      - name: Bake gpu-examples screenshots (sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-gpu-examples
-          for crate in $GPU_EXAMPLES_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            out="${crate}/screenshots/${short}_default_macos.png"
-            echo "::group::Baking crates/truce-gpu-examples/$out"
-            "$CARGO_TRUCE" screenshot -p "$crate" --out "$out"
+            ./target/release/cargo-moose screenshot -p "$crate" --out "$out"
             echo "::endgroup::"
           done
 
@@ -310,9 +180,6 @@ jobs:
           name: baked-screenshots-macos
           path: |
             examples/*/screenshots/*_macos.png
-            crates/truce-slint/examples/*/screenshots/*_macos.png
-            crates/truce-vizia/examples/*/screenshots/*_macos.png
-            crates/truce-gpu-examples/*/screenshots/*_macos.png
           if-no-files-found: error
           retention-days: 30
 
@@ -334,8 +201,8 @@ jobs:
           key: bake-windows-latest
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose --release
 
       - name: Bake screenshots
         shell: pwsh
@@ -343,72 +210,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $crates = $env:EXAMPLE_CRATES -split '\s+' | Where-Object { $_ }
           foreach ($crate in $crates) {
-            $short = ($crate -replace '^truce-example-', '') -replace '-', '_'
+            $short = ($crate -replace '^moose-example-', '') -replace '-', '_'
             $out = "examples/$crate/screenshots/${short}_default_windows.png"
             Write-Host "::group::Baking $out"
-            & ./target/release/cargo-truce.exe screenshot -p $crate --out $out
+            & ./target/release/cargo-moose.exe screenshot -p $crate --out $out
             if ($LASTEXITCODE -ne 0) { throw "screenshot failed for $crate (exit $LASTEXITCODE)" }
             Write-Host "::endgroup::"
-          }
-
-      - name: Bake slint screenshots (sub-workspace)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargoTruce = Join-Path $PWD "target/release/cargo-truce.exe"
-          $crates = $env:SLINT_CRATES -split '\s+' | Where-Object { $_ }
-          Push-Location crates/truce-slint
-          try {
-            foreach ($crate in $crates) {
-              $short = ($crate -replace '^truce-example-', '') -replace '-', '_'
-              $out = "examples/$crate/screenshots/${short}_default_windows.png"
-              Write-Host "::group::Baking crates/truce-slint/$out"
-              & $cargoTruce screenshot -p $crate --out $out
-              if ($LASTEXITCODE -ne 0) { throw "screenshot failed for $crate (exit $LASTEXITCODE)" }
-              Write-Host "::endgroup::"
-            }
-          } finally {
-            Pop-Location
-          }
-
-      - name: Bake vizia screenshots (sub-workspace)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargoTruce = Join-Path $PWD "target/release/cargo-truce.exe"
-          $crates = $env:VIZIA_CRATES -split '\s+' | Where-Object { $_ }
-          Push-Location crates/truce-vizia
-          try {
-            foreach ($crate in $crates) {
-              $short = ($crate -replace '^truce-example-', '') -replace '-', '_'
-              $out = "examples/$crate/screenshots/${short}_default_windows.png"
-              Write-Host "::group::Baking crates/truce-vizia/$out"
-              & $cargoTruce screenshot -p $crate --out $out
-              if ($LASTEXITCODE -ne 0) { throw "screenshot failed for $crate (exit $LASTEXITCODE)" }
-              Write-Host "::endgroup::"
-            }
-          } finally {
-            Pop-Location
-          }
-
-      - name: Bake gpu-examples screenshots (sub-workspace)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $cargoTruce = Join-Path $PWD "target/release/cargo-truce.exe"
-          $crates = $env:GPU_EXAMPLES_CRATES -split '\s+' | Where-Object { $_ }
-          Push-Location crates/truce-gpu-examples
-          try {
-            foreach ($crate in $crates) {
-              $short = ($crate -replace '^truce-example-', '') -replace '-', '_'
-              $out = "$crate/screenshots/${short}_default_windows.png"
-              Write-Host "::group::Baking crates/truce-gpu-examples/$out"
-              & $cargoTruce screenshot -p $crate --out $out
-              if ($LASTEXITCODE -ne 0) { throw "screenshot failed for $crate (exit $LASTEXITCODE)" }
-              Write-Host "::endgroup::"
-            }
-          } finally {
-            Pop-Location
           }
 
       - uses: actions/upload-artifact@v4
@@ -416,162 +223,5 @@ jobs:
           name: baked-screenshots-windows
           path: |
             examples/*/screenshots/*_windows.png
-            crates/truce-slint/examples/*/screenshots/*_windows.png
-            crates/truce-vizia/examples/*/screenshots/*_windows.png
-            crates/truce-gpu-examples/*/screenshots/*_windows.png
-          if-no-files-found: error
-          retention-days: 30
-
-  ios:
-    if: github.event_name != 'workflow_dispatch' || contains(inputs.platforms, 'ios')
-    name: bake (macos-latest, iOS Simulator)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Reclaim the runner's unused Xcode versions. Simulator
-      # runtimes stay: this job boots an iOS simulator.
-      - name: Free runner disk
-        run: |
-          df -h /
-          keep="$(xcode-select -p)"; keep="${keep%/Contents/Developer}"
-          for x in /Applications/Xcode*.app; do
-            [ "$(readlink -f "$x")" = "$(readlink -f "$keep")" ] || sudo rm -rf "$x" &
-          done
-          wait
-          df -h /
-
-      # iOS-sim slice needs the `-sim` rustup target; the desktop
-      # `cargo-truce` runs on the host triple (already covered by
-      # the default toolchain).
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios-sim
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: bake-macos-latest-ios
-          cache-bin: false
-
-      # Boot the simulator pinned to `IOS_SIM_DEVICE` /
-      # `IOS_SIM_RUNTIME` (see workflow-level `env:` block). The
-      # script fails loudly with the runner's currently-available
-      # IDs if either pin has been retired — that's the signal to
-      # bump both workflows (this one and `ci-ios.yml`) in lockstep
-      # and re-bake the iOS baselines.
-      - name: Boot iOS Simulator
-        run: python3 scripts/ci/boot-ios-simulator.py truce-bake
-
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
-
-      # Pre-build every example's iOS-sim slice in a single cargo
-      # invocation. Lets cargo dedup shared dep compilation (truce-core,
-      # wgpu, baseview, etc.) across all plugins instead of paying the
-      # dep build cost separately in each per-crate `install_one_screenshot`
-      # below. After this step, the `cargo build` inside each install is
-      # a fast fingerprint-only no-op.
-      #
-      # vizia plugins are *not* iterated here at all: they live in
-      # the truce-vizia sub-workspace and their transitive chain
-      # `truce-vizia → vizia → vizia_baseview → baseview` doesn't
-      # link on iOS (neither vizia/baseview nor our truce-audio fork
-      # carry a `cfg(target_os = "ios")` `platform` module).
-      # truce-egui / truce-iced / truce-slint sidestep this with a
-      # `cfg(not(target_os = "ios"))` gate on their baseview dep + an
-      # iOS-specific CAMetalLayer editor; vizia can't because
-      # vizia_baseview is unconditional inside the vizia crate itself. See
-      # `crates/truce-vizia/Cargo.toml`'s `[patch]` header for the
-      # full unblocking conditions.
-      - name: Pre-build iOS plugin slices
-        run: |
-          set -euo pipefail
-          args=()
-          for crate in $EXAMPLE_CRATES; do
-            args+=("-p" "$crate")
-          done
-          cargo build "${args[@]}" --target aarch64-apple-ios-sim \
-            --release --no-default-features --features au
-
-      # Same pre-build pass for the slint sub-workspace.
-      - name: Pre-build iOS plugin slices (truce-slint sub-workspace)
-        run: |
-          set -euo pipefail
-          args=()
-          for crate in $SLINT_CRATES; do
-            args+=("-p" "$crate")
-          done
-          cargo build --manifest-path crates/truce-slint/Cargo.toml \
-            "${args[@]}" --target aarch64-apple-ios-sim \
-            --release --no-default-features --features au
-
-      # One install + launch + simctl capture per crate, with both
-      # `_default_ios.png` (editor crop) and `_container_ios.png`
-      # (container chrome) emitted from the same screenshot. Was
-      # doing the install + launch twice per crate; `--container-out`
-      # writes the second crop from the same captured PNG.
-      - name: Bake iOS screenshots
-        run: |
-          set -euo pipefail
-          # Restart the simulator between plugins (see ci-ios.yml for
-          # rationale — accumulated AUExt / componentd / Metal state
-          # otherwise wedges later plugins' first paint).
-          for crate in $EXAMPLE_CRATES; do
-            # Plugins dropped from the iOS screenshot *check* (see
-            # ci-ios.yml): their (editor-backend x AU-type) cell is
-            # already covered on the sim by gain / gui-zoo / synth /
-            # transpose / gui-zoo-egui / gui-zoo-iced, and their editor
-            # render is still gated on desktop. Skip the per-plugin sim
-            # reboot here too; their committed iOS baselines stay frozen.
-            # To re-enable one, drop it from this list and from the
-            # ci-ios.yml loop, then re-bake. (gain-iced / gui-zoo-iced
-            # bake + check.)
-            case "$crate" in
-              truce-example-eq|truce-example-tremolo) continue ;;
-              truce-example-arpeggio) continue ;;
-              truce-example-state|truce-example-gain-egui) continue ;;
-              truce-example-fundsp-reverb-worker|truce-example-fundsp-reverb-simple) continue ;;
-              truce-example-dasp-bitcrusher) continue ;;
-            esac
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            default_out="examples/${crate}/screenshots/${short}_default_ios.png"
-            container_out="examples/${crate}/screenshots/${short}_container_ios.png"
-            echo "::group::Baking $default_out + $container_out"
-            xcrun simctl shutdown truce-bake 2>/dev/null || true
-            xcrun simctl boot truce-bake
-            xcrun simctl bootstatus truce-bake
-            ./target/release/cargo-truce screenshot --ios \
-              --out "$default_out" --container-out "$container_out" \
-              -p "$crate"
-            echo "::endgroup::"
-          done
-
-      - name: Bake iOS screenshots (truce-slint sub-workspace)
-        run: |
-          set -euo pipefail
-          CARGO_TRUCE="$PWD/target/release/cargo-truce"
-          cd crates/truce-slint
-          for crate in $SLINT_CRATES; do
-            short="${crate#truce-example-}"
-            short="${short//-/_}"
-            default_out="examples/${crate}/screenshots/${short}_default_ios.png"
-            container_out="examples/${crate}/screenshots/${short}_container_ios.png"
-            echo "::group::Baking crates/truce-slint/$default_out + crates/truce-slint/$container_out"
-            xcrun simctl shutdown truce-bake 2>/dev/null || true
-            xcrun simctl boot truce-bake
-            xcrun simctl bootstatus truce-bake
-            "$CARGO_TRUCE" screenshot --ios \
-              --out "$default_out" --container-out "$container_out" \
-              -p "$crate"
-            echo "::endgroup::"
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: baked-screenshots-ios
-          path: |
-            examples/*/screenshots/*_ios.png
-            crates/truce-slint/examples/*/screenshots/*_ios.png
           if-no-files-found: error
           retention-days: 30

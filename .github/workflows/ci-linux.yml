@@ -34,9 +34,6 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo fmt --all --manifest-path crates/truce-slint/Cargo.toml -- --check
-      - run: cargo fmt --all --manifest-path crates/truce-vizia/Cargo.toml -- --check
-      - run: cargo fmt --all --manifest-path crates/truce-gpu-examples/Cargo.toml -- --check
 
   test:
     name: ubuntu-24.04 (stable)
@@ -87,51 +84,20 @@ jobs:
       - name: test
         run: cargo test --workspace -- --skip gui_screenshot
 
-      # Screenshot tests render through truce-gui, whose backend is
+      # Screenshot tests render through moose-gui, whose backend is
       # feature-selected (`cpu` default / `gpu` opt-in). A single
       # `cargo test --workspace` unifies features across the graph, so
-      # truce-example-eq's `gpu` opt-in would flip every cpu example
+      # moose-example-eq's `gpu` opt-in would flip every cpu example
       # onto the GpuEditor and break the cpu reference PNGs. Run them
-      # split by renderer instead — each invocation builds truce-gui
+      # split by renderer instead — each invocation builds moose-gui
       # with one backend, matching how the baselines are baked
-      # (`cargo truce screenshot -p <crate>`, per-crate). eq is the only
-      # crate enabling `truce-gui/gpu`, so excluding it yields a
+      # (`cargo moose screenshot -p <crate>`, per-crate). eq is the only
+      # crate enabling `moose-gui/gpu`, so excluding it yields a
       # cpu-only build for everything else.
       - name: screenshot tests (cpu)
-        run: cargo test --workspace --exclude truce-example-eq -- gui_screenshot
+        run: cargo test --workspace --exclude moose-example-eq -- gui_screenshot
       - name: screenshot tests (gpu)
-        run: cargo test -p truce-example-eq -- gui_screenshot
-
-      # truce-slint and truce-vizia each live in their own Cargo
-      # sub-workspace (see their respective `crates/<name>/Cargo.toml`
-      # headers for the rationale - skia-bindings `links` collision
-      # for slint, vizia's hard-pinned baseview rev for vizia). The
-      # parent `--workspace` doesn't reach into either, so mirror the
-      # gates here against each sub-workspace's own manifest.
-      - name: clippy (truce-slint sub-workspace)
-        run: cargo clippy --manifest-path crates/truce-slint/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: build (truce-slint sub-workspace)
-        run: cargo build --manifest-path crates/truce-slint/Cargo.toml --workspace --all-targets
-      - name: test (truce-slint sub-workspace)
-        run: cargo test --manifest-path crates/truce-slint/Cargo.toml --workspace -- --skip gui_screenshot
-      - name: screenshot tests (truce-slint sub-workspace)
-        run: cargo test --manifest-path crates/truce-slint/Cargo.toml --workspace -- gui_screenshot
-      - name: clippy (truce-vizia sub-workspace)
-        run: cargo clippy --manifest-path crates/truce-vizia/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: build (truce-vizia sub-workspace)
-        run: cargo build --manifest-path crates/truce-vizia/Cargo.toml --workspace --all-targets
-      - name: test (truce-vizia sub-workspace)
-        run: cargo test --manifest-path crates/truce-vizia/Cargo.toml --workspace -- --skip gui_screenshot
-      - name: screenshot tests (truce-vizia sub-workspace)
-        run: cargo test --manifest-path crates/truce-vizia/Cargo.toml --workspace -- gui_screenshot
-      - name: clippy (truce-gpu-examples sub-workspace)
-        run: cargo clippy --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: build (truce-gpu-examples sub-workspace)
-        run: cargo build --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace --all-targets
-      - name: test (truce-gpu-examples sub-workspace)
-        run: cargo test --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace -- --skip gui_screenshot
-      - name: screenshot tests (truce-gpu-examples sub-workspace)
-        run: cargo test --manifest-path crates/truce-gpu-examples/Cargo.toml --workspace -- gui_screenshot
+        run: cargo test -p moose-example-eq -- gui_screenshot
 
       # Ratio-based regression guard: gain_simd_fast must run at
       # least 5x faster than the naive gain shape on the same
@@ -140,7 +106,7 @@ jobs:
       # generous headroom for slow runners while still catching
       # real regressions in is_smoothing / chunks_mut / gain_block.
       - name: perf regression (gain vs gain-simd)
-        run: cargo test --release -p truce-simd --test gain_perf_regression -- --ignored --nocapture
+        run: cargo test --release -p moose-simd --test gain_perf_regression -- --ignored --nocapture
 
       # ─────────────────────────────────────────────────────────────────
       # CLAP + VST3 validation against industry validators.
@@ -185,14 +151,14 @@ jobs:
 
       - name: Install plugin (CLAP + VST3)
         # Release profile: pluginval's process-without-setActive paths trip
-        # a debug_assert in `truce-vst3::cb_process` (separate bug); release
+        # a debug_assert in `moose-vst3::cb_process` (separate bug); release
         # also matches what users actually ship.
-        run: ./target/debug/cargo-truce install --user --clap --vst3 -p truce-example-gain
+        run: ./target/debug/cargo-moose install --user --clap --vst3 -p moose-example-gain
 
       - name: Validate CLAP + VST3
         run: |
           set -e -o pipefail
-          xvfb-run -a ./target/debug/cargo-truce validate --clap --pluginval -p truce-example-gain 2>&1 | tee validate.log
+          xvfb-run -a ./target/debug/cargo-moose validate --clap --pluginval -p moose-example-gain 2>&1 | tee validate.log
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step — failing"
             exit 1
@@ -206,180 +172,3 @@ jobs:
           path: target/screenshots/
           if-no-files-found: ignore
           retention-days: 14
-
-  # Slint sub-workspace install + validate + package. Stays on the
-  # standard `ubuntu-24.04` runner because slint's editor renders
-  # through CPU-backed Skia and never opens a GL context - the
-  # headless software-GL trap that bites vizia (see the
-  # `sub-workspaces-vizia` job below) doesn't apply here.
-  sub-workspaces-slint:
-    name: ubuntu-24.04 (truce-slint sub-workspace)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ubuntu-24.04-sub-workspaces-slint
-          cache-bin: false
-
-      - name: Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
-            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev mesa-vulkan-drivers \
-            libwayland-dev \
-            libasound2-dev libjack-jackd2-dev \
-            libfontconfig1-dev libfreetype-dev \
-            xvfb
-
-      - name: Cache pluginval
-        id: cache-pluginval
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/bin/pluginval
-          key: pluginval-linux-1.0.4
-
-      - name: Download pluginval
-        if: steps.cache-pluginval.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.local/bin
-          curl -fsSL -o /tmp/pluginval.zip \
-            https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Linux.zip
-          unzip -oq /tmp/pluginval.zip -d /tmp/pluginval-bin
-          install -m 755 /tmp/pluginval-bin/pluginval ~/.local/bin/pluginval
-
-      - name: Cache clap-validator
-        id: cache-clap-validator
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/clap-validator
-          key: clap-validator-linux-2026-05-09
-
-      - name: Install clap-validator
-        if: steps.cache-clap-validator.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/free-audio/clap-validator clap-validator
-
-      - name: Validators on PATH
-        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Pre-flight — validators present
-        run: |
-          command -v clap-validator
-          command -v pluginval
-
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
-
-      - name: Install + validate (truce-slint sub-workspace)
-        run: |
-          set -e -o pipefail
-          cd crates/truce-slint
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" install --user --clap --vst3 -p truce-example-gain-slint
-          xvfb-run -a "$GITHUB_WORKSPACE/target/debug/cargo-truce" validate --clap --pluginval -p truce-example-gain-slint 2>&1 | tee validate-slint.log
-          if grep -E "SKIP|not found" validate-slint.log >/dev/null; then
-            echo "::error::slint validate skipped a step — failing"
-            exit 1
-          fi
-
-      - name: Package (truce-slint sub-workspace)
-        run: |
-          set -e -o pipefail
-          cd crates/truce-slint
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" package -p truce-example-gain-slint --formats clap,vst3 --no-sign --no-notarize
-
-  # Vizia sub-workspace install + validate + package. Kept in its
-  # own job (separate from `sub-workspaces-slint`) so the heavy
-  # skia-bindings + vizia compile times don't push either job toward
-  # the 30-minute soft cap. Pluginval's "Open editor whilst
-  # processing" probe is skipped via `--skip-gui-tests` because
-  # `ubuntu-24.04`'s headless software-GL stack returns zero
-  # FBConfigs from `glXChooseFBConfig` - baseview's editor needs a
-  # real GLX implementation (GPU or NVIDIA software ICD) to
-  # construct a window context. Same fallback the Windows variant
-  # uses for the same reason.
-  sub-workspaces-vizia:
-    name: ubuntu-24.04 (truce-vizia sub-workspace)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ubuntu-24.04-sub-workspaces-vizia
-          cache-bin: false
-
-      - name: Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
-            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev mesa-vulkan-drivers \
-            libwayland-dev \
-            libasound2-dev libjack-jackd2-dev \
-            libfontconfig1-dev libfreetype-dev \
-            xvfb
-
-      - name: Cache pluginval
-        id: cache-pluginval
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/bin/pluginval
-          key: pluginval-linux-1.0.4
-
-      - name: Download pluginval
-        if: steps.cache-pluginval.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.local/bin
-          curl -fsSL -o /tmp/pluginval.zip \
-            https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Linux.zip
-          unzip -oq /tmp/pluginval.zip -d /tmp/pluginval-bin
-          install -m 755 /tmp/pluginval-bin/pluginval ~/.local/bin/pluginval
-
-      - name: Cache clap-validator
-        id: cache-clap-validator
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/clap-validator
-          key: clap-validator-linux-2026-05-09
-
-      - name: Install clap-validator
-        if: steps.cache-clap-validator.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/free-audio/clap-validator clap-validator
-
-      - name: Validators on PATH
-        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Pre-flight — validators present
-        run: |
-          command -v clap-validator
-          command -v pluginval
-
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
-
-      - name: Install + validate (truce-vizia sub-workspace)
-        run: |
-          set -e -o pipefail
-          cd crates/truce-vizia
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" install --user --clap --vst3 -p truce-example-gain-vizia
-          xvfb-run -a "$GITHUB_WORKSPACE/target/debug/cargo-truce" validate --clap --pluginval --skip-gui-tests -p truce-example-gain-vizia 2>&1 | tee validate-vizia.log
-          if grep -E "SKIP|not found" validate-vizia.log >/dev/null; then
-            echo "::error::vizia validate skipped a step — failing"
-            exit 1
-          fi
-
-      - name: Package (truce-vizia sub-workspace)
-        run: |
-          set -e -o pipefail
-          cd crates/truce-vizia
-          "$GITHUB_WORKSPACE/target/debug/cargo-truce" package -p truce-example-gain-vizia --formats clap,vst3 --no-sign --no-notarize

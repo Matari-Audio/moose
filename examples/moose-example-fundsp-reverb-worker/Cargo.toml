@@ -1,0 +1,53 @@
+[package]
+name = "moose-example-fundsp-reverb-worker"
+# Internal-only - workspace demonstrations not for crates.io.
+publish = false
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "moose-example-fundsp-reverb-worker-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["clap", "vst3"]
+clap = ["dep:moose-clap", "dep:clap-sys"]
+vst3 = ["dep:moose-vst3"]
+standalone = ["dep:moose-standalone"]
+shell = ["moose/shell"]
+# Real-time allocation checking for the tests (dev/test only).
+rt-paranoid = ["moose/rt-paranoid"]
+
+[dependencies]
+moose = { workspace = true }
+moose-core = { workspace = true }
+moose-params = { workspace = true }
+moose-clap = { workspace = true, optional = true }
+moose-vst3 = { workspace = true, optional = true }
+clap-sys = { version = "0.5", optional = true }
+moose-standalone = { workspace = true, features = ["gui"], optional = true }
+moose-gui-types = { workspace = true }
+moose-gui = { workspace = true, features = ["cpu"] }
+moose-loader = { workspace = true }
+# fundsp 0.23's main prelude runs every node in f32 - matches moose's
+# default `prelude` import, no widen/narrow on the audio boundary.
+# Pinned to a minor version because fundsp moves combinator surface
+# (e.g. `hacker` module dropped between 0.22 and 0.23) on every release.
+fundsp = "0.23"
+# Lock-free bounded queues for handing graphs between the audio
+# thread and the rebuild worker without locks or allocation.
+crossbeam-queue = "0.3"
+
+[dev-dependencies]
+moose-test = { workspace = true }
+
+[lints]
+workspace = true

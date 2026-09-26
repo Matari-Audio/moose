@@ -2,7 +2,7 @@ name: Miri
 
 # UB detection on the pure-Rust core: the buffer transmutes, the
 # mediation lock, the state/UMP parsers. FFI surfaces (shims, GUI,
-# cpal) can't run under Miri; pluginval/auval remain their harness.
+# cpal) can't run under Miri; pluginval/clap-validator remain their harness.
 on:
   push:
     branches: [main]
@@ -60,17 +60,17 @@ jobs:
       # stays on for every other crate and test here.
       - name: miri test (core crates)
         run: |
-          cargo +nightly miri test -p truce-utils -p truce-params
-          cargo +nightly miri test -p truce-core --lib -- --skip tasks::tests
+          cargo +nightly miri test -p moose-utils -p moose-params
+          cargo +nightly miri test -p moose-core --lib -- --skip tasks::tests
 
-      # The managed background-task pool (`truce-core::tasks`) spawns
+      # The managed background-task pool (`moose-core::tasks`) spawns
       # process-global worker threads that never join by design, so Miri's
       # default check flags them as "leaked" at exit. Scope
       # `-Zmiri-ignore-leaks` to just these tests: the pool's cross-thread
       # handshake still runs under Miri (data-race checking, the point of
       # running it here), while everything above keeps full leak detection.
       - name: miri test (task pool)
-        run: cargo +nightly miri test -p truce-core --lib tasks::tests
+        run: cargo +nightly miri test -p moose-core --lib tasks::tests
         env:
           MIRIFLAGS: -Zmiri-ignore-leaks
 
@@ -80,7 +80,7 @@ jobs:
       # guard against reintroducing a raw-pointer shortcut - Miri's
       # data-race detector flags the pre-mediation pattern.
       - name: miri test (mediation schedules)
-        run: cargo +nightly miri test -p truce-core --test mediation_repro
+        run: cargo +nightly miri test -p moose-core --test mediation_repro
         env:
           MIRIFLAGS: -Zmiri-many-seeds=0..8
 

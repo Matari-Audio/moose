@@ -107,44 +107,17 @@ sed_inplace() {
 
 # Every occurrence of the version string in Cargo.toml updates in
 # one pass: `[workspace.package].version` (source of truth) plus the
-# `version = "X.Y.Z"` field on every internal `truce-*` entry in
+# `version = "X.Y.Z"` field on every internal `moose-*` entry in
 # `[workspace.dependencies]` (load-bearing for crates.io publish,
 # since cargo strips `path` and embeds the registry version). The
 # global sed catches all of them — release.sh re-verifies the lot.
 echo "→ editing Cargo.toml"
 sed_inplace "s/\"$CURRENT\"/\"$NEW\"/g" Cargo.toml
 
-# `truce-slint`, `truce-vizia`, and `truce-gpu-examples` live in their
-# own Cargo workspaces under `crates/<name>/` (slint: skia-bindings
-# collision; vizia: pinned baseview rev with no iOS impl + an inert
-# `[patch]` we don't want infecting the parent lockfile;
-# truce-gpu-examples: a `truce-gui/gpu` feature that would unify
-# across the parent workspace and silently flip every CPU screenshot
-# test to the GPU renderer - see each sub-workspace's Cargo.toml
-# header). Each carries its own `[package].version` plus path-dep
-# `version` pins to other `truce-*` crates - all of those must move
-# in lockstep with the parent workspace. The sed is applied to every
-# `Cargo.toml` under each sub-workspace.
-for sub in crates/truce-slint crates/truce-vizia crates/truce-gpu-examples; do
-    [[ -f "$sub/Cargo.toml" ]] || continue
-    while IFS= read -r -d '' subtoml; do
-        echo "→ editing $subtoml"
-        sed_inplace "s/\"$CURRENT\"/\"$NEW\"/g" "$subtoml"
-    done < <(find "$sub" -name Cargo.toml -not -path '*/target/*' -print0)
-done
-
 # Refresh Cargo.lock ----------------------------------------------------------
 
 echo "→ refreshing Cargo.lock ($CARGO check --workspace)"
 "$CARGO" check --workspace
-
-# Same for each sub-workspace's lock.
-for sub in crates/truce-slint crates/truce-vizia crates/truce-gpu-examples; do
-    if [[ -f "$sub/Cargo.toml" ]]; then
-        echo "→ refreshing $sub/Cargo.lock"
-        "$CARGO" check --manifest-path "$sub/Cargo.toml"
-    fi
-done
 
 # Commit ----------------------------------------------------------------------
 
@@ -156,14 +129,6 @@ fi
 
 echo "→ committing on $(git rev-parse --abbrev-ref HEAD)"
 git add Cargo.toml Cargo.lock
-for sub in crates/truce-slint crates/truce-vizia crates/truce-gpu-examples; do
-    if [[ -f "$sub/Cargo.toml" ]]; then
-        [[ -f "$sub/Cargo.lock" ]] && git add "$sub/Cargo.lock"
-        while IFS= read -r -d '' subtoml; do
-            git add "$subtoml"
-        done < <(find "$sub" -name Cargo.toml -not -path '*/target/*' -print0)
-    fi
-done
 git commit -m "Release v$NEW"
 
 echo

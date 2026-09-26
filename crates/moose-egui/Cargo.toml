@@ -1,0 +1,49 @@
+[package]
+name = "moose-egui"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "egui-based GUI backend for moose audio plugins"
+
+[dependencies]
+moose-core = { workspace = true }
+moose-gui = { workspace = true }
+moose-params = { workspace = true }
+egui = "0.35"
+# default-features off so wgpu/default doesn't re-enable every backend;
+# moose-gpu gates them per target_os.
+egui-wgpu = { version = "0.35", default-features = false }
+wgpu = { workspace = true }
+pollster = "0.4"
+raw-window-handle = "0.5"
+keyboard-types = "0.7"
+log = "0.4"
+
+# baseview is desktop-only. iOS uses the in-tree editor_ios.rs which
+# builds its wgpu surface from a CAMetalLayer attached to a UIView.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+baseview = { workspace = true }
+
+# `wgpu/metal` is gated on the Apple targets because
+# `from_metal_layer` in `renderer.rs` references
+# `SurfaceTargetUnsafe::CoreAnimationLayer`, which only exists when
+# the Metal backend is compiled in. In workspace builds cargo
+# unifies features through `moose-gpu` and this would be redundant,
+# but `cargo publish --verify` compiles this crate in isolation —
+# without an explicit declaration here, `moose-gpu`'s feature
+# unification doesn't apply and the variant disappears. Same
+# pattern as `moose-gpu/Cargo.toml`'s per-OS wgpu backend block.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }
+wgpu = { workspace = true, features = ["metal"] }
+
+[lints]
+workspace = true

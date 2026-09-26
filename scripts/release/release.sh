@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release.sh — tag HEAD, publish every truce workspace crate to
+# release.sh — tag HEAD, publish every moose workspace crate to
 # crates.io, push the tag, create the GitHub Release. Idempotent:
 # each step skips if it's already done.
 #
@@ -80,7 +80,7 @@ is_published_on_crates_io() {
     # crates.io. Uses the public HTTP API (no cargo dependency).
     local crate="$1" version="$2"
     curl -sf -o /dev/null \
-        -H "User-Agent: truce-release-script/1.0 (https://github.com/truce-audio/truce)" \
+        -H "User-Agent: moose-release-script/1.0 (https://github.com/Matari-Audio/moose)" \
         "https://crates.io/api/v1/crates/$crate/$version" \
         2>/dev/null
 }
@@ -91,7 +91,7 @@ crate_exists_on_crates_io() {
     # first publish).
     local crate="$1"
     curl -sf -o /dev/null \
-        -H "User-Agent: truce-release-script/1.0 (https://github.com/truce-audio/truce)" \
+        -H "User-Agent: moose-release-script/1.0 (https://github.com/Matari-Audio/moose)" \
         "https://crates.io/api/v1/crates/$crate" \
         2>/dev/null
 }
@@ -129,7 +129,7 @@ fi
 DRIFT="$(awk -v want="$WS_VERSION" '
     /^\[workspace\.dependencies\]/ { in_deps = 1; next }
     in_deps && /^\[/ { in_deps = 0 }
-    in_deps && /^truce/ && /version *=/ && /path *=/ {
+    in_deps && /^moose/ && /version *=/ && /path *=/ {
         if (match($0, /version *= *"[^"]*"/)) {
             v = substr($0, RSTART, RLENGTH)
             sub(/^version *= *"/, "", v)
@@ -140,52 +140,6 @@ DRIFT="$(awk -v want="$WS_VERSION" '
         }
     }
 ' Cargo.toml)"
-
-# Sub-workspaces have their own [package] manifests with
-# `truce-* = { version = "...", path = "..." }` entries pointing back
-# into the main workspace. They're not in [workspace.dependencies] so
-# the awk above misses them; sweep each sub-workspace manifest here.
-#
-# `crates/truce-vizia/Cargo.toml` and `crates/truce-gpu-examples/
-# Cargo.toml` are intentionally NOT in this list. truce-vizia isn't
-# published (vizia upstream hasn't tagged a release with the
-# `baseview` feature, so crates.io rejects the git-only dep);
-# truce-gpu-examples has no publishable library (virtual workspace,
-# its only member is an internal `publish = false` example). See
-# `scripts/release/topo.py`'s `SUB_WORKSPACES` for the longer
-# explanation. bump.sh still keeps those manifests' versions in sync;
-# the release-time drift gate just doesn't fail loud about them.
-for sub_manifest in \
-    crates/truce-slint/Cargo.toml \
-    crates/truce-slint/build/Cargo.toml; do
-    sub_drift="$(awk -v want="$WS_VERSION" -v file="$sub_manifest" '
-        /^\[package\]/ {
-            if (match($0, /^version *= *"[^"]*"/)) {
-                v = substr($0, RSTART, RLENGTH)
-                sub(/^version *= *"/, "", v)
-                sub(/"$/, "", v)
-                if (v != want) printf "  %s [package].version = \"%s\"\n", file, v
-            }
-        }
-        /^version *= *"/ && !/path *=/ && /^version/ {
-            v = $0
-            sub(/^version *= *"/, "", v)
-            sub(/".*$/, "", v)
-            if (v != want) printf "  %s version = \"%s\"\n", file, v
-        }
-        /^truce[a-z-]* *= *\{/ && /version *=/ && /path *=/ {
-            if (match($0, /version *= *"[^"]*"/)) {
-                v = substr($0, RSTART, RLENGTH)
-                sub(/^version *= *"/, "", v)
-                sub(/"$/, "", v)
-                name = $0
-                sub(/ *=.*/, "", name)
-                if (v != want) printf "  %s %s = \"%s\"\n", file, name, v
-            }
-        }
-    ' "$sub_manifest")"
-    DRIFT="${DRIFT}${sub_drift}"
-done
 
 if [[ -n "$DRIFT" ]]; then
     echo "Error: workspace dependency version drift vs $WS_VERSION:" >&2
@@ -218,7 +172,7 @@ if git rev-parse --verify "$TAG" >/dev/null 2>&1; then
     fi
     echo "  already exists at HEAD; using it"
 else
-    git tag -a "$TAG" -m "truce $WS_VERSION"
+    git tag -a "$TAG" -m "moose $WS_VERSION"
     echo "  created"
 fi
 
@@ -251,17 +205,15 @@ printf '%s\n' "$ORDER" | sed 's/^/  /'
 publish_one() {
     # Run `cargo publish -p <crate>` from `<workspace_dir>`, retrying
     # on rate-limit errors with exponential backoff. `<workspace_dir>`
-    # is `.` for main-workspace crates and the sub-workspace path
-    # (e.g. `crates/truce-slint`) for slint / vizia. The `cd` ensures
-    # `cargo publish` picks up the right `[workspace]` context and
-    # Cargo.lock - the sub-workspaces are independent and the main
-    # `cargo publish -p <crate>` from the repo root doesn't see them.
+    # is `.` (the main workspace) for every crate topo.py emits; the
+    # `cd` ensures `cargo publish` picks up that `[workspace]` context
+    # and Cargo.lock.
     # Returns non-zero on a non-rate-limit failure or after
     # MAX_RETRY_ATTEMPTS rate-limit retries.
     local crate="$1"
     local workspace_dir="$2"
     local log delay attempts
-    log="$(mktemp -t truce-publish.XXXXXX)"
+    log="$(mktemp -t moose-publish.XXXXXX)"
     delay="$RATE_LIMIT_INITIAL_DELAY"
     attempts=0
 
@@ -354,7 +306,7 @@ if is_github_release_present "$TAG"; then
     echo "  already exists: $release_url"
 else
     gh release create "$TAG" \
-        --title "truce $WS_VERSION"
+        --title "moose $WS_VERSION"
 fi
 
 # ---------------------------------------------------------------------------
@@ -363,8 +315,8 @@ fi
 
 echo
 echo "Released $TAG."
-echo "  https://crates.io/crates/cargo-truce/$WS_VERSION"
+echo "  https://crates.io/crates/cargo-moose/$WS_VERSION"
 echo
 echo "Smoke-test from a clean install:"
-echo "  cargo install --force cargo-truce --version $WS_VERSION"
-echo "  cargo truce --help"
+echo "  cargo install --force cargo-moose --version $WS_VERSION"
+echo "  cargo moose --help"

@@ -3,14 +3,14 @@
 # rt-paranoid.sh - run the rt-paranoid audio-thread allocation check on
 # every example crate that opts into it.
 #
-# Each such crate has an `rt-paranoid` feature, `truce::enable_rt_paranoid!()`
+# Each such crate has an `rt-paranoid` feature, `moose::enable_rt_paranoid!()`
 # at its root, and at least one `assert_no_audio_alloc` test. Building the
 # crate with `--features rt-paranoid` installs the checking global
 # allocator; the `assert_no_audio_alloc` / `assert_audio_alloc` helpers
 # gate each test on the allocation count directly, so no mode needs setting.
 #
 # Only the DSP-distinct examples carry the check. The GUI-backend variants
-# (gain-egui / -iced / -vizia / -gpu, gui-zoo-*) share their `process`
+# (gain-egui*, gui-zoo-*) share their `process`
 # byte-for-byte with their base example, so re-checking them adds build
 # cost with no new coverage.
 

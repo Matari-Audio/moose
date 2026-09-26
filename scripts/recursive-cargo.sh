@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# Run `cargo <args>` in the main workspace and in every sub-workspace
-# (currently `crates/truce-vizia`, `crates/truce-slint`, and
-# `crates/truce-gpu-examples`). Each sub-workspace is its own Cargo
-# workspace: vizia / slint pin incompatible skia-bindings revs and can't
-# share a workspace with the main truce build; truce-gpu-examples is
-# split out because its `truce-gui/gpu` feature request would unify
-# across the parent workspace and silently flip every CPU screenshot
-# test to the GPU renderer.
+# Run `cargo <args>` in every workspace listed by moose-workspaces.sh
+# (currently just the main workspace).
 #
 # Usage: recursive-cargo.sh <cargo-args>
 # Examples:
-#   recursive-cargo.sh build -p truce-example-gain
+#   recursive-cargo.sh build -p moose-example-gain
 #   recursive-cargo.sh test
 #   recursive-cargo.sh clippy --all-targets
 #
-# A `-p` for a package a given sub-workspace doesn't contain makes cargo
+# A `-p` for a package a given workspace doesn't contain makes cargo
 # exit non-zero with a "no matching packages" message. Since each plugin
 # lives in exactly one workspace, that miss is expected - the script
 # reports it as [SKIP] and does NOT fail the overall run. Callers that
@@ -27,14 +21,13 @@ set -uo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/.." && pwd)"
 
-# shellcheck source=truce-workspaces.sh
-source "$script_dir/truce-workspaces.sh"
+# shellcheck source=moose-workspaces.sh
+source "$script_dir/moose-workspaces.sh"
 
-# Pick the cargo binary. On Windows the truce build must use the
+# Pick the cargo binary. On Windows the moose build must use the
 # Windows toolchain, so prefer `cargo.exe` whenever it's on PATH -
 # including under WSL, where bare `cargo` is the Linux toolchain that
-# can't build the Windows plug-ins (and where slint's deps need
-# fontconfig/pkg-config that aren't installed). `cargo.exe` only
+# can't build the Windows plug-ins. `cargo.exe` only
 # exists on Windows / WSL / Git Bash, so this is a no-op on native
 # Linux/macOS. Override explicitly with `CARGO=...`.
 if [[ -n "${CARGO:-}" ]]; then
@@ -51,7 +44,7 @@ fi
 # color on when *our* own stdout is a real terminal (leave it off for a
 # redirected / piped run so files don't fill with escape codes).
 # `CARGO_TERM_COLOR` covers cargo + the rustc it drives; `CLICOLOR_FORCE`
-# covers clicolors-spec subcommands like cargo-truce. Respect either if
+# covers clicolors-spec subcommands like cargo-moose. Respect either if
 # the caller already set it.
 if [[ -t 1 ]]; then
     : "${CARGO_TERM_COLOR:=always}"
@@ -63,17 +56,12 @@ if [[ $# -eq 0 ]]; then
     cat >&2 <<EOF
 usage: $(basename "$0") <cargo-args>
 
-Runs 'cargo <args>' in the main workspace and in each sub-workspace.
-
-Sub-workspaces:
-  crates/truce-slint
-  crates/truce-vizia
-  crates/truce-gpu-examples
+Runs 'cargo <args>' in every workspace listed by moose-workspaces.sh.
 EOF
     exit 64
 fi
 
-# Packages absent from a sub-workspace are an expected miss; cargo phrases
+# Packages absent from a workspace are an expected miss; cargo phrases
 # it as "no matching packages" or "did not match any packages" depending
 # on the subcommand. Callers can add their own subcommand-specific miss
 # message to the alternation.
@@ -87,7 +75,7 @@ fi
 workspaces=()
 while IFS= read -r ws_path; do
     workspaces+=("$ws_path")
-done < <(truce_workspaces "$root_dir")
+done < <(moose_workspaces "$root_dir")
 
 overall_status=0
 for ws in "${workspaces[@]}"; do
@@ -96,7 +84,7 @@ for ws in "${workspaces[@]}"; do
     [[ -z "$label" ]] && label="(main)"
     printf '\n=== %s %s [%s] ===\n' "$cargo_bin" "$*" "$label"
     # `tee` to a temp file so output still streams live while we
-    # inspect it for the "package not in this sub-workspace" miss.
+    # inspect it for the "package not in this workspace" miss.
     # `PIPESTATUS[0]` is cargo's exit code, not tee's.
     tmp="$(mktemp)"
     ( cd "$ws" && "$cargo_bin" "$@" ) 2>&1 | tee "$tmp"

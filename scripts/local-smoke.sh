@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Local smoke test: like post-publish-smoke.sh but against a checked-out
-# truce. Installs cargo-truce from the checkout and patches every local
-# truce crate into the scaffolded project, so nothing comes from crates.io.
-# Run under bash. Usage: local-smoke.sh [truce-dir]
+# moose. Installs cargo-moose from the checkout and patches every local
+# moose crate into the scaffolded project, so nothing comes from crates.io.
+# Run under bash. Usage: local-smoke.sh [moose-dir]
 #   env: BASEVIEW_DIR (also patch baseview-truce), RUN_SECS=N (CI auto-close), KEEP=1
 set -euo pipefail
 
@@ -11,8 +11,8 @@ ok()  { printf '[ OK ] %s\n' "$*"; }
 die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
 SELF="$(cd "$(dirname "$0")" && pwd)"
-TRUCE_DIR="$(cd "${1:-$SELF/..}" && pwd)"
-[ -d "$TRUCE_DIR/crates/cargo-truce" ] || die "not a truce checkout: $TRUCE_DIR"
+MOOSE_DIR="$(cd "${1:-$SELF/..}" && pwd)"
+[ -d "$MOOSE_DIR/crates/cargo-moose" ] || die "not a moose checkout: $MOOSE_DIR"
 
 case "$(uname -s)" in
   Darwin)               OS=macos;   EXE=""     ;;
@@ -22,7 +22,7 @@ case "$(uname -s)" in
 esac
 command -v cargo >/dev/null || die "cargo not on PATH"
 
-WORK="$(mktemp -d /tmp/truce-local-smoke.XXXXXX)"
+WORK="$(mktemp -d /tmp/moose-local-smoke.XXXXXX)"
 APP_PID=""
 cleanup() {
   [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null || true
@@ -31,31 +31,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 1. install cargo-truce from the local checkout
-cargo install --path "$TRUCE_DIR/crates/cargo-truce" --force --locked
-cargo truce --help >/dev/null || die "'cargo truce' not runnable"
-ok "installed local cargo-truce"
+# 1. install cargo-moose from the local checkout
+cargo install --path "$MOOSE_DIR/crates/cargo-moose" --force --locked
+cargo moose --help >/dev/null || die "'cargo moose' not runnable"
+ok "installed local cargo-moose"
 
 # 2. scaffold defaults
-( cd "$WORK" && cargo truce new smoketest )
+( cd "$WORK" && cargo moose new smoketest )
 PROJ="$WORK/smoketest"
 [ -f "$PROJ/Cargo.toml" ] || die "scaffold produced no Cargo.toml"
 
-# 3. patch every local truce-* crate (+ optional baseview) into the project.
-#    Unused-patch warnings for non-dep crates (aax, lv2, ...) are expected.
+# 3. patch every local moose-* crate (+ optional baseview) into the project.
+#    Unused-patch warnings for non-dep crates are expected.
 {
   echo ""
   echo "[patch.crates-io]"
-  for toml in "$TRUCE_DIR"/crates/*/Cargo.toml; do
+  for toml in "$MOOSE_DIR"/crates/*/Cargo.toml; do
     name="$(grep -m1 '^name *= *"' "$toml" | cut -d'"' -f2)"
     case "$name" in
-      cargo-truce|"") continue ;;   # CLI, not a dep
-      truce*) printf '%s = { path = "%s" }\n' "$name" "$(dirname "$toml")" ;;
+      cargo-moose|"") continue ;;   # CLI, not a dep
+      moose*) printf '%s = { path = "%s" }\n' "$name" "$(dirname "$toml")" ;;
     esac
   done
   [ -n "${BASEVIEW_DIR:-}" ] && printf 'baseview-truce = { path = "%s" }\n' "$(cd "$BASEVIEW_DIR" && pwd)"
 } >> "$PROJ/Cargo.toml"
-ok "patched truce deps -> $TRUCE_DIR"
+ok "patched moose deps -> $MOOSE_DIR"
 
 # 4. build standalone against local crates
 ( cd "$PROJ" && cargo build --release )

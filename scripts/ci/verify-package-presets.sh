@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Verify that `cargo truce package` shipped a plugin's factory presets
+# Verify that `cargo moose package` shipped a plugin's factory presets
 # in the produced installer, per OS.
 #
 # Usage: scripts/ci/verify-package-presets.sh <macos|linux|windows>
 #
-# Assumes `cargo truce package -p truce-example-synth` already ran and
+# Assumes `cargo moose package -p moose-example-synth` already ran and
 # wrote its artifact(s) to target/dist/. Run from the repo root. The
 # synth ships six authored presets (Init, bass/Sub, lead/Bright Saw,
 # lead/Square Stab, pad/Glass, pad/Warm Strings).
@@ -22,19 +22,19 @@ set -euo pipefail
 
 OS="${1:?usage: verify-package-presets.sh <macos|linux|windows>}"
 DIST="target/dist"
-VENDOR="Truce"
-PLUGIN="Truce Synth"
+VENDOR="Moose"
+PLUGIN="Moose Synth"
 EXPECT_VST3=6
 # Standalone factory presets ride as a `<bin>.presets/` sibling next to
 # the installed binary - the path the standalone resolves at runtime.
-STANDALONE_BIN="truce-example-synth-standalone"
+STANDALONE_BIN="moose-example-synth-standalone"
 
 pass() { echo "  ok: $1"; }
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 case "$OS" in
   macos)
-    pkg=$(ls "$DIST"/truce-example-synth-*-macos.pkg 2>/dev/null | head -1) \
+    pkg=$(ls "$DIST"/moose-example-synth-*-macos.pkg 2>/dev/null | head -1) \
       || fail "no .pkg in $DIST"
     exp=$(mktemp -d)
     pkgutil --expand "$pkg" "$exp/x"
@@ -43,7 +43,7 @@ case "$OS" in
     for bom in "$exp"/x/*.pkg/Bom; do
       files+=$'\n'"$(lsbom -s "$bom" 2>/dev/null || true)"
     done
-    grep -q '\.trucepreset$' <<<"$files" || fail "no .trucepreset in CLAP/AU payload"
+    grep -q '\.trucepreset$' <<<"$files" || fail "no .trucepreset in CLAP payload"
     n=$(grep -c '\.vstpreset$' <<<"$files" || true)
     [ "$n" -eq "$EXPECT_VST3" ] || fail "expected $EXPECT_VST3 .vstpreset, found $n"
     ls "$exp"/x/*VST3-Presets.pkg >/dev/null 2>&1 || fail "no VST3-Presets component in .pkg"
@@ -51,19 +51,18 @@ case "$OS" in
     # `Contents/Resources/Presets/` (the path the installed app resolves).
     grep -qE '\.app/Contents/Resources/Presets/.*\.trucepreset' <<<"$files" \
       || fail "no standalone .app presets in .pkg"
-    pass "macOS .pkg carries CLAP/AU + $n VST3 + standalone presets (component present)"
+    pass "macOS .pkg carries CLAP + $n VST3 + standalone presets (component present)"
     ;;
 
   linux)
-    tar=$(ls "$DIST"/truce-example-synth-*-linux-*.tar.gz 2>/dev/null | head -1) \
+    tar=$(ls "$DIST"/moose-example-synth-*-linux-*.tar.gz 2>/dev/null | head -1) \
       || fail "no tarball in $DIST"
     list=$(tar tzf "$tar")
     grep -q "clap/$PLUGIN.presets/.*\.trucepreset" <<<"$list" || fail "no CLAP presets in tarball"
-    grep -q 'lv2/.*\.lv2/presets/.*\.ttl'          <<<"$list" || fail "no LV2 preset TTLs in tarball"
     grep -q "vst3-presets/$VENDOR/$PLUGIN/.*\.vstpreset" <<<"$list" || fail "no VST3 presets in tarball"
     grep -q "standalone/$STANDALONE_BIN.presets/.*\.trucepreset" <<<"$list" \
       || fail "no standalone presets in tarball"
-    pass "Linux tarball carries CLAP + LV2 + VST3 + standalone presets"
+    pass "Linux tarball carries CLAP + VST3 + standalone presets"
 
     # Layer B: install into a throwaway HOME with a pre-seeded user
     # preset to prove the VST3 merge never wipes the user's own files.
@@ -73,7 +72,7 @@ case "$OS" in
     mkdir -p "$seed"
     echo MINE >"$seed/mine.vstpreset"
     tar xzf "$tar" -C "$work"
-    dir=$(ls -d "$work"/truce-example-synth-*-linux-*/ | head -1)
+    dir=$(ls -d "$work"/moose-example-synth-*-linux-*/ | head -1)
     ( cd "$dir" && HOME="$fake" bash ./install.sh --user --all >/dev/null )
 
     test -f "$seed/mine.vstpreset" || fail "install WIPED the user preset (VST3 merge unsafe!)"
@@ -88,7 +87,7 @@ case "$OS" in
     ;;
 
   windows)
-    exe=$(ls "$DIST"/truce-example-synth-*-windows*.exe 2>/dev/null | head -1) \
+    exe=$(ls "$DIST"/moose-example-synth-*-windows*.exe 2>/dev/null | head -1) \
       || fail "no .exe in $DIST"
     docs="$(cygpath -u "$USERPROFILE")/Documents/VST3 Presets/$VENDOR/$PLUGIN"
     mkdir -p "$docs"

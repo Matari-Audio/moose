@@ -17,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 # Asks one question, on each scaffold shape: would a plugin
-# scaffolded by the LAST released `cargo-truce` still compile against
-# THIS commit of truce?
+# scaffolded by the LAST released `cargo-moose` still compile against
+# THIS commit of moose?
 #
 # Catches accidental breakage in the public surface that older
 # scaffold-templated plugins lean on (renamed prelude items, dropped
@@ -32,7 +32,7 @@ concurrency:
 # check` we run; format-specific install/package coverage stays on
 # the platform-specific workflows.
 
-# `cargo install` of the released cargo-truce takes ~1 min on a
+# `cargo install` of the released cargo-moose takes ~1 min on a
 # fresh runner; we cache it by tag and reuse across the three
 # matrix shapes. The setup job resolves the tag and primes the
 # cache. The matrix jobs use `actions/cache/restore` (read-only)
@@ -51,7 +51,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Latest non-prerelease tag on the truce repo, e.g. `v0.43.0`.
+      # Latest non-prerelease tag on the moose repo, e.g. `v0.43.0`.
       # Sort by semver-ish descending; pick the first plain
       # `vN.M.P` (skip alpha/beta/rc).
       - name: Resolve latest released tag
@@ -59,12 +59,12 @@ jobs:
         shell: bash
         run: |
           tag=$(git ls-remote --tags --sort='-v:refname' \
-                  https://github.com/truce-audio/truce \
+                  https://github.com/Matari-Audio/moose \
                   | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
                   | head -1 \
                   | sed 's|refs/tags/||')
           if [ -z "$tag" ]; then
-            echo "::error::No released tags found on truce-audio/truce"
+            echo "::error::No released tags found on moose-audio/moose"
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -94,21 +94,21 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Cache released cargo-truce
-        id: cache-old-cargo-truce
+      - name: Cache released cargo-moose
+        id: cache-old-cargo-moose
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/old-cargo-truce
-          key: old-cargo-truce-${{ steps.latest.outputs.tag }}-ubuntu
+          path: ${{ runner.temp }}/old-cargo-moose
+          key: old-cargo-moose-${{ steps.latest.outputs.tag }}-ubuntu
 
-      - name: Install released cargo-truce
-        if: steps.cache-old-cargo-truce.outputs.cache-hit != 'true'
+      - name: Install released cargo-moose
+        if: steps.cache-old-cargo-moose.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          cargo install --git https://github.com/truce-audio/truce \
+          cargo install --git https://github.com/Matari-Audio/moose \
                         --tag "${{ steps.latest.outputs.tag }}" \
-                        cargo-truce \
-                        --root "$RUNNER_TEMP/old-cargo-truce"
+                        cargo-moose \
+                        --root "$RUNNER_TEMP/old-cargo-moose"
 
   backcompat:
     needs: setup
@@ -142,8 +142,8 @@ jobs:
           cache-bin: false
 
       # Same Linux dep set the other CI workflows install. The
-      # scaffolded plugin pulls truce-standalone (cpal → alsa-sys
-      # needs libasound2-dev), truce-gui (X11 / wayland / fontconfig),
+      # scaffolded plugin pulls moose-standalone (cpal → alsa-sys
+      # needs libasound2-dev), moose-gui (X11 / wayland / fontconfig),
       # and wgpu (Mesa / Vulkan). Without these, `cargo check` fails
       # in alsa-sys's build script before reaching any Rust code.
       - name: Install system deps
@@ -157,45 +157,45 @@ jobs:
             libasound2-dev libjack-jackd2-dev \
             libfontconfig1-dev libfreetype-dev
 
-      # Restore the cargo-truce binary the setup job primed. On a
+      # Restore the cargo-moose binary the setup job primed. On a
       # cache miss (new tag, cache propagation lag), the next step
       # installs the binary directly so this matrix is self-sufficient.
-      - name: Restore released cargo-truce from cache
+      - name: Restore released cargo-moose from cache
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/old-cargo-truce
-          key: old-cargo-truce-${{ needs.setup.outputs.tag }}-ubuntu
+          path: ${{ runner.temp }}/old-cargo-moose
+          key: old-cargo-moose-${{ needs.setup.outputs.tag }}-ubuntu
 
-      - name: Install released cargo-truce (cache-miss fallback)
+      - name: Install released cargo-moose (cache-miss fallback)
         if: steps.cache-restore.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          cargo install --git https://github.com/truce-audio/truce \
+          cargo install --git https://github.com/Matari-Audio/moose \
                         --tag "${{ needs.setup.outputs.tag }}" \
-                        cargo-truce \
-                        --root "$RUNNER_TEMP/old-cargo-truce"
+                        cargo-moose \
+                        --root "$RUNNER_TEMP/old-cargo-moose"
 
-      - name: Show released cargo-truce version
+      - name: Show released cargo-moose version
         shell: bash
         run: |
-          "$RUNNER_TEMP/old-cargo-truce/bin/cargo-truce" --version || \
-          "$RUNNER_TEMP/old-cargo-truce/bin/cargo-truce" -h | head -1
+          "$RUNNER_TEMP/old-cargo-moose/bin/cargo-moose" --version || \
+          "$RUNNER_TEMP/old-cargo-moose/bin/cargo-moose" -h | head -1
 
       - name: Scaffold (${{ matrix.shape.id }})
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/scaffold"
           cd "$RUNNER_TEMP/scaffold"
-          "$RUNNER_TEMP/old-cargo-truce/bin/cargo-truce" new ${{ matrix.shape.new_args }}
+          "$RUNNER_TEMP/old-cargo-moose/bin/cargo-moose" new ${{ matrix.shape.new_args }}
           ls -la "${{ matrix.shape.project_dir }}/"
 
-      # Rewrite scaffolded `{ git = ".../truce", tag = "..." }` deps
+      # Rewrite scaffolded `{ git = ".../moose", tag = "..." }` deps
       # to `{ path = "<workspace>/crates/<name>" }` so the older
-      # scaffold consumes THIS commit of truce instead of the
+      # scaffold consumes THIS commit of moose instead of the
       # published tag it was generated against. Shared with
       # `cli-scaffold.yml`.
-      - name: Rewrite git deps to local truce HEAD
+      - name: Rewrite git deps to local moose HEAD
         env:
           SCAFFOLD_DIR: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
         run: python3 scripts/ci/rewrite-scaffold-deps.py
@@ -206,7 +206,7 @@ jobs:
       # scope for backwards-compat (the install + package CI in
       # `cli-install.yml` already exercises those against current
       # templates).
-      - name: cargo check against truce HEAD
+      - name: cargo check against moose HEAD
         shell: bash
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
         run: cargo check --all-targets

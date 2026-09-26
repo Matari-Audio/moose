@@ -1,12 +1,12 @@
 name: Bug report
-description: Something in truce or the cargo truce CLI is broken or behaves incorrectly.
+description: Something in moose or the cargo moose CLI is broken or behaves incorrectly.
 title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report. truce spans many formats, platforms, and hosts, so a few
+        Thanks for the report. moose spans many formats, platforms, and hosts, so a few
         specifics up front (which format, which platform, which host, the version, and a
         minimal repro) are the difference between an actionable bug and a guessing game.
         Please fill them in.
@@ -35,7 +35,7 @@ body:
         A minimal, ordered list. A link to a minimal repro crate or branch is the single
         biggest factor in getting a fix quickly - please include one if you can.
       placeholder: |
-        1. Build the vizia gain example: cargo truce install --vst3
+        1. Build the egui gain example: cargo moose install --vst3
         2. Load it in <host> on a HiDPI display
         3. Observe that the editor overflows the plugin window
     validations:
@@ -54,11 +54,6 @@ body:
       options:
         - label: CLAP
         - label: VST3
-        - label: VST2
-        - label: LV2
-        - label: AU v2
-        - label: AU v3
-        - label: AAX
         - label: Standalone
         - label: Not format-specific / N/A
   - type: checkboxes
@@ -69,7 +64,6 @@ body:
         - label: macOS
         - label: Windows
         - label: Linux
-        - label: iOS
   - type: input
     id: host
     attributes:
@@ -90,17 +84,13 @@ body:
         - Not GUI-related
         - Built-in
         - egui
-        - iced
-        - Vizia
-        - Slint
-        - GPU (wgpu)
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: truce version
-      description: Workspace version or git revision (run `cargo truce --version`, or check Cargo.toml).
+      label: moose version
+      description: Workspace version or git revision (run `cargo moose --version`, or check Cargo.toml).
       placeholder: "1.0.2 (or a commit SHA)"
     validations:
       required: true
@@ -114,7 +104,7 @@ body:
     attributes:
       label: Logs / output
       description: >
-        Relevant `cargo truce` output, validator (auval / pluginval / clap-validator)
+        Relevant `cargo moose` output, validator (pluginval / clap-validator)
         output, panic backtraces, or host logs. Paste as text rather than a screenshot
         so it stays searchable.
       render: shell

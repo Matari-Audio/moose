@@ -1,149 +1,52 @@
-<p align="center">
-  <a href="https://truce.audio/"><img src="https://truce.audio/branding/logo-banner.svg" alt="truce" width="480" /></a>
-  <br/>
-  <a href="https://truce.audio/"><b>https://truce.audio</b></a>
-</p>
+# MOOSE
 
-<p align="center">
-  Build audio plugins in Rust. VST3, CLAP, AU v2, AU v3 (macOS + iOS), 
-  AAX (Pro Tools), and standalone from a single Rust codebase. 
-  Dead simple developer experience: in 5 minutes, you can load
-  your own plugin in a DAW and test your custom DSP, MIDI, and
-  GUI.
-</p>
-
-<p align="center">
-  <a href="https://crates.io/crates/cargo-truce"><img src="https://img.shields.io/crates/v/cargo-truce?logo=rust&logoColor=white" alt="crates.io"></a>
-  <a href="https://truce.audio/docs/"><img src="https://img.shields.io/badge/getting_started-guide-purple?logo=readthedocs&logoColor=white" alt="Getting Started"></a>
-</p>
+**Matari's Own Open Sound Engine.** A Rust audio-plugin framework for
+Matari Audio, forked from [truce](https://github.com/truce-audio/truce)
+at v6.3.0 (`25791270`). Build CLAP, VST3 and standalone plugins from
+one Rust codebase.
 
 ## Quick Start
 
 ```sh
-# Install the CLI (one-time)
-cargo install cargo-truce
+# Install the CLI (one-time), from this repo
+cargo install --git https://github.com/Matari-Audio/moose cargo-moose
 
-# Scaffold a new plugin
-cargo truce new my-plugin
-cd my-plugin
-
-# Run the plugin standalone — no DAW needed
-cargo truce run
-
-# Build and install
-cargo truce install --clap
-cargo truce install --vst3
-
-# Open your DAW, scan for plugins, load "MyPlugin"
+cargo moose new my-plugin && cd my-plugin
+cargo moose run                  # standalone, no DAW needed
+cargo moose install --clap       # build + install CLAP
+cargo moose install --vst3       # build + install VST3
 ```
 
-> Every `cargo truce` command builds in **release** mode by default; pass `--debug` for fast-compile iteration.
-
-Other formats:
+Every `cargo moose` command builds in **release** mode by default; pass
+`--debug` for fast-compile iteration.
 
 ```sh
-cargo truce install              # formats in your plugin's default features
-cargo truce install --vst3       # VST3
-cargo truce install --au3        # AU v3 (macOS, requires Xcode)
-cargo truce install --ios        # AU v3 on the booted iOS Simulator
-cargo truce install --ios-device # AU v3 on a tethered iPhone / iPad
-cargo truce install --aax        # AAX (requires AAX SDK)
-cargo truce install --vst2       # VST2 
-cargo truce install --lv2        # LV2
-
-cargo truce validate             # auval + pluginval + clap-validator on installed plugins
+cargo moose build                # bundle every enabled format into target/bundles/
+cargo moose build --clap --vst3  # a subset
+cargo moose build --shell        # hot-reload shell build
+cargo moose screenshot --out screenshots/main.png
+cargo moose validate             # pluginval + clap-validator on installed plugins
+cargo moose package              # signed .pkg (macOS) or Inno Setup .exe (Windows)
+cargo moose doctor               # environment health
 ```
 
-Build without installing:
-
-```sh
-cargo truce build                # bundle all formats into target/bundles/ without installing
-cargo truce build --clap --vst3  # subset of formats
-cargo truce build --shell        # hot-reload shell build
-
-cargo truce run                  # launch the plugin standalone (no DAW)
-cargo truce run -p my-plugin     # standalone for a specific crate
-cargo truce screenshot --out screenshots/main.png            # render the editor to a file
-cargo truce screenshot -p my-plugin --out screenshots/main.png   # multi-plugin: pick one
-cargo truce screenshot --state s.pluginstate --out shots/cool.png   # load saved state first
-cargo truce screenshot --check --out screenshots/main.png    # CI gate: diff against baseline
-
-cargo truce package              # signed .pkg (macOS) or Inno Setup .exe (Windows)
-                                 # → target/dist/<Plugin>-<version>-<platform>.{pkg,exe}
-cargo truce package -p my-plugin --formats clap,vst3,aax   # subset
-cargo truce package --no-sign                              # dev builds, skip signing
-```
-
-Scaffolded plugins default to **CLAP + VST3 + standalone**. VST2, AU, and AAX are
-opt-in per plugin via `Cargo.toml` features. On Windows, `cargo truce
-install` must be run from an Administrator command prompt (plugin
+Scaffolded plugins default to **CLAP + VST3 + standalone**. On Windows,
+`cargo moose install` must run from an Administrator prompt (plugin
 directories are system-wide).
 
 ## Presets
 
-Drop a `presets/` directory of `.preset` TOML files next to your crate and
-`cargo truce install` ships them to every format's native preset system —
-CLAP preset-discovery, the AU factory list in Logic, `.vstpreset`, LV2
-`pset:Preset`. `cargo truce preset` is the authoring toolbox on top:
-
-```sh
-cargo truce preset list                   # every preset across factory / user / pack scopes
-cargo truce preset pull                    # harvest presets you saved in your DAW into the library
-cargo truce preset convert in.aupreset out.vstpreset   # re-envelope between any two formats
-cargo truce preset init                    # stamp uuids into hand-authored .preset files
-```
-
-Your DAW's own "Save Preset" is the authoring frontend: dial in a sound,
-save it in the host, then `pull` converts it into a `.preset` — uuid-stable,
-so re-pulling the same name updates in place instead of duplicating. The
-standalone host (`cargo truce run`) also has a native Presets menu for
-browsing and saving. Full reference at
-[truce.audio/docs/guide/presets](https://truce.audio/docs/guide/presets/).
-
-## Examples
-
-A suite of example plugins ship in-tree to cover the basics — gain,
-EQ, synth, transpose, arpeggio, tremolo, plus four gain variants
-showing the egui / iced / Slint / Vizia backends. See
-[truce.audio/docs/examples](https://truce.audio/docs/examples/) for the full
-table with screenshots.
-
-<p align="center">
-  <a href="examples/truce-example-eq"><img src="examples/truce-example-eq/screenshots/eq_default_macos.png" height="200" alt="EQ" /></a>
-  <a href="examples/truce-example-arpeggio"><img src="examples/truce-example-arpeggio/screenshots/arpeggio_default_macos.png" height="200" alt="Arpeggiator" /></a>
-  <a href="examples/truce-example-gain"><img src="examples/truce-example-gain/screenshots/gain_default_macos.png" height="200" alt="Gain" /></a>
-  <a href="examples/truce-example-synth"><img src="examples/truce-example-synth/screenshots/synth_default_macos.png" height="200" alt="Synth" /></a>
-  <a href="examples/truce-example-transpose"><img src="examples/truce-example-transpose/screenshots/transpose_default_macos.png" height="200" alt="Transpose" /></a>
-  <a href="examples/truce-example-tremolo"><img src="examples/truce-example-tremolo/screenshots/tremolo_default_macos.png" height="200" alt="Tremolo" /></a>
-</p>
-
-[**reiss-mcpherson-effects**](https://github.com/truce-audio/reiss-mcpherson-effects/),
-a companion repo porting the audio-effect implementations from Reiss
-& McPherson's *Audio Effects: Theory, Implementation and Application*
-to truce.
-
-<p align="center">
-  <a href="https://github.com/truce-audio/reiss-mcpherson-effects/tree/main/plugins/reiss-mcpherson-compressor"><img src="https://raw.githubusercontent.com/truce-audio/reiss-mcpherson-effects/main/screenshots/reiss-mcpherson-compressor.png" height="160" alt="Compressor" /></a>
-  <a href="https://github.com/truce-audio/reiss-mcpherson-effects/tree/main/plugins/reiss-mcpherson-delay"><img src="https://raw.githubusercontent.com/truce-audio/reiss-mcpherson-effects/main/screenshots/reiss-mcpherson-delay.png" height="160" alt="Delay" /></a>
-  <a href="https://github.com/truce-audio/reiss-mcpherson-effects/tree/main/plugins/reiss-mcpherson-phaser"><img src="https://raw.githubusercontent.com/truce-audio/reiss-mcpherson-effects/main/screenshots/reiss-mcpherson-phaser.png" height="160" alt="Phaser" /></a>
-  <a href="https://github.com/truce-audio/reiss-mcpherson-effects/tree/main/plugins/reiss-mcpherson-chorus"><img src="https://raw.githubusercontent.com/truce-audio/reiss-mcpherson-effects/main/screenshots/reiss-mcpherson-chorus.png" height="160" alt="Chorus" /></a>
-  <a href="https://github.com/truce-audio/reiss-mcpherson-effects/tree/main/plugins/reiss-mcpherson-wahwah"><img src="https://raw.githubusercontent.com/truce-audio/reiss-mcpherson-effects/main/screenshots/reiss-mcpherson-wahwah.png" height="160" alt="Wah-wah" /></a>
-  <a href="https://github.com/truce-audio/reiss-mcpherson-effects/tree/main/plugins/reiss-mcpherson-flanger"><img src="https://raw.githubusercontent.com/truce-audio/reiss-mcpherson-effects/main/screenshots/reiss-mcpherson-flanger.png" height="160" alt="Flanger" /></a>
-</p>
-
-[**truce-analyzer**](https://github.com/truce-audio/truce-analyzer),
-a real-time spectrum analyzer with diff overlay for debugging/reverse-engineering plugins.
-
-<p align="center">
-  <a href="https://github.com/truce-audio/truce-analyzer"><img src="https://raw.githubusercontent.com/truce-audio/truce-analyzer/main/screenshots/analyzer_diff_macos.png" width="760" alt="truce-analyzer diff overlay" /></a>
-</p>
+Put a `presets/` directory of `.preset` TOML files next to your crate and
+`cargo moose install` ships them as CLAP preset-discovery entries and
+`.vstpreset` files. `cargo moose preset list | pull | convert | init` is
+the authoring toolbox.
 
 ## Minimal Example
 
 ```rust
-use truce::prelude::*;
-use truce_gui::IntoLayoutEditor;
-use truce_gui_types::layout::{knob, widgets, GridLayout};
+use moose::prelude::*;
+use moose_gui::IntoLayoutEditor;
+use moose_gui_types::layout::{knob, widgets, GridLayout};
 
 #[derive(Params)]
 pub struct GainParams {
@@ -177,89 +80,126 @@ impl PurePluginLogic for Gain {
     }
 }
 
-truce::plugin! { logic: Gain, params: GainParams }
+moose::plugin! { logic: Gain, params: GainParams }
 ```
 
-> Switch the import to `truce::prelude64::*` to write `f64` DSP
+> Switch the import to `moose::prelude64::*` to write `f64` DSP
 > instead — `param.read()` returns `f64`, the audio buffer is
 > `f64`, and the format wrapper widens/narrows at the block
 > boundary. Same `impl PluginLogic` header on both precisions.
 
-## Format Support
+## Formats and GUI backends
 
-By platform:
+| Format     | macOS | Windows | Linux |
+|------------|-------|---------|-------|
+| CLAP       | Yes   | Yes     | Yes   |
+| VST3       | Yes   | Yes     | Yes   |
+| Standalone | Yes   | Yes     | Yes   |
 
-| Format | macOS | Windows | Linux | iOS |
-|--------|-------|---------|-------|-----|
-| CLAP   | Yes   | Yes     | Yes   | —   |
-| VST3   | Yes   | Yes     | Yes   | —   |
-| VST2   | Yes   | Yes     | Yes   | —   |
-| LV2    | Yes   | Yes     | Yes   | —   |
-| AU v2  | Yes   | —       | —     | —   |
-| AU v3  | Yes   | —       | —     | Yes |
-| AAX    | Yes   | Yes     | —     | —   |
+GUI: the built-in widget set (`moose-gui`, CPU or GPU rendering), egui
+(`moose-egui`), or a raw window handle.
 
-AU is Apple-only by design — v2 is the legacy macOS-only component,
-v3 ships on both macOS (`.appex` extension) and iOS (`.appex` inside
-a container `.app` for AUM, GarageBand, Logic Pro for iPad, Cubasis,
-BeatMaker 3, Loopy Pro). LV2 is the native Linux format and also
-builds on macOS and Windows — supports audio, MIDI, state, and UI
-(X11UI on Linux, CocoaUI on macOS, WindowsUI on Windows). AAX
-requires the Avid AAX SDK and PACE/iLok signing for retail Pro Tools
-releases. VST2 is opt-in on all platforms. iOS only hosts AU v3 by 
-platform contract; every other format is unviable there.
+Workspace crates: `moose`, `moose-core`, `moose-params`,
+`moose-derive`, `moose-utils`, `moose-simd`,
+`moose-build`, `moose-plugin`, `moose-clap`, `moose-vst3`,
+`moose-standalone`, `moose-loader`, `moose-test`, `moose-driver`,
+`moose-gui`, `moose-gui-types`, `moose-gui-utils`, `moose-gpu`,
+`moose-egui`, `moose-font`, `moose-cpu` and the `cargo-moose` CLI.
 
-## Features
+## Differences from truce
 
-- **7 plugin formats** from one codebase (CLAP, VST3 default; VST2, LV2, AU v2, AU v3, AAX opt-in)
-- **Cross-platform** — macOS, Windows, Linux, plus iOS via AU v3 with the same Rust DSP, params, and editor
-- **MIDI 2.0 & multi-port** — opt-in MIDI 2.0 / UMP and multiple MIDI in/out ports, with per-note expression (MPE) mapped across CLAP, VST3, and AU v3; MIDI 1.0 single-port plugins are unchanged
-- **f32 or f64 DSP** — write 64-bit DSP with `prelude64`; the host's native 64-bit audio wire is taken directly on VST3, VST2, and CLAP, widen/narrow elsewhere
-- **Presets** — factory presets from a directory of TOML files, shipped to every format's native preset system at install; `cargo truce preset` converts between formats and pulls presets saved in your DAW back into the library
-- **Flexible GUI frameworks** — Built-in widgets, egui, iced, slint, vizia, or raw window handle
-- **Resizable editors** — `.resizable(true).min_size(_).max_size(_)` on any backend, round-tripped through CLAP `gui_set_size`, VST3 `IPlugView::onSize`, AU view-frame change, and LV2 `ui:resize`
-- **egui desktop integration** — selective physical-key capture with native X11 repeat normalization, native file hover/drop input on Windows/macOS, and an owned, cancellable Zenity dialog lifecycle on Linux
-- **Declarative params** — `#[derive(Params)]` + `#[param(...)]` with linear/log/skewed/reversed ranges, linear/exp/log smoothing, units, and sample-accurate automation by default
-- **Background work** - offload graph builds, FFTs, or file reads onto a shared, bounded worker pool with `BackgroundTask`; each task type picks concurrent or serialized (one-slot) execution. `AudioTap` streams samples off the audio thread for analyzers and meters, drop-on-full so a stall never desyncs channels
-- **`truce::plugin!`** — one macro generates all format exports + GUI + state serialization
-- **`cargo truce`** — scaffold, build, install, validate, and package; `doctor` reports environment health, and `package` produces signed distributable installers (`.pkg` with notarization on macOS; Inno Setup `.exe` with Authenticode on Windows)
-- **Real-time safe** - your DSP never allocates or locks in `process()`, and the audio thread never waits on another thread. Every path across the boundary is lock-free: params use atomic storage, meters ride wait-free atomic slots, state loads arrive on an SPSC queue drained between blocks, and a host state save reads a snapshot the audio thread publishes each block, so saving never touches the running plugin
-- **State migration** — a `migrate_state` hook accepts pre-truce or other-framework state blobs, so a ported plugin keeps loading its old sessions and presets
-- **Hot reload** — edit DSP/layout, rebuild, hear changes without restarting the DAW
-- **Automated tests** — audio, render, state, params, GUI screenshots
-- **Automated validation** — `cargo truce validate` runs auval, pluginval, and clap-validator in one command
+MOOSE is a hard fork. It does not track truce releases.
 
-## Documentation
+### Removed
 
-Full docs live at **[truce.audio](https://truce.audio/)** — install
-guide, first-plugin walkthrough, params / processing / GUI / audio
-testing / presets / shipping / hot-reload reference, per-format gotchas
-(CLAP, VST3, VST2, LV2, AU, AAX), and current status.
+- **Formats:** AU v2, AU v3 (macOS and iOS), AAX (with `aax-bridge`),
+  VST2 and LV2, with their wrapper crates, `cargo moose` flags
+  (`--au2`, `--au3`, `--ios`, `--ios-device`, `--aax`, `--vst2`,
+  `--lv2`), packaging paths, validators (auval, AAX validator) and
+  scaffold templates.
+- **GUI backends:** `truce-iced`, `truce-vizia`, `truce-slint` and
+  `truce-gpu-examples`, plus the examples built on them (`gain-iced`,
+  `gain-vizia`, `gain-slint`, `gui-zoo-iced`, `gui-zoo-slint`,
+  `midi-inspector`).
+- iOS CI, simulator tooling and iOS screenshot baselines.
+
+### Fixes carried on top of truce 6.3.0
+
+IDs refer to Matari's internal fork inventory.
+
+- **Fork line (DerpcatMusic/truce, 7.0.0):** A01 explicit VST3 class
+  IDs; A02 full 31-bit parameter IDs; A03 bounded lossless core event
+  lane; A04 exact CLAP MIDI/note round-trip; A05 lossless VST3 native
+  events; A08 optional buses and stepped-parameter contracts; A09
+  configurable CLAP discovery metadata; A10 VST3 `activateBus`; A12
+  egui/egui-wgpu 0.35; A13 output-event delivery status; A14 CLAP
+  fractional fixed-step params; A15/A16 managed background tasks under
+  hot reload and RT-safe continuations; A17 `ProcessContext::bus_routing`;
+  A20 egui key capture, native file drop and Linux file dialog, with
+  baseview pinned to `DerpcatMusic/baseview@15cf1fe` (X01, X11
+  autorepeat normalization). The AU/AAX/LV2 halves of A06, A07, A11,
+  A18 and A19 went away with those formats; A21/A22 (vizia) went away
+  with vizia.
+- **B01** CLAP requests `CLAP_PARAM_RESCAN_VALUES` after state and preset
+  loads (clap-validator state reproducibility, upstream #232).
+- **B02** correct VST3 IIDs for `IUnitInfo` and
+  `IEditControllerHostEditing`.
+- **B03** correct VST3 `IProcessContextRequirements` IID.
+- **B04** CLAP replays the host GUI scale into every newly created
+  editor.
+- `moose-core` worker-pool test no longer depends on test ordering.
+
+### Naming
+
+| truce | moose |
+|-------|-------|
+| `truce`, `truce-*` crates | `moose`, `moose-*` |
+| `cargo truce` | `cargo moose` |
+| `truce::plugin!` | `moose::plugin!` |
+| `truce.toml` | `moose.toml` (`truce.toml` still read, with a deprecation warning) |
+| `TRUCE_*` env vars | `MOOSE_*` (`TRUCE_*` still read, with a deprecation warning) |
+| `TRUCE_NOTARY` keychain profile | `MOOSE_NOTARY` |
+
+Kept on purpose, so existing users' data keeps loading: the
+`.trucepreset` extension, `truce-preset://` URIs, the `truce/` user preset
+folder, the state and preset blob magics, and the plugin ID derivation.
+
+### Migrating a truce 6.3 plugin
+
+1. In `Cargo.toml`, replace each `truce*` dependency with its `moose*`
+   counterpart at 7.0 (git: `https://github.com/Matari-Audio/moose`).
+   Drop the `au`, `aax`, `vst2` and `lv2` features.
+2. Replace `truce::` / `truce_*::` paths with `moose::` / `moose_*::`,
+   including `truce::plugin!`.
+3. Rename `truce.toml` to `moose.toml` and remove the AU/AAX/iOS keys
+   (`au_type`, `au_subtype`, `au3_subtype`, `au_tag`, `aax_category`,
+   `ios_*`) and any removed format in `[packaging] formats`, which no
+   longer parses.
+4. Rename `TRUCE_*` variables in `.cargo/config.toml` and CI to
+   `MOOSE_*`. Recreate or rename the notary keychain profile to
+   `MOOSE_NOTARY`, or set `MOOSE_NOTARY_PROFILE`.
+5. If your editor used egui, move your direct `egui` dependency to 0.35.
+6. Rebuild with `cargo moose build --clap --vst3`. Saved sessions and
+   presets load unchanged.
 
 ## Requirements
 
-- Rust 1.92+ (`rustup update`).
-- **macOS**: Xcode CLI tools (`xcode-select --install`). Full Xcode for AU v3 + iOS.
-- **Windows**: MSVC build tools (Visual Studio 2019+ with the "Desktop
-  development with C++" workload). Rust `x86_64-pc-windows-msvc`
-  toolchain is required.
-- **Linux**: X11 + Vulkan development headers and JACK (via the PipeWire
-  shim on modern distros). 
-- **iOS**: full Xcode, a booted iOS Simulator (`xcrun simctl boot ...`)
-  for `--ios`, or a paired & trusted device + Apple Developer team ID
-  and `.mobileprovision` for `--ios-device`.
-- AAX: Avid AAX SDK (optional, obtain from [developer.avid.com](https://developer.avid.com)).
+- Rust 1.92+.
+- **macOS:** Xcode command-line tools.
+- **Windows:** MSVC build tools, `x86_64-pc-windows-msvc` toolchain.
+- **Linux:** X11 and Vulkan development headers, JACK (or PipeWire's
+  shim).
 
 ## Acknowledgements
 
-truce drew inspiration from [**nih-plug**](https://github.com/robbert-vdh/nih-plug)
-by Robbert van der Helm — the trailblazing Rust audio plugin framework
-whose API design, thread-safe parameter model, and overall shape
-informed countless decisions here. 
+MOOSE is built on [**truce**](https://github.com/truce-audio/truce) by
+the truce authors; see [`NOTICE`](NOTICE). truce drew on
+[**nih-plug**](https://github.com/robbert-vdh/nih-plug) by Robbert van
+der Helm.
 
 ## License
 
-truce is licensed under **The Truce License, Version 1.0**
+MOOSE, like truce, is licensed under **The Truce License, Version 1.0**
 ([`LICENSE`](LICENSE), SPDX `LicenseRef-TruceLicense-1.0`), a dual
 [Apache-2.0](LICENSE-APACHE) / [MIT](LICENSE-MIT) permissive grant
 with one narrow rider.
@@ -275,40 +215,12 @@ you explicitly state otherwise.
 ### The one rider — commercial frameworks and services
 
 You need a Framework License, granted by permission, only to
-redistribute truce **as a commercial framework** to other developers,
+redistribute moose **as a commercial framework** to other developers,
 or to run it **as a commercial service** that provides its framework
 capabilities to other developers - anything sold, subscription-gated,
 dual-licensed commercially, or bundled into a paid offering. Free,
-OSI-licensed framework projects on top of truce are exempt. Plug-in
+OSI-licensed framework projects on top of moose are exempt. Plug-in
 authors and internal-SDK use are unaffected.
 
 See [`LICENSE`](LICENSE) Section 2 for the precise boundary, the
 exemption criteria, and the request procedure.
-
-## Contact
-
-- General questions, bug reports, and maintainer contact:
-  [mahae@truce.audio](mailto:mahae@truce.audio)
-- Commercial Framework License requests:
-  [framework-licensing@truce.audio](mailto:framework-licensing@truce.audio)
-
-## Badges
-
-Built a plugin with truce? You are welcome to add a "Built with Truce"
-badge to your project's README or site. It is optional - nothing requires
-it - but it helps others find the framework, and we appreciate it. Grab
-light, stacked, and mini variants plus copy-paste snippets at
-[truce.audio/docs/reference/badges](https://truce.audio/docs/reference/badges).
-
-<p>
-  <a href="https://truce.audio/"><img src="https://truce.audio/branding/built-with-truce-dark.svg" alt="Built with Truce" height="42"></a>
-</p>
-<p>
-  <a href="https://truce.audio/"><img src="https://truce.audio/branding/built-with-truce-light.svg" alt="Built with Truce" height="42"></a>
-</p>
-<p>
-  <a href="https://truce.audio/"><img src="https://truce.audio/branding/built-with-truce-stacked.svg" alt="Built with Truce" height="86"></a>
-</p>
-<p>
-  <a href="https://truce.audio/"><img src="https://truce.audio/branding/truce-mini.svg" alt="Truce" height="34"></a>
-</p>
