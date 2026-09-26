@@ -313,6 +313,7 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// never left half-restored from a document it can't read. Runs on
     /// the host thread. Default: accept everything (derive:
     /// `#[params(validate_persist = "function")]`).
+    #[must_use]
     fn validate_persist(_data: &[u8]) -> bool
     where
         Self: Sized,

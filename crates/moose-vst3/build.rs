@@ -70,18 +70,15 @@ fn main() {
     // libstdc++-6.dll, so the module fails to load. rustc already
     // links libgcc and winpthread statically on windows-gnu.
     if mingw {
-        match static_libstdcxx_dir(&build) {
-            Some(dir) => {
-                println!("cargo:rustc-link-search=native={}", dir.display());
-                println!("cargo:rustc-link-lib=static=stdc++");
-            }
-            None => {
-                println!(
-                    "cargo:warning=moose-vst3: no libstdc++.a next to the MinGW compiler; \
-                     linking libstdc++ dynamically"
-                );
-                println!("cargo:rustc-link-lib=stdc++");
-            }
+        if let Some(dir) = static_libstdcxx_dir(&build) {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=stdc++");
+        } else {
+            println!(
+                "cargo:warning=moose-vst3: no libstdc++.a next to the MinGW compiler; \
+                 linking libstdc++ dynamically"
+            );
+            println!("cargo:rustc-link-lib=stdc++");
         }
     }
 }

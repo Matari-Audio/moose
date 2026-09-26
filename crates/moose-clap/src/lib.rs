@@ -2130,7 +2130,6 @@ fn declared_input_port(port: u16, count: u8) -> Option<u8> {
     (port < u16::from(count)).then(|| u8::try_from(port).ok())?
 }
 
-#[allow(clippy::too_many_lines)]
 /// Record a `params_flush` param change for replay in the next process
 /// block, latest value per id. Bounded by the vec's capacity (the param
 /// count), so an id the plugin doesn't declare can't grow it.
@@ -2158,6 +2157,7 @@ fn replay_deferred_params(
     deferred.clear();
 }
 
+#[allow(clippy::too_many_lines)]
 unsafe fn convert_input_events<P: PluginExport>(
     scr: &mut ClapAudio<P>,
     info: &PluginInfo,

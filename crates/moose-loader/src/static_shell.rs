@@ -119,12 +119,14 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
 
     /// Shared meter storage handle - the GUI-thread-safe channel
     /// for meter reads (see `PluginExport::meter_store`).
+    #[must_use]
     pub fn meter_store(&self) -> Arc<MeterStore> {
         Arc::clone(&self.meters)
     }
 
     /// Shared snapshot slot for lock-free state save (see
     /// `PluginExport::snapshot_slot`).
+    #[must_use]
     pub fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
         Arc::clone(&self.snapshots)
     }
@@ -132,11 +134,13 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
     /// The plugin's background-task spawner (see
     /// `PluginExport::task_spawner`). `None` unless the plugin wired
     /// `tasks:` on `plugin!`.
+    #[must_use]
     pub fn task_spawner(&self) -> Option<AnyTaskSpawner> {
         self.tasks.clone()
     }
 
     /// Access the plugin's DSP state (for testing).
+    #[must_use]
     pub fn state_ref(&self) -> &L::DspState {
         &self.state
     }
