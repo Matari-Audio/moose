@@ -2,11 +2,10 @@
 ///
 /// By convention, the **first** input bus is the main audio in
 /// (effects + analyzers) and any subsequent input buses are sidechain
-/// inputs. The first output bus is the main audio out. Format
-/// wrappers (CLAP / VST3 / AU / AAX / LV2) rely on this ordering when
-/// they translate into format-specific main/aux bus designations, and
-/// `BusConfig::kind` lets call-sites that need it ask the bus
-/// directly rather than re-deriving the convention.
+/// inputs. The first output bus is the main audio out and any later
+/// output buses are aux outputs. The builders record that role in
+/// [`BusConfig::kind`], and format wrappers (CLAP / VST3) read the kind
+/// rather than re-deriving it from bus position.
 ///
 /// Construct via [`Self::new`] / [`Self::mono`] / [`Self::stereo`] + the `with_*`
 /// builders rather than struct literal - `#[non_exhaustive]` so
@@ -33,9 +32,9 @@ pub struct BusConfig {
 }
 
 /// Whether a bus is the plugin's main audio I/O or a secondary
-/// sidechain / aux bus. Format wrappers use this to set the
-/// per-bus role flag the host expects (`kBusType_Main` /
-/// `kBusType_Aux` in VST3, `is_sidechain` in CLAP, etc.).
+/// sidechain input / aux output. Format wrappers use this to set the
+/// per-bus role flag the host expects (`kMain` / `kAux` in VST3,
+/// `CLAP_AUDIO_PORT_IS_MAIN` in CLAP).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BusKind {
     Main,
@@ -139,8 +138,8 @@ impl BusLayout {
 
     /// Append a structurally stable sidechain which a dynamic bus layout may
     /// omit. CLAP exposes it only in enabled configurations; fixed-topology
-    /// VST3, AU, and AAX adapters keep the declaration but feed silence until
-    /// the host activates/connects it. LV2 currently exposes main I/O only.
+    /// VST3 keeps the declaration but feeds silence until the host
+    /// activates it.
     #[must_use]
     pub fn with_optional_sidechain_input(
         mut self,
@@ -157,12 +156,20 @@ impl BusLayout {
         self
     }
 
+    /// Append an audio output bus. First call → main audio out;
+    /// subsequent calls → auxiliary outputs ([`BusKind::Sidechain`]),
+    /// which formats expose as aux buses (VST3 `kAux`, no CLAP main flag).
     #[must_use]
     pub fn with_output(mut self, name: &'static str, channels: ChannelConfig) -> Self {
+        let kind = if self.outputs.is_empty() {
+            BusKind::Main
+        } else {
+            BusKind::Sidechain
+        };
         self.outputs.push(BusConfig {
             name,
             channels,
-            kind: BusKind::Main,
+            kind,
             enabled: true,
         });
         self
@@ -193,5 +200,17 @@ impl BusLayout {
             .filter(|b| b.enabled)
             .map(|b| b.channels.channel_count())
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BusKind, BusLayout, ChannelConfig};
+
+    #[test]
+    fn extra_outputs_are_aux() {
+        let layout = BusLayout::stereo().with_output("Aux", ChannelConfig::Stereo);
+        let kinds: Vec<_> = layout.outputs.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, [BusKind::Main, BusKind::Sidechain]);
     }
 }

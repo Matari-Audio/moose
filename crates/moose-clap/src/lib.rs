@@ -100,7 +100,7 @@ use clap_sys::version::CLAP_VERSION;
 
 use moose_core::TransportSlot;
 use moose_core::buffer::AudioBuffer;
-use moose_core::bus::ChannelConfig;
+use moose_core::bus::{BusConfig, BusKind, ChannelConfig};
 use moose_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 use moose_core::cast::{len_u32, size_of_u32};
 use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
@@ -4020,6 +4020,17 @@ unsafe extern "C" fn audio_ports_count<P: PluginExport>(
     }
 }
 
+/// CLAP allows one main port per direction, at index 0. Take the role
+/// from the bus kind so a layout whose first enabled bus is a sidechain
+/// (its main bus disabled) doesn't advertise the sidechain as main.
+fn audio_port_main_flag(index: u32, kind: BusKind) -> u32 {
+    if index == 0 && kind == BusKind::Main {
+        CLAP_AUDIO_PORT_IS_MAIN
+    } else {
+        0
+    }
+}
+
 unsafe extern "C" fn audio_ports_get<P: PluginExport>(
     plugin: *const clap_plugin,
     index: u32,
@@ -4048,11 +4059,7 @@ unsafe extern "C" fn audio_ports_get<P: PluginExport>(
         out.name = [0; CLAP_NAME_SIZE];
         copy_str_to_buf(&mut out.name, bus.name);
         out.channel_count = bus.channels.channel_count();
-        out.flags = if index == 0 {
-            CLAP_AUDIO_PORT_IS_MAIN
-        } else {
-            0
-        };
+        out.flags = audio_port_main_flag(index, bus.kind);
         // f64 plugins take the host's 64-bit wire directly (zero
         // copy, no precision loss at the boundary); the process loop
         // reads whichever of data32/data64 the host picked per port.
@@ -4085,6 +4092,13 @@ unsafe extern "C" fn audio_ports_config_count<P: PluginExport>(_plugin: *const c
     len_u32(P::bus_layouts().len())
 }
 
+fn main_bus(buses: &[BusConfig]) -> Option<&BusConfig> {
+    buses
+        .iter()
+        .find(|bus| bus.enabled)
+        .filter(|bus| bus.kind == BusKind::Main)
+}
+
 unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
     _plugin: *const clap_plugin,
     index: u32,
@@ -4107,28 +4121,17 @@ unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
         copy_str_to_buf(&mut out.name, &name);
         out.input_port_count = len_u32(layout.inputs.iter().filter(|bus| bus.enabled).count());
         out.output_port_count = len_u32(layout.outputs.iter().filter(|bus| bus.enabled).count());
-        out.has_main_input = layout.inputs.iter().any(|bus| bus.enabled);
-        out.main_input_channel_count = layout
-            .inputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(0, |b| b.channels.channel_count());
-        out.main_input_port_type = layout
-            .inputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
-        out.has_main_output = layout.outputs.iter().any(|bus| bus.enabled);
-        out.main_output_channel_count = layout
-            .outputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(0, |b| b.channels.channel_count());
-        out.main_output_port_type = layout
-            .outputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
+        // The main port is the first enabled bus, and only if it is Main.
+        let main_input = main_bus(&layout.inputs);
+        out.has_main_input = main_input.is_some();
+        out.main_input_channel_count = main_input.map_or(0, |b| b.channels.channel_count());
+        out.main_input_port_type =
+            main_input.map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
+        let main_output = main_bus(&layout.outputs);
+        out.has_main_output = main_output.is_some();
+        out.main_output_channel_count = main_output.map_or(0, |b| b.channels.channel_count());
+        out.main_output_port_type =
+            main_output.map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
         true
     }
 }
@@ -5813,5 +5816,21 @@ mod deferred_param_tests {
         replay_deferred_params(&mut list, &mut deferred, true);
         assert_eq!(list.iter().count(), 0);
         assert!(deferred.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bus_kind_tests {
+    use super::{BusKind, CLAP_AUDIO_PORT_IS_MAIN, audio_port_main_flag};
+
+    #[test]
+    fn only_a_main_bus_at_index_zero_is_clap_main() {
+        assert_eq!(
+            audio_port_main_flag(0, BusKind::Main),
+            CLAP_AUDIO_PORT_IS_MAIN
+        );
+        // Main bus disabled: the first enabled port is the sidechain.
+        assert_eq!(audio_port_main_flag(0, BusKind::Sidechain), 0);
+        assert_eq!(audio_port_main_flag(1, BusKind::Sidechain), 0);
     }
 }

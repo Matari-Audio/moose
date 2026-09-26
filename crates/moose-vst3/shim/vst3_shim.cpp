@@ -1201,7 +1201,7 @@ public:
                 : 0;
             const bool aux = kinds && kinds[index] != 0;
             const char* nm = (dir == kInput) ? (aux ? "Sidechain" : "Input")
-                                             : "Output";
+                                             : (aux ? "Aux Output" : "Output");
             str_to_char16(bus->name, nm, 128);
             bus->busType = aux ? kAux : kMain;
             // kDefaultActive is truthful per role: the main path is live on a
