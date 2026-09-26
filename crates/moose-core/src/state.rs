@@ -179,7 +179,7 @@ pub fn parse_or_migrate<P: PluginExport>(
     format: PluginFormat,
     source_key: Option<&str>,
 ) -> Option<DeserializedState> {
-    match moose_utils::state::parse_state(data, expected_plugin_id) {
+    let state = match moose_utils::state::parse_state(data, expected_plugin_id) {
         StateParse::Ok(state) => Some(state),
         StateParse::NotAnEnvelope => P::migrate_state(&ForeignState::Raw {
             format,
@@ -209,7 +209,14 @@ pub fn parse_or_migrate<P: PluginExport>(
             eprintln!("moose: state blob is a corrupt moose envelope - load failed");
             None
         }
+    }?;
+    // Reject before any wrapper touches the params: a blob the store
+    // can't read must not leave it half-restored.
+    if !<P::Params as moose_params::Params>::validate_persist(&state.persist) {
+        eprintln!("moose: saved #[persist] state failed validation - load failed");
+        return None;
     }
+    Some(state)
 }
 
 /// Apply just the parameter values from a deserialized state - the
@@ -236,8 +243,10 @@ pub fn parse_or_migrate<P: PluginExport>(
 /// `String` / `Vec`). Running it on the host thread keeps both off the
 /// real-time path.
 pub fn apply_params<P: moose_params::Params>(params: &P, state: &DeserializedState) {
-    params.restore_values(&state.params);
-    params.load_persist(&state.persist);
+    if !P::validate_persist(&state.persist) {
+        return;
+    }
+    params.restore_state(&state.params, &state.persist);
     params.snap_smoothers();
 }
 
@@ -312,8 +321,10 @@ pub fn snapshot_plugin<P: PluginExport>(plugin: &P) -> Vec<u8> {
 pub fn restore_plugin<P: PluginExport>(plugin: &mut P, bytes: &[u8]) -> Result<(), RestoreError> {
     let id = hash_plugin_id(P::info().clap_id);
     let s = deserialize_state(bytes, id).ok_or(RestoreError::Invalid)?;
-    plugin.params().restore_values(&s.params);
-    plugin.params().load_persist(&s.persist);
+    if !<P::Params as Params>::validate_persist(&s.persist) {
+        return Err(RestoreError::Invalid);
+    }
+    plugin.params().restore_state(&s.params, &s.persist);
     if let Some(extra) = s.extra {
         plugin.load_state(&extra).map_err(RestoreError::LoadState)?;
     }

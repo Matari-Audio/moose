@@ -340,6 +340,68 @@ mod tests {
         assert_eq!(plugin.params().edit_count.load(), 0);
     }
 
+    /// `#[params(validate_persist = ...)]` rejects a saved document
+    /// before anything is restored: neither the param values nor the
+    /// persist fields of the rejected state may land.
+    #[test]
+    fn rejected_persist_blob_restores_nothing() {
+        use moose_core::state::{self, DeserializedState};
+
+        #[derive(Params)]
+        #[params(validate_persist = "accept", post_load = "loaded")]
+        struct Guarded {
+            #[param(name = "Gain", range = "linear(0, 1)", default = 0.5)]
+            gain: FloatParam,
+            #[persist]
+            note: RwLock<String>,
+            #[skip]
+            loads: AtomicCell<u32>,
+        }
+        impl Guarded {
+            fn accept(data: &[u8]) -> bool {
+                !data.windows(6).any(|w| w == b"reject")
+            }
+            fn loaded(&self) {
+                self.loads.store(self.loads.load() + 1);
+            }
+        }
+
+        let source = Guarded::new();
+        *source.note.write().unwrap() = "reject".into();
+        let gain_id = source.gain.id();
+        let bad = DeserializedState {
+            params: vec![(gain_id, 0.9)],
+            extra: None,
+            persist: source.serialize_persist(),
+        };
+        let target = Guarded::new();
+        state::apply_params(&target, &bad);
+        assert!((target.gain.value() - 0.5).abs() < 1e-9, "param restored from a rejected state");
+        assert_eq!(*target.note.read().unwrap(), "");
+        assert_eq!(target.loads.load(), 0);
+
+        *source.note.write().unwrap() = "fine".into();
+        let good = DeserializedState {
+            persist: source.serialize_persist(),
+            ..bad
+        };
+        state::apply_params(&target, &good);
+        assert!((target.gain.value() - 0.9).abs() < 1e-9);
+        assert_eq!(*target.note.read().unwrap(), "fine");
+        assert_eq!(target.loads.load(), 1, "post_load runs once per restore");
+    }
+
+    /// Params without a `parse_fn` still parse host text: the derive
+    /// round-trips the display string through the param's formatter.
+    #[test]
+    fn host_text_parses_without_parse_fn() {
+        let params = StateExampleParams::new();
+        let id = params.active.id();
+        assert_eq!(params.parse_value(id, "Off"), Some(0.0));
+        let on = params.format_value(id, 1.0).unwrap();
+        assert_eq!(params.parse_value(id, &on), Some(1.0));
+    }
+
     /// `#[derive(State)]` is keyed: a struct whose fields were reordered,
     /// with one removed and one added, still recovers each field's value
     /// by name. Positional decoding would mis-assign here.
