@@ -44,7 +44,7 @@
 // Gated on `not(miri)` to match `pin_current_module`, which is a no-op
 // under Miri (no dynamic loader to pin), so these FFI types aren't used.
 use std::collections::VecDeque;
-#[cfg(all(any(unix, windows), not(miri)))]
+#[cfg(all(unix, not(miri)))]
 use std::ffi::c_void;
 #[cfg(all(unix, not(miri)))]
 use std::ffi::{c_char, c_int};
@@ -465,20 +465,17 @@ fn pin_current_module() {
 
 #[cfg(all(windows, not(miri)))]
 fn pin_current_module() {
-    unsafe extern "system" {
-        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
-    }
-    // GET_MODULE_HANDLE_EX_FLAG_PIN | ..._FROM_ADDRESS: interpret `name`
-    // as an address inside this module and bump its load count so it
-    // never unloads.
-    const PIN_FROM_ADDRESS: u32 = 0x0000_0001 | 0x0000_0004;
-
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExW,
+    };
+    // FROM_ADDRESS: interpret `name` as an address inside this module;
+    // PIN: bump its load count so it never unloads.
     // SAFETY: `name` is the address of a live function in this module;
     // `module` receives the pinned handle, which we intentionally leak.
     unsafe {
-        let mut module: *mut c_void = core::ptr::null_mut();
+        let mut module = core::ptr::null_mut();
         let _ = GetModuleHandleExW(
-            PIN_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             pin_current_module as *const u16,
             &raw mut module,
         );

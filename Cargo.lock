@@ -1552,6 +1552,7 @@ dependencies = [
  "moose-params",
  "moose-utils",
  "png 0.18.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

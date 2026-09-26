@@ -48,7 +48,7 @@ version = "0.9"
 # `UpdateResource` / `EndUpdateResource` directly - same shell-out-free
 # pattern as the mt.exe-driven manifest embed sitting next to it.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }
+windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 hound = "3"

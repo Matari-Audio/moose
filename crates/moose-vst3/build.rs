@@ -28,6 +28,9 @@ fn main() {
     let mingw = target_os == "windows" && target_env == "gnu";
     if build.get_compiler().is_like_msvc() {
         build.flag("/std:c++17");
+        // The shim's `strncpy` calls are bounded by the destination size;
+        // silence the MSVC CRT's "use strncpy_s" deprecation noise.
+        build.define("_CRT_SECURE_NO_WARNINGS", None);
         // /MT when the Rust side links the CRT statically, /MD
         // otherwise. A /MD shim inside a `+crt-static` cdylib imports
         // VCRUNTIME140 and can abort the host on process attach; a /MT
