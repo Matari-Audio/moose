@@ -31,15 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The fuzz harnesses + corpus live in their own repo; mounted
-      # at fuzz/ so their `../crates/*` path deps resolve against
-      # this checkout (the corpus replay step below runs there).
-      - name: Checkout fuzz harnesses
-        uses: actions/checkout@v4
-        with:
-          repository: truce-audio/truce-fuzz-tests
-          path: fuzz
-
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -84,11 +75,5 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-many-seeds=0..8
 
-      # Replay the committed fuzz corpus under Miri: native fuzzing
-      # finds the inputs, this promotes them to UB-checked. Isolation
-      # off only for the corpus-file reads; the harnesses do no I/O.
-      - name: miri corpus replay
-        working-directory: fuzz
-        run: cargo +nightly miri run --bin replay
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
+      # Fuzz corpus replay dropped until MOOSE has its own harness repo
+      # (truce-audio/truce-fuzz-tests path-depends on truce-* crates).

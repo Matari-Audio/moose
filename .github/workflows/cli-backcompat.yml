@@ -63,9 +63,11 @@ jobs:
                   | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
                   | head -1 \
                   | sed 's|refs/tags/||')
+          # No MOOSE release yet: nothing to be backwards-compatible
+          # with, so the bump step below skips the matrix.
           if [ -z "$tag" ]; then
-            echo "::error::No released tags found on moose-audio/moose"
-            exit 1
+            echo "::notice::No released tags on Matari-Audio/moose yet; skipping backcompat."
+            exit 0
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Latest released tag: $tag"
@@ -80,6 +82,10 @@ jobs:
         id: bump
         shell: bash
         run: |
+          if [ -z "${{ steps.latest.outputs.tag }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           released_major=$(echo "${{ steps.latest.outputs.tag }}" \
                              | sed -E 's/^v([0-9]+)\..*/\1/')
           current=$(grep -m1 -E '^version = ' Cargo.toml \
@@ -96,13 +102,14 @@ jobs:
 
       - name: Cache released cargo-moose
         id: cache-old-cargo-moose
+        if: steps.bump.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/old-cargo-moose
           key: old-cargo-moose-${{ steps.latest.outputs.tag }}-ubuntu
 
       - name: Install released cargo-moose
-        if: steps.cache-old-cargo-moose.outputs.cache-hit != 'true'
+        if: steps.bump.outputs.skip != 'true' && steps.cache-old-cargo-moose.outputs.cache-hit != 'true'
         shell: bash
         run: |
           cargo install --git https://github.com/Matari-Audio/moose \

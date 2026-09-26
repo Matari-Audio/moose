@@ -5,7 +5,7 @@
 //! - [`cast`] - numeric-cast helpers for the audio-plugin → host FFI
 //!   boundary (`usize` ↔ `u32` length casts, host `f64` ↔ DSP `f32`,
 //!   discrete-index ↔ normalized).
-//! - [`env`] - `MOOSE_*` env vars with the old `TRUCE_*` names as a
+//! - [`mod@env`] - `MOOSE_*` env vars with the old `TRUCE_*` names as a
 //!   deprecated fallback.
 //! - [`midi`] - MIDI value-domain normalize / denormalize between
 //!   wire-native integers and `f32` ranges, plus the spec's MIDI 1.0
