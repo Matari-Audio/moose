@@ -435,7 +435,7 @@ where
     }
 
     let mut bytes = [0; 16];
-    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).expect("validated ASCII"), 16)
             .expect("validated hexadecimal digits");
     }

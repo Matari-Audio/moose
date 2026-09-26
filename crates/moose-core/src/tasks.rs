@@ -1409,10 +1409,10 @@ mod tests {
 
     #[test]
     fn serialized_runs_one_at_a_time_and_drops_nothing() {
-        warm_pool(); // never lazy; Miri runs tests one at a time
         // One-slot mode: the handler must never run concurrently with
         // itself for this instance, and every FIFO task must still run.
         const N: u32 = 64;
+        warm_pool(); // never lazy; Miri runs tests one at a time
         let in_flight = Arc::new(AtomicU32::new(0));
         let peak = Arc::new(AtomicU32::new(0));
         let latch = Arc::new(Latch::default());

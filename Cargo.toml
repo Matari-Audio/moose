@@ -87,6 +87,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# New in clippy 1.98 (style); `as_chunks` would churn every SIMD kernel.
+chunks_exact_to_as_chunks = "allow"
 
 # Workspace deps. Every internal `moose-*` entry pins
 # `version = "<workspace version>"` alongside `path = "..."`. The
