@@ -28,6 +28,7 @@ members = [
     "crates/moose-simd",
     "crates/moose-font",
     "crates/moose-utils",
+    "crates/moose-baseview",
     "examples/moose-example-gain",
     "examples/moose-example-gain-inplace",
     "examples/moose-example-block-gain",
