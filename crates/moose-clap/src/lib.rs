@@ -3733,6 +3733,30 @@ unsafe extern "C" fn state_save<P: PluginExport>(
     })
 }
 
+/// Largest state blob a host stream may hand us. Anything bigger is a
+/// misbehaving stream (or an unrelated file), not a moose state.
+const MAX_HOST_STATE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Drain a host `clap_istream` into one bounded blob. `read` fills the
+/// buffer and returns the host's byte count: `0` is end of stream, a
+/// negative count is a read error. A count larger than the buffer, or a
+/// stream past [`MAX_HOST_STATE_BYTES`], fails the load before any
+/// further allocation.
+fn read_host_state(mut read: impl FnMut(&mut [u8]) -> i64) -> Option<Vec<u8>> {
+    let mut blob = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = usize::try_from(read(&mut buf)).ok()?;
+        if n == 0 {
+            return Some(blob);
+        }
+        if n > buf.len() || blob.len() + n > MAX_HOST_STATE_BYTES {
+            return None;
+        }
+        blob.extend_from_slice(&buf[..n]);
+    }
+}
+
 unsafe extern "C" fn state_load<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_istream,
@@ -3747,20 +3771,11 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
-        // Read all data from stream
-        let mut blob = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let read = read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64);
-            if read <= 0 {
-                break;
-            }
-            // `read > 0` checked above; CLAP plugin state blob fits
-            // in usize on every supported target.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let n = read as usize;
-            blob.extend_from_slice(&buf[..n]);
-        }
+        let Some(blob) = read_host_state(|buf| {
+            read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64)
+        }) else {
+            return false;
+        };
 
         if blob.is_empty() {
             return false;
@@ -5673,5 +5688,42 @@ mod remote_controls_tests {
             remote_controls_page_id("EQ", 0),
             remote_controls_page_id("DYN", 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod host_state_tests {
+    use super::{MAX_HOST_STATE_BYTES, read_host_state};
+
+    #[test]
+    fn reads_until_end_of_stream() {
+        let mut chunks = vec![3_i64, 2, 0].into_iter();
+        let blob = read_host_state(|buf| {
+            let n = chunks.next().unwrap();
+            buf[..usize::try_from(n).unwrap()].fill(7);
+            n
+        });
+        assert_eq!(blob, Some(vec![7; 5]));
+    }
+
+    #[test]
+    fn rejects_read_errors_and_overlong_counts() {
+        assert_eq!(read_host_state(|_| -1), None);
+        // A host claiming more bytes than the buffer holds is lying.
+        assert_eq!(
+            read_host_state(|buf| i64::try_from(buf.len()).unwrap() + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_streams_past_the_cap() {
+        let mut total = 0usize;
+        let blob = read_host_state(|buf| {
+            total += buf.len();
+            assert!(total <= MAX_HOST_STATE_BYTES + buf.len(), "kept reading");
+            i64::try_from(buf.len()).unwrap()
+        });
+        assert_eq!(blob, None);
     }
 }

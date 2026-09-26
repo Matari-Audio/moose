@@ -1690,6 +1690,13 @@ unsafe extern "C" fn cb_param_format<P: PluginExport>(
     })
 }
 
+/// Parse host text entry for a MIDI-CC proxy param: a plain number,
+/// clamped to the proxy's normalized `0..=1` domain.
+fn parse_midi_proxy_text(text: &str) -> Option<f64> {
+    let v = text.trim().parse::<f64>().ok()?;
+    v.is_finite().then(|| v.clamp(0.0, 1.0))
+}
+
 unsafe extern "C" fn cb_param_parse<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     id: u32,
@@ -1705,6 +1712,17 @@ unsafe extern "C" fn cb_param_parse<P: PluginExport>(
             return 0;
         };
         let inst = &*ctx.cast::<Vst3Instance<P>>();
+        // MIDI-CC proxy params have no `Params` entry; their display
+        // text is the shim's `%.2f` fallback of the normalized value.
+        if allocated_midi_proxy_index(&inst.midi_proxy_ids, id).is_some() {
+            return match parse_midi_proxy_text(text) {
+                Some(v) => {
+                    *out_plain = v;
+                    1
+                }
+                None => 0,
+            };
+        }
         match inst.params_arc.parse_value(id, text) {
             Some(v) => {
                 *out_plain = v;
@@ -3917,6 +3935,101 @@ mod channel_limit_tests {
 mod tests {
     use super::*;
     use moose_core::events::EventBody;
+    use std::ffi::c_void;
+
+    #[test]
+    fn midi_proxy_text_parses_the_fallback_display() {
+        assert_eq!(parse_midi_proxy_text("0.50"), Some(0.5));
+        assert_eq!(parse_midi_proxy_text(" 2 "), Some(1.0));
+        assert_eq!(parse_midi_proxy_text("-1"), Some(0.0));
+        assert_eq!(parse_midi_proxy_text("NaN"), None);
+        assert_eq!(parse_midi_proxy_text("loud"), None);
+    }
+
+    unsafe extern "C" {
+        fn moose_vst3_read_state_stream(stream: *mut c_void, out_len: *mut i32) -> *mut u8;
+        fn moose_vst3_write_state_stream(stream: *mut c_void, data: *const u8, len: u32) -> i32;
+    }
+
+    /// A fake `IBStream`: the vtable pointer first, then a script of
+    /// `(tresult, byte count)` replies the shim sees per read/write.
+    #[repr(C)]
+    struct FakeStream {
+        vtbl: *const FakeVtbl,
+        replies: Vec<(i32, i32)>,
+        calls: usize,
+    }
+
+    unsafe extern "C" fn fake_io(s: *mut c_void, _buf: *mut c_void, n: i32, out: *mut i32) -> i32 {
+        let s = unsafe { &mut *s.cast::<FakeStream>() };
+        let (r, count) = s.replies.get(s.calls).copied().unwrap_or((0, 0));
+        s.calls += 1;
+        unsafe { *out = if count == i32::MAX { n } else { count } };
+        r
+    }
+
+    type IoFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, *mut i32) -> i32;
+
+    /// `IBStream` vtable layout: 3 `FUnknown` slots, read, write, seek, tell.
+    #[repr(C)]
+    struct FakeVtbl {
+        _unknown: [usize; 3],
+        read: IoFn,
+        write: IoFn,
+        _seek_tell: [usize; 2],
+    }
+
+    static FAKE_VTBL: FakeVtbl = FakeVtbl {
+        _unknown: [0; 3],
+        read: fake_io,
+        write: fake_io,
+        _seek_tell: [0; 2],
+    };
+
+    fn fake(replies: &[(i32, i32)]) -> FakeStream {
+        FakeStream {
+            vtbl: &raw const FAKE_VTBL,
+            replies: replies.to_vec(),
+            calls: 0,
+        }
+    }
+
+    fn read(replies: &[(i32, i32)]) -> Option<i32> {
+        let mut s = fake(replies);
+        let mut len = 0;
+        let data = unsafe { moose_vst3_read_state_stream((&raw mut s).cast(), &raw mut len) };
+        if data.is_null() {
+            return None;
+        }
+        unsafe { libc_free(data.cast()) };
+        Some(len)
+    }
+
+    #[test]
+    fn state_read_is_bounded() {
+        assert_eq!(read(&[(0, 4096), (0, 10), (0, 0)]), Some(4106));
+        // Empty stream, negative or overlong counts fail the load.
+        assert_eq!(read(&[(0, 0)]), None);
+        assert_eq!(read(&[(0, -1)]), None);
+        assert_eq!(read(&[(0, 4097)]), None);
+        // A stream that never ends stops at the 32 MiB cap.
+        assert_eq!(read(&vec![(0, i32::MAX); 8200]), None);
+    }
+
+    #[test]
+    fn state_write_loops_over_partial_writes() {
+        let blob = [7u8; 100];
+        let write = |replies: &[(i32, i32)]| {
+            let mut s = fake(replies);
+            let ok =
+                unsafe { moose_vst3_write_state_stream((&raw mut s).cast(), blob.as_ptr(), 100) };
+            (ok, s.calls)
+        };
+        assert_eq!(write(&[(0, 60), (0, 40)]), (1, 2));
+        // No progress, or a count past the request, fails the save.
+        assert_eq!(write(&[(0, 60), (0, 0)]).0, 0);
+        assert_eq!(write(&[(0, 101)]).0, 0);
+    }
     use moose_params::{MidiSource, ParamFlags, ParamUnit, ParamValueKind};
 
     fn info(range: ParamRange, midi_map: Option<MidiSource>) -> ParamInfo {
