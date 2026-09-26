@@ -1,4 +1,4 @@
-//! Helpers shared across format wrappers (CLAP, VST3, VST2, AU, AAX, LV2).
+//! Helpers shared across format wrappers (CLAP, VST3, standalone).
 //!
 //! Each wrapper still owns its format-specific descriptor types and
 //! callback tables; those don't unify cleanly. What unifies is the
@@ -23,13 +23,12 @@ use std::sync::Arc;
 
 use moose_params::ParamInfo;
 
-use crate::bus::BusLayout;
 use crate::export::PluginExport;
 
 pub use plugin_cell::{PluginCell, PluginGuard};
 
-/// The ownership cell the real-time format wrappers (CLAP, VST3, VST2,
-/// AU, AAX) put around their plugin instance. The audio thread owns the
+/// The ownership cell the real-time format wrappers (CLAP, VST3) put
+/// around their plugin instance. The audio thread owns the
 /// plugin while the host is processing (`process`, the queued state
 /// apply); the host thread owns it while processing is stopped (`init`,
 /// `reset`, an inactive state load). The host contract makes those two
@@ -38,13 +37,6 @@ pub use plugin_cell::{PluginCell, PluginGuard};
 /// lock and the audio thread never waits. Ownership handoff carries a
 /// release-acquire edge (each owner observes the previous owner's
 /// writes), not mutual exclusion.
-///
-/// LV2 is the exception: its `save`/`restore` run in the non-realtime
-/// instantiation thread class, which the host already serializes against
-/// `run`, so it owns its plugin directly and saves through
-/// `Plugin::save_state` (which still funnels to `snapshot_into`) rather
-/// than the snapshot slot. Nothing there contends with the audio thread,
-/// so the cell would buy it nothing.
 ///
 /// A host state save no longer touches the plugin at all: it reads the
 /// lock-free [`SnapshotSlot`](crate::snapshot::SnapshotSlot) the audio
@@ -297,15 +289,8 @@ impl ParamCStrings {
 /// Used by every format's vtable / descriptor to advertise channel
 /// counts at registration time.
 ///
-/// **Note for `aumi` (MIDI processor) plugins:** the convention is
-/// `bus_layouts: [BusLayout::new()]`, which has zero input *and* zero
-/// output channels. This helper returns `Some((0, 0))` for that case,
-/// which is correct for AU (the AU shim's `channelCapabilities`
-/// returns `[0, 0]` and the host treats the plugin as MIDI-only) but
-/// **wrong for AAX**, which requires every plugin to advertise at
-/// least stereo audio I/O. AAX maps `(0, 0)` to `(2, 2)` (synthesizing
-/// a stereo passthrough) after this helper returns. Don't push that
-/// remap into this helper; only AAX needs it.
+/// MIDI-only plugins declare `bus_layouts: [BusLayout::new()]` (zero
+/// input and output channels), for which this returns `Some((0, 0))`.
 ///
 /// `None` indicates a plugin-author bug: zero-bus plugins must return
 /// `vec![BusLayout::new()]` explicitly. Callers should log a
@@ -319,42 +304,10 @@ pub fn default_io_channels<P: PluginExport>() -> Option<(u32, u32)> {
         .map(|l| (l.total_input_channels(), l.total_output_channels()))
 }
 
-/// `(max_input_channels, max_output_channels)` across every declared bus
-/// layout, or `None` when the plugin declares no layouts. Wrappers that
-/// let the host switch layouts at runtime (AU's per-instance stream
-/// format) size their process-time scratch to this so a later, wider
-/// layout selection doesn't outgrow buffers allocated for the first one.
-#[must_use]
-pub fn max_io_channels<P: PluginExport>() -> Option<(u32, u32)> {
-    P::bus_layouts().iter().fold(None, |acc, l| {
-        let (in_, out) = (l.total_input_channels(), l.total_output_channels());
-        Some(acc.map_or((in_, out), |(ai, ao): (u32, u32)| {
-            (ai.max(in_), ao.max(out))
-        }))
-    })
-}
-
-/// Pick the plugin's first bus layout, or `None` when the plugin
-/// declares no layouts.
-/// Used by wrappers (AAX, VST2) that need to read the layout *before*
-/// host-side bus-config negotiation, where a missing layout would
-/// otherwise produce silently-misreported channel counts.
-///
-/// For `aumi` plugins the returned layout is typically `BusLayout::new()`
-/// (zero in / zero out). AAX synthesizes `(2, 2)` from that case in
-/// `register_aax`; see [`default_io_channels`] for the rationale.
-///
-/// `None` is the same plugin-author-bug indicator as
-/// [`default_io_channels`]: log a diagnostic and skip registration.
-#[must_use]
-pub fn first_bus_layout<P: PluginExport>() -> Option<BusLayout> {
-    P::bus_layouts().into_iter().next()
-}
-
 /// Find the `bus_layouts()` index whose total input/output channel counts
 /// match `(inputs, outputs)`. Wrappers that negotiate a layout from a
-/// host-proposed arrangement (VST3 `setBusArrangements`, AU channel-config
-/// selection, the standalone device match, VST2's fixed I/O at load) use
+/// host-proposed arrangement (VST3 `setBusArrangements`, the standalone
+/// device match) use
 /// this to map a request onto a supported layout. `None` when nothing
 /// matches; the caller then rejects the arrangement or falls back to the
 /// first layout.
@@ -365,32 +318,17 @@ pub fn find_bus_layout<P: PluginExport>(inputs: u32, outputs: u32) -> Option<usi
         .position(|l| l.total_input_channels() == inputs && l.total_output_channels() == outputs)
 }
 
-/// Standard diagnostic emitted by `register_*` when [`first_bus_layout`]
-/// or [`default_io_channels`] returns `None`. Centralised so every
+/// Standard diagnostic emitted by `register_*` when
+/// [`default_io_channels`] returns `None`. Centralised so every
 /// wrapper prints the same actionable message.
 pub fn log_missing_bus_layout<P: PluginExport>(format: &str) {
     eprintln!(
         "[moose {format}] {}::bus_layouts() returned an empty list - \
          plugin will not register. Plugins with no audio I/O (e.g. \
-         aumi MIDI-effects) should return vec![BusLayout::new()] \
+         MIDI effects) should return vec![BusLayout::new()] \
          explicitly.",
         type_name::<P>(),
     );
-}
-
-/// Diagnostic for a plugin that declared more MIDI ports than the
-/// format can carry. The wrapper clamps to a single port and routes
-/// all traffic to port `0`; without this line the truncation would read
-/// as "multi-port supported." `declared` is the plugin's per-direction
-/// port count; nothing is logged for the single-port (or zero-port)
-/// case. `direction` is `"input"` / `"output"`.
-pub fn log_midi_ports_clamped(format: &str, direction: &str, declared: u8) {
-    if declared > 1 {
-        eprintln!(
-            "[moose {format}] plugin declares {declared} MIDI {direction} ports, but {format} \
-             carries one - routing all {direction} MIDI to port 0.",
-        );
-    }
 }
 
 /// Run a `register_*` body under [`std::panic::catch_unwind`].
