@@ -11,7 +11,10 @@ use crate::platform::x11::window_thread::{
 };
 use crate::warn;
 use crate::wrappers::xkbcommon::XkbcommonState;
-use crate::{Event, MouseButton, MouseEvent, ScrollDelta, WindowEvent, WindowHandler, WindowSize};
+use crate::{
+    Event, EventStatus, MouseButton, MouseEvent, ScrollDelta, WindowEvent, WindowHandler,
+    WindowSize,
+};
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, LoopSignal, Mode, PostAction};
@@ -21,7 +24,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::errors::ConnectionError;
+use x11rb::protocol::xproto::{ConnectionExt as _, EventMask, KeyPressEvent, KeyReleaseEvent};
 use x11rb::protocol::Event as XEvent;
+use x11rb::CURRENT_TIME;
 
 pub struct MainThreadCaller {
     sender: mpsc::Sender<HostCallback>,
@@ -64,6 +69,13 @@ pub(crate) struct EventLoop {
 
     response_sender: mpsc::Sender<WindowThreadResponseMessage>,
     main_thread: Option<MainThreadCaller>,
+
+    /// Keys currently held down in this window, by X keycode. Used to flag
+    /// auto-repeat key-downs (MOOSE X01).
+    pressed_keys: [bool; 256],
+    /// Key-downs the handler ignored and that were forwarded to the embed
+    /// parent, so the matching key-up can be synthesized on focus loss/close.
+    forwarded_keys: [Option<KeyPressEvent>; 256],
 }
 
 impl EventLoop {
@@ -102,6 +114,8 @@ impl EventLoop {
             xkb_state: XkbcommonState::new(&window.connection),
             run_error: None,
             main_thread,
+            pressed_keys: [false; 256],
+            forwarded_keys: [None; 256],
 
             window,
             response_sender,
@@ -111,9 +125,35 @@ impl EventLoop {
     #[inline]
     fn drain_xcb_events(&mut self) -> Result<bool, ConnectionError> {
         let mut event_received = false;
+        // Core X11 auto-repeat arrives as a KeyRelease/KeyPress pair with the
+        // same keycode, timestamp and window. Swallow the synthetic release so
+        // handlers see one repeated key-down instead of release + fresh press.
+        let mut pending_release: Option<KeyReleaseEvent> = None;
         while let Some(event) = self.window.connection.conn.poll_for_event()? {
             event_received = true;
-            self.handle_xcb_event(event)?;
+            match event {
+                XEvent::KeyRelease(release) => {
+                    if let Some(previous) = pending_release.replace(release) {
+                        self.handle_xcb_event(XEvent::KeyRelease(previous))?;
+                    }
+                }
+                XEvent::KeyPress(press) => {
+                    let release = pending_release.take();
+                    if let Some(release) = release.filter(|r| !is_auto_repeat_pair(r, &press)) {
+                        self.handle_xcb_event(XEvent::KeyRelease(release))?;
+                    }
+                    self.handle_xcb_event(XEvent::KeyPress(press))?;
+                }
+                event => {
+                    if let Some(release) = pending_release.take() {
+                        self.handle_xcb_event(XEvent::KeyRelease(release))?;
+                    }
+                    self.handle_xcb_event(event)?;
+                }
+            }
+        }
+        if let Some(release) = pending_release {
+            self.handle_xcb_event(XEvent::KeyRelease(release))?;
         }
 
         Ok(event_received)
@@ -336,6 +376,7 @@ impl EventLoop {
         self.drain_xcb_events()?;
         inner.run(None, &mut self, Self::handle_idle)?;
 
+        self.release_forwarded_keys();
         self.handle_event(Event::Window(WindowEvent::WillClose));
 
         // If the event loop doesn't stop because the host asked it to, then we should notify it
@@ -496,13 +537,23 @@ impl EventLoop {
             // keys
             ////
             XEvent::KeyPress(event) if event.event == self.window.raw_id() => {
-                let ev = Event::Keyboard(convert_key_press_event(&event, &mut self.xkb_state));
-                self.handle_event(ev);
+                let mut key = convert_key_press_event(&event, &mut self.xkb_state);
+                if let Some(pressed) = self.pressed_keys.get_mut(usize::from(event.detail)) {
+                    key.repeat = std::mem::replace(pressed, true);
+                }
+                if self.handler.on_event(Event::Keyboard(key)) == EventStatus::Ignored {
+                    self.forward_key_event(event);
+                }
             }
 
             XEvent::KeyRelease(event) if event.event == self.window.raw_id() => {
-                let ev = Event::Keyboard(convert_key_release_event(&event, &mut self.xkb_state));
-                self.handle_event(ev);
+                if let Some(pressed) = self.pressed_keys.get_mut(usize::from(event.detail)) {
+                    *pressed = false;
+                }
+                let key = convert_key_release_event(&event, &mut self.xkb_state);
+                if self.handler.on_event(Event::Keyboard(key)) == EventStatus::Ignored {
+                    self.forward_key_event(event);
+                }
             }
 
             XEvent::FocusIn(event) if event.event == self.window.raw_id() => {
@@ -512,6 +563,8 @@ impl EventLoop {
 
             XEvent::FocusOut(e) if e.event == self.window.raw_id() => {
                 self.window.is_focused.set(false);
+                self.pressed_keys.fill(false);
+                self.release_forwarded_keys();
                 self.handle_event(Event::Window(WindowEvent::Unfocused));
             }
 
@@ -566,6 +619,45 @@ impl EventLoop {
     fn handle_event(&mut self, event: Event) {
         self.handler.on_event(event);
     }
+
+    /// Hands a key event the handler ignored to the embed parent, so host
+    /// shortcuts (transport, undo, ...) keep working while the editor has
+    /// focus. Ported from KURV (K26).
+    fn forward_key_event(&mut self, mut event: KeyPressEvent) {
+        let Some(parent) = self.window.visibility_state.parent_id() else {
+            return;
+        };
+        // XSendEvent sets the high bit. Never bounce a host-redispatched event
+        // back; only forward original input.
+        if event.response_type & 0x80 != 0 {
+            return;
+        }
+        event.event = parent.get();
+        event.child = self.window.raw_id();
+        let conn = &self.window.connection.conn;
+        let mask = EventMask::KEY_PRESS | EventMask::KEY_RELEASE;
+        if conn.send_event(true, parent.get(), mask, event).is_ok() {
+            if let Some(slot) = self.forwarded_keys.get_mut(usize::from(event.detail)) {
+                *slot = (event.response_type == x11rb::protocol::xproto::KEY_PRESS_EVENT)
+                    .then_some(event);
+            }
+        }
+        let _ = conn.flush();
+    }
+
+    fn release_forwarded_keys(&mut self) {
+        let held: Vec<KeyPressEvent> =
+            self.forwarded_keys.iter_mut().filter_map(Option::take).collect();
+        for mut event in held {
+            event.response_type = x11rb::protocol::xproto::KEY_RELEASE_EVENT;
+            event.time = CURRENT_TIME;
+            self.forward_key_event(event);
+        }
+    }
+}
+
+fn is_auto_repeat_pair(release: &KeyReleaseEvent, press: &KeyPressEvent) -> bool {
+    release.detail == press.detail && release.time == press.time && release.event == press.event
 }
 
 fn mouse_id(id: u8) -> MouseButton {
