@@ -2,7 +2,17 @@
 
 Notable changes per release.
 
-## 7.0.0
+## 7.0.0 (MOOSE)
+
+First release as MOOSE, a hard fork of truce 6.3.0. See the README's
+"Differences from truce" for the full list and migration steps.
+
+- Renamed every crate `truce*` → `moose*`, the CLI to `cargo moose`, and the config file to `moose.toml`. `truce.toml` and `TRUCE_*` environment variables are still read, with a deprecation warning.
+- Removed AU v2/v3, AAX, VST2, LV2 and iOS support, and the iced, vizia and Slint GUI backends with their examples. Remaining formats: CLAP, VST3, standalone.
+- CLAP rescans parameter values after state and preset loads; CLAP replays the host GUI scale into newly created editors.
+- VST3 interface IDs for `IUnitInfo`, `IEditControllerHostEditing` and `IProcessContextRequirements` are corrected.
+
+### Inherited from the truce 7.0.0 fork line
 
 Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `truce-egui` now uses egui and egui-wgpu 0.35, so plugins that name egui types in their editor code must also update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.
 
