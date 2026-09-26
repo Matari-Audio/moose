@@ -6,7 +6,7 @@
 
 <!-- Does this touch the state envelope, id derivation (bundle_id /
 clap_id / vst3_id / envelope hash), preset containers, the
-truce.toml schema, parameter ids, or the MIDI wire? CI only catches
+moose.toml schema, parameter ids, or the MIDI wire? CI only catches
 the compile-time slice, so declare wire-format and behavioral
 changes loudly. Breaking changes wait for a major version and need
 a migration path in the changelog. -->
@@ -18,7 +18,7 @@ a migration path in the changelog. -->
 
 <!-- A new capability lands in every format that can carry it, in
 the same change: same scaling, ranges, and edge cases, shared
-semantics in truce-core helpers. For real format gaps, note whether
+semantics in moose-core helpers. For real format gaps, note whether
 each is bridged or documented + logged as a skip. -->
 
 | Format | Carried / bridged / skipped (why) |
@@ -28,7 +28,7 @@ each is bridged or documented + logged as a skip. -->
 ## Example
 
 <!-- Every feature lands with an example - a small but real plugin
-showing the idiomatic shape, verified by running it: `cargo truce
+showing the idiomatic shape, verified by running it: `cargo moose
 run`, play it, hear it. If no useful example can be written, that's
 a design smell: raise it here. Not applicable for pure fixes. -->
 
@@ -52,8 +52,8 @@ Linux: Bitwig, REAPER -->
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo test --workspace --lib` passes
 - [ ] `cargo doc --workspace --no-deps` warning-free (new crates / modules)
-- [ ] Screenshot baselines regenerated for layout changes (`cargo truce screenshot -p <crate> --out <path>`)
-- [ ] Unit tests / `truce_test::driver!` scripts cover the change
+- [ ] Screenshot baselines regenerated for layout changes (`cargo moose screenshot -p <crate> --out <path>`)
+- [ ] Unit tests / `moose_test::driver!` scripts cover the change
 - [ ] Changelog entry (with migration steps if breaking)
 
 <!-- Opening this PR is the contributor grant described in

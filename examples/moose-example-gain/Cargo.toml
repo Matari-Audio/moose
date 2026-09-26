@@ -1,0 +1,54 @@
+[package]
+name = "moose-example-gain"
+# Internal-only - workspace demonstrations not for crates.io.
+publish = false
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "moose-example-gain-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["clap", "vst3", "standalone-playback"]
+clap = ["dep:moose-clap", "dep:clap-sys"]
+vst3 = ["dep:moose-vst3"]
+standalone = ["dep:moose-standalone"]
+standalone-playback = ["standalone", "moose-standalone/playback"]
+shell = ["moose/shell"]
+rt-paranoid = ["moose/rt-paranoid"]
+
+[dependencies]
+# Workspace declares `moose` with `default-features = false`; this
+# example's per-format `[features]` propagate to `moose/<format>`
+# explicitly so the macOS default build behaviour is unchanged.
+moose = { workspace = true }
+moose-core = { workspace = true }
+moose-params = { workspace = true }
+moose-clap = { workspace = true, optional = true }
+moose-vst3 = { workspace = true, optional = true }
+clap-sys = { version = "0.5", optional = true }
+moose-standalone = { workspace = true, features = ["gui"], optional = true }
+moose-gui-types = { workspace = true }
+moose-gui = { workspace = true, features = ["cpu"] }
+moose-loader = { workspace = true }
+
+
+[dev-dependencies]
+moose-test = { workspace = true }
+# `moose-driver` is the offline-render harness `moose-test::driver!`
+# wraps. The `chunker_perf` integration test uses `moose_driver::Script`
+# directly to script per-block automation densities.
+moose-driver = { workspace = true }
+hound = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,226 @@
+//! Noise gate: pass audio through when the block peak is above
+//! threshold, zero the output when below.
+//!
+//! Per-block detect/apply (not per-sample), so this gate is hard
+//! and has zero ramp. That keeps the example focused on the two
+//! ops it exists to demo:
+//!
+//! - `abs_max_block` for the per-channel peak detection in the
+//!   detect stage.
+//! - `zero_block` for the fast silence path in the apply stage.
+//!
+//! For a production gate you'd also want attack/release smoothing
+//! (a per-sample envelope between 0 and 1, applied via
+//! `mul_block`); that lives in `moose-example-block-gain`'s envelope
+//! shape. Stripping it here keeps the diff tight.
+
+use moose::prelude::*;
+use moose_gui::IntoLayoutEditor;
+use moose_gui_types::layout::{GridLayout, knob, meter, widgets};
+use moose_simd::ops;
+
+use GateParamsParamId as P;
+use std::sync::Arc;
+
+#[derive(Params)]
+pub struct GateParams {
+    #[param(
+        name = "Threshold",
+        range = "linear(-80, 0)",
+        default = -40.0,
+        unit = "dB",
+        smooth = "exp(20)"
+    )]
+    pub threshold: FloatParam,
+
+    #[meter]
+    pub meter_left: MeterSlot,
+
+    #[meter]
+    pub meter_right: MeterSlot,
+}
+
+/// Stateless descriptor - the gate carries no DSP state, only params.
+pub struct Gate;
+
+impl PurePluginLogic for Gate {
+    type Params = GateParams;
+
+    fn process(
+        params: &GateParams,
+        buffer: &mut AudioBuffer,
+        _events: &EventList,
+        context: &mut ProcessContext,
+    ) -> ProcessStatus {
+        // `read_after(n)` advances the smoother by the whole block
+        // in one atomic pair, so the threshold's `exp(20)` smoothing
+        // settles in ~20 ms wall-clock instead of ~20 blocks (which
+        // a per-block `.read()` would silently downsample to).
+        let threshold_lin = db_to_linear(params.threshold.read_after(buffer.num_samples()));
+        let nch = buffer.channels();
+
+        // Detect: peak over every input channel. The gate opens
+        // if ANY channel exceeds threshold (so stereo signals
+        // with content on only one side don't get spuriously
+        // silenced).
+        let mut peak = 0.0_f32;
+        for ch in 0..nch {
+            let inp = buffer.input(ch);
+            let ch_peak = ops::abs_max_block(inp);
+            if ch_peak > peak {
+                peak = ch_peak;
+            }
+        }
+
+        if peak < threshold_lin {
+            // Gate closed: zero the output. One SIMD store-zero
+            // pass per channel; no copy from input needed.
+            for ch in 0..nch {
+                let (_inp, out) = buffer.io(ch);
+                ops::zero_block(out);
+            }
+        } else {
+            // Gate open: pass input through unchanged.
+            for ch in 0..nch {
+                let (inp, out) = buffer.io(ch);
+                ops::copy_block(out, inp);
+            }
+        }
+
+        if buffer.num_output_channels() >= 1 {
+            context.set_meter(P::MeterLeft, buffer.output_peak(0));
+        }
+        if buffer.num_output_channels() >= 2 {
+            context.set_meter(P::MeterRight, buffer.output_peak(1));
+        }
+
+        ProcessStatus::Normal
+    }
+
+    fn editor(params: Arc<GateParams>) -> Box<dyn Editor> {
+        GridLayout::build(vec![widgets(vec![
+            knob(P::Threshold, "Thresh").at(0, 0),
+            meter(&[P::MeterLeft, P::MeterRight], "Level").at(1, 0),
+        ])])
+        .with_title("GATE")
+        .into_editor(&params)
+    }
+}
+
+moose::plugin! {
+    logic: Gate,
+    params: GateParams,
+}
+
+moose::enable_rt_paranoid!();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_is_allocation_free() {
+        use moose_test::{InputSource, assert_no_audio_alloc, driver};
+        use std::time::Duration;
+        assert_no_audio_alloc(|| {
+            driver!(Plugin)
+                .duration(Duration::from_millis(40))
+                .input(InputSource::Constant(0.25))
+                .script(|s| {
+                    s.set_param(P::Threshold, 0.9);
+                    s.wait_ms(15);
+                    s.set_param(P::Threshold, 0.1);
+                    s.wait_ms(15);
+                })
+                .run()
+        });
+    }
+
+    #[test]
+    fn info_is_valid() {
+        moose_test::assert_valid_info::<Plugin>();
+    }
+
+    #[test]
+    fn renders_nonzero_output_when_above_threshold() {
+        use moose_test::{InputSource, assertions, driver};
+        use std::time::Duration;
+        let result = driver!(Plugin)
+            .duration(Duration::from_millis(12))
+            .input(InputSource::Constant(0.3))
+            .run();
+        // 0.3 amplitude is well above -40 dB → gate open → pass.
+        assertions::assert_nonzero(&result);
+        assertions::assert_no_nans(&result);
+    }
+
+    #[test]
+    fn has_editor() {
+        moose_test::assert_has_editor::<Plugin>();
+    }
+
+    #[test]
+    fn state_round_trips() {
+        moose_test::assert_state_round_trip::<Plugin>();
+    }
+
+    #[test]
+    fn param_defaults_match() {
+        moose_test::assert_param_defaults_match::<Plugin>();
+    }
+
+    #[test]
+    fn param_normalized_clamped() {
+        moose_test::assert_param_normalized_clamped::<Plugin>();
+    }
+
+    #[test]
+    fn param_normalized_roundtrip() {
+        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+    }
+
+    #[test]
+    fn no_duplicate_param_ids() {
+        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+    }
+
+    /// Silent input → silent output regardless of threshold.
+    /// Exercises the `zero_block` path end-to-end.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn silence_passes_to_silence() {
+        use moose_test::{InputSource, driver};
+        use std::time::Duration;
+        let result = driver!(Plugin)
+            .duration(Duration::from_millis(50))
+            .input(InputSource::Constant(0.0))
+            .run();
+        for ch in &result.output {
+            for &s in ch {
+                assert_eq!(s, 0.0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_screenshot_macos() {
+        moose_test::screenshot!(Plugin, "screenshots/block_gate_default_macos.png").run();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gui_screenshot_linux() {
+        moose_test::screenshot!(Plugin, "screenshots/block_gate_default_linux.png")
+            .pixel_threshold(2)
+            .run();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn gui_screenshot_windows() {
+        moose_test::screenshot!(Plugin, "screenshots/block_gate_default_windows.png")
+            .pixel_threshold(2)
+            .run();
+    }
+}

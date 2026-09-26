@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release.sh — tag HEAD, publish every truce workspace crate to
+# release.sh — tag HEAD, publish every moose workspace crate to
 # crates.io, push the tag, create the GitHub Release. Idempotent:
 # each step skips if it's already done.
 #
@@ -80,7 +80,7 @@ is_published_on_crates_io() {
     # crates.io. Uses the public HTTP API (no cargo dependency).
     local crate="$1" version="$2"
     curl -sf -o /dev/null \
-        -H "User-Agent: truce-release-script/1.0 (https://github.com/truce-audio/truce)" \
+        -H "User-Agent: moose-release-script/1.0 (https://github.com/Matari-Audio/moose)" \
         "https://crates.io/api/v1/crates/$crate/$version" \
         2>/dev/null
 }
@@ -91,7 +91,7 @@ crate_exists_on_crates_io() {
     # first publish).
     local crate="$1"
     curl -sf -o /dev/null \
-        -H "User-Agent: truce-release-script/1.0 (https://github.com/truce-audio/truce)" \
+        -H "User-Agent: moose-release-script/1.0 (https://github.com/Matari-Audio/moose)" \
         "https://crates.io/api/v1/crates/$crate" \
         2>/dev/null
 }
@@ -129,7 +129,7 @@ fi
 DRIFT="$(awk -v want="$WS_VERSION" '
     /^\[workspace\.dependencies\]/ { in_deps = 1; next }
     in_deps && /^\[/ { in_deps = 0 }
-    in_deps && /^truce/ && /version *=/ && /path *=/ {
+    in_deps && /^moose/ && /version *=/ && /path *=/ {
         if (match($0, /version *= *"[^"]*"/)) {
             v = substr($0, RSTART, RLENGTH)
             sub(/^version *= *"/, "", v)
@@ -172,7 +172,7 @@ if git rev-parse --verify "$TAG" >/dev/null 2>&1; then
     fi
     echo "  already exists at HEAD; using it"
 else
-    git tag -a "$TAG" -m "truce $WS_VERSION"
+    git tag -a "$TAG" -m "moose $WS_VERSION"
     echo "  created"
 fi
 
@@ -213,7 +213,7 @@ publish_one() {
     local crate="$1"
     local workspace_dir="$2"
     local log delay attempts
-    log="$(mktemp -t truce-publish.XXXXXX)"
+    log="$(mktemp -t moose-publish.XXXXXX)"
     delay="$RATE_LIMIT_INITIAL_DELAY"
     attempts=0
 
@@ -306,7 +306,7 @@ if is_github_release_present "$TAG"; then
     echo "  already exists: $release_url"
 else
     gh release create "$TAG" \
-        --title "truce $WS_VERSION"
+        --title "moose $WS_VERSION"
 fi
 
 # ---------------------------------------------------------------------------
@@ -315,8 +315,8 @@ fi
 
 echo
 echo "Released $TAG."
-echo "  https://crates.io/crates/cargo-truce/$WS_VERSION"
+echo "  https://crates.io/crates/cargo-moose/$WS_VERSION"
 echo
 echo "Smoke-test from a clean install:"
-echo "  cargo install --force cargo-truce --version $WS_VERSION"
-echo "  cargo truce --help"
+echo "  cargo install --force cargo-moose --version $WS_VERSION"
+echo "  cargo moose --help"

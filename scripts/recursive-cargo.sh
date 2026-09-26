@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run `cargo <args>` in every workspace listed by truce-workspaces.sh
+# Run `cargo <args>` in every workspace listed by moose-workspaces.sh
 # (currently just the main workspace).
 #
 # Usage: recursive-cargo.sh <cargo-args>
 # Examples:
-#   recursive-cargo.sh build -p truce-example-gain
+#   recursive-cargo.sh build -p moose-example-gain
 #   recursive-cargo.sh test
 #   recursive-cargo.sh clippy --all-targets
 #
@@ -21,10 +21,10 @@ set -uo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/.." && pwd)"
 
-# shellcheck source=truce-workspaces.sh
-source "$script_dir/truce-workspaces.sh"
+# shellcheck source=moose-workspaces.sh
+source "$script_dir/moose-workspaces.sh"
 
-# Pick the cargo binary. On Windows the truce build must use the
+# Pick the cargo binary. On Windows the moose build must use the
 # Windows toolchain, so prefer `cargo.exe` whenever it's on PATH -
 # including under WSL, where bare `cargo` is the Linux toolchain that
 # can't build the Windows plug-ins. `cargo.exe` only
@@ -44,7 +44,7 @@ fi
 # color on when *our* own stdout is a real terminal (leave it off for a
 # redirected / piped run so files don't fill with escape codes).
 # `CARGO_TERM_COLOR` covers cargo + the rustc it drives; `CLICOLOR_FORCE`
-# covers clicolors-spec subcommands like cargo-truce. Respect either if
+# covers clicolors-spec subcommands like cargo-moose. Respect either if
 # the caller already set it.
 if [[ -t 1 ]]; then
     : "${CARGO_TERM_COLOR:=always}"
@@ -56,7 +56,7 @@ if [[ $# -eq 0 ]]; then
     cat >&2 <<EOF
 usage: $(basename "$0") <cargo-args>
 
-Runs 'cargo <args>' in every workspace listed by truce-workspaces.sh.
+Runs 'cargo <args>' in every workspace listed by moose-workspaces.sh.
 EOF
     exit 64
 fi
@@ -75,7 +75,7 @@ fi
 workspaces=()
 while IFS= read -r ws_path; do
     workspaces+=("$ws_path")
-done < <(truce_workspaces "$root_dir")
+done < <(moose_workspaces "$root_dir")
 
 overall_status=0
 for ws in "${workspaces[@]}"; do

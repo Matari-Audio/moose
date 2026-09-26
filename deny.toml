@@ -9,9 +9,9 @@ ignore = [
     "RUSTSEC-2024-0436", # paste - unmaintained (proc-macro, deep transitive)
     # quick-xml 0.39 DoS advisories (quadratic duplicate-attribute check;
     # unbounded NsReader namespace allocation). Rides in via plist <-
-    # cargo-truce, which never hits either affected path: plist parses
+    # cargo-moose, which never hits either affected path: plist parses
     # with the plain `Reader` (no `NsReader` / `NamespaceResolver`) and
-    # never calls `.attributes()`. cargo-truce also only parses local,
+    # never calls `.attributes()`. cargo-moose also only parses local,
     # self-generated plists, not untrusted XML. plist 1.9.0 pins
     # quick-xml ^0.39, so no upgrade exists; drop both ignores when a
     # plist release moves to quick-xml >= 0.41.
@@ -38,7 +38,7 @@ allow = [
     "Zlib",
     "OFL-1.1",         # epaint_default_fonts embeds OFL fonts (AND clause)
     "Ubuntu-font-1.0", # epaint_default_fonts embeds the Ubuntu font (AND clause)
-    # truce's own crates: the dual MIT/Apache grant plus the framework
+    # moose's own crates: the dual MIT/Apache grant plus the framework
     # rider, carried as a custom SPDX identifier (see LICENSE).
     "LicenseRef-TruceLicense-1.0",
 ]

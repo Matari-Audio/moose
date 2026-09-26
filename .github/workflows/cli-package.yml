@@ -1,4 +1,4 @@
-name: cargo truce package
+name: cargo moose package
 
 on:
   push:
@@ -16,12 +16,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Exercises `cargo truce package` end-to-end on each OS:
+# Exercises `cargo moose package` end-to-end on each OS:
 #   macOS   -> productbuild .pkg (codesigned ad-hoc, NOT notarized)
 #   Linux   -> tarball + install.sh
 #   Windows -> Inno Setup .exe (unsigned: no signtool creds in CI)
 #
-# Packages `truce-example-synth` (which ships six factory presets) so
+# Packages `moose-example-synth` (which ships six factory presets) so
 # each run also verifies preset packaging via
 # `scripts/ci/verify-package-presets.sh`: the installer must carry the
 # presets, and on Linux / Windows the script installs into a throwaway
@@ -45,21 +45,21 @@ jobs:
           key: cli-package-macos-14
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
       # --no-notarize: notarization needs a paid Apple Developer
       # account + an app-specific password / notary keychain profile,
       # neither of which is wired up in CI. The pkg still gets a
       # codesign pass against the ad-hoc identity (`-`).
-      - name: cargo truce package --formats clap,vst3,standalone --no-notarize
-        run: ./target/debug/cargo-truce package --formats clap,vst3,standalone --no-notarize -p truce-example-synth
+      - name: cargo moose package --formats clap,vst3,standalone --no-notarize
+        run: ./target/debug/cargo-moose package --formats clap,vst3,standalone --no-notarize -p moose-example-synth
 
       - name: Verify .pkg produced
         run: |
           set -e
           ls -la target/dist/
-          test -f target/dist/truce-example-synth-*-macos.pkg
+          test -f target/dist/moose-example-synth-*-macos.pkg
 
       # The synth ships factory presets; assert the .pkg carries them
       # (CLAP in-bundle + the dedicated VST3-Presets component).
@@ -69,7 +69,7 @@ jobs:
       - name: Upload .pkg artifact
         uses: actions/upload-artifact@v4
         with:
-          name: truce-example-synth-macos.pkg
+          name: moose-example-synth-macos.pkg
           path: target/dist/*.pkg
           if-no-files-found: error
           retention-days: 14
@@ -98,17 +98,17 @@ jobs:
             libasound2-dev libjack-jackd2-dev \
             libfontconfig1-dev libfreetype-dev
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
-      - name: cargo truce package --formats clap,vst3,standalone
-        run: ./target/debug/cargo-truce package --formats clap,vst3,standalone -p truce-example-synth
+      - name: cargo moose package --formats clap,vst3,standalone
+        run: ./target/debug/cargo-moose package --formats clap,vst3,standalone -p moose-example-synth
 
       - name: Verify tarball produced
         run: |
           set -e
           ls -la target/dist/
-          test -f target/dist/truce-example-synth-*-linux-*.tar.gz
+          test -f target/dist/moose-example-synth-*-linux-*.tar.gz
 
       # Assert the tarball carries CLAP/VST3 presets, then install
       # into a throwaway HOME with a pre-seeded user preset to prove the
@@ -119,7 +119,7 @@ jobs:
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
         with:
-          name: truce-example-synth-linux.tar.gz
+          name: moose-example-synth-linux.tar.gz
           path: target/dist/*.tar.gz
           if-no-files-found: error
           retention-days: 14
@@ -138,28 +138,28 @@ jobs:
           cache-bin: false
 
       # Inno Setup 6 ships ISCC.exe at `C:\Program Files (x86)\Inno
-      # Setup 6\` - exactly where `cargo-truce`'s `locate_iscc` looks
+      # Setup 6\` - exactly where `cargo-moose`'s `locate_iscc` looks
       # first. The choco package is the standard pre-installed source
       # on GHA windows-latest runners.
       - name: Install Inno Setup 6
         run: choco install innosetup --no-progress --yes
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
-      # No Authenticode signing: TRUCE_CERT_SHA1 / TRUCE_PFX_PATH /
-      # TRUCE_AZURE_ACCOUNT are unset, so `sign_files` short-circuits.
+      # No Authenticode signing: MOOSE_CERT_SHA1 / MOOSE_PFX_PATH /
+      # MOOSE_AZURE_ACCOUNT are unset, so `sign_files` short-circuits.
       # The installer comes out unsigned but valid.
-      - name: cargo truce package --formats clap,vst3,standalone
+      - name: cargo moose package --formats clap,vst3,standalone
         shell: bash
-        run: ./target/debug/cargo-truce.exe package --formats clap,vst3,standalone -p truce-example-synth
+        run: ./target/debug/cargo-moose.exe package --formats clap,vst3,standalone -p moose-example-synth
 
       - name: Verify installer produced
         shell: bash
         run: |
           set -e
           ls -la target/dist/
-          ls target/dist/truce-example-synth-*-windows.exe
+          ls target/dist/moose-example-synth-*-windows.exe
 
       # Silent per-user install with a pre-seeded user preset; assert
       # the VST3 factory presets land AND the user's preset survives.
@@ -170,7 +170,7 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: truce-example-synth-windows.exe
+          name: moose-example-synth-windows.exe
           path: target/dist/*.exe
           if-no-files-found: error
           retention-days: 14

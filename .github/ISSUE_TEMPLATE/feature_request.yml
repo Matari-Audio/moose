@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest a capability or improvement for truce or the cargo truce CLI.
+description: Suggest a capability or improvement for moose or the cargo moose CLI.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
@@ -29,7 +29,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: What you would like truce to do, if you have something in mind (CLI shape, API surface, behavior).
+      description: What you would like moose to do, if you have something in mind (CLI shape, API surface, behavior).
   - type: textarea
     id: alternatives
     attributes:
@@ -39,9 +39,9 @@ body:
     id: area
     attributes:
       label: Area
-      description: Which part of truce does this touch?
+      description: Which part of moose does this touch?
       options:
-        - cargo truce CLI (build / install / package / validate / ...)
+        - cargo moose CLI (build / install / package / validate / ...)
         - A plugin format (CLAP / VST3 / standalone)
         - Parameters / state
         - GUI / editor backend

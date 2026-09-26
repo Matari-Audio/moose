@@ -19,7 +19,7 @@ concurrency:
 # Builds the DSP-distinct example plugins with the `rt-paranoid` feature
 # and runs their `assert_no_audio_alloc` tests, so any allocation the audio
 # thread makes inside `process` fails the build. Also proves a freshly
-# `cargo truce new`-scaffolded plugin is allocation-free and that its
+# `cargo moose new`-scaffolded plugin is allocation-free and that its
 # scaffolded rt-paranoid wiring works.
 #
 # Runs on all three OSes: an audio-thread allocation can be platform-
@@ -86,18 +86,18 @@ jobs:
             libasound2-dev libjack-jackd2-dev \
             libfontconfig1-dev libfreetype-dev
 
-      - name: Build cargo-truce (its template wires in rt-paranoid)
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose (its template wires in rt-paranoid)
+        run: cargo build -p cargo-moose
 
       # Windows needs the `.exe` suffix; store the resolved path so every
       # later bash step uses the same string.
-      - name: Resolve cargo-truce path
+      - name: Resolve cargo-moose path
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "CARGO_TRUCE=$GITHUB_WORKSPACE/target/debug/cargo-truce.exe" >> "$GITHUB_ENV"
+            echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose.exe" >> "$GITHUB_ENV"
           else
-            echo "CARGO_TRUCE=$GITHUB_WORKSPACE/target/debug/cargo-truce" >> "$GITHUB_ENV"
+            echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose" >> "$GITHUB_ENV"
           fi
 
       - name: Scaffold a plugin
@@ -106,9 +106,9 @@ jobs:
           set -e
           mkdir -p "$RUNNER_TEMP/scaffold"
           cd "$RUNNER_TEMP/scaffold"
-          "$CARGO_TRUCE" new probe-fx --vendor Probe --vendor-id com.probe.test
+          "$CARGO_MOOSE" new probe-fx --vendor Probe --vendor-id com.probe.test
 
-      # Point the scaffolded git/registry truce deps at this checkout.
+      # Point the scaffolded git/registry moose deps at this checkout.
       # Shared with cli-scaffold.yml / cli-backcompat.yml; runs in the
       # default shell so `python3` + pathlib handle Windows paths.
       - name: Rewrite git deps to local paths
@@ -129,7 +129,7 @@ jobs:
           {
             echo ""
             echo "[dev-dependencies]"
-            echo "truce-test = { path = \"$ws/crates/truce-test\" }"
+            echo "moose-test = { path = \"$ws/crates/moose-test\" }"
           } >> Cargo.toml
           cat "$ws/scripts/ci/rt-paranoid-scaffold-test.rs" >> src/lib.rs
           cargo test --features rt-paranoid --lib

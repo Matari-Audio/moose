@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Post-publish smoke test: force-install cargo-truce from crates.io,
+# Post-publish smoke test: force-install cargo-moose from crates.io,
 # scaffold a default plugin in /tmp, build + launch the standalone.
 # Run under bash (Git Bash / `shell: bash` on Windows).
-# Usage: post-publish-smoke.sh [cargo-truce-version]   env: RUN_SECS=N (CI auto-close), KEEP=1
+# Usage: post-publish-smoke.sh [cargo-moose-version]   env: RUN_SECS=N (CI auto-close), KEEP=1
 set -euo pipefail
 
 VERSION="${1:-}"
@@ -18,7 +18,7 @@ case "$(uname -s)" in
 esac
 command -v cargo >/dev/null || die "cargo not on PATH"
 
-WORK="$(mktemp -d /tmp/truce-smoke.XXXXXX)"
+WORK="$(mktemp -d /tmp/moose-smoke.XXXXXX)"
 APP_PID=""
 cleanup() {
   [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null || true
@@ -28,14 +28,14 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. force-install the published CLI
-args=(cargo-truce --force --locked)
+args=(cargo-moose --force --locked)
 [ -n "$VERSION" ] && args+=(--version "$VERSION")
 cargo install "${args[@]}"
-cargo truce --help >/dev/null || die "'cargo truce' not runnable"
-ok "installed cargo-truce"
+cargo moose --help >/dev/null || die "'cargo moose' not runnable"
+ok "installed cargo-moose"
 
 # 2. scaffold defaults
-( cd "$WORK" && cargo truce new smoketest )
+( cd "$WORK" && cargo moose new smoketest )
 PROJ="$WORK/smoketest"
 [ -f "$PROJ/Cargo.toml" ] || die "scaffold produced no Cargo.toml"
 ok "scaffolded $PROJ"

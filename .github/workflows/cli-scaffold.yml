@@ -1,4 +1,4 @@
-name: cargo truce new + install + validate + package + uninstall
+name: cargo moose new + install + validate + package + uninstall
 
 on:
   push:
@@ -16,10 +16,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Round-trips `cargo truce new` through the install / validate /
+# Round-trips `cargo moose new` through the install / validate /
 # package / uninstall pipeline on each OS, for each scaffold shape.
 # Catches regressions where the template produces a buildable plugin
-# but one of the downstream packagers chokes on its truce.toml /
+# but one of the downstream packagers chokes on its moose.toml /
 # Cargo.toml shape (e.g. workspace-mode bundle-id derivation,
 # instrument vs effect category routing). The `pure` / `stateful`
 # shapes additionally guard that both statefulness variants of the
@@ -88,8 +88,8 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: choco install innosetup --no-progress --yes
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
       # ─────────────────────────────────────────────────────────────────
       # Validators - same cache shape as cli-install.yml so the binaries
@@ -168,13 +168,13 @@ jobs:
       # and Linux don't. Stored in $GITHUB_ENV so every later `bash` step
       # uses the same string.
       # ─────────────────────────────────────────────────────────────────
-      - name: Resolve cargo-truce path
+      - name: Resolve cargo-moose path
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "CARGO_TRUCE=$GITHUB_WORKSPACE/target/debug/cargo-truce.exe" >> "$GITHUB_ENV"
+            echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose.exe" >> "$GITHUB_ENV"
           else
-            echo "CARGO_TRUCE=$GITHUB_WORKSPACE/target/debug/cargo-truce" >> "$GITHUB_ENV"
+            echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose" >> "$GITHUB_ENV"
           fi
 
       - name: Scaffold (${{ matrix.shape.id }})
@@ -183,13 +183,13 @@ jobs:
           set -e
           mkdir -p "$RUNNER_TEMP/scaffold"
           cd "$RUNNER_TEMP/scaffold"
-          "$CARGO_TRUCE" new ${{ matrix.shape.new_args }}
+          "$CARGO_MOOSE" new ${{ matrix.shape.new_args }}
           ls -la "${{ matrix.shape.project_dir }}"
 
-      # The scaffold templates pin `truce = { git = "...", tag = "..." }`
+      # The scaffold templates pin `moose = { git = "...", tag = "..." }`
       # so generated projects build against a published release. In CI
       # we want them to build against THIS commit instead, so rewrite
-      # every git ref to a local `path = ...` pointing at the truce
+      # every git ref to a local `path = ...` pointing at the moose
       # crates checked out in $GITHUB_WORKSPACE. Shared with
       # `cli-backcompat.yml`.
       - name: Rewrite git deps to local paths
@@ -210,20 +210,20 @@ jobs:
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
         run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic
 
-      - name: cargo truce install --user
+      - name: cargo moose install --user
         shell: bash
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
-        run: $CARGO_TRUCE install --user --clap --vst3
+        run: $CARGO_MOOSE install --user --clap --vst3
 
-      - name: cargo truce validate --clap --pluginval
+      - name: cargo moose validate --clap --pluginval
         shell: bash
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
         run: |
           set -e -o pipefail
           if [ "${{ runner.os }}" = "Linux" ]; then
-            xvfb-run -a $CARGO_TRUCE validate --clap --pluginval 2>&1 | tee validate.log
+            xvfb-run -a $CARGO_MOOSE validate --clap --pluginval 2>&1 | tee validate.log
           else
-            $CARGO_TRUCE validate --clap --pluginval 2>&1 | tee validate.log
+            $CARGO_MOOSE validate --clap --pluginval 2>&1 | tee validate.log
           fi
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step - failing"
@@ -234,19 +234,19 @@ jobs:
       # (no credentials in CI). Windows package goes through Inno Setup
       # installed above. `--formats` is constrained to CLAP + VST3 -
       # the plugin formats the scaffold templates enable by default.
-      - name: cargo truce package
+      - name: cargo moose package
         shell: bash
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
         run: |
           set -e
           if [ "${{ runner.os }}" = "macOS" ]; then
-            $CARGO_TRUCE package --formats clap,vst3 --no-notarize
+            $CARGO_MOOSE package --formats clap,vst3 --no-notarize
           else
-            $CARGO_TRUCE package --formats clap,vst3
+            $CARGO_MOOSE package --formats clap,vst3
           fi
           ls -la target/dist/
 
-      - name: cargo truce uninstall --user --yes
+      - name: cargo moose uninstall --user --yes
         shell: bash
         working-directory: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
-        run: $CARGO_TRUCE uninstall --user --yes
+        run: $CARGO_MOOSE uninstall --user --yes

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# topo.py — emit truce workspace crates in publish order, one per line.
+# topo.py — emit moose workspace crates in publish order, one per line.
 #
 # Filter: workspace members under `crates/` (examples are scaffolded
 # demonstrations, not published, and crates that opt out via
@@ -98,15 +98,15 @@ main_pkgs = workspace_members(path_filter="/crates/")
 main_order = topo_sort(main_pkgs)
 
 # Force the ordering of user-selectable crates so the most consumer-
-# facing surfaces (cargo-truce, truce, format wrappers) come last and
+# facing surfaces (cargo-moose, moose, format wrappers) come last and
 # fail loudly if a transitive dep didn't make it onto the registry.
 forced_order = [
-    "truce-simd",
-    "truce-standalone",
-    "truce-clap",
-    "truce-vst3",
-    "truce",
-    "cargo-truce",
+    "moose-simd",
+    "moose-standalone",
+    "moose-clap",
+    "moose-vst3",
+    "moose",
+    "cargo-moose",
 ]
 
 missing_forced = [name for name in forced_order if name not in main_order]

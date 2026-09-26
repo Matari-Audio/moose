@@ -1,4 +1,4 @@
-# Contributing to truce
+# Contributing to moose
 
 Patches, bug reports, and feature requests are welcome. Opening a
 PR accepts the [contributor grant](#code-submissions-and-the-dual-license-contributor-grant)
@@ -11,10 +11,10 @@ in the sections below.
 
 ### We do not break userspace
 
-Within a major version, a plugin built against truce `N.x` keeps
+Within a major version, a plugin built against moose `N.x` keeps
 compiling and running against every later `N.y`, and its users'
 sessions and presets keep loading. "Userspace" is more than the Rust
-API: the prelude / `truce::plugin!` / derive surface, the `truce.toml`
+API: the prelude / `moose::plugin!` / derive surface, the `moose.toml`
 schema, the state-envelope wire format and everything plugin identity
 derives from (`bundle_id`, `clap_id`, `vst3_id`, the envelope hash),
 and host-visible behavior (parameter ids, preset containers, MIDI
@@ -30,20 +30,20 @@ say so loudly in the PR.
 ### All or nothing
 
 A new capability lands in every format that can carry it, in the same
-change - a CLAP-only feature is a discrepancy truce created, and
+change - a CLAP-only feature is a discrepancy moose created, and
 plugin authors inherit it invisibly. Real format gaps are fine: bridge
 them where a faithful translation exists, document and log a skip
-where it doesn't. What is never acceptable is the same truce event or
+where it doesn't. What is never acceptable is the same moose event or
 config meaning different things per format - same scaling, ranges, and
-edge cases everywhere, with shared semantics in `truce-core` helpers
+edge cases everywhere, with shared semantics in `moose-core` helpers
 rather than re-derived per wrapper (duplicated constants drift). When
 prioritizing, all-format work beats another single-format capability.
 
 ### Every feature has an example
 
 Every feature lands with an example, and the example is how it gets
-manually verified before merge: `cargo truce run` it, play it, hear
-it - on top of unit tests and sample-accurate `truce_test::driver!`
+manually verified before merge: `cargo moose run` it, play it, hear
+it - on top of unit tests and sample-accurate `moose_test::driver!`
 scripts in the example crate's tests (no host needed), not instead
 of them. Examples are canonical reference code that plugin authors copy,
 so each must be a small but real plugin demonstrating the feature's
@@ -103,7 +103,7 @@ before merge.
 - New crates / modules need rustdoc-warning-free `cargo doc
   --workspace --no-deps`.
 - Layout changes regenerate the screenshot baselines with
-  `cargo truce screenshot -p <crate> --out <path>` (the pixel diff
+  `cargo moose screenshot -p <crate> --out <path>` (the pixel diff
   is strict).
 - Comments explain **why**, not what. Don't reference past audits or
   PRs by name — those rot.
@@ -121,16 +121,16 @@ version.
 
 ## Code submissions and the dual-license contributor grant
 
-truce ships under the dual license in `LICENSE`:
+moose ships under the dual license in `LICENSE`:
 
 - The Author License — **Apache License, Version 2.0**
   (`LICENSE-APACHE`) — granted freely to plug-in authors, end-user
   audio software, **and** free, OSI-licensed, non-commercial
-  framework / SDK / developer-tool projects built on top of truce
+  framework / SDK / developer-tool projects built on top of moose
   (the Section 2.1 exemption).
 - A Framework License granted only by separate written permission
   from the project maintainers, for **commercial** audio-plug-in
-  frameworks built on truce — anything sold, subscription-gated,
+  frameworks built on moose — anything sold, subscription-gated,
   dual-licensed commercially, or bundled into a paid product.
 
 For the dual-license model to work, code you contribute needs to be
@@ -142,14 +142,14 @@ to this repository, you agree that:**
 1. You wrote the contribution yourself, or you have the legal right
    to submit it under the terms below.
 
-2. Your contribution is licensed to the truce project and to all
+2. Your contribution is licensed to the moose project and to all
    downstream recipients under the **Apache License, Version 2.0**
    (`LICENSE-APACHE`). This is identical to the standard "Inbound =
    Outbound" Apache 2.0 contribution rule per the Apache License
    §5 — your patch flows to users on the same terms as the rest of
    the project.
 
-3. You grant the truce project the additional right to include your
+3. You grant the moose project the additional right to include your
    contribution under any Framework License the project grants under
    Section 2 of `LICENSE`, on whatever terms the project negotiates.
 

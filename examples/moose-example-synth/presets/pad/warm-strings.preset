@@ -1,0 +1,15 @@
+uuid = "e4b7a8d2-19c3-4f60-b5d8-7a2c91e0f655"
+name = "Warm Strings"
+author = "Moose"
+comment = "Slow dark saw pad"
+tags = ["pad", "warm", "slow"]
+
+[params]
+waveform = 1   # saw
+cutoff = 2200.0   # Hz
+resonance = 0.1
+attack = 0.6   # s
+decay = 0.3   # s
+sustain = 0.85
+release = 1.8   # s
+volume = -8.0   # dB

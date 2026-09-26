@@ -7,25 +7,25 @@
 # Usage:
 #   scripts/release/upload-dist.sh
 #
-# Run on each platform after `cargo truce package` has populated
+# Run on each platform after `cargo moose package` has populated
 # `target/dist/`:
 #
 #   # macOS
-#   cargo truce package          # produces target/dist/*.pkg
+#   cargo moose package          # produces target/dist/*.pkg
 #   upload-dist.sh
 #
 #   # Windows (Git Bash / WSL)
-#   cargo truce package          # produces target/dist/*.exe
+#   cargo moose package          # produces target/dist/*.exe
 #   upload-dist.sh
 #
 #   # Linux
-#   cargo truce package          # produces target/dist/*.tar.gz
+#   cargo moose package          # produces target/dist/*.tar.gz
 #   upload-dist.sh
 #
 # GitHub release assets live in a flat namespace — there's no
-# per-OS directory at the API level. `cargo truce package` already
-# bakes the host OS into every filename (`Truce
-# Gain-0.38.1-macos.pkg`, `Truce Gain-0.38.1-windows.exe`, etc.),
+# per-OS directory at the API level. `cargo moose package` already
+# bakes the host OS into every filename (`Moose
+# Gain-0.38.1-macos.pkg`, `Moose Gain-0.38.1-windows.exe`, etc.),
 # so uploading files as-is keeps them sortable and unambiguous on
 # the release page. Running this on every platform sequentially
 # accumulates a full per-OS set against the same tag.
@@ -44,17 +44,17 @@
 #   - The GitHub release `vX.Y.Z` already exists (run
 #     `scripts/release/release.sh` first).
 #   - `gh auth login` already run.
-#   - `target/dist/` populated by `cargo truce package` (this
+#   - `target/dist/` populated by `cargo moose package` (this
 #     script does not run package itself).
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
-TRUCE_ROOT="$PWD"
+MOOSE_ROOT="$PWD"
 
 # ----------------------------------------------------------------------------
 # Detect host OS (only used in log output — filenames already carry
-# the OS via `cargo truce package`'s naming)
+# the OS via `cargo moose package`'s naming)
 # ----------------------------------------------------------------------------
 
 case "$(uname -s)" in
@@ -77,7 +77,7 @@ WS_VERSION="$(awk -F\" '
 ' Cargo.toml)"
 
 if [[ -z "$WS_VERSION" ]]; then
-    echo "Error: could not read [workspace.package].version from $TRUCE_ROOT/Cargo.toml" >&2
+    echo "Error: could not read [workspace.package].version from $MOOSE_ROOT/Cargo.toml" >&2
     exit 1
 fi
 
@@ -87,7 +87,7 @@ TAG="v$WS_VERSION"
 # Verify dist contents + release existence
 # ----------------------------------------------------------------------------
 
-# Resolve a workspace's actual dist dir. `cargo truce package` writes to
+# Resolve a workspace's actual dist dir. `cargo moose package` writes to
 # cargo's real target directory, which honors `CARGO_TARGET_DIR` and a
 # `.cargo/config.toml` `target-dir` and is NOT always `<ws>/target`, so
 # ask cargo rather than assume. `python3` parses the JSON (it unescapes
@@ -107,7 +107,7 @@ workspace_dist_dir() {
     fi
 }
 
-# Workspace roots to scan. Keep in sync with scripts/truce-workspaces.sh.
+# Workspace roots to scan. Keep in sync with scripts/moose-workspaces.sh.
 # A dist dir that doesn't exist (workspace not packaged on this run /
 # platform) contributes nothing under `nullglob` rather than erroring.
 WORKSPACES=(
@@ -128,8 +128,8 @@ shopt -u nullglob
 
 if [[ ${#dist_files[@]} -eq 0 ]]; then
     echo "Error: no artifacts found in any workspace's target/dist." >&2
-    echo "       Scanned (relative to $TRUCE_ROOT): ${DIST_DIRS[*]}" >&2
-    echo "       Run \`cargo truce package\` (or scripts/recursive-cargo-truce.sh package) first." >&2
+    echo "       Scanned (relative to $MOOSE_ROOT): ${DIST_DIRS[*]}" >&2
+    echo "       Run \`cargo moose package\` (or scripts/recursive-cargo-moose.sh package) first." >&2
     exit 1
 fi
 

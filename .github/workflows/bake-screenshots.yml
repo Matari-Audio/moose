@@ -9,10 +9,10 @@ name: Bake screenshots
 # artifact, replace the references, commit. Drift only re-appears if
 # GHA upgrades the runner image.
 #
-# The render scale is fixed at `truce_core::screenshot::DEFAULT_SCREENSHOT_SCALE`
+# The render scale is fixed at `moose_core::screenshot::DEFAULT_SCREENSHOT_SCALE`
 # (currently 2.0) regardless of the runner's reported display DPI.
 # Tests that opt into a custom scale via `ScreenshotTest::scale` need
-# a separate manual bake — `cargo run -p cargo-truce -- screenshot
+# a separate manual bake — `cargo run -p cargo-moose -- screenshot
 # --scale <x> --out …` — since this workflow doesn't enumerate per-test
 # overrides.
 
@@ -38,40 +38,40 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Keep this list in sync with truce.toml's [[plugin]] entries that
+  # Keep this list in sync with moose.toml's [[plugin]] entries that
   # have screenshot tests under examples/<crate>/src/lib.rs. The
   # `_linux` / `_macos` / `_windows` suffix on the output filename
   # matches the convention enforced by each example's
   # `gui_screenshot_<os>` test.
   EXAMPLE_CRATES: >-
-    truce-example-gain
-    truce-example-block-gain
-    truce-example-synth
-    truce-example-eq
-    truce-example-stereo-utility
-    truce-example-block-saturate
-    truce-example-block-drywet
-    truce-example-block-gate
-    truce-example-block-widen
-    truce-example-block-surround-meter
-    truce-example-gain-egui
-    truce-example-gain-egui-aspect
-    truce-example-arpeggio
-    truce-example-tremolo
-    truce-example-state
-    truce-example-fundsp-reverb-worker
-    truce-example-fundsp-reverb-simple
-    truce-example-transpose
-    truce-example-gui-zoo
-    truce-example-gui-zoo-egui
-    truce-example-dasp-bitcrusher
-    truce-example-envelope
-    truce-example-chord
-    truce-example-cc-filter
-    truce-example-mpe-spreader
-    truce-example-sysex-echo
-    truce-example-mpe-synth
-    truce-example-multiport
+    moose-example-gain
+    moose-example-block-gain
+    moose-example-synth
+    moose-example-eq
+    moose-example-stereo-utility
+    moose-example-block-saturate
+    moose-example-block-drywet
+    moose-example-block-gate
+    moose-example-block-widen
+    moose-example-block-surround-meter
+    moose-example-gain-egui
+    moose-example-gain-egui-aspect
+    moose-example-arpeggio
+    moose-example-tremolo
+    moose-example-state
+    moose-example-fundsp-reverb-worker
+    moose-example-fundsp-reverb-simple
+    moose-example-transpose
+    moose-example-gui-zoo
+    moose-example-gui-zoo-egui
+    moose-example-dasp-bitcrusher
+    moose-example-envelope
+    moose-example-chord
+    moose-example-cc-filter
+    moose-example-mpe-spreader
+    moose-example-sysex-echo
+    moose-example-mpe-synth
+    moose-example-multiport
 
 jobs:
   linux:
@@ -106,18 +106,18 @@ jobs:
             libasound2-dev libjack-jackd2-dev \
             libfontconfig1-dev libfreetype-dev
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose --release
 
       - name: Bake screenshots
         run: |
           set -euo pipefail
           for crate in $EXAMPLE_CRATES; do
-            short="${crate#truce-example-}"
+            short="${crate#moose-example-}"
             short="${short//-/_}"
             out="examples/${crate}/screenshots/${short}_default_linux.png"
             echo "::group::Baking $out"
-            ./target/release/cargo-truce screenshot -p "$crate" --out "$out"
+            ./target/release/cargo-moose screenshot -p "$crate" --out "$out"
             echo "::endgroup::"
           done
 
@@ -160,18 +160,18 @@ jobs:
           key: bake-macos-14
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose --release
 
       - name: Bake screenshots
         run: |
           set -euo pipefail
           for crate in $EXAMPLE_CRATES; do
-            short="${crate#truce-example-}"
+            short="${crate#moose-example-}"
             short="${short//-/_}"
             out="examples/${crate}/screenshots/${short}_default_macos.png"
             echo "::group::Baking $out"
-            ./target/release/cargo-truce screenshot -p "$crate" --out "$out"
+            ./target/release/cargo-moose screenshot -p "$crate" --out "$out"
             echo "::endgroup::"
           done
 
@@ -201,8 +201,8 @@ jobs:
           key: bake-windows-latest
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce --release
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose --release
 
       - name: Bake screenshots
         shell: pwsh
@@ -210,10 +210,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $crates = $env:EXAMPLE_CRATES -split '\s+' | Where-Object { $_ }
           foreach ($crate in $crates) {
-            $short = ($crate -replace '^truce-example-', '') -replace '-', '_'
+            $short = ($crate -replace '^moose-example-', '') -replace '-', '_'
             $out = "examples/$crate/screenshots/${short}_default_windows.png"
             Write-Host "::group::Baking $out"
-            & ./target/release/cargo-truce.exe screenshot -p $crate --out $out
+            & ./target/release/cargo-moose.exe screenshot -p $crate --out $out
             if ($LASTEXITCODE -ne 0) { throw "screenshot failed for $crate (exit $LASTEXITCODE)" }
             Write-Host "::endgroup::"
           }

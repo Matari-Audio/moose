@@ -15,17 +15,17 @@ set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/.." && pwd)"
-# shellcheck source=truce-workspaces.sh
-source "$script_dir/truce-workspaces.sh"
+# shellcheck source=moose-workspaces.sh
+source "$script_dir/moose-workspaces.sh"
 
 # The audit sweep also covers the fuzz workspace (committed
 # Cargo.lock, real third-party deps like libfuzzer-sys). It lives in
 # truce-audio/truce-fuzz-tests, mounted at fuzz/ - CI checks it out
 # there, locally it's an optional clone - so audit it when present.
-# Kept out of `truce_workspaces` because the build/release scripts
+# Kept out of `moose_workspaces` because the build/release scripts
 # that share that list have no business in fuzz/.
 audit_workspaces() {
-    truce_workspaces "$1"
+    moose_workspaces "$1"
     if [[ -f "$1/fuzz/Cargo.toml" ]]; then
         printf '%s\n' "$1/fuzz"
     else

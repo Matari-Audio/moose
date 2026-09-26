@@ -1,0 +1,15 @@
+[package]
+name = "moose-params"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Parameter system for the moose framework"
+
+[dependencies]
+bitflags = "2"
+
+[lints]
+workspace = true

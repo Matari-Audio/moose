@@ -1,0 +1,35 @@
+[package]
+name = "moose-loader-tests"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Integration tests for moose-loader. Lives in its own crate so the test deps (umbrella `moose` + `moose-derive`) can be normal deps without forming a `moose <-> moose-loader` cycle in cargo metadata."
+# Internal-only — never published. The `release.sh` filter excludes
+# `publish = false` crates from the workspace publish set.
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+moose = { workspace = true }
+moose-core = { workspace = true }
+moose-derive = { workspace = true }
+moose-gui = { workspace = true }
+moose-loader = { workspace = true }
+moose-params = { workspace = true }
+# Shared params / state / logic for the reload-transition fixtures. A
+# dev-dep (not a build-graph edge to the cdylibs, which expose no rlib)
+# so the test can build `FxParams` for the shared params pointer.
+reload-fixture-common = { path = "fixtures/reload-fixture-common" }
+
+[features]
+# Mirror `moose-loader`'s `shell` feature so `#[cfg(feature = "shell")]`
+# gates inside the integration tests stay consistent with the gates
+# in `moose-loader` itself. The dylib-loading tests (`loader_test`,
+# `graceful_degradation`) opt in by enabling this feature.
+shell = ["moose-loader/shell"]
+
+[lints]
+workspace = true

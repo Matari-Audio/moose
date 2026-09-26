@@ -1,4 +1,4 @@
-name: cargo truce install + validate
+name: cargo moose install + validate
 
 on:
   push:
@@ -16,8 +16,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Each OS job exercises `cargo truce install` end-to-end and then
-# runs `cargo truce validate` against the freshly installed bundles -
+# Each OS job exercises `cargo moose install` end-to-end and then
+# runs `cargo moose validate` against the freshly installed bundles -
 # validate needs the plugin in the host's scan path, so the order is
 # fixed (install first, validate second). The three OS jobs run in
 # parallel.
@@ -35,11 +35,11 @@ jobs:
           key: cli-install-macos-14
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
-      - name: cargo truce doctor
-        run: ./target/debug/cargo-truce doctor
+      - name: cargo moose doctor
+        run: ./target/debug/cargo-moose doctor
 
       - name: Cache pluginval
         id: cache-pluginval
@@ -73,25 +73,25 @@ jobs:
 
       # System scope: CI macOS runners have passwordless sudo, so
       # --system exercises the /Library/Audio/Plug-Ins/ install path.
-      - name: cargo truce install --system --clap --vst3
-        run: sudo ./target/debug/cargo-truce install --system --clap --vst3 -p truce-example-gain
+      - name: cargo moose install --system --clap --vst3
+        run: sudo ./target/debug/cargo-moose install --system --clap --vst3 -p moose-example-gain
 
       - name: Verify installed bundle filetypes
         run: |
           set -e
           # CLAP / VST3 bundle binaries must be MH_BUNDLE.
-          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3"; do
-            otool -hv "/Library/Audio/Plug-Ins/$fmt/Contents/MacOS/Truce Gain" | tee /tmp/hdr.txt
+          for fmt in "CLAP/Moose Gain.clap" "VST3/Moose Gain.vst3"; do
+            otool -hv "/Library/Audio/Plug-Ins/$fmt/Contents/MacOS/Moose Gain" | tee /tmp/hdr.txt
             grep -q "BUNDLE" /tmp/hdr.txt || { echo "::error::$fmt expected MH_BUNDLE"; exit 1; }
           done
 
-      - name: cargo truce status
-        run: ./target/debug/cargo-truce status
+      - name: cargo moose status
+        run: ./target/debug/cargo-moose status
 
-      - name: cargo truce validate --clap --pluginval
+      - name: cargo moose validate --clap --pluginval
         run: |
           set -e -o pipefail
-          ./target/debug/cargo-truce validate --clap --pluginval -p truce-example-gain 2>&1 | tee validate.log
+          ./target/debug/cargo-moose validate --clap --pluginval -p moose-example-gain 2>&1 | tee validate.log
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step - failing"
             exit 1
@@ -101,13 +101,13 @@ jobs:
       # confirm nothing is left behind. `--yes` bypasses the
       # confirmation prompt; system scope needs sudo to remove from
       # /Library/Audio/Plug-Ins/.
-      - name: cargo truce uninstall --system --yes
-        run: sudo ./target/debug/cargo-truce uninstall --system --yes -p truce-example-gain
+      - name: cargo moose uninstall --system --yes
+        run: sudo ./target/debug/cargo-moose uninstall --system --yes -p moose-example-gain
 
       - name: Verify nothing left behind
         run: |
           set -e
-          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3"; do
+          for fmt in "CLAP/Moose Gain.clap" "VST3/Moose Gain.vst3"; do
             if [ -e "/Library/Audio/Plug-Ins/$fmt" ]; then
               echo "::error::uninstall left $fmt behind"
               exit 1
@@ -140,11 +140,11 @@ jobs:
             libfontconfig1-dev libfreetype-dev \
             xvfb
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
-      - name: cargo truce doctor
-        run: ./target/debug/cargo-truce doctor
+      - name: cargo moose doctor
+        run: ./target/debug/cargo-moose doctor
 
       - name: Cache pluginval
         id: cache-pluginval
@@ -181,8 +181,8 @@ jobs:
           command -v clap-validator
           command -v pluginval
 
-      - name: cargo truce install --clap --vst3
-        run: ./target/debug/cargo-truce install --user --clap --vst3 -p truce-example-gain
+      - name: cargo moose install --clap --vst3
+        run: ./target/debug/cargo-moose install --user --clap --vst3 -p moose-example-gain
 
       - name: Verify installed bundles
         run: |
@@ -190,22 +190,22 @@ jobs:
           ls -la "$HOME/.clap/"
           ls -la "$HOME/.vst3/"
 
-      - name: cargo truce validate --clap --pluginval
+      - name: cargo moose validate --clap --pluginval
         run: |
           set -e -o pipefail
-          xvfb-run -a ./target/debug/cargo-truce validate --clap --pluginval -p truce-example-gain 2>&1 | tee validate.log
+          xvfb-run -a ./target/debug/cargo-moose validate --clap --pluginval -p moose-example-gain 2>&1 | tee validate.log
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step - failing"
             exit 1
           fi
 
-      - name: cargo truce uninstall --user --yes
-        run: ./target/debug/cargo-truce uninstall --user --yes -p truce-example-gain
+      - name: cargo moose uninstall --user --yes
+        run: ./target/debug/cargo-moose uninstall --user --yes -p moose-example-gain
 
       - name: Verify nothing left behind
         run: |
           set -e
-          for fmt in ".clap/Truce Gain.clap" ".vst3/Truce Gain.vst3"; do
+          for fmt in ".clap/Moose Gain.clap" ".vst3/Moose Gain.vst3"; do
             if [ -e "$HOME/$fmt" ]; then
               echo "::error::uninstall left $fmt behind"
               exit 1
@@ -225,12 +225,12 @@ jobs:
           key: cli-install-windows-latest
           cache-bin: false
 
-      - name: Build cargo-truce
-        run: cargo build -p cargo-truce
+      - name: Build cargo-moose
+        run: cargo build -p cargo-moose
 
-      - name: cargo truce doctor
+      - name: cargo moose doctor
         shell: bash
-        run: ./target/debug/cargo-truce.exe doctor
+        run: ./target/debug/cargo-moose.exe doctor
 
       - name: Cache pluginval
         id: cache-pluginval
@@ -269,9 +269,9 @@ jobs:
           command -v clap-validator
           command -v pluginval
 
-      - name: cargo truce install --clap --vst3
+      - name: cargo moose install --clap --vst3
         shell: bash
-        run: ./target/debug/cargo-truce.exe install --user --clap --vst3 -p truce-example-gain
+        run: ./target/debug/cargo-moose.exe install --user --clap --vst3 -p moose-example-gain
 
       - name: Verify installed bundles
         shell: bash
@@ -280,25 +280,25 @@ jobs:
           ls -la "$LOCALAPPDATA/Programs/Common/CLAP/"
           ls -la "$LOCALAPPDATA/Programs/Common/VST3/"
 
-      - name: cargo truce validate --clap --pluginval
+      - name: cargo moose validate --clap --pluginval
         shell: bash
         run: |
           set -e -o pipefail
-          ./target/debug/cargo-truce.exe validate --clap --pluginval -p truce-example-gain 2>&1 | tee validate.log
+          ./target/debug/cargo-moose.exe validate --clap --pluginval -p moose-example-gain 2>&1 | tee validate.log
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step - failing"
             exit 1
           fi
 
-      - name: cargo truce uninstall --user --yes
+      - name: cargo moose uninstall --user --yes
         shell: bash
-        run: ./target/debug/cargo-truce.exe uninstall --user --yes -p truce-example-gain
+        run: ./target/debug/cargo-moose.exe uninstall --user --yes -p moose-example-gain
 
       - name: Verify nothing left behind
         shell: bash
         run: |
           set -e
-          for fmt in "CLAP/Truce Gain.clap" "VST3/Truce Gain.vst3"; do
+          for fmt in "CLAP/Moose Gain.clap" "VST3/Moose Gain.vst3"; do
             if [ -e "$LOCALAPPDATA/Programs/Common/$fmt" ]; then
               echo "::error::uninstall left $fmt behind"
               exit 1

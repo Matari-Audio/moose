@@ -107,7 +107,7 @@ sed_inplace() {
 
 # Every occurrence of the version string in Cargo.toml updates in
 # one pass: `[workspace.package].version` (source of truth) plus the
-# `version = "X.Y.Z"` field on every internal `truce-*` entry in
+# `version = "X.Y.Z"` field on every internal `moose-*` entry in
 # `[workspace.dependencies]` (load-bearing for crates.io publish,
 # since cargo strips `path` and embeds the registry version). The
 # global sed catches all of them — release.sh re-verifies the lot.

@@ -5,20 +5,20 @@
 # headless screenshot tests miss. Run on the NEWEST macOS — this was an
 # OS-behaviour regression (AppKit isa-swizzling the view), so OS coverage is
 # the point; it won't reproduce on an image whose AppKit doesn't swizzle.
-# Usage: gui-window-test.sh [package]   (default: truce-example-gain)
+# Usage: gui-window-test.sh [package]   (default: moose-example-gain)
 set -euo pipefail
 
 [ "$(uname -s)" = Darwin ] || { echo "macOS only; skipping"; exit 0; }
 
 SELF="$(cd "$(dirname "$0")" && pwd)"
-TRUCE_DIR="$(cd "$SELF/.." && pwd)"
-PKG="${1:-truce-example-gain}"
+MOOSE_DIR="$(cd "$SELF/.." && pwd)"
+PKG="${1:-moose-example-gain}"
 ok()  { printf '[ OK ] %s\n' "$*"; }
 die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
-cd "$TRUCE_DIR"
+cd "$MOOSE_DIR"
 cargo build --release -p "$PKG" --no-default-features --features standalone
-BIN="$TRUCE_DIR/target/release/${PKG}-standalone"
+BIN="$MOOSE_DIR/target/release/${PKG}-standalone"
 [ -x "$BIN" ] || die "no standalone binary at $BIN"
 
 LOG="$(mktemp)"

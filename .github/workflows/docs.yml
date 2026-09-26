@@ -53,9 +53,9 @@ jobs:
       - name: cargo doc
         run: cargo doc --workspace --no-deps
 
-      - name: redirect index.html → truce
+      - name: redirect index.html → moose
         if: github.event_name != 'pull_request'
-        run: echo '<meta http-equiv="refresh" content="0; url=truce/">' > target/doc/index.html
+        run: echo '<meta http-equiv="refresh" content="0; url=moose/">' > target/doc/index.html
 
       - uses: actions/configure-pages@v5
         if: github.event_name != 'pull_request'
