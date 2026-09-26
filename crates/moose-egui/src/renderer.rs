@@ -46,7 +46,7 @@ fn editor_present_mode() -> wgpu::PresentMode {
 }
 
 impl EguiRenderer {
-    /// Create from a baseview `Window` by bridging its rwh 0.5 handle
+    /// Create from a baseview window by handing its rwh 0.6 handle
     /// to wgpu's rwh 0.6 via `SurfaceTargetUnsafe::RawHandle`.
     ///
     /// macOS / Linux only: on Windows the renderer is built and owned
@@ -59,7 +59,7 @@ impl EguiRenderer {
     #[cfg(not(any(target_os = "ios", target_os = "windows")))]
     #[must_use]
     pub unsafe fn from_window(
-        window: &baseview::Window,
+        window: &baseview::WindowContext,
         width: u32,
         height: u32,
         device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,

@@ -55,7 +55,7 @@ pub struct BuiltinEditor<P: Params> {
     /// Active baseview window handle for the cpu-path `Editor`
     /// impl. Only meaningful when `cpu` is on.
     #[cfg(feature = "cpu")]
-    window: Option<baseview::WindowHandle>,
+    window: Option<crate::window::EditorWindow>,
     /// Weak-ish handle to the blit backend the window-handler
     /// materializes. The editor keeps the canonical `Arc` and the
     /// handler gets a clone. On close we take the `Option` out of
@@ -88,17 +88,6 @@ pub struct BuiltinEditor<P: Params> {
     /// `EditorScale` and this field is unused.
     #[cfg(feature = "cpu")]
     scale: EditorScale,
-    /// Standalone hosts set this (via `set_uses_system_scale`) so the
-    /// editor honors the desktop `Xft.dpi` scale on Linux; plugins leave
-    /// it false and drive scale from the host instead. See
-    /// [`crate::platform::editor_window_scale`]. No effect off Linux.
-    #[cfg(feature = "cpu")]
-    use_system_scale: bool,
-    /// Whether the host announced a content scale via `set_scale_factor`.
-    /// On Linux this gates whether an embedded editor trusts `scale`
-    /// (host-announced) or defaults to 1.0.
-    #[cfg(feature = "cpu")]
-    host_scale_set: bool,
     /// Meter IDs referenced by the layout, collected once at
     /// construction. Meters are display-only values written from the
     /// audio thread (`PluginContext::get_meter`); they never move
@@ -127,8 +116,8 @@ pub struct BuiltinEditor<P: Params> {
     pending_size: Arc<AtomicU64>,
 }
 
-// SAFETY: `baseview::WindowHandle` holds a raw native window pointer
-// (HWND / NSView / X11 Window) and is not auto-`Send`. Hosts call
+// SAFETY: the editor holds a raw pointer-backed window and blit state
+// that are not auto-`Send`. Hosts call
 // `Editor::open` / `idle` / `close` from a single dedicated GUI thread
 // - never concurrently and never from the audio thread - so the
 // handle is only ever touched on the thread that created it. The
@@ -279,10 +268,6 @@ impl<P: Params + 'static> BuiltinEditor<P> {
             last_painted_values: Vec::new(),
             #[cfg(feature = "cpu")]
             scale: EditorScale::new(crate::backing_scale()),
-            #[cfg(feature = "cpu")]
-            use_system_scale: false,
-            #[cfg(feature = "cpu")]
-            host_scale_set: false,
             #[cfg(feature = "cpu")]
             meter_ids,
             #[cfg(feature = "cpu")]
@@ -692,7 +677,7 @@ pub fn update_interaction<P: Params + 'static>(editor: &mut BuiltinEditor<P>) {
 /// spawn at all (blank but harmless editor).
 #[cfg(feature = "cpu")]
 fn create_wgpu_backend(
-    window: &mut baseview::Window,
+    window: &baseview::WindowContext,
     phys_w: u32,
     phys_h: u32,
 ) -> Option<BlitBackend> {
@@ -944,16 +929,6 @@ struct BuiltinWindowHandler<P: Params> {
     /// guards the lifecycle, so reading `editor.scale` is the
     /// canonical access path.
     last_applied_scale: f32,
-    /// Whether the window's scale is host-driven (baseview
-    /// `WindowScalePolicy::ScaleFactor`, i.e. an embedded plug-in) rather
-    /// than OS-detected (`SystemScaleFactor`, i.e. the standalone). When
-    /// true, the host's `set_scale_factor` is authoritative and baseview's
-    /// echoed `info.scale()` must NOT overwrite it - instead the `Resized`
-    /// handler pushes the host scale into baseview (via
-    /// `Window::set_scale_factor`) when the two diverge, so a late
-    /// `IPlugViewContentScaleSupport` report (REAPER on Linux) is applied
-    /// without the editor and baseview fighting over the scale.
-    host_driven_scale: bool,
     /// Enforces min/max/aspect on host resizes that bypassed the
     /// format's negotiation hooks (Linux hosts resizing the embed
     /// window directly).
@@ -979,7 +954,7 @@ unsafe impl<P: Params> Send for BuiltinWindowHandler<P> {}
 
 #[cfg(feature = "cpu")]
 impl<P: Params + 'static> BuiltinWindowHandler<P> {
-    fn on_frame_inner(&mut self, window: &mut baseview::Window) {
+    fn on_frame_inner(&mut self, window: &baseview::WindowContext) {
         // Lock the shared backend cell *before* deref'ing `self.editor`.
         // `BuiltinEditor::close` calls `drop(guard.take())` on the same
         // mutex before returning; the host then drops the editor. So
@@ -1032,7 +1007,10 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
                     Layout::Rows(pl) => editor.interaction.build_regions(pl),
                     Layout::Grid(gl) => editor.interaction.build_regions_grid(gl),
                 }
-                window.resize(baseview::Size::new(f64::from(new_w), f64::from(new_h)));
+                let _ = window.resize(baseview::dpi::LogicalSize::new(
+                    f64::from(new_w),
+                    f64::from(new_h),
+                ));
                 editor.request_repaint();
             }
         }
@@ -1056,17 +1034,11 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
         // Skip the whole frame while the editor isn't presentable:
         // detached / occluded on macOS, host child window hidden /
         // minimized on Windows (no-op on Linux).
-        {
-            use raw_window_handle::HasRawWindowHandle;
-            if crate::platform::should_skip_frame(window.raw_window_handle()) {
-                return;
-            }
+        if crate::platform::should_skip_frame(window) {
+            return;
         }
         #[cfg(target_os = "macos")]
-        {
-            use raw_window_handle::HasRawWindowHandle;
-            crate::platform::reanchor_to_superview_top(window.raw_window_handle());
-        }
+        crate::platform::reanchor_to_superview_top(window);
 
         // Pick up scale changes that landed in the shared cell since
         // the last frame - either from a host callback (CLAP
@@ -1083,14 +1055,14 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
                 backend.resize(phys_w, phys_h);
             }
             editor.request_repaint();
-            // Push the corrected scale into baseview so its window /
-            // mouse-coordinate mapping tracks the host. Without this, a host
-            // that reports its content scale only after the view is attached
-            // (REAPER on Linux, via `IPlugViewContentScaleSupport`) leaves
-            // baseview pinned to the creation-time scale and the two fight,
-            // flickering 1x-in-a-2x-frame until it happens to settle. No-op on
-            // Windows/macOS (OS-driven DPI).
-            window.set_scale_factor(f64::from(cur_scale));
+            // A host-owned scale is pushed into baseview so its window size
+            // and DPI handling follow the host, then the window is resized
+            // to keep its logical size at the new scale. OS-driven changes
+            // (DPI / monitor moves) already resized the window.
+            if let Some(host_scale) = editor.scale.host_override() {
+                let _ = window.set_scale_factor_override(Some(host_scale));
+                let _ = window.resize(baseview::dpi::LogicalSize::new(f64::from(lw), f64::from(lh)));
+            }
         }
 
         update_interaction(editor);
@@ -1138,11 +1110,8 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
             // stale, and the size check discards it and repaints.
             #[cfg(target_os = "windows")]
             if !self.surface_synced {
-                use raw_window_handle::HasRawWindowHandle;
                 self.surface_synced = true;
-                if let Some((cw, ch)) =
-                    crate::platform::win32_client_size(window.raw_window_handle())
-                {
+                if let Some((cw, ch)) = crate::platform::win32_client_size(window) {
                     backend.configure_surface(cw, ch);
                 }
             }
@@ -1214,7 +1183,7 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
     #[allow(clippy::needless_pass_by_value)]
     fn on_event_inner(
         &mut self,
-        window: &mut baseview::Window,
+        window: &baseview::WindowContext,
         event: baseview::Event,
     ) -> baseview::EventStatus {
         // `window` is only read on Windows (focus-on-click below);
@@ -1235,7 +1204,7 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
             #[cfg(target_os = "windows")]
             {
                 if !window.has_focus() {
-                    window.focus();
+                    let _ = window.focus();
                 }
             }
         }
@@ -1246,7 +1215,7 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
         // pointer is no longer guaranteed valid and we must not deref.
         // Recover a poisoned lock (see `on_frame`) rather than ignore every
         // event forever.
-        let mut guard = self
+        let guard = self
             .backend
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1256,173 +1225,140 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
 
         match event {
             baseview::Event::Mouse(_) => {
-                let Some(input) = self.translator.translate(&event) else {
+                let editor = unsafe { &mut *self.editor };
+                let Some(input) = self.translator.translate(&event, editor.scale.get()) else {
                     return baseview::EventStatus::Ignored;
                 };
-                let editor = unsafe { &mut *self.editor };
                 editor.dispatch_events(&[input]);
                 baseview::EventStatus::Captured
             }
-            baseview::Event::Window(baseview::WindowEvent::Resized(info)) => {
-                // Two things can flow through `Resized`:
-                //  - A backing-scale change (monitor-boundary drag,
-                //    host calling `set_scale_factor`): logical w×h is
-                //    invariant, only `info.scale()` matters.
-                //  - A logical resize via the autoresize cascade
-                //    (host grows the parent NSView with our child
-                //    tagged `WidthSizable | HeightSizable`, or the
-                //    standalone window grows around us). For
-                //    resizable editors we route the new bounds into
-                //    `set_size` so the grid reflows; fixed-size
-                //    editors stay pinned.
+            baseview::Event::Window(baseview::WindowEvent::ScaleFactorChanged(os_scale)) => {
+                // DPI / monitor change. Ignored by the cell once the host
+                // owns the scale; `on_frame` picks the change up.
                 let editor = unsafe { &mut *self.editor };
-                // In host-driven (plug-in) mode the host's reported scale is
-                // authoritative; baseview's echoed `info.scale()` is the value
-                // we pinned at creation. If the host has since reported a
-                // different scale (a late `IPlugViewContentScaleSupport` call
-                // from REAPER on Linux), baseview is stale and this event's
-                // physical size is at the wrong scale. Push the host scale into
-                // baseview and drop the event; baseview re-emits a `Resized` at
-                // the corrected scale (X11 only - a no-op elsewhere, where this
-                // branch also never triggers because scale is OS-driven).
-                let bv_scale = info.scale();
-                let host_scale = editor.scale.get_f32();
-                #[allow(clippy::cast_possible_truncation)]
-                if self.host_driven_scale && (host_scale - bv_scale as f32).abs() > 1.0e-3 {
-                    window.set_scale_factor(f64::from(host_scale));
-                    return baseview::EventStatus::Ignored;
+                editor.scale.set_from_os(os_scale);
+                if editor.scale.host_override().is_none() {
+                    crate::platform::note_linux_scale_factor(os_scale);
                 }
-                // Mirror baseview's scale into the shared cell ONLY in
-                // system-scale (standalone) mode, where `info.scale()` is the
-                // authoritative OS-detected value. In host-driven mode the host
-                // owns the cell and we confirmed above that baseview agrees, so
-                // writing here would clobber a concurrent host update (the race
-                // that stranded the editor at 1x).
-                if !self.host_driven_scale {
-                    editor.scale.set(info.scale());
-                }
-                crate::platform::note_linux_scale_factor(info.scale());
-                let phys = info.physical_size();
-                if editor.can_resize() {
-                    let scale = info.scale();
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let (lw, lh) = if scale > 0.0 {
-                        (
-                            (f64::from(phys.width) / scale).round() as u32,
-                            (f64::from(phys.height) / scale).round() as u32,
-                        )
-                    } else {
-                        (phys.width, phys.height)
-                    };
-                    if lw > 0 && lh > 0 {
-                        // A host that resized the embed window directly
-                        // never ran the format's constraint preflight -
-                        // fit here and push the corrected size back.
-                        let ((fw, fh), correct) = self.resize_corrector.fit(
-                            lw,
-                            lh,
-                            editor.min_size(),
-                            editor.max_size(),
-                            editor.aspect_ratio(),
-                        );
-                        if (fw, fh) != editor.size() {
-                            editor.set_size(fw, fh);
-                        }
-                        if let Some((rw, rh)) = correct {
-                            // On Linux, hosts that bypass size negotiation
-                            // (Bitwig) ignore this request and react by
-                            // *growing* the embed window - a resize loop.
-                            // Clamp the content (and counter-resize our child)
-                            // but never ask the host to resize its frame.
-                            // mac/windows honor it (and negotiate via
-                            // `checkSizeConstraint`) anyway.
-                            #[cfg(not(target_os = "linux"))]
-                            if let Some(ctx) = editor.context.as_ref() {
-                                let _ = ctx.request_resize(rw, rh);
-                            }
-                            #[cfg(target_os = "linux")]
-                            let _ = (rw, rh);
-                        }
-                    }
-                }
-                // Keep the swapchain covering the window's *actual*
-                // physical size. The WM (X11 resize-increment snap) or
-                // host sets that size, and it isn't bit-identical to the
-                // `to_physical_px(logical)` the `on_frame` resize paths
-                // configure the surface to - so without this the trailing
-                // edge of the window shows whatever is behind it. Driving
-                // the surface from the authoritative `info.physical_size()`
-                // here closes that gap; the blit letterboxes any ≤few-px
-                // difference to black on a pixel-snapped centre (no
-                // stretch), so a fixed editor under a host that wobbles
-                // the embed size ±1px stays crisp instead of shimmering.
-                if phys.width > 0
-                    && phys.height > 0
-                    && let Some(backend) = guard.as_mut()
-                {
-                    backend.configure_surface(phys.width, phys.height);
-                }
-                // Always repaint on a `Resized`, even when the logical
-                // size is unchanged. Our own `set_size` -> `on_frame`
-                // resize is asynchronous on X11: `on_frame` reconfigures
-                // the surface and presents one frame *before* the
-                // `ConfigureNotify` actually grows the child window, then
-                // clears the dirty bit. The trailing `Resized` that
-                // reports the now-grown window carries a logical size
-                // that already matches `editor.size()`, so without this
-                // the gate short-circuits and the freshly exposed region
-                // is never painted - it shows whatever was behind the
-                // window until the next unrelated repaint.
                 editor.request_repaint();
                 baseview::EventStatus::Ignored
             }
             _ => baseview::EventStatus::Ignored,
         }
     }
+
+    fn resized_inner(&mut self, size: baseview::WindowSize) {
+        // Same lock-then-deref pattern as `on_frame`.
+        let mut guard = self
+            .backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            return;
+        }
+        // Two things can flow through here:
+        //  - A scale change (DPI change, monitor move, host scale):
+        //    logical w×h is invariant, only the physical size moved.
+        //  - A logical resize via the autoresize cascade (host grows
+        //    the parent NSView with our child tagged `WidthSizable |
+        //    HeightSizable`, or the standalone window grows around us).
+        //    For resizable editors we route the new bounds into
+        //    `set_size` so the grid reflows; fixed-size editors stay
+        //    pinned.
+        let editor = unsafe { &mut *self.editor };
+        let phys = size.physical;
+        if editor.can_resize() {
+            let scale = size.scale_factor;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let (lw, lh) = if scale > 0.0 {
+                    (
+                        (f64::from(phys.width) / scale).round() as u32,
+                        (f64::from(phys.height) / scale).round() as u32,
+                    )
+                } else {
+                    (phys.width, phys.height)
+                };
+                if lw > 0 && lh > 0 {
+                    // A host that resized the embed window directly
+                    // never ran the format's constraint preflight -
+                    // fit here and push the corrected size back.
+                    let ((fw, fh), correct) = self.resize_corrector.fit(
+                        lw,
+                        lh,
+                        editor.min_size(),
+                        editor.max_size(),
+                        editor.aspect_ratio(),
+                    );
+                    if (fw, fh) != editor.size() {
+                        editor.set_size(fw, fh);
+                    }
+                    if let Some((rw, rh)) = correct {
+                        // On Linux, hosts that bypass size negotiation
+                        // (Bitwig) ignore this request and react by
+                        // *growing* the embed window - a resize loop.
+                        // Clamp the content (and counter-resize our child)
+                        // but never ask the host to resize its frame.
+                        // mac/windows honor it (and negotiate via
+                        // `checkSizeConstraint`) anyway.
+                        #[cfg(not(target_os = "linux"))]
+                        if let Some(ctx) = editor.context.as_ref() {
+                            let _ = ctx.request_resize(rw, rh);
+                        }
+                        #[cfg(target_os = "linux")]
+                        let _ = (rw, rh);
+                    }
+                }
+            }
+            // Keep the swapchain covering the window's *actual*
+            // physical size. The WM (X11 resize-increment snap) or
+            // host sets that size, and it isn't bit-identical to the
+            // `to_physical_px(logical)` the `on_frame` resize paths
+            // configure the surface to - so without this the trailing
+            // edge of the window shows whatever is behind it. Driving
+            // the surface from the authoritative `info.physical_size()`
+            // here closes that gap; the blit letterboxes any ≤few-px
+            // difference to black on a pixel-snapped centre (no
+            // stretch), so a fixed editor under a host that wobbles
+            // the embed size ±1px stays crisp instead of shimmering.
+            if phys.width > 0
+                && phys.height > 0
+                && let Some(backend) = guard.as_mut()
+            {
+                backend.configure_surface(phys.width, phys.height);
+            }
+            // Always repaint on a `Resized`, even when the logical
+            // size is unchanged. Our own `set_size` -> `on_frame`
+            // resize is asynchronous on X11: `on_frame` reconfigures
+            // the surface and presents one frame *before* the
+            // `ConfigureNotify` actually grows the child window, then
+            // clears the dirty bit. The trailing `Resized` that
+            // reports the now-grown window carries a logical size
+            // that already matches `editor.size()`, so without this
+            // the gate short-circuits and the freshly exposed region
+            // is never painted - it shows whatever was behind the
+            // window until the next unrelated repaint.
+        editor.request_repaint();
+    }
 }
 
+// Panics are caught by the `crate::window` adapter, so an editor bug can't
+// unwind through baseview's `extern "C"` frames into the host.
 #[cfg(feature = "cpu")]
-impl<P: Params + 'static> baseview::WindowHandler for BuiltinWindowHandler<P> {
-    fn on_frame(&mut self, window: &mut baseview::Window) {
-        // Catch panics at the FFI boundary. baseview calls us through
-        // an `extern "C-unwind"` AppKit override; an unwinding Rust
-        // panic becomes an ObjC exception and `NSApplication run`
-        // rethrows it, terminating the host. Swallow the panic and
-        // log it so the host stays alive.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.on_frame_inner(window);
-        }));
-        if let Err(e) = result {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            log::error!("BuiltinWindowHandler::on_frame panic swallowed: {msg}");
-        }
+impl<P: Params + 'static> crate::window::EditorWindowHandler for BuiltinWindowHandler<P> {
+    fn on_frame(&mut self, window: &baseview::WindowContext) {
+        self.on_frame_inner(window);
     }
 
     fn on_event(
         &mut self,
-        window: &mut baseview::Window,
+        window: &baseview::WindowContext,
         event: baseview::Event,
     ) -> baseview::EventStatus {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.on_event_inner(window, event)
-        }));
-        result.unwrap_or_else(|e| {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            log::error!("BuiltinWindowHandler::on_event panic swallowed: {msg}");
-            baseview::EventStatus::Ignored
-        })
+        self.on_event_inner(window, event)
+    }
+
+    fn resized(&mut self, _window: &baseview::WindowContext, size: baseview::WindowSize) {
+        self.resized_inner(size);
     }
 }
 
@@ -1517,32 +1453,15 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
         // so the next frame doesn't immediately re-resize the
         // freshly-built window to a previous request.
         self.pending_size.store(0, Ordering::Relaxed);
-        // Refresh the shared scale from the parent window - on macOS
-        // this is the live `[NSWindow backingScaleFactor]`, on
-        // Windows the per-monitor DPI from the parent HWND. Any
-        // `set_scale_factor` the host issues after open will overwrite
-        // through the same shared cell.
-        // Pick the baseview scale policy. On Linux an embedded plugin
-        // follows the host's scale (default 1.0) rather than the desktop
-        // Xft.dpi, which a non-DPI-aware host (Bitwig) doesn't share; the
-        // standalone and every macOS/Windows path keep SystemScaleFactor.
-        let scale_policy = if let Some(s) = crate::platform::editor_window_scale(
-            self.use_system_scale,
-            self.host_scale_set,
-            self.scale.get(),
-        ) {
-            self.scale.set(s);
-            baseview::WindowScalePolicy::ScaleFactor(s)
-        } else {
+        // Scale policy (see `crate::platform::host_scale_override`): a
+        // host-announced scale pins the window; otherwise estimate the OS
+        // scale from the parent here, and the build closure below corrects
+        // it from the real window (`ctx.scale_factor()`).
+        let scale_override = self.scale.host_override();
+        if scale_override.is_none() {
             self.scale
-                .set(crate::platform::query_backing_scale(&parent));
-            baseview::WindowScalePolicy::SystemScaleFactor
-        };
-        // Host-driven scale = pinned `ScaleFactor` policy (embedded plug-in).
-        // In that mode baseview's echoed `info.scale()` is our own pinned
-        // value, not new information, so the `Resized` handler must not let it
-        // overwrite a later host-reported scale.
-        let host_driven_scale = matches!(scale_policy, baseview::WindowScalePolicy::ScaleFactor(_));
+                .set_from_os(crate::platform::query_backing_scale(&parent));
+        }
         let scale = self.scale.get();
         let scale_f32 = self.scale.get_f32();
         self.backend = CpuBackend::new(w, h, scale_f32);
@@ -1560,17 +1479,10 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
         self.render();
         self.request_repaint();
 
-        let (lw, lh) = (f64::from(w), f64::from(h));
         let phys_w = crate::platform::to_physical_px(w, scale);
         let phys_h = crate::platform::to_physical_px(h, scale);
+        let scale_cell = self.scale.clone();
 
-        let options = baseview::WindowOpenOptions {
-            title: String::from("moose"),
-            size: baseview::Size::new(lw, lh),
-            scale: scale_policy,
-        };
-
-        let parent_wrapper = crate::platform::ParentWindow(parent);
         let editor_addr = ptr::from_mut::<BuiltinEditor<P>>(self) as usize;
 
         // Snapshot the frame rendered just above so the build closure -
@@ -1591,10 +1503,17 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
         self.blit_backend = Some(shared_backend.clone());
         let shared_for_handler = shared_backend;
 
-        let window = baseview::Window::open_parented(
-            &parent_wrapper,
-            options,
-            move |window: &mut baseview::Window| {
+        let window = crate::window::open_child_window(
+            parent,
+            (w, h),
+            scale_override,
+            move |window: &baseview::WindowContext| {
+                // The window's real scale. If it differs from the estimate
+                // the pixmap was built at, the first `on_frame` rebuilds.
+                scale_cell.set_from_os(window.scale_factor());
+                if scale_cell.host_override().is_none() {
+                    crate::platform::note_linux_scale_factor(window.scale_factor());
+                }
                 let backend = create_wgpu_backend(window, phys_w, phys_h);
 
                 // Present the initial frame synchronously, before baseview
@@ -1655,7 +1574,6 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
                     backend: shared_for_handler.clone(),
                     translator: crate::interaction::BaseviewTranslator::default(),
                     last_applied_scale: scale_f32,
-                    host_driven_scale,
                     pacer: crate::platform::PaintPacer::default(),
                     resize_corrector: ResizeCorrector::default(),
                     #[cfg(target_os = "windows")]
@@ -1664,20 +1582,15 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
             },
         );
 
-        self.window = Some(window);
+        self.window = window;
     }
 
     fn set_scale_factor(&mut self, factor: f64) {
         // Write to the shared cell; the baseview handler picks up the
-        // change on its next frame and rebuilds the CPU pixmap +
-        // reconfigures the wgpu surface. The trait's default no-op
-        // would silently swallow host scale changes here.
-        self.host_scale_set = true;
-        self.scale.set(factor);
-    }
-
-    fn set_uses_system_scale(&mut self, yes: bool) {
-        self.use_system_scale = yes;
+        // change on its next frame, rebuilds the CPU pixmap, reconfigures
+        // the wgpu surface and pins baseview to the host scale. The
+        // trait's default no-op would silently swallow host scale changes.
+        self.scale.set_from_host(factor);
     }
 
     fn close(&mut self) {
@@ -1739,7 +1652,7 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
             }
         }
 
-        if let Some(mut window) = self.window.take() {
+        if let Some(window) = self.window.take() {
             window.close();
         }
         self.context = None;

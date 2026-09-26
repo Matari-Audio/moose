@@ -332,21 +332,18 @@ impl<T: Send + 'static> SurfacePump<T> {
     /// error, not UB).
     #[cfg(not(target_os = "ios"))]
     pub unsafe fn spawn(
-        window: &baseview::Window,
+        window: &(impl raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle),
         device_lost: &Arc<AtomicBool>,
         init: PumpInitFn<T>,
     ) -> Option<Self> {
         #[cfg(target_os = "windows")]
         {
-            use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
-            let RawWindowHandle::Win32(handle) = window.raw_window_handle() else {
+            let raw_window_handle::RawWindowHandle::Win32(handle) =
+                window.window_handle().ok()?.as_raw()
+            else {
                 return None;
             };
-            let hwnd = handle.hwnd as isize;
-            if hwnd == 0 {
-                return None;
-            }
-            Self::spawn_threaded(hwnd, device_lost.clone(), init)
+            Self::spawn_threaded(handle.hwnd.get(), device_lost.clone(), init)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -437,10 +434,16 @@ impl<T: Send + 'static> Drop for SurfacePump<T> {
             .wait_timeout_while(slot, std::time::Duration::from_secs(1), |s| !s.exited)
             .unwrap_or_else(PoisonError::into_inner);
         drop(slot);
-        if timeout.timed_out() {
+        // A detached thread still runs code from this module after the
+        // host may unload it, so detach only once the image is pinned
+        // (K17). If pinning fails, wait for the thread instead.
+        if timeout.timed_out() && baseview::pin_current_image_for_detached_work() {
             log::warn!("surface pump did not exit within 1s (driver stall?); detaching");
             drop(self.join.take());
         } else if let Some(join) = self.join.take() {
+            if timeout.timed_out() {
+                log::warn!("surface pump stalled and the module could not be pinned; joining");
+            }
             let _ = join.join();
         }
     }

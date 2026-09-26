@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use baseview::{Event, EventStatus, Window, WindowHandler, WindowOpenOptions, WindowScalePolicy};
+use baseview::{Event, EventStatus, WindowContext};
 
 use moose_core::editor::{
     Editor, PluginContext, PluginContextReadF64, RawWindowHandle, ResizeCorrector,
@@ -15,7 +15,6 @@ use moose_core::editor::{
 use moose_params::Params;
 
 use crate::lifecycle::EditorLifecycle;
-use crate::platform::ParentWindow;
 #[cfg(target_os = "windows")]
 use crate::render_thread::{FramePacket, RenderThread};
 #[cfg(not(target_os = "windows"))]
@@ -140,25 +139,15 @@ pub struct EguiEditor<P: Params + ?Sized> {
     /// reconfiguration on the next frame when the value diverges
     /// from its last-applied snapshot.
     scale: EditorScale,
-    /// Standalone hosts set this (via `set_uses_system_scale`) so the
-    /// editor honors the desktop `Xft.dpi` scale on Linux; plugins leave
-    /// it false and drive scale from the host instead. See
-    /// [`moose_gui::platform::editor_window_scale`]. No effect off Linux.
-    use_system_scale: bool,
-    /// Whether the host announced a content scale via `set_scale_factor`.
-    /// On Linux this gates whether an embedded editor trusts `scale`
-    /// (host-announced) or defaults to 1.0.
-    host_scale_set: bool,
-    /// Active baseview window handle - exists only while editor is open.
-    window: Option<baseview::WindowHandle>,
+    /// Active baseview window - exists only while editor is open.
+    window: Option<moose_gui::window::EditorWindow>,
     /// Per-open close gate and framework-owned platform resource cleanup.
     lifecycle: Option<EditorLifecycle>,
     /// Typed editor context stored at `open()` for `state_changed` forwarding.
     context: Option<PluginContext<P>>,
 }
 
-// SAFETY: `baseview::WindowHandle` holds a raw native window pointer
-// (HWND / NSView / X11 Window) and is not auto-`Send`. Hosts call
+// SAFETY: the editor's UI state is not auto-`Send`. Hosts call
 // `Editor::open` / `idle` / `close` from a single dedicated GUI thread
 // - never concurrently and never from the audio thread - so the
 // handle is only ever touched on the thread that created it. The
@@ -184,8 +173,6 @@ impl<P: Params + 'static> EguiEditor<P> {
             visuals: None,
             font: None,
             scale: EditorScale::new(moose_gui::backing_scale()),
-            use_system_scale: false,
-            host_scale_set: false,
             window: None,
             lifecycle: None,
             context: None,
@@ -208,8 +195,6 @@ impl<P: Params + 'static> EguiEditor<P> {
             visuals: None,
             font: None,
             scale: EditorScale::new(moose_gui::backing_scale()),
-            use_system_scale: false,
-            host_scale_set: false,
             window: None,
             lifecycle: None,
             context: None,
@@ -421,16 +406,9 @@ struct EguiWindowHandler<P: Params + ?Sized> {
     /// `Resized` event (Reaper on Windows is the typical case).
     scale: EditorScale,
     last_applied_scale: f32,
-    /// Whether the window's scale is host-driven (baseview
-    /// `WindowScalePolicy::ScaleFactor`, i.e. an embedded plug-in) rather
-    /// than OS-detected (`SystemScaleFactor`, i.e. the standalone). When
-    /// true, the host's `set_scale_factor` is authoritative and baseview's
-    /// echoed `info.scale()` must NOT overwrite it - instead the `Resized`
-    /// handler pushes the host scale into baseview (via
-    /// `Window::set_scale_factor`) when the two diverge, so a late
-    /// `IPlugViewContentScaleSupport` report (REAPER on Linux) is applied
-    /// without the editor and baseview fighting over the scale.
-    host_driven_scale: bool,
+    /// The keyboard capture last pushed to baseview (`None` = not yet).
+    /// See [`crate::input::wants_native_capture`].
+    keyboard_capture: Option<bool>,
     last_cursor_pos: egui::Pos2,
     /// Raised by the renderer's device-lost callback (or a swallowed render
     /// panic). Polled in `on_frame`, which rebuilds the renderer + recreates
@@ -590,6 +568,16 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
         }
     }
 
+    /// A baseview (physical-pixel) position in the logical points egui
+    /// lays out in.
+    fn logical_pos(&self, position: baseview::dpi::PhysicalPosition<f64>) -> egui::Pos2 {
+        let scale = f64::from(self.last_applied_scale);
+        let p = position.to_logical::<f64>(if scale > 0.0 { scale } else { 1.0 });
+        // egui uses f32; window dimensions never reach 2^23.
+        #[allow(clippy::cast_possible_truncation)]
+        egui::pos2(p.x as f32, p.y as f32)
+    }
+
     fn release_captured_keys_for_focus_loss(&mut self) {
         for held in &mut self.held_captured_keys {
             if held.awaiting_release {
@@ -612,7 +600,7 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
     /// device loss. The new renderer starts with an empty texture map, so the
     /// context must be recreated to re-emit the font atlas on the next frame.
     /// UI memory (widget state) is lost - acceptable after a GPU reset.
-    fn recover_device(&mut self, window: &mut Window) {
+    fn recover_device(&mut self, window: &WindowContext) {
         let device_lost = Arc::new(AtomicBool::new(false));
         let phys_w = moose_gui::to_physical_px(self.size.0, f64::from(self.last_applied_scale));
         let phys_h = moose_gui::to_physical_px(self.size.1, f64::from(self.last_applied_scale));
@@ -743,7 +731,7 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
     /// undersized drawable.
     fn apply_resize(
         &mut self,
-        window: &mut Window,
+        window: &WindowContext,
         new_size: (u32, u32),
         scale: f64,
         surface_phys: Option<(u32, u32)>,
@@ -759,7 +747,7 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
         // from us (programmatic `set_size`) or the host handed us an
         // out-of-bounds box that needs correcting.
         if resize_window {
-            window.resize(baseview::Size::new(
+            let _ = window.resize(baseview::dpi::LogicalSize::new(
                 f64::from(new_size.0),
                 f64::from(new_size.1),
             ));
@@ -784,7 +772,7 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
     /// next frame, a finite delay schedules one, and `Duration::MAX`
     /// means idle.
     #[allow(clippy::cast_precision_loss)]
-    fn run_frame(&mut self, window: &mut Window) -> Option<std::time::Duration> {
+    fn run_frame(&mut self, window: &WindowContext) -> Option<std::time::Duration> {
         if !self.painter_ready() {
             return None;
         }
@@ -798,14 +786,15 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
             let phys_w = moose_gui::to_physical_px(self.size.0, f64::from(cur_scale));
             let phys_h = moose_gui::to_physical_px(self.size.1, f64::from(cur_scale));
             self.painter_resize(phys_w, phys_h);
-            // Push the corrected scale into baseview so its window /
-            // mouse-coordinate mapping tracks the host. Without this, a host
-            // that reports its content scale only after the view is attached
-            // (REAPER on Linux, via `IPlugViewContentScaleSupport`) leaves
-            // baseview pinned to the creation-time scale and the two fight,
-            // flickering 1x-in-a-2x-frame until it settles. No-op on
-            // Windows/macOS (OS-driven DPI).
-            window.set_scale_factor(f64::from(cur_scale));
+            // Pin baseview to a host-owned scale and keep the window's
+            // logical size at it. OS-driven changes already resized.
+            if let Some(host_scale) = self.scale.host_override() {
+                let _ = window.set_scale_factor_override(Some(host_scale));
+                let _ = window.resize(baseview::dpi::LogicalSize::new(
+                    f64::from(self.size.0),
+                    f64::from(self.size.1),
+                ));
+            }
         }
 
         let ppp = self.last_applied_scale;
@@ -853,6 +842,15 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ui(ui, context);
         });
+
+        // Windows: take keys from the host only while egui wants them
+        // (a focused text field, or a capture policy), so DAW shortcuts
+        // keep working otherwise. Pushed on change only.
+        let capture = crate::input::wants_native_capture(&self.egui_ctx);
+        if self.keyboard_capture != Some(capture) {
+            self.keyboard_capture = Some(capture);
+            window.set_keyboard_capture(capture);
+        }
 
         let repaint_delay = output
             .viewport_output
@@ -911,8 +909,8 @@ impl<P: Params + ?Sized> EguiWindowHandler<P> {
     }
 }
 
-impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
-    fn on_frame(&mut self, window: &mut Window) {
+impl<P: Params + ?Sized + 'static> moose_gui::window::EditorWindowHandler for EguiWindowHandler<P> {
+    fn on_frame(&mut self, window: &WindowContext) {
         if self.lifecycle.is_closing() {
             return;
         }
@@ -949,21 +947,15 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
             // body runs on the host's GUI thread, so skipping an
             // unpresentable frame keeps a blocking present from freezing
             // the host while its FX window is closed.
-            {
-                use raw_window_handle::HasRawWindowHandle;
-                if moose_gui::platform::should_skip_frame(window.raw_window_handle()) {
-                    return;
-                }
+            if moose_gui::platform::should_skip_frame(window) {
+                return;
             }
             // Re-anchor each frame so the child NSView's origin tracks
             // size changes against the host's plug-in pane - without it
             // the canvas drifts off-anchor as it grows, clipping the
             // layout's top off the visible area in CLAP hosts (REAPER).
             #[cfg(target_os = "macos")]
-            {
-                use raw_window_handle::HasRawWindowHandle;
-                moose_gui::platform::reanchor_to_superview_top(window.raw_window_handle());
-            }
+            moose_gui::platform::reanchor_to_superview_top(window);
             // Pick up host-driven `set_size` requests since the last frame.
             // baseview's macOS `Window::resize` doesn't synthesise a
             // `Resized` event, so the wgpu surface has to be reconfigured
@@ -1111,7 +1103,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
     // intact; the allow lets the Windows branch use the binding without
     // renaming.
     #[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
-    fn on_event(&mut self, _window: &mut Window, event: Event) -> EventStatus {
+    fn on_event(&mut self, _window: &WindowContext, event: Event) -> EventStatus {
         if self.lifecycle.is_closing() {
             return EventStatus::Ignored;
         }
@@ -1137,11 +1129,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                             modifiers,
                         } => {
                             self.modifiers = convert_kb_modifiers(modifiers);
-                            // baseview reports cursor in f64 logical points;
-                            // egui uses f32. Window dimensions never reach
-                            // 2^23 - the narrowing is invisible.
-                            #[allow(clippy::cast_possible_truncation)]
-                            let pos = egui::pos2(position.x as f32, position.y as f32);
+                            let pos = self.logical_pos(position);
                             self.last_cursor_pos = pos;
                             self.pending_events.push(egui::Event::PointerMoved(pos));
                             EventStatus::Captured
@@ -1155,7 +1143,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                             #[cfg(target_os = "windows")]
                             {
                                 if !_window.has_focus() {
-                                    _window.focus();
+                                    let _ = _window.focus();
                                 }
                             }
                             self.modifiers = convert_kb_modifiers(modifiers);
@@ -1213,8 +1201,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                             data,
                         } => {
                             self.modifiers = convert_kb_modifiers(modifiers);
-                            #[allow(clippy::cast_possible_truncation)]
-                            let pos = egui::pos2(position.x as f32, position.y as f32);
+                            let pos = self.logical_pos(position);
                             self.last_cursor_pos = pos;
                             self.pending_events.push(egui::Event::PointerMoved(pos));
                             self.hovered_files = hovered_files(&data);
@@ -1235,8 +1222,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                             data,
                         } => {
                             self.modifiers = convert_kb_modifiers(modifiers);
-                            #[allow(clippy::cast_possible_truncation)]
-                            let pos = egui::pos2(position.x as f32, position.y as f32);
+                            let pos = self.logical_pos(position);
                             self.last_cursor_pos = pos;
                             self.pending_events.push(egui::Event::PointerMoved(pos));
                             self.hovered_files.clear();
@@ -1247,6 +1233,7 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                                 EventStatus::AcceptDrop(baseview::DropEffect::Copy)
                             }
                         }
+                        _ => EventStatus::Ignored,
                     }
                 }
                 Event::Keyboard(kb) => {
@@ -1302,128 +1289,20 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                             self.lifecycle.close();
                             return EventStatus::Ignored;
                         }
-                        baseview::WindowEvent::Resized(_) => {}
-                    }
-                    if let baseview::WindowEvent::Resized(info) = win {
-                        // In host-driven (plug-in) mode the host's reported
-                        // scale is authoritative; baseview's echoed
-                        // `info.scale()` is the value we pinned at creation. If
-                        // the host has since reported a different scale (a late
-                        // `IPlugViewContentScaleSupport` call from REAPER on
-                        // Linux), baseview is stale and this event's physical
-                        // size is at the wrong scale. Push the host scale into
-                        // baseview and drop the event; baseview re-emits a
-                        // `Resized` at the corrected scale (X11 only - a no-op
-                        // elsewhere, where this branch also never triggers
-                        // because scale is OS-driven).
-                        let bv_scale = info.scale();
-                        let host_scale = self.scale.get_f32();
-                        #[allow(clippy::cast_possible_truncation)]
-                        if self.host_driven_scale && (host_scale - bv_scale as f32).abs() > 1.0e-3 {
-                            _window.set_scale_factor(f64::from(host_scale));
-                            return EventStatus::Ignored;
-                        }
-                        let pw = info.physical_size().width;
-                        let ph = info.physical_size().height;
-                        // Any change in the window's physical extent (re)arms
-                        // the paint settle gate - see `RESIZE_SETTLE`. The
-                        // pending-size tracking in `on_frame` can't see this
-                        // churn for a fixed-size editor: the fitted logical
-                        // size stays at the natural size while the host drags
-                        // the window through arbitrary extents.
-                        if (pw, ph) != self.last_resize_phys {
-                            self.last_size_change = Some(std::time::Instant::now());
-                        }
-                        // Authoritative window extent for the wgpu surface -
-                        // see `last_resize_phys`. `on_frame` reads it when it
-                        // matches the pending logical size.
-                        self.last_resize_phys = (pw, ph);
-                        // Display scale never exceeds 4.0 in practice.
-                        #[allow(clippy::cast_possible_truncation)]
-                        let scale = info.scale() as f32;
-                        moose_gui::platform::note_linux_scale_factor(info.scale());
-                        // Store logical size - egui screen_rect uses logical
-                        // points. Round so a physical 800px@2× reports as 400
-                        // logical, not 399 (truncating cast). Window
-                        // dimensions stay well below u32::MAX.
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            clippy::cast_precision_loss
-                        )]
-                        let logical_in = (
-                            (pw as f32 / scale).round() as u32,
-                            (ph as f32 / scale).round() as u32,
-                        );
-                        // A host that resized the embed window directly
-                        // never ran the format's constraint preflight - fit
-                        // here and push the corrected size back.
-                        let (logical_size, correct) = self.resize_corrector.fit(
-                            logical_in.0,
-                            logical_in.1,
-                            self.min_size,
-                            self.max_size,
-                            self.aspect_ratio,
-                        );
-                        if let Some((rw, rh)) = correct {
-                            // On Linux, hosts that bypass size negotiation
-                            // (Bitwig) ignore this request and react by
-                            // *growing* the embed window - a resize loop,
-                            // worsened by our own corrective `window.resize`
-                            // feeding a fresh in-bounds `Resized` that re-arms
-                            // the guard. Clamp the content (and counter-resize
-                            // our child) but never ask the host to resize its
-                            // frame. mac/windows honor the request and
-                            // negotiate via `checkSizeConstraint` anyway.
-                            // Deferred to `on_frame`: issued inline, this
-                            // re-enters the host's own resize dispatch
-                            // (VST3 forbids `resizeView` inside `onSize`;
-                            // Ableton hangs on it, e.g. title-bar
-                            // double-click snapping the window back).
-                            // Linux AND Windows: never ask the host to
-                            // resize its frame - clamp the content and
-                            // letterbox instead. Bitwig/X11 answers the
-                            // request by growing the window (a loop), and
-                            // REAPER on Windows re-asserts a maximized FX
-                            // window every tick (double-click maximize),
-                            // fighting the correction forever while each
-                            // round trips a driver wait. Windows hosts
-                            // shape interactive drags via
-                            // `checkSizeConstraint` anyway. macOS keeps
-                            // the push-back (hosts honor it, no fights).
-                            #[cfg(target_os = "macos")]
-                            {
-                                self.pending_correct = Some((rw, rh));
+                        baseview::WindowEvent::ScaleFactorChanged(os_scale) => {
+                            // DPI / monitor change; ignored once the host
+                            // owns the scale. `run_frame` picks it up.
+                            self.scale.set_from_os(*os_scale);
+                            if self.scale.host_override().is_none() {
+                                moose_gui::platform::note_linux_scale_factor(*os_scale);
                             }
-                            #[cfg(not(target_os = "macos"))]
-                            let _ = (rw, rh);
+                            self.force_paint = true;
                         }
-                        // Write through to the shared scale so `on_frame` /
-                        // `run_frame` convert with the OS-reported DPI. Only in
-                        // system-scale (standalone) mode: in host-driven mode
-                        // the host owns the cell and we confirmed above that
-                        // baseview agrees, so writing here would clobber a
-                        // concurrent host update (the race that stranded the
-                        // editor at 1x).
-                        if !self.host_driven_scale {
-                            self.scale.set(info.scale());
-                        }
-                        // Defer the surface reconfigure to `on_frame` (via the
-                        // same `pending_size` cell `set_size` uses) instead of
-                        // calling `renderer.resize()` inline here. A fast
-                        // host-driven drag fires `Resized` far quicker than
-                        // vblank - on Windows the LV2 parent-HWND subclass turns
-                        // REAPER's `WM_SIZE` storm into exactly that - and
-                        // reconfiguring the wgpu swapchain on every event backs
-                        // up the present queue until the GPU's timeout-detection
-                        // (TDR) fires and hangs the host. `on_frame` coalesces
-                        // the pending size to one reconfigure per frame.
-                        self.last_resize_fitted = logical_size;
-                        self.pending_size
-                            .store(pack_size(logical_size), Ordering::Relaxed);
+                        _ => {}
                     }
                     EventStatus::Ignored
                 }
+                _ => EventStatus::Ignored,
             }
         }));
         match event_result {
@@ -1438,6 +1317,103 @@ impl<P: Params + ?Sized + 'static> WindowHandler for EguiWindowHandler<P> {
                 EventStatus::Ignored
             }
         }
+    }
+
+    fn resized(&mut self, _window: &WindowContext, size: baseview::WindowSize) {
+        if self.lifecycle.is_closing() {
+            return;
+        }
+        let pw = size.physical.width;
+        let ph = size.physical.height;
+        // Any change in the window's physical extent (re)arms
+        // the paint settle gate - see `RESIZE_SETTLE`. The
+        // pending-size tracking in `on_frame` can't see this
+        // churn for a fixed-size editor: the fitted logical
+        // size stays at the natural size while the host drags
+        // the window through arbitrary extents.
+        if (pw, ph) != self.last_resize_phys {
+            self.last_size_change = Some(std::time::Instant::now());
+        }
+        // Authoritative window extent for the wgpu surface -
+        // see `last_resize_phys`. `on_frame` reads it when it
+        // matches the pending logical size.
+        self.last_resize_phys = (pw, ph);
+        // Display scale never exceeds 4.0 in practice.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = size.scale_factor as f32;
+        // Store logical size - egui screen_rect uses logical
+        // points. Round so a physical 800px@2× reports as 400
+        // logical, not 399 (truncating cast). Window
+        // dimensions stay well below u32::MAX.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let logical_in = (
+            (pw as f32 / scale).round() as u32,
+            (ph as f32 / scale).round() as u32,
+        );
+        // A host that resized the embed window directly
+        // never ran the format's constraint preflight - fit
+        // here and push the corrected size back.
+        let (logical_size, correct) = self.resize_corrector.fit(
+            logical_in.0,
+            logical_in.1,
+            self.min_size,
+            self.max_size,
+            self.aspect_ratio,
+        );
+        if let Some((rw, rh)) = correct {
+            // On Linux, hosts that bypass size negotiation
+            // (Bitwig) ignore this request and react by
+            // *growing* the embed window - a resize loop,
+            // worsened by our own corrective `window.resize`
+            // feeding a fresh in-bounds `Resized` that re-arms
+            // the guard. Clamp the content (and counter-resize
+            // our child) but never ask the host to resize its
+            // frame. mac/windows honor the request and
+            // negotiate via `checkSizeConstraint` anyway.
+            // Deferred to `on_frame`: issued inline, this
+            // re-enters the host's own resize dispatch
+            // (VST3 forbids `resizeView` inside `onSize`;
+            // Ableton hangs on it, e.g. title-bar
+            // double-click snapping the window back).
+            // Linux AND Windows: never ask the host to
+            // resize its frame - clamp the content and
+            // letterbox instead. Bitwig/X11 answers the
+            // request by growing the window (a loop), and
+            // REAPER on Windows re-asserts a maximized FX
+            // window every tick (double-click maximize),
+            // fighting the correction forever while each
+            // round trips a driver wait. Windows hosts
+            // shape interactive drags via
+            // `checkSizeConstraint` anyway. macOS keeps
+            // the push-back (hosts honor it, no fights).
+            #[cfg(target_os = "macos")]
+            {
+                self.pending_correct = Some((rw, rh));
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (rw, rh);
+        }
+        // Write the window's scale through so `run_frame`
+        // converts with it. Ignored once the host owns the
+        // scale (then baseview is pinned to it anyway).
+        self.scale.set_from_os(size.scale_factor);
+        // Defer the surface reconfigure to `on_frame` (via the
+        // same `pending_size` cell `set_size` uses) instead of
+        // calling `renderer.resize()` inline here. A fast
+        // host-driven drag fires `Resized` far quicker than
+        // vblank - on Windows the LV2 parent-HWND subclass turns
+        // REAPER's `WM_SIZE` storm into exactly that - and
+        // reconfiguring the wgpu swapchain on every event backs
+        // up the present queue until the GPU's timeout-detection
+        // (TDR) fires and hangs the host. `on_frame` coalesces
+        // the pending size to one reconfigure per frame.
+        self.last_resize_fitted = logical_size;
+        self.pending_size
+            .store(pack_size(logical_size), Ordering::Relaxed);
     }
 }
 
@@ -1462,7 +1438,7 @@ fn convert_mouse_button(btn: baseview::MouseButton) -> Option<egui::PointerButto
         // the events; ones that don't simply ignore the variant.
         baseview::MouseButton::Back => Some(egui::PointerButton::Extra1),
         baseview::MouseButton::Forward => Some(egui::PointerButton::Extra2),
-        baseview::MouseButton::Other(_) => None,
+        _ => None,
     }
 }
 
@@ -1476,7 +1452,7 @@ fn hovered_files(data: &baseview::DropData) -> Vec<egui::HoveredFile> {
                 ..Default::default()
             })
             .collect(),
-        baseview::DropData::None => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -1489,7 +1465,7 @@ fn dropped_files(data: baseview::DropData) -> Vec<egui::DroppedFile> {
                 ..Default::default()
             })
             .collect(),
-        baseview::DropData::None => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -1525,9 +1501,10 @@ fn convert_kb_modifiers(mods: keyboard_types::Modifiers) -> egui::Modifiers {
 }
 
 fn convert_key(key: &keyboard_types::Key) -> Option<egui::Key> {
-    use keyboard_types::Key::{
-        ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Backspace, Character, Delete, End, Enter,
-        Escape, Home, PageDown, PageUp, Tab,
+    use keyboard_types::Key::{Character, Named};
+    use keyboard_types::NamedKey::{
+        ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Backspace, Delete, End, Enter, Escape, Home,
+        PageDown, PageUp, Tab,
     };
     Some(match key {
         Character(s) => match s.as_str() {
@@ -1569,19 +1546,19 @@ fn convert_key(key: &keyboard_types::Key) -> Option<egui::Key> {
             "9" => egui::Key::Num9,
             _ => return None,
         },
-        Enter => egui::Key::Enter,
-        Tab => egui::Key::Tab,
-        Backspace => egui::Key::Backspace,
-        Escape => egui::Key::Escape,
-        Delete => egui::Key::Delete,
-        ArrowLeft => egui::Key::ArrowLeft,
-        ArrowRight => egui::Key::ArrowRight,
-        ArrowUp => egui::Key::ArrowUp,
-        ArrowDown => egui::Key::ArrowDown,
-        Home => egui::Key::Home,
-        End => egui::Key::End,
-        PageUp => egui::Key::PageUp,
-        PageDown => egui::Key::PageDown,
+        Named(Enter) => egui::Key::Enter,
+        Named(Tab) => egui::Key::Tab,
+        Named(Backspace) => egui::Key::Backspace,
+        Named(Escape) => egui::Key::Escape,
+        Named(Delete) => egui::Key::Delete,
+        Named(ArrowLeft) => egui::Key::ArrowLeft,
+        Named(ArrowRight) => egui::Key::ArrowRight,
+        Named(ArrowUp) => egui::Key::ArrowUp,
+        Named(ArrowDown) => egui::Key::ArrowDown,
+        Named(Home) => egui::Key::Home,
+        Named(End) => egui::Key::End,
+        Named(PageUp) => egui::Key::PageUp,
+        Named(PageDown) => egui::Key::PageDown,
         _ => return None,
     })
 }
@@ -1598,7 +1575,7 @@ impl<P: Params + ?Sized> EguiEditor<P> {
         // framework-owned state, before either the native close/join or the
         // fallible plugin callback can run.
         lifecycle.close();
-        if let Some(mut window) = self.window.take() {
+        if let Some(window) = self.window.take() {
             window.close();
         }
         self.context = None;
@@ -1633,35 +1610,9 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         egui_ctx.set_visuals(visuals.clone());
         let font = self.font;
 
-        // Refresh the shared scale from the parent window - on macOS
-        // the parent's NSWindow may live on a non-main display whose
-        // `backingScaleFactor` differs from `NSScreen.mainScreen`'s.
-        // On Linux the same call returns the cached baseview scale.
-        // Any `set_scale_factor` the host issues *after* open will
-        // override this on the next frame via the shared state.
-        // Pick the baseview scale policy. On Linux an embedded plugin
-        // follows the host's scale (default 1.0) rather than the desktop
-        // Xft.dpi, which a non-DPI-aware host (Bitwig) doesn't share; the
-        // standalone and every macOS/Windows path keep SystemScaleFactor.
-        let scale_policy = if let Some(s) = moose_gui::platform::editor_window_scale(
-            self.use_system_scale,
-            self.host_scale_set,
-            self.scale.get(),
-        ) {
-            self.scale.set(s);
-            WindowScalePolicy::ScaleFactor(s)
-        } else {
-            self.scale
-                .set(crate::platform::query_backing_scale(&parent));
-            WindowScalePolicy::SystemScaleFactor
-        };
-        // Host-driven scale = pinned `ScaleFactor` policy (embedded plug-in).
-        // In that mode baseview's echoed `info.scale()` is our own pinned
-        // value, not new information, so the `Resized` handler must not let it
-        // overwrite a later host-reported scale.
-        let host_driven_scale = matches!(scale_policy, WindowScalePolicy::ScaleFactor(_));
-        let system_scale = self.scale.get();
-        let (lw, lh) = self.size; // logical points
+        // Scale policy: a host-announced scale pins the window, else the
+        // build closure below reads the OS scale from the real window.
+        let scale_override = self.scale.host_override();
 
         // --- baseview + wgpu ---
         let ui = Arc::clone(&self.ui);
@@ -1670,13 +1621,6 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
             .opened(&typed_ctx);
         let size = self.size;
 
-        let options = WindowOpenOptions {
-            title: String::from("moose-egui"),
-            size: baseview::Size::new(f64::from(lw), f64::from(lh)),
-            scale: scale_policy,
-        };
-
-        let parent_wrapper = ParentWindow(parent);
         let handler_ctx = typed_ctx.clone();
         // A non-resizable editor pins to its natural size: report it as
         // both the min and the max so the `ResizeCorrector` clamps any
@@ -1724,13 +1668,17 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         let handler_visuals = visuals.clone();
         let handler_lifecycle = lifecycle.clone();
 
-        let window = baseview::Window::open_parented(
-            &parent_wrapper,
-            options,
-            move |window: &mut Window| {
-                // Display scale never exceeds 4.0 in practice.
-                #[allow(clippy::cast_possible_truncation)]
-                let scale = system_scale as f32;
+        let window = moose_gui::window::open_child_window(
+            parent,
+            size,
+            scale_override,
+            move |window: &WindowContext| {
+                scale_handle.set_from_os(window.scale_factor());
+                if scale_handle.host_override().is_none() {
+                    moose_gui::platform::note_linux_scale_factor(window.scale_factor());
+                }
+                let system_scale = scale_handle.get();
+                let scale = scale_handle.get_f32();
                 let phys_w = moose_gui::to_physical_px(size.0, system_scale);
                 let phys_h = moose_gui::to_physical_px(size.1, system_scale);
                 #[cfg(not(target_os = "windows"))]
@@ -1782,7 +1730,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
                     pending_size,
                     scale: scale_handle,
                     last_applied_scale: scale,
-                    host_driven_scale,
+                    keyboard_capture: None,
                     last_cursor_pos: egui::Pos2::ZERO,
                     device_lost,
                     font,
@@ -1807,7 +1755,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
             },
         );
 
-        self.window = Some(window);
+        self.window = window;
         self.lifecycle = Some(lifecycle);
     }
 
@@ -1864,12 +1812,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         // change on its next frame and resizes the wgpu surface +
         // renderer to match. No explicit notification needed -
         // baseview's frame loop polls.
-        self.host_scale_set = true;
-        self.scale.set(factor);
-    }
-
-    fn set_uses_system_scale(&mut self, yes: bool) {
-        self.use_system_scale = yes;
+        self.scale.set_from_host(factor);
     }
 
     fn state_changed(&mut self) {
@@ -1916,8 +1859,7 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
 
 impl<P: Params + ?Sized> Drop for EguiEditor<P> {
     fn drop(&mut self) {
-        // `baseview::WindowHandle` does not cancel the macOS frame timer
-        // on drop, so a host that drops the editor without calling
+        // Dropping the window is what stops its frame timer, so a host that drops the editor without calling
         // `Editor::close` leaves the timer firing `on_frame`. Unlike the
         // cpu/iced raw-pointer handlers this can't use-after-free (the
         // handler holds owned `Arc`/`EditorScale` clones), but it keeps

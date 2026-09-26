@@ -20,7 +20,7 @@ moose-gui-types = { workspace = true }
 moose-gui-utils = { workspace = true }
 moose-params = { workspace = true }
 moose-plugin = { workspace = true }
-raw-window-handle = "0.5"
+raw-window-handle = "0.6"
 wgpu = { workspace = true }
 pollster = "0.4"
 log = "0.4"
@@ -41,6 +41,12 @@ wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { workspace = true, features = ["vulkan", "gles"] }
@@ -57,6 +63,9 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }
 objc2-ui-kit = { version = "0.3", features = ["UIView", "UIScreen", "UIWindow"] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
+
+[target.'cfg(not(target_os = "ios"))'.dev-dependencies]
+keyboard-types = "0.8"
 
 [features]
 # `cpu` is the default - tiny-skia software rasterizer with a wgpu

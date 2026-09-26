@@ -17,7 +17,7 @@ wgpu = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 lyon_tessellation = "1"
-raw-window-handle = "0.5"
+raw-window-handle = "0.6"
 log = "0.4"
 
 # baseview is the macOS/Windows/Linux windowing layer; iOS embeds
@@ -47,6 +47,7 @@ wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"] }
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { workspace = true, features = ["vulkan", "gles"] }
