@@ -290,14 +290,13 @@ struct ClapPluginData<P: PluginExport> {
     transport_slot: Arc<TransportSlot>,
     /// Host-reported GUI scale (via `clap_plugin_gui::set_scale`).
     /// Sources of truth, by platform:
-    /// - **macOS**: ignored at `gui_get_size` (`AppKit` handles backing
-    ///   scale through the parent `NSView`; we report logical points
-    ///   and let the OS scale). Stored only for editors that consume
-    ///   it directly via `set_scale_factor`.
+    /// - **macOS**: `gui_set_scale` refuses, so this stays unset
+    ///   (`AppKit` handles backing scale through the parent `NSView`; we
+    ///   report logical points and let the OS scale).
     /// - **Windows / Linux**: used at `gui_get_size` to convert
-    ///   logical→physical. Default `1.0` is correct for hosts that
-    ///   never call `set_scale` (which by convention are non-DPI-aware
-    ///   and want logical points anyway). HiDPI-aware hosts call
+    ///   logical→physical. Unset, the editor's own window scale is used
+    ///   instead (see `window_scale`): 1.0 in a non-DPI-aware host, the
+    ///   monitor DPI or `Xft.dpi` otherwise. HiDPI-aware hosts call
     ///   `set_scale` before `gui_get_size`.
     ///
     /// f64 bits, `0` until the host calls `set_scale`; GUI-thread-only, but atomic so `gui_get_size`, `set_scale`,
@@ -305,6 +304,11 @@ struct ClapPluginData<P: PluginExport> {
     /// `&ClapPluginData` without a `&mut *ctx` - and so it stays outside the
     /// `gui` cell, which the resize closure would otherwise re-enter.
     host_scale: AtomicU64,
+    /// The open editor's own window scale (`Editor::window_scale`, f64 bits,
+    /// `0` = none), refreshed by the size callbacks. Converts sizes while the
+    /// host never called `set_scale`, so the reported size matches the child
+    /// window the editor created at the monitor DPI / `Xft.dpi`.
+    window_scale: AtomicU64,
     /// A resize the plugin requested through `PluginContext::request_resize`
     /// that came back into a GUI callback (`gui_set_size` / `gui_get_size`)
     /// synchronously - the host answering `request_host_resize` on the same
@@ -378,9 +382,25 @@ struct ClapGui {
 }
 
 impl<P: PluginExport> ClapPluginData<P> {
-    /// The host's scale, `1.0` until it calls `gui.set_scale`.
+    /// The scale between the host's physical pixels and the editor's logical
+    /// size: the host's `gui.set_scale` value, else the open editor's window
+    /// scale, else `1.0`. Never both multiplied.
     fn host_scale(&self) -> f64 {
-        self.reported_host_scale().unwrap_or(1.0)
+        self.reported_host_scale()
+            .or_else(|| match self.window_scale.load(Ordering::Relaxed) {
+                0 => None,
+                bits => Some(f64::from_bits(bits)),
+            })
+            .unwrap_or(1.0)
+    }
+
+    /// Cache `editor`'s window scale for [`Self::host_scale`].
+    fn note_window_scale(&self, editor: &dyn Editor) {
+        let bits = editor
+            .window_scale()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map_or(0, f64::to_bits);
+        self.window_scale.store(bits, Ordering::Relaxed);
     }
 
     /// The last scale the host passed to `gui.set_scale`, if it ever did.
@@ -4302,7 +4322,10 @@ unsafe extern "C" fn gui_set_scale<P: PluginExport>(
     // `Editor::set_scale_factor` is author code; firewall it so a panic
     // can't unwind across the C ABI (false = "scale not applied").
     run_extern_callback_with::<P, bool>("CLAP", "gui_set_scale", false, || unsafe {
-        if !scale.is_finite() || scale <= 0.0 {
+        // macOS: the Cocoa GUI API is in logical points and AppKit applies
+        // the backing scale, so refuse (the spec's answer for "the OS
+        // handles scaling"). Accepting would divide host sizes by it.
+        if cfg!(target_os = "macos") || !scale.is_finite() || scale <= 0.0 {
             return false;
         }
         let data = data_from_plugin::<P>(plugin);
@@ -4341,6 +4364,9 @@ unsafe extern "C" fn gui_get_size<P: PluginExport>(
         // Apply a resize the plugin requested re-entrantly (stashed by
         // `gui_set_size` because the cell was busy) before reporting.
         let packed = data.pending_resize.swap(0, Ordering::Relaxed);
+        if let Some(editor) = gui.editor.as_deref() {
+            data.note_window_scale(editor);
+        }
         if packed != 0
             && let Some(editor) = gui.editor.as_mut()
         {
@@ -4751,7 +4777,6 @@ unsafe extern "C" fn gui_set_size<P: PluginExport>(
     // them (false = "size rejected").
     run_extern_callback_with::<P, bool>("CLAP", "gui_set_size", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let host_scale = data.host_scale();
         // A host answering a plugin `request_resize` (`request_host_resize`)
         // synchronously calls `set_size` back here while an outer GUI callback
         // (open / set_scale / a re-entrant set_size) still holds the cell.
@@ -4767,6 +4792,8 @@ unsafe extern "C" fn gui_set_size<P: PluginExport>(
         let Some(editor) = gui.editor.as_mut() else {
             return false;
         };
+        data.note_window_scale(editor.as_ref());
+        let host_scale = data.host_scale();
         if editor.can_resize() {
             // Host passes physical points; moose works in logical.
             // Divide by the host-applied scale before handing to the
@@ -4815,7 +4842,6 @@ unsafe extern "C" fn gui_adjust_size<P: PluginExport>(
     // (false = "no adjustment").
     run_extern_callback_with::<P, bool>("CLAP", "gui_adjust_size", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let host_scale = data.host_scale();
         // `try_enter`, not `enter`: a host may query the nearest valid size
         // while an outer GUI callback holds the cell mid resize round-trip
         // (same hazard the `gui_set_size` / `gui_get_size` siblings guard).
@@ -4827,6 +4853,8 @@ unsafe extern "C" fn gui_adjust_size<P: PluginExport>(
         let Some(editor) = gui.editor.as_ref() else {
             return false;
         };
+        data.note_window_scale(editor.as_ref());
+        let host_scale = data.host_scale();
         if editor.can_resize() {
             let req = scale_physical_to_logical(*width, *height, host_scale);
             let (lw, lh) = fit_logical_size(req.0, req.1, editor.as_ref());
@@ -5131,6 +5159,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             needs_rescan: Arc::new(AtomicBool::new(false)),
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),
+            window_scale: AtomicU64::new(0),
             pending_resize: AtomicU64::new(0),
             extensions: Extensions::<P>::new(),
             audio: PluginCell::new(ClapAudio {
