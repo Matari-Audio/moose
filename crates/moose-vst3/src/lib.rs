@@ -1618,6 +1618,38 @@ unsafe extern "C" fn cb_param_set_value<P: PluginExport>(
     }
 }
 
+unsafe extern "C" fn cb_param_presentation<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: u32,
+    out: *mut c_char,
+    capacity: u32,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "parameter_presentation", -1, || unsafe {
+        if ctx.is_null() || out.is_null() || capacity == 0 {
+            return -1;
+        }
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let Some(presentation) = inst.params_arc.parameter_presentation(id) else {
+            return -1;
+        };
+        let _ = copy_c_str(out, capacity as usize, &presentation.name);
+        i32::from(presentation.hidden)
+    })
+}
+
+unsafe extern "C" fn cb_param_presentation_revision<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+) -> u64 {
+    run_extern_callback_with::<P, u64>("vst3", "parameter_presentation_revision", 0, || unsafe {
+        if ctx.is_null() {
+            return 0;
+        }
+        (*ctx.cast::<Vst3Instance<P>>())
+            .params_arc
+            .parameter_presentation_revision()
+    })
+}
+
 /// Whether `id` is a `CHUNKED` param. The shim keys its block-rate
 /// pre-commit on this: chunked params are committed per-offset by
 /// `process_chunked`, so the shim must not pre-write their end value.
@@ -3661,6 +3693,8 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         layout_bus_channels: cb_layout_bus_channels::<P>,
         match_bus_layout_perbus: cb_match_bus_layout_perbus::<P>,
         param_is_chunked: cb_param_is_chunked::<P>,
+        param_presentation: cb_param_presentation::<P>,
+        param_presentation_revision: cb_param_presentation_revision::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every

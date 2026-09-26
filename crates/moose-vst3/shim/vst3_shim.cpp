@@ -524,6 +524,11 @@ struct Vst3Callbacks {
     // block, so process_chunked applies each point at its sample offset
     // instead of the end value landing from sample 0.
     int32_t (*param_is_chunked)(void*, uint32_t);
+    // Runtime title for a param: -1 = none (keep the static info),
+    // otherwise 0 / 1 = hidden. Writes the NUL-terminated title.
+    int32_t (*param_presentation)(void*, uint32_t, char*, uint32_t);
+    // Bumped whenever any param_presentation result changes.
+    uint64_t (*param_presentation_revision)(void*);
 };
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1910,17 @@ public:
         info->defaultNormalizedValue = p.default_normalized;
         info->unitId = ((uint32_t)index < 4096) ? g_param_unit_id[index] : 0;
         info->flags = p.flags;
+        if (g_cb && ctx) {
+            char title[512] = {};
+            int32 hidden = g_cb->param_presentation(ctx, p.id, title, sizeof(title));
+            if (hidden >= 0) {
+                str_to_char16(info->title, title, 128);
+                str_to_char16(info->shortTitle, title, 128);
+                // ParameterFlags: kCanAutomate=1, kIsReadOnly=2, kIsHidden=16.
+                // The SDK defines hidden as read-only and not automatable.
+                if (hidden) info->flags = (info->flags | 2 | 16) & ~1;
+            }
+        }
         return kResultOk;
     }
 
@@ -1972,7 +1988,14 @@ public:
     // main-thread callbacks (param reads, edit gestures), so the call
     // lands on the UI thread as VST3 wants. IComponentHandler vtable:
     //   [3] beginEdit [4] performEdit [5] endEdit [6] restartComponent
+    uint64_t presentationRevision = 0;
     void flushPendingRestart() {
+        if (!componentHandler) return;
+        uint64_t revision = (g_cb && ctx) ? g_cb->param_presentation_revision(ctx) : 0;
+        if (revision != presentationRevision) {
+            presentationRevision = revision;
+            pendingRestart.fetch_or(1 << 4, std::memory_order_release); // kParamTitlesChanged
+        }
         int32 flags = pendingRestart.exchange(0, std::memory_order_acq_rel);
         if (!flags || !componentHandler) return;
         auto restart = (tresult (*)(void*, int32))(*(void***)componentHandler)[6];

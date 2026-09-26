@@ -157,9 +157,6 @@ pub struct ParameterPresentation {
     pub name: String,
     pub group: String,
     pub hidden: bool,
-    /// Whether dynamic-list formats (CLAP) enumerate this parameter.
-    /// Fixed-list formats (VST3) keep it and only apply `hidden`.
-    pub available: bool,
 }
 
 /// Trait implemented by #[derive(Params)] on a struct.

@@ -348,7 +348,12 @@ mod tests {
         use moose_core::state::{self, DeserializedState};
 
         #[derive(Params)]
-        #[params(validate_persist = "accept", post_load = "loaded")]
+        #[params(
+            validate_persist = "accept",
+            post_load = "loaded",
+            presentation = "present",
+            presentation_revision = "revision"
+        )]
         struct Guarded {
             #[param(name = "Gain", range = "linear(0, 1)", default = 0.5)]
             gain: FloatParam,
@@ -363,6 +368,16 @@ mod tests {
             }
             fn loaded(&self) {
                 self.loads.store(self.loads.load() + 1);
+            }
+            fn present(&self, id: u32) -> Option<moose::params::ParameterPresentation> {
+                (id == self.gain.id()).then(|| moose::params::ParameterPresentation {
+                    name: "Drive".into(),
+                    group: String::new(),
+                    hidden: false,
+                })
+            }
+            fn revision(&self) -> u64 {
+                u64::from(self.loads.load())
             }
         }
 
@@ -389,6 +404,11 @@ mod tests {
         assert!((target.gain.value() - 0.9).abs() < 1e-9);
         assert_eq!(*target.note.read().unwrap(), "fine");
         assert_eq!(target.loads.load(), 1, "post_load runs once per restore");
+        assert_eq!(target.parameter_presentation_revision(), 1);
+        assert_eq!(
+            target.parameter_presentation(gain_id).map(|p| p.name),
+            Some("Drive".to_string())
+        );
     }
 
     /// Params without a `parse_fn` still parse host text: the derive

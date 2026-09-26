@@ -65,7 +65,7 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
     CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info, clap_plugin_params,
 };
-use clap_sys::ext::params::{CLAP_PARAM_RESCAN_VALUES, clap_host_params};
+use clap_sys::ext::params::{CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, clap_host_params};
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
     clap_plugin_preset_load,
@@ -286,6 +286,8 @@ struct ClapPluginData<P: PluginExport> {
     render_mode: AtomicU8,
     /// Flag: GUI changed params, need rescan on main thread.
     needs_rescan: Arc<AtomicBool>,
+    /// Last `Params::parameter_presentation_revision` the host saw.
+    presentation_revision: AtomicU64,
     /// Shared transport slot: audio thread writes each block, editor reads.
     transport_slot: Arc<TransportSlot>,
     /// Host-reported GUI scale (via `clap_plugin_gui::set_scale`).
@@ -886,12 +888,25 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        if data.needs_rescan.swap(false, Ordering::Relaxed)
+        // Runtime names / groups / hidden flags (`parameter_presentation`)
+        // are re-read by the host on RESCAN_INFO, which CLAP allows while
+        // active.
+        let revision = data.params_arc.parameter_presentation_revision();
+        let info_changed = data.presentation_revision.swap(revision, Ordering::Relaxed) != revision;
+        let values_changed = data.needs_rescan.swap(false, Ordering::Relaxed);
+        if (values_changed || info_changed)
             && !data.host_params.is_null()
             && !data.host.is_null()
             && let Some(rescan) = (*data.host_params).rescan
         {
-            rescan(data.host, CLAP_PARAM_RESCAN_VALUES);
+            let mut flags = 0;
+            if values_changed {
+                flags |= CLAP_PARAM_RESCAN_VALUES;
+            }
+            if info_changed {
+                flags |= CLAP_PARAM_RESCAN_INFO;
+            }
+            rescan(data.host, flags);
         }
 
         // Latency changed on the audio thread: tell the host here, off
@@ -3450,7 +3465,8 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
             }
             _ => {}
         }
-        out.flags = flags;
+        let presentation = data.params_arc.parameter_presentation(info.id);
+        out.flags = presented_flags(flags, presentation.as_ref());
 
         out.min_value = info.range.min();
         out.max_value = info.range.max();
@@ -3458,15 +3474,54 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
 
         // Name
         out.name = [0; CLAP_NAME_SIZE];
-        copy_str_to_buf(&mut out.name, info.name);
+        copy_str_to_buf(
+            &mut out.name,
+            presentation.as_ref().map_or(info.name, |p| p.name.as_str()),
+        );
 
         // Module path (use group if non-empty)
         out.module = [0; CLAP_PATH_SIZE];
-        if !info.group.is_empty() {
-            copy_str_to_buf(&mut out.module, info.group);
-        }
+        copy_str_to_buf(
+            &mut out.module,
+            presentation.as_ref().map_or(info.group, |p| p.group.as_str()),
+        );
 
         true
+    }
+}
+
+/// A runtime presentation's `hidden` overrides the static flag.
+fn presented_flags(flags: u32, presentation: Option<&moose_params::ParameterPresentation>) -> u32 {
+    match presentation {
+        Some(p) if p.hidden => flags | CLAP_PARAM_IS_HIDDEN,
+        Some(_) => flags & !CLAP_PARAM_IS_HIDDEN,
+        None => flags,
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    use moose_params::ParameterPresentation;
+
+    #[test]
+    fn presentation_hidden_overrides_static_flag() {
+        let shown = ParameterPresentation {
+            name: "A".into(),
+            group: String::new(),
+            hidden: false,
+        };
+        let hidden = ParameterPresentation {
+            hidden: true,
+            ..shown.clone()
+        };
+        let base = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_HIDDEN;
+        assert_eq!(presented_flags(base, None), base);
+        assert_eq!(presented_flags(base, Some(&shown)), CLAP_PARAM_IS_AUTOMATABLE);
+        assert_eq!(
+            presented_flags(CLAP_PARAM_IS_AUTOMATABLE, Some(&hidden)),
+            base
+        );
     }
 }
 
@@ -5215,6 +5270,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             active: AtomicBool::new(false),
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
             needs_rescan: Arc::new(AtomicBool::new(false)),
+            presentation_revision: AtomicU64::new(0),
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),
             window_scale: AtomicU64::new(0),
