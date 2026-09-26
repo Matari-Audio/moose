@@ -644,20 +644,34 @@ fn extract_target_triples<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
 /// per-target rustflags don't apply to host builds that omit
 /// `--target`.
 fn apply_target_cpu(cmd: &mut Command, targets: &[&str]) {
-    use crate::util::resolve_target_cpu;
-
     if targets.is_empty() {
-        if let Some(cpu) = resolve_target_cpu(moose_build::host_triple()) {
-            append_rustflags_env(cmd, "RUSTFLAGS", &format!("-C target-cpu={cpu}"));
+        if let Some(flags) = target_rustflags(moose_build::host_triple()) {
+            append_rustflags_env(cmd, "RUSTFLAGS", &flags);
         }
         return;
     }
     for triple in targets {
-        let Some(cpu) = resolve_target_cpu(triple) else {
-            continue;
-        };
-        let var = cargo_target_rustflags_var(triple);
-        append_rustflags_env(cmd, &var, &format!("-C target-cpu={cpu}"));
+        if let Some(flags) = target_rustflags(triple) {
+            append_rustflags_env(cmd, &cargo_target_rustflags_var(triple), &flags);
+        }
+    }
+}
+
+/// Extra rustflags cargo-moose adds for `triple`: the resolved
+/// `target-cpu`, and `+crt-static` on Windows MSVC so a plugin DLL
+/// carries its C runtime instead of importing `VCRUNTIME140`, which
+/// hosts that `LoadLibrary` without `LOAD_WITH_ALTERED_SEARCH_PATH`
+/// (FL Studio's scanner) cannot find. The VST3 shim's build script
+/// follows the same `crt-static` setting. (windows-gnu ignores the
+/// feature; the shim links libstdc++ statically there instead.)
+fn target_rustflags(triple: &str) -> Option<String> {
+    let cpu = crate::util::resolve_target_cpu(triple).map(|cpu| format!("-C target-cpu={cpu}"));
+    let crt = triple
+        .ends_with("-windows-msvc")
+        .then(|| "-C target-feature=+crt-static".to_string());
+    match (cpu, crt) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
     }
 }
 
@@ -835,4 +849,19 @@ pub(crate) fn cargo_build_multi_arch_with_profile(
     }
     let arg_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
     cargo_build_with_profile(&[], &arg_refs, dt, profile)
+}
+
+#[cfg(test)]
+mod rustflags_tests {
+    use super::target_rustflags;
+
+    #[test]
+    fn windows_targets_link_the_crt_statically() {
+        for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+            let flags = target_rustflags(triple).unwrap_or_default();
+            assert!(flags.contains("+crt-static"), "{triple}: {flags}");
+        }
+        let linux = target_rustflags("x86_64-unknown-linux-gnu").unwrap_or_default();
+        assert!(!linux.contains("crt-static"));
+    }
 }
