@@ -340,6 +340,12 @@ struct ClapAudio<P: PluginExport> {
     /// capacity as `event_list` so steady-state operation stays
     /// allocation-free.
     sub_event_scratch: EventList,
+    /// Param changes a stopped-transport `params_flush` applied, kept
+    /// latest-wins per id and replayed at offset 0 of the next process
+    /// block, so the plugin sees the host's explicit events (including
+    /// same-value ones) rather than only a changed snapshot. Capacity is
+    /// the param count, so it never grows.
+    deferred_params: Vec<(u32, f64)>,
     /// Current sample rate.
     sample_rate: f64,
     /// Current max block size.
@@ -2110,6 +2116,33 @@ fn declared_input_port(port: u16, count: u8) -> Option<u8> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Record a `params_flush` param change for replay in the next process
+/// block, latest value per id. Bounded by the vec's capacity (the param
+/// count), so an id the plugin doesn't declare can't grow it.
+fn defer_param_change(deferred: &mut Vec<(u32, f64)>, id: u32, value: f64) {
+    if let Some(slot) = deferred.iter_mut().find(|(d, _)| *d == id) {
+        slot.1 = value;
+    } else if deferred.len() < deferred.capacity() {
+        deferred.push((id, value));
+    }
+}
+
+/// Push the deferred flush changes at offset 0 ahead of the block's own
+/// events, then forget them. A state load discards them: they predate
+/// the recalled state, like the live param events it drops.
+fn replay_deferred_params(
+    list: &mut EventList,
+    deferred: &mut Vec<(u32, f64)>,
+    state_loaded: bool,
+) {
+    if !state_loaded {
+        for &(id, value) in deferred.iter() {
+            list.push(Event::new(0, EventBody::ParamChange { id, value }));
+        }
+    }
+    deferred.clear();
+}
+
 unsafe fn convert_input_events<P: PluginExport>(
     scr: &mut ClapAudio<P>,
     info: &PluginInfo,
@@ -2120,6 +2153,11 @@ unsafe fn convert_input_events<P: PluginExport>(
 ) {
     unsafe {
         scr.event_list.clear();
+        // Process path only (`params_flush` passes no frame count):
+        // stopped-transport param events precede this block's events.
+        if frames_count.is_some() {
+            replay_deferred_params(&mut scr.event_list, &mut scr.deferred_params, state_loaded);
+        }
 
         if in_events.is_null() {
             return;
@@ -3531,6 +3569,7 @@ unsafe extern "C" fn params_flush<P: PluginExport>(
         for ev in scr.event_list.iter() {
             if let EventBody::ParamChange { id, value } = ev.body {
                 params.set_plain(id, value);
+                defer_param_change(&mut scr.deferred_params, id, value);
             }
         }
         let _ = flush_gui_changes::<P>(data, out_events);
@@ -5123,6 +5162,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let info = P::info();
         let plugin_id_hash = state::hash_plugin_id(info.clap_id);
         let param_infos = instance.params().param_infos();
+        let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let meter_store = instance.meter_store();
         let snapshot = instance.snapshot_slot();
@@ -5178,10 +5218,11 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             pending_resize: AtomicU64::new(0),
             extensions: Extensions::<P>::new(),
             audio: PluginCell::new(ClapAudio {
-                event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                event_list: EventList::with_capacity(EVENT_LIST_PREALLOC + param_count),
                 sounding_notes: SoundingNotes::new(midi_input_ports),
                 output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
-                sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC + param_count),
+                deferred_params: Vec::with_capacity(param_count),
                 sample_rate: 44100.0,
                 max_block_size: 1024,
                 input_slices: Vec::with_capacity(max_in),
@@ -5725,5 +5766,52 @@ mod host_state_tests {
             i64::try_from(buf.len()).unwrap()
         });
         assert_eq!(blob, None);
+    }
+}
+
+#[cfg(test)]
+mod deferred_param_tests {
+    use super::{Event, EventBody, EventList, defer_param_change, replay_deferred_params};
+
+    fn change(offset: u32, id: u32, value: f64) -> Event {
+        Event::new(offset, EventBody::ParamChange { id, value })
+    }
+
+    #[test]
+    fn flushed_changes_are_latest_wins_and_bounded() {
+        let mut deferred = Vec::with_capacity(2);
+        defer_param_change(&mut deferred, 7, 0.2);
+        defer_param_change(&mut deferred, 7, 0.6);
+        defer_param_change(&mut deferred, 8, 0.1);
+        defer_param_change(&mut deferred, 9, 0.9); // over capacity: dropped
+        assert_eq!(deferred, vec![(7, 0.6), (8, 0.1)]);
+    }
+
+    #[test]
+    fn replayed_changes_precede_the_block_and_sort_stays_stable() {
+        let mut deferred = vec![(7, 0.6)];
+        let mut list = EventList::with_capacity(8);
+        replay_deferred_params(&mut list, &mut deferred, false);
+        list.push(change(32, 7, 0.7));
+        list.push(change(0, 8, 0.1));
+        list.ensure_sorted_by_offset();
+        let seen: Vec<_> = list
+            .iter()
+            .map(|e| match e.body {
+                EventBody::ParamChange { id, value } => (e.sample_offset, id, value),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(seen, vec![(0, 7, 0.6), (0, 8, 0.1), (32, 7, 0.7)]);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn state_load_discards_deferred_changes() {
+        let mut deferred = vec![(7, 0.6)];
+        let mut list = EventList::with_capacity(8);
+        replay_deferred_params(&mut list, &mut deferred, true);
+        assert_eq!(list.iter().count(), 0);
+        assert!(deferred.is_empty());
     }
 }
