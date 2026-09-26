@@ -247,7 +247,6 @@ mod tests {
         moose_test::assert_state_round_trip::<Plugin>();
     }
 
-
     #[test]
     fn bus_config_effect() {
         moose_test::assert_bus_config_effect::<Plugin>();

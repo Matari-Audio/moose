@@ -3483,7 +3483,9 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
         out.module = [0; CLAP_PATH_SIZE];
         copy_str_to_buf(
             &mut out.module,
-            presentation.as_ref().map_or(info.group, |p| p.group.as_str()),
+            presentation
+                .as_ref()
+                .map_or(info.group, |p| p.group.as_str()),
         );
 
         true
@@ -3517,7 +3519,10 @@ mod presentation_tests {
         };
         let base = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_HIDDEN;
         assert_eq!(presented_flags(base, None), base);
-        assert_eq!(presented_flags(base, Some(&shown)), CLAP_PARAM_IS_AUTOMATABLE);
+        assert_eq!(
+            presented_flags(base, Some(&shown)),
+            CLAP_PARAM_IS_AUTOMATABLE
+        );
         assert_eq!(
             presented_flags(CLAP_PARAM_IS_AUTOMATABLE, Some(&hidden)),
             base

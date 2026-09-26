@@ -16,9 +16,10 @@ fn library() -> Vec<moose_build::presets::AuthoredPreset> {
     // The same sidecar-derived name map `cargo moose install` uses;
     // written by `derive(Params)` during this crate's own build.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let annotations = read_param_annotations(
-        &moose_build::param_index_dir(&moose_build::target_dir(&workspace_root), "moose-example-synth"),
-    );
+    let annotations = read_param_annotations(&moose_build::param_index_dir(
+        &moose_build::target_dir(&workspace_root),
+        "moose-example-synth",
+    ));
     let names = ParamNameMap::from_annotations(&annotations);
     assert!(
         !names.is_empty(),
@@ -92,9 +93,10 @@ fn nested_preset_names_resolve_to_exact_runtime_ids() {
     // (but still valid) nested parameter. `cutoff`/`resonance` live in
     // the nested `filter`, `attack` in the nested `envelope`.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let annotations = read_param_annotations(
-        &moose_build::param_index_dir(&moose_build::target_dir(&dir), "moose-example-synth"),
-    );
+    let annotations = read_param_annotations(&moose_build::param_index_dir(
+        &moose_build::target_dir(&dir),
+        "moose-example-synth",
+    ));
     let names = ParamNameMap::from_annotations(&annotations);
     let p = SynthParams::default();
 

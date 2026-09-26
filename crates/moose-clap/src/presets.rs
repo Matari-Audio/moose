@@ -334,16 +334,14 @@ unsafe extern "C" fn provider_get_metadata<P: PluginExport>(
                 PresetScope::User
             };
             let hash = shared_plugin_state_hash(&info);
-            for preset in
-                moose_core::presets::enumerate_scope(
-                    path,
-                    scope,
-                    info.vendor,
-                    info.name,
-                    hash,
-                    info.preset_extension,
-                )
-            {
+            for preset in moose_core::presets::enumerate_scope(
+                path,
+                scope,
+                info.vendor,
+                info.name,
+                hash,
+                info.preset_extension,
+            ) {
                 if !report_preset::<P>(receiver, metadata_receiver, &preset) {
                     return false;
                 }

@@ -391,7 +391,10 @@ mod tests {
         };
         let target = Guarded::new();
         state::apply_params(&target, &bad);
-        assert!((target.gain.value() - 0.5).abs() < 1e-9, "param restored from a rejected state");
+        assert!(
+            (target.gain.value() - 0.5).abs() < 1e-9,
+            "param restored from a rejected state"
+        );
         assert_eq!(*target.note.read().unwrap(), "");
         assert_eq!(target.loads.load(), 0);
 

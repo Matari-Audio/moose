@@ -137,7 +137,9 @@ fn aggregate(
     // Track the active path, not every visited struct: one Params type
     // reused in two `#[nested]` slots is walked twice, a cycle is not.
     if !ancestors.insert(struct_name.to_string()) {
-        return Err(format!("cyclic #[nested] reference through `{struct_name}`"));
+        return Err(format!(
+            "cyclic #[nested] reference through `{struct_name}`"
+        ));
     }
     let path = sidecar_dir.join(format!("{struct_name}.params.toml"));
     let content = std::fs::read_to_string(&path).map_err(|e| {

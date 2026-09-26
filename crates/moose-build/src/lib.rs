@@ -481,10 +481,10 @@ impl PresetsConfig {
 /// `[plugin.presets]` table (default `trucepreset`).
 #[must_use]
 pub fn preset_extension(plugin: &PluginDef) -> &str {
-    plugin
-        .presets
-        .as_ref()
-        .map_or(moose_utils::preset::PRESET_FILE_EXT, PresetsConfig::extension)
+    plugin.presets.as_ref().map_or(
+        moose_utils::preset::PRESET_FILE_EXT,
+        PresetsConfig::extension,
+    )
 }
 
 /// Where `derive(Params)` writes a plugin crate's param sidecars and

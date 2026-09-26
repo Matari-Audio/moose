@@ -618,11 +618,8 @@ fn cmd_export(args: &[String]) -> Res {
         };
         let display = safe_filename(&preset.meta.name);
 
-        zip.start_file(
-            format!("{ext}/{dir}{}.{ext}", preset.stem),
-            options,
-        )
-        .map_err(zip_err)?;
+        zip.start_file(format!("{ext}/{dir}{}.{ext}", preset.stem), options)
+            .map_err(zip_err)?;
         zip.write_all(&moose_utils::preset::write_preset_file(&preset.meta, &blob))?;
 
         zip.start_file(format!("vstpreset/{dir}{display}.vstpreset"), options)
@@ -809,7 +806,9 @@ fn collect_files(dir: &Path, depth: usize, native_ext: &str, out: &mut Vec<PathB
         let path = entry.path();
         if path.is_dir() {
             collect_files(&path, depth - 1, native_ext, out);
-        } else if PresetFormat::from_path(&path, native_ext).is_some_and(|f| f != PresetFormat::AuthoredToml) {
+        } else if PresetFormat::from_path(&path, native_ext)
+            .is_some_and(|f| f != PresetFormat::AuthoredToml)
+        {
             out.push(path);
         }
     }

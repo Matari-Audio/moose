@@ -717,7 +717,10 @@ mod temp_name_tests {
     #[test]
     fn hot_temp_name_is_unique_per_process() {
         let name = super::hot_temp_name("gain", "so", 3, 7);
-        assert_eq!(name, format!("moose-hot-gain-{}-3-7.so", std::process::id()));
+        assert_eq!(
+            name,
+            format!("moose-hot-gain-{}-3-7.so", std::process::id())
+        );
     }
 }
 
