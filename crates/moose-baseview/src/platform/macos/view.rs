@@ -318,7 +318,8 @@ impl ViewImpl for BaseviewView {
         let current_size = this.view.size();
         let current_scale_factor = this.view.backing_scale_factor();
 
-        if this.state.scale_factor.get() != current_scale_factor {
+        let scale_changed = this.state.scale_factor.get() != current_scale_factor;
+        if scale_changed {
             Self::apply_size_constraints(this);
         }
 
@@ -347,6 +348,13 @@ impl ViewImpl for BaseviewView {
 
                     Self::resize(this, previous.into(), false, false);
                 }
+            }
+
+            if scale_changed {
+                Self::trigger_event(
+                    this,
+                    Event::Window(WindowEvent::ScaleFactorChanged(current_scale_factor)),
+                );
             }
         }
     }

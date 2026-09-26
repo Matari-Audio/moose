@@ -131,6 +131,19 @@ impl Window {
         Ok(())
     }
 
+    /// MOOSE addition: sets or clears the scale factor override.
+    ///
+    /// See [`WindowSettings::scale_factor_override`]. This does not resize the window: the
+    /// physical size stays the same and only the logical size reported afterwards changes.
+    /// Call [`resize`](Self::resize) afterwards to keep a logical size.
+    ///
+    /// On macOS this is a no-op.
+    #[inline]
+    pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<(), Error> {
+        self.inner.set_scale_factor_override(crate::settings::sanitize_scale_factor(scale_factor))?;
+        Ok(())
+    }
+
     /// Closes and destroys the window.
     ///
     /// This releases all resources the window uses.

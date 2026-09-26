@@ -77,7 +77,7 @@ impl X11Connection {
 
     pub fn get_scaling(&self) -> Option<f64> {
         if let Ok(Some(dpi)) = self.resources.get_value::<u32>("Xft.dpi", "") {
-            Some(dpi as f64 / 96.0)
+            Some(xft_dpi_to_scale(dpi))
         } else {
             None
         }
@@ -127,5 +127,25 @@ impl X11Connection {
             window_id.get(),
             &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
         )
+    }
+}
+
+/// MOOSE: `Xft.dpi` is a desktop-wide setting that some sessions set to junk (0, or huge
+/// values). Clamp the scale to 0.5..=4 so a bad value cannot produce an unusable window.
+fn xft_dpi_to_scale(dpi: u32) -> f64 {
+    (f64::from(dpi) / 96.0).clamp(0.5, 4.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xft_dpi_to_scale;
+
+    #[test]
+    fn xft_dpi_is_scaled_and_clamped() {
+        assert_eq!(xft_dpi_to_scale(96), 1.0);
+        assert_eq!(xft_dpi_to_scale(192), 2.0);
+        assert_eq!(xft_dpi_to_scale(144), 1.5);
+        assert_eq!(xft_dpi_to_scale(0), 0.5);
+        assert_eq!(xft_dpi_to_scale(96 * 10), 4.0);
     }
 }

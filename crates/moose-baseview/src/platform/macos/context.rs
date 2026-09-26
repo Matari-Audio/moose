@@ -71,6 +71,11 @@ impl WindowContext {
         Ok(())
     }
 
+    pub fn set_scale_factor_override(&self, _scale_factor: Option<f64>) -> Result<()> {
+        // No-op on macOS: coordinates are logical and the backing scale is authoritative.
+        Ok(())
+    }
+
     pub fn set_mouse_cursor(&self, cursor: MouseCursor) -> Result<()> {
         let Some(view) = self.view.load() else { return Ok(()) };
         let Some(view) = view.inner_ref() else { return Ok(()) };

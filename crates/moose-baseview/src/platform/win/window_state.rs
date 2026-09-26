@@ -96,6 +96,13 @@ impl WindowState {
         Ok(())
     }
 
+    pub fn set_scale_factor_override(
+        &self, scale_factor: Option<f64>,
+    ) -> Result<(), super::PlatformError> {
+        self.shared.scale_factor_override.set(scale_factor);
+        Ok(())
+    }
+
     pub fn set_mouse_cursor(&self, mouse_cursor: MouseCursor) -> Result<(), super::PlatformError> {
         self.cursor_icon.set(mouse_cursor);
         if let Ok(cursor) = SystemCursor::load(mouse_cursor) {
@@ -134,6 +141,7 @@ pub struct WindowSharedState {
     pub current_size: Cell<PhysicalSize<u32>>,
     pub current_dpi: Cell<Option<Dpi>>, // None if Win32 HiDPI isn't supported
     pub fallback_scale_factor: Cell<Option<f64>>,
+    pub scale_factor_override: Cell<Option<f64>>,
     pub resize_host_originated: Cell<bool>,
     pub destroy_host_originated: Cell<bool>,
     pub dpi_scaling_strategy: Cell<DpiScalingStrategy>,
@@ -148,8 +156,14 @@ impl WindowSharedState {
             parented: (settings.parent.is_some() || settings.wait_for_parent).into(),
             is_alive: true.into(),
             current_dpi: None.into(),
-            current_size: settings.size.to_physical(1.0).into(),
+            // With an override the final physical size is already known, so the window is
+            // created at that size (no resize flash in `after_create`).
+            current_size: settings
+                .size
+                .to_physical(settings.scale_factor_override.unwrap_or(1.0))
+                .into(),
             fallback_scale_factor: settings.fallback_scale_factor.into(),
+            scale_factor_override: settings.scale_factor_override.into(),
             resize_host_originated: false.into(),
             destroy_host_originated: false.into(),
             sizing_strategy: SizingStrategy::from_settings(settings),
@@ -180,6 +194,15 @@ impl WindowSharedState {
     }
 
     pub fn scale_factor(&self) -> f64 {
+        if let Some(scale_factor) = self.scale_factor_override.get() {
+            return scale_factor;
+        }
+
+        self.platform_scale_factor()
+    }
+
+    /// The scale factor from the OS DPI (or the fallback), ignoring the override.
+    pub fn platform_scale_factor(&self) -> f64 {
         if let Some(dpi) = self.current_dpi.get() {
             dpi.scale_factor()
         } else {

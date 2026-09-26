@@ -49,6 +49,23 @@ pub struct WindowSettings {
     /// On macOS, this function is always a no-op.
     pub fallback_scale_factor: Option<f64>,
 
+    /// MOOSE addition: a scale factor that takes precedence over the platform's.
+    ///
+    /// Plugin hosts often tell the plugin which scale to render at (CLAP `set_scale`,
+    /// VST3 `IPlugViewContentScaleSupport`). When set, this value is used for every
+    /// logical/physical conversion (window creation, [`Window::resize`](crate::Window::resize),
+    /// the [`WindowSize`](crate::WindowSize) given to the handler) instead of the OS DPI.
+    /// Platform scale changes are still reported through
+    /// [`WindowEvent::ScaleFactorChanged`](crate::WindowEvent::ScaleFactorChanged).
+    ///
+    /// Non-finite or non-positive values are ignored.
+    ///
+    /// # Platform compatibility notes
+    ///
+    /// On macOS this is ignored: AppKit coordinates are logical and the backing scale of
+    /// the window is always authoritative.
+    pub scale_factor_override: Option<f64>,
+
     /// If provided, then an OpenGL context will be created for this window. You'll be able to
     /// access this context through [crate::WindowContext::gl_context].
     ///
@@ -107,6 +124,13 @@ impl WindowSettings {
         self
     }
 
+    /// Sets [`scale_factor_override`](Self::scale_factor_override) to the given value.
+    #[inline]
+    pub fn with_scale_factor_override(mut self, scale_factor: impl Into<Option<f64>>) -> Self {
+        self.scale_factor_override = sanitize_scale_factor(scale_factor.into());
+        self
+    }
+
     /// Sets [`resizable`](Self::resizable) to the given value.
     #[inline]
     pub fn with_resizable(mut self, resizable: bool) -> Self {
@@ -143,6 +167,7 @@ impl Default for WindowSettings {
             parent: None,
             wait_for_parent: false,
             fallback_scale_factor: None,
+            scale_factor_override: None,
             resizable: true,
             min_size: None,
             max_size: None,
@@ -192,4 +217,9 @@ impl From<platform::ParentWindowHandle> for ParentWindowHandle {
     fn from(inner: platform::ParentWindowHandle) -> Self {
         Self { inner }
     }
+}
+
+/// Returns `None` for scale factors that cannot be used (non-finite, zero or negative).
+pub(crate) fn sanitize_scale_factor(scale_factor: Option<f64>) -> Option<f64> {
+    scale_factor.filter(|s| s.is_finite() && *s > 0.0)
 }

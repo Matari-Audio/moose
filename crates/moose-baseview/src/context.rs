@@ -59,6 +59,14 @@ impl WindowContext {
         self.inner.scale_factor()
     }
 
+    /// MOOSE addition: sets or clears the scale factor override from inside the handler.
+    ///
+    /// Same as [`Window::set_scale_factor_override`](crate::Window::set_scale_factor_override).
+    pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<(), Error> {
+        self.inner.set_scale_factor_override(crate::settings::sanitize_scale_factor(scale_factor))?;
+        Ok(())
+    }
+
     /// Returns the current size of this window.
     pub fn size(&self) -> WindowSize {
         self.inner.size()

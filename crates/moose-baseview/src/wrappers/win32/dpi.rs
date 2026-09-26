@@ -80,9 +80,9 @@ pub enum ProcessDpiAwareness {
 impl ProcessDpiAwareness {
     fn from_raw(raw: PROCESS_DPI_AWARENESS) -> Option<Self> {
         match raw {
-            PROCESS_DPI_UNAWARE => Some(Self::SystemDpiAware),
-            PROCESS_SYSTEM_DPI_AWARE => Some(Self::PerMonitorDpiAware),
-            PROCESS_PER_MONITOR_DPI_AWARE => Some(Self::Unaware),
+            PROCESS_DPI_UNAWARE => Some(Self::Unaware),
+            PROCESS_SYSTEM_DPI_AWARE => Some(Self::SystemDpiAware),
+            PROCESS_PER_MONITOR_DPI_AWARE => Some(Self::PerMonitorDpiAware),
             _ => {
                 crate::warn!("Unknown PROCESS_DPI_AWARENESS value: {}", raw);
                 None
@@ -159,9 +159,10 @@ impl DpiAwarenessContext {
 
     /// Windows 10, version 1607.
     pub fn set_thread(&self, user32: &ExtendedUser32) -> Option<Result<DpiAwarenessContext>> {
-        let previous = unsafe {
-            user32.set_thread_dpi_awareness_context?(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-        };
+        // MOOSE: upstream always passed PER_MONITOR_AWARE_V2 here, so the guard's
+        // restore in `Drop` re-applied V2 instead of the host thread's previous
+        // context and left the host's GUI thread permanently switched.
+        let previous = unsafe { user32.set_thread_dpi_awareness_context?(self.inner.as_ptr()) };
 
         let Some(inner) = NonNull::new(previous) else { return Some(Err(Error::from_thread())) };
 
@@ -169,9 +170,7 @@ impl DpiAwarenessContext {
     }
 
     pub fn set_process(&self, user32: &ExtendedUser32) -> Option<Result<()>> {
-        let result = unsafe {
-            user32.set_process_dpi_awareness_context?(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-        };
+        let result = unsafe { user32.set_process_dpi_awareness_context?(self.inner.as_ptr()) };
 
         if result == FALSE {
             return Some(Err(Error::from_thread()));

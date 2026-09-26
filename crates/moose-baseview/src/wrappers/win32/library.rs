@@ -4,7 +4,9 @@ use std::ops::Deref;
 use std::ptr::NonNull;
 use windows_core::Error;
 use windows_sys::Win32::Foundation::FreeLibrary;
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 /// # Safety
 ///
@@ -68,7 +70,13 @@ pub struct RawLibrary(NonNull<c_void>);
 
 impl RawLibrary {
     pub unsafe fn load(module_name: &CStr) -> Result<Self, Error> {
-        let library = unsafe { LoadLibraryA(module_name.as_ptr().cast()) };
+        // MOOSE: wide-char API, and only look in System32 so a DLL planted next to
+        // the host executable or in the current directory can never be picked up.
+        let wide: Vec<u16> =
+            module_name.to_bytes().iter().map(|&b| u16::from(b)).chain(Some(0)).collect();
+        let library = unsafe {
+            LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)
+        };
         let Some(library) = NonNull::new(library) else { return Err(Error::from_thread()) };
 
         Ok(Self(library))

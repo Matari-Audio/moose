@@ -115,6 +115,13 @@ pub enum WindowEvent {
     Focused,
     Unfocused,
     WillClose,
+    /// MOOSE addition: the platform scale factor of the window changed, e.g. because it
+    /// moved to a monitor with a different DPI. Carries the new platform scale factor.
+    ///
+    /// This is reported even while a scale factor override is active, so the handler can
+    /// decide whether to follow the platform. Sent on Windows (top-level and child windows)
+    /// and macOS. On X11 the scale is read once at creation and this is never sent.
+    ScaleFactorChanged(f64),
 }
 
 #[derive(Debug, Clone)]

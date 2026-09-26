@@ -20,10 +20,16 @@ use x11rb::CURRENT_TIME;
 pub struct ScalingFactor {
     system: Cell<Option<f64>>,
     suggested: Cell<Option<f64>>,
+    /// MOOSE: `WindowSettings::scale_factor_override`, wins over everything else.
+    overridden: Cell<Option<f64>>,
 }
 
 impl ScalingFactor {
     pub fn get(&self) -> f64 {
+        if let Some(factor) = self.overridden.get() {
+            return factor;
+        };
+
         if let Some(factor) = self.system.get() {
             return factor;
         };
@@ -38,7 +44,11 @@ impl ScalingFactor {
     pub fn suggest(&self, value: f64) -> bool {
         self.suggested.set(Some(value));
 
-        self.system.get().is_none()
+        self.system.get().is_none() && self.overridden.get().is_none()
+    }
+
+    pub fn set_override(&self, value: Option<f64>) {
+        self.overridden.set(value);
     }
 }
 
@@ -75,8 +85,14 @@ impl WindowInner {
         let xcb_connection = X11Connection::new()?;
 
         let scaling = xcb_connection.get_scaling();
+        let scaling_factor = ScalingFactor {
+            system: scaling.into(),
+            suggested: options.fallback_scale_factor.into(),
+            overridden: options.scale_factor_override.into(),
+        };
 
-        let initial_scale_factor = scaling.unwrap_or(1.0);
+        // MOOSE: honour the override (and the fallback) at creation too, not only later.
+        let initial_scale_factor = scaling_factor.get();
         shared.set_scaling_factor(initial_scale_factor);
 
         let physical_size = options.size.to_physical(initial_scale_factor);
@@ -139,10 +155,7 @@ impl WindowInner {
             xcb_window,
             visual_id: visual_info.visual_id,
             window_size: physical_size.into(),
-            scaling_factor: ScalingFactor {
-                system: scaling.into(),
-                suggested: options.fallback_scale_factor.into(),
-            },
+            scaling_factor,
             sizing_strategy,
             mouse_cursor: MouseCursor::default().into(),
             loop_signal: ev_loop.get_signal(),
@@ -225,6 +238,12 @@ impl WindowInner {
         // This will trigger a `ConfigureNotify` event which will in turn change `self.window_info`
         // and notify the window handler about it
 
+        Ok(())
+    }
+
+    pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
+        self.scaling_factor.set_override(scale_factor);
+        self.main_thread_shared.set_scaling_factor(self.scaling_factor.get());
         Ok(())
     }
 

@@ -281,6 +281,9 @@ impl EventLoop {
 
                 Ok(())
             }
+            WindowThreadRequest::SetScaleFactorOverride(scale_factor) => {
+                self.window.set_scale_factor_override(scale_factor)
+            }
             WindowThreadRequest::SetParent(new_parent) => {
                 self.window.xcb_window.reparent(Some(new_parent.window_id))?;
 

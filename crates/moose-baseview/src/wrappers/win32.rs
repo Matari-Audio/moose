@@ -19,7 +19,7 @@ pub use user32::*;
 use std::ptr::null_mut;
 use windows_core::{Error, Result, HRESULT};
 use windows_sys::Win32::Foundation::{S_FALSE, S_OK};
-use windows_sys::Win32::System::Ole::OleInitialize;
+use windows_sys::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, TranslateMessage, MSG,
 };
@@ -30,6 +30,12 @@ pub fn ole_initialize() -> Result<()> {
         S_OK | S_FALSE => Ok(()),
         result => Err(Error::new(HRESULT(result), "OLE initialization failed")),
     }
+}
+
+/// Balances one successful [`ole_initialize`] call on the same thread.
+pub fn ole_uninitialize() {
+    // SAFETY: only called after a successful OleInitialize on this thread.
+    unsafe { OleUninitialize() }
 }
 
 pub fn run_thread_message_loop_until(until: impl Fn() -> bool) -> Result<()> {

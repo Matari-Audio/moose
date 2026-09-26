@@ -22,7 +22,7 @@ use crate::window::WindowInitializer;
 use crate::wrappers::win32::cursor::SystemCursor;
 use crate::wrappers::win32::window::*;
 use crate::wrappers::win32::{
-    ole_initialize, run_thread_message_loop_until, Dpi, DpiAwarenessGuard, LibraryModule, Rect,
+    ole_initialize, ole_uninitialize, run_thread_message_loop_until, Dpi, DpiAwarenessGuard, LibraryModule, Rect,
     WindowStyle,
 };
 use crate::{Event, MouseButton, MouseEvent, ScrollDelta, WindowEvent, WindowSize};
@@ -132,6 +132,11 @@ impl WindowHandle {
         }
     }
 
+    pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
+        self.state.scale_factor_override.set(scale_factor);
+        Ok(())
+    }
+
     pub fn set_parent(&self, new_parent: ParentWindowHandle) -> Result<()> {
         let hwnd = match self.hwnd.get() {
             Some(hwnd) => hwnd,
@@ -213,6 +218,7 @@ pub struct BaseviewWindow {
     // Things not directly used, but kept so their Drop impl runs when the window is destroyed
     _keyboard_hook: Cell<Option<hook::KeyboardHookHandle>>,
     _drop_target: Cell<Option<ComObject<DropTarget>>>,
+    ole_initialized: Cell<bool>,
 
     #[cfg(feature = "opengl")]
     pub gl_config: Option<crate::gl::GlConfig>,
@@ -249,6 +255,7 @@ impl BaseviewWindow {
                     host: init.host,
 
                     _drop_target: None.into(),
+                    ole_initialized: false.into(),
                     _keyboard_hook: None.into(),
 
                     #[cfg(feature = "opengl")]
@@ -335,32 +342,43 @@ impl WindowImpl for BaseviewWindow {
             .get()
             .get_dpi_for_window(window, &self.shared_state.user32);
 
-        if let Some(dpi) = dpi {
-            if Some(dpi) != window_state.shared.current_dpi.get() {
-                window_state.shared.current_dpi.set(Some(dpi));
-
-                // We cannot create a window in "logical" pixels, and we can't DPI-scale to physical pixels because we
-                // have no way to know where the window will end up.
-                // So, at window creation, we assume a DPI=96, and if it ends up wrong, we resize the window
-                // to the actual logical size the user desired.
-                let new_size = self.initial_size.to_physical(dpi.scale_factor());
-
-                // Preemptively update so a synchronous WM_SIZE from SetWindowPos below
-                // doesn't also emit Resized.
-                window_state.shared.current_size.set(new_size);
-                let guard = DpiAwarenessGuard::new(
-                    &window_state.shared.user32,
-                    self.shared_state.dpi_scaling_strategy.get(),
-                )?;
-                window.resize_and_activate(new_size, Some(dpi), &guard)?;
-            }
+        if dpi.is_some() {
+            window_state.shared.current_dpi.set(dpi);
         }
 
-        let drop_target = ComObject::new(DropTarget::new(Rc::downgrade(window_state), window));
-        self._drop_target.set(Some(drop_target.clone()));
+        // We cannot create a window in "logical" pixels, and we can't DPI-scale to physical pixels because we
+        // have no way to know where the window will end up.
+        // So, at window creation, we assume a DPI=96, and if it ends up wrong, we resize the window
+        // to the actual logical size the user desired.
+        // MOOSE: the effective scale also honours `scale_factor_override`.
+        let new_size = self.initial_size.to_physical(window_state.shared.scale_factor());
+        if new_size != window_state.shared.current_size.get() {
+            // Preemptively update so a synchronous WM_SIZE from SetWindowPos below
+            // doesn't also emit Resized.
+            window_state.shared.current_size.set(new_size);
+            let guard = DpiAwarenessGuard::new(
+                &window_state.shared.user32,
+                self.shared_state.dpi_scaling_strategy.get(),
+            )?;
+            window.resize_and_activate(new_size, window_state.shared.current_dpi.get(), &guard)?;
+        }
 
-        ole_initialize()?;
-        window.register_drag_drop(drop_target.as_interface())?;
+        // MOOSE: every successful OleInitialize (S_OK or S_FALSE) is balanced by an
+        // OleUninitialize in `before_destroy`. A host GUI thread that is already in the
+        // multithreaded apartment returns RPC_E_CHANGED_MODE: that only disables drag and
+        // drop, it must not fail the whole editor window.
+        match ole_initialize() {
+            Ok(()) => {
+                self.ole_initialized.set(true);
+                let drop_target =
+                    ComObject::new(DropTarget::new(Rc::downgrade(window_state), window));
+                match window.register_drag_drop(drop_target.as_interface()) {
+                    Ok(()) => self._drop_target.set(Some(drop_target)),
+                    Err(e) => warn!("RegisterDragDrop failed, drag and drop disabled: {}", e),
+                }
+            }
+            Err(e) => warn!("OleInitialize failed, drag and drop disabled: {}", e),
+        }
 
         #[cfg(feature = "opengl")]
         if let Some(gl_config) = self.gl_config.clone() {
@@ -391,7 +409,13 @@ impl WindowImpl for BaseviewWindow {
     }
 
     fn before_destroy(&self, window: HWnd) {
-        let _ = window.revoke_drag_drop();
+        if let Some(drop_target) = self._drop_target.take() {
+            let _ = window.revoke_drag_drop();
+            drop(drop_target);
+        }
+        if self.ole_initialized.replace(false) {
+            ole_uninitialize();
+        }
     }
 }
 
@@ -623,10 +647,15 @@ unsafe fn wnd_proc_inner(
 
             let new_size = suggested_rect.size();
 
-            let changed = window_state.shared.current_size.get() != new_size
-                || window_state.shared.current_dpi.get() != Some(dpi);
+            let dpi_changed = window_state.shared.current_dpi.get() != Some(dpi);
+            let changed = window_state.shared.current_size.get() != new_size || dpi_changed;
 
             window_state.shared.current_dpi.set(Some(dpi));
+            if dpi_changed {
+                window_bv.handle_event(Event::Window(WindowEvent::ScaleFactorChanged(
+                    dpi.scale_factor(),
+                )));
+            }
             let previous_size = window_state.shared.current_size.replace(new_size);
 
             // Windows makes us resize the window manually. This however will not send a WM_SIZE event,
@@ -635,7 +664,7 @@ unsafe fn wnd_proc_inner(
 
             if changed {
                 let handler = window_bv.handler.get()?;
-                let new_size = WindowSize::from_physical(new_size, dpi.scale_factor());
+                let new_size = WindowSize::from_physical(new_size, window_state.shared.scale_factor());
 
                 if let Err(e) = handler.resized(new_size) {
                     warn!("Window Handler failed to resize: {}", e);
@@ -663,6 +692,40 @@ unsafe fn wnd_proc_inner(
             }
 
             None
+        }
+        // MOOSE: child windows never get WM_DPICHANGED. Per-monitor-v2 children get
+        // WM_DPICHANGED_AFTERPARENT instead once the top-level window moved to a monitor with
+        // another DPI. Re-read the DPI, report it, and keep the logical size unless an
+        // override pins the scale (then the handler decides what to do).
+        WM_DPICHANGED_AFTERPARENT => {
+            let shared = &window_state.shared;
+            let Some(dpi) =
+                shared.dpi_scaling_strategy.get().get_dpi_for_window(window, &window_state.user32)
+            else {
+                return Some(0);
+            };
+
+            let previous_scale = shared.scale_factor();
+            if shared.current_dpi.replace(Some(dpi)) == Some(dpi) {
+                return Some(0);
+            }
+
+            window_bv.handle_event(Event::Window(WindowEvent::ScaleFactorChanged(
+                dpi.scale_factor(),
+            )));
+
+            if shared.scale_factor_override.get().is_none() {
+                let new_size = shared
+                    .current_size
+                    .get()
+                    .to_logical::<f64>(previous_scale)
+                    .to_physical::<u32>(shared.scale_factor());
+                if let Err(e) = window_state.resize(new_size.into()) {
+                    warn!("Failed to resize after a DPI change: {}", e);
+                }
+            }
+
+            Some(0)
         }
         // If WM_SETCURSOR returns `None`, WM_SETCURSOR continues to get handled by the outer window(s),
         // If it returns `Some(1)`, the current window decides what the cursor is

@@ -85,6 +85,7 @@ impl Drop for ThreadStopWatcher {
 
 pub enum WindowThreadRequest {
     SuggestScaleFactor(f64),
+    SetScaleFactorOverride(Option<f64>),
     Resize(Size),
     SetParent(ParentWindowHandle),
     Show,
@@ -170,6 +171,10 @@ impl WindowThreadHandle {
 
     pub fn suggest_scale_factor(&self, scale_factor: f64) -> Result<()> {
         self.request(WindowThreadRequest::SuggestScaleFactor(scale_factor))
+    }
+
+    pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
+        self.request(WindowThreadRequest::SetScaleFactorOverride(scale_factor))
     }
 
     fn request(&self, req: WindowThreadRequest) -> Result<()> {
