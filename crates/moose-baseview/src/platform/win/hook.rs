@@ -168,7 +168,9 @@ unsafe fn offer_message_to_baseview(msg: *mut MSG) -> bool {
         if matches!(msg.message, WM_KEYUP | WM_SYSKEYUP) {
             for (window, owner) in state.open_windows.iter_mut() {
                 if GetParent(window.0) == msg.hwnd {
-                    owner.held[scan] = None;
+                    if let Some(held) = owner.held.get_mut(scan) {
+                        *held = None;
+                    }
                 }
             }
         }
@@ -176,10 +178,12 @@ unsafe fn offer_message_to_baseview(msg: *mut MSG) -> bool {
     }
     let Some(owner) = state.open_windows.get_mut(&target) else { return false };
 
+    let default = owner.capture;
+    let Some(held) = owner.held.get_mut(scan) else { return false };
     let capture = match msg.message {
-        WM_KEYDOWN | WM_SYSKEYDOWN => *owner.held[scan].get_or_insert(owner.capture),
-        WM_KEYUP | WM_SYSKEYUP => owner.held[scan].take().unwrap_or(owner.capture),
-        _ => owner.held[scan].unwrap_or(owner.capture),
+        WM_KEYDOWN | WM_SYSKEYDOWN => *held.get_or_insert(default),
+        WM_KEYUP | WM_SYSKEYUP => held.take().unwrap_or(default),
+        _ => held.unwrap_or(default),
     };
     // wnd_proc may change focus or close the window, which takes this lock again.
     drop(state);
