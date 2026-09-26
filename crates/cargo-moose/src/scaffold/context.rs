@@ -156,7 +156,6 @@ impl WorkspaceContext {
 pub(crate) struct MooseTomlContext {
     pub vendor_name: String,
     pub vendor_id: String,
-    pub vendor_fourcc: String,
     pub plugins: Vec<MooseTomlPlugin>,
     /// Suite-installer block emitted only for multi-plugin workspace
     /// scaffolds. `None` collapses the `{{ if suite }}` template guard
@@ -171,7 +170,6 @@ pub(crate) struct MooseTomlPlugin {
     pub bundle_id: String,
     pub crate_name: String,
     pub category: &'static str,
-    pub fourcc: String,
     pub vst3_subcategory: &'static str,
 }
 
@@ -186,7 +184,6 @@ impl MooseTomlContext {
         vendor: &VendorInfo,
         plugins: &[PluginSpec],
         workspace_name: &str,
-        fourcc_map: &std::collections::HashMap<String, String>,
         is_workspace: bool,
     ) -> Self {
         let entries = plugins
@@ -203,7 +200,6 @@ impl MooseTomlContext {
                     bundle_id: p.name.clone(),
                     crate_name,
                     category: p.kind.category(),
-                    fourcc: fourcc_map[&p.name].clone(),
                     vst3_subcategory: p.kind.vst3_subcategory(),
                 }
             })
@@ -219,7 +215,6 @@ impl MooseTomlContext {
         Self {
             vendor_name: vendor.name.clone(),
             vendor_id: vendor.id.clone(),
-            vendor_fourcc: super::fourcc::to_fourcc(&vendor.name),
             plugins: entries,
             suite,
         }

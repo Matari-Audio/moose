@@ -28,7 +28,7 @@ use crate::{run_sudo, tmp_manifests};
 use std::ffi::OsStr;
 
 use crate::preset_codec::vstpreset_bytes;
-use moose_utils::preset::{PRESET_FILE_EXT, PresetMeta, write_preset_file};
+use moose_utils::preset::{PresetMeta, write_preset_file};
 use moose_utils::{safe_filename, state};
 
 /// One preset ready for per-format emission.
@@ -51,7 +51,7 @@ impl EmittablePreset {
     }
 
     /// Like [`Self::rel_path`] but named after the display name - for
-    /// the host-facing formats (`.vstpreset`, `.aupreset`) whose
+    /// the host-facing format (`.vstpreset`) whose
     /// hosts label presets by file name. Library validation rejects
     /// duplicate (category, name) pairs, so the path is unique.
     fn display_rel_path(&self, ext: &str) -> PathBuf {
@@ -71,6 +71,8 @@ impl EmittablePreset {
 /// A plugin's parsed factory-preset library.
 pub(crate) struct FactoryPresets {
     presets: Vec<EmittablePreset>,
+    /// Native container extension (`[presets] extension`).
+    extension: String,
 }
 
 /// The plugin's authored-library directory (`presets/` next to the
@@ -138,9 +140,7 @@ pub(crate) fn load_factory_presets(
         return Ok(None);
     }
 
-    let sidecar_dir = moose_build::target_dir(root)
-        .join("lv2-meta")
-        .join(&p.crate_name);
+    let sidecar_dir = moose_build::param_index_dir(&moose_build::target_dir(root), &p.crate_name);
     let annotations = moose_build::presets::read_param_annotations(&sidecar_dir);
     let names = moose_build::presets::ParamNameMap::from_annotations(&annotations);
     let authored = moose_build::presets::read_presets_dir(&dir, true, Some(&names))?;
@@ -157,7 +157,10 @@ pub(crate) fn load_factory_presets(
             stem: a.stem,
         })
         .collect();
-    Ok(Some(FactoryPresets { presets }))
+    Ok(Some(FactoryPresets {
+        presets,
+        extension: moose_build::preset_extension(p).to_string(),
+    }))
 }
 
 /// Write a preset tree (relative path → bytes) under `dest_root`,
@@ -220,11 +223,10 @@ fn write_tree(
     Ok(())
 }
 
-/// Emit a tree of `.trucepreset` containers under `dest_root`. Two
-/// consumers: the CLAP factory location (the wrapper's discovery
-/// provider declares it to the host) and the AU component's
-/// `Contents/Resources/Presets/` (the shim's factory-presets
-/// property enumerates it).
+/// Emit a tree of native preset containers (`.trucepreset`, or the
+/// plugin's `[presets] extension`) under `dest_root`: the CLAP factory
+/// location (the wrapper's discovery provider declares it to the host)
+/// and the standalone's factory directory.
 pub(crate) fn emit_trucepreset_tree(
     fp: &FactoryPresets,
     dest_root: &Path,
@@ -236,7 +238,7 @@ pub(crate) fn emit_trucepreset_tree(
         .iter()
         .map(|p| {
             (
-                p.rel_path(PRESET_FILE_EXT),
+                p.rel_path(&fp.extension),
                 write_preset_file(&p.meta, &p.blob),
             )
         })

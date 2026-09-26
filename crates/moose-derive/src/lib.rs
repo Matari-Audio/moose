@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Expr, Fields, Lit, Type, TypePath, UnOp};
 
-mod lv2_emit;
+mod param_index;
 
 /// Resolve `moose.toml` and pull out the `[[plugin]]` entry for the
 /// current crate. Routes every failure mode through `Result<…, String>`
@@ -105,30 +105,10 @@ fn resolve_midi(
     Ok((wiring, midi2_in, midi2_out))
 }
 
-/// Validate 4-ASCII-byte fourccs for `plugin_info!`. `Some(message)` on
-/// the first bad code. `info::fourcc` asserts this at runtime (during the
-/// host scan), so an invalid code otherwise compiles clean and the plugin
-/// never loads in any DAW.
-fn fourcc_error(codes: &[(&str, &str)]) -> Option<String> {
-    for (label, code) in codes {
-        if code.len() != 4 || !code.is_ascii() {
-            return Some(format!(
-                "`{label}` must be exactly 4 ASCII characters (a VST3/AU fourcc); \
-                 got {code:?} ({} bytes)",
-                code.len(),
-            ));
-        }
-    }
-    None
-}
-
-// `au_name` / `au3_name` (and similar `vst2_name` / `vst3_name`)
-// mirror the user-facing moose.toml keys; renaming would break the
-// 1:1 with the TOML schema.
 // Linear metadata assembly: one `let` per moose.toml field feeding a
 // single `PluginInfo` literal - splitting it would just thread the same
 // locals through helpers without aiding clarity.
-#[allow(clippy::similar_names, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 #[proc_macro]
 pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let (config, pkg_name, moose_toml_path) = match try_resolve_plugin() {
@@ -164,10 +144,8 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         .to_string();
 
     // Category-string vocabulary parsed by every consumer that reads
-    // `moose.toml`. Note-effect plugins (`midi` / `note_effect`) must
-    // map to a distinct variant from `Effect` so the LV2 MIDI input
-    // decode path stays open; collapsing them silently drops every
-    // host MIDI event.
+    // `moose.toml`. Note-effect plugins (`midi` / `note_effect`) map to
+    // a distinct variant from `Effect`.
     let category = match plugin.category.as_str() {
         "instrument" => quote! { ::moose::core::PluginCategory::Instrument },
         "midi" | "note_effect" => quote! { ::moose::core::PluginCategory::NoteEffect },
@@ -194,46 +172,8 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     };
     let midi_input_dialect = dialect_tokens(midi2_in);
     let midi_output_dialect = dialect_tokens(midi2_out);
-    // NoteEffect plugins map to `aumi` (Apple's MIDI Processor type).
-    // Pairs with empty `bus_layouts` at the plugin level: aumi
-    // plugins must not expose audio I/O. Logic routes `aumi` to the
-    // MIDI FX slot, which is where arpeggiators / transposers /
-    // note-shapers belong. A mismatch with the AU-type computed at
-    // install / package time causes auval to report "Class Data
-    // fields ... do not match component description".
-    // An audio effect that accepts MIDI input is an `aumf` MusicEffect,
-    // not a plain `aufx`: AU routes MIDI to a plugin by its component
-    // type, so an `aufx` would never be handed the events.
-    let au_type = plugin
-        .au_type
-        .as_deref()
-        .unwrap_or(match plugin.category.as_str() {
-            "instrument" => "aumu",
-            "midi" | "note_effect" => "aumi",
-            _ if accepts_midi_in => "aumf",
-            _ => "aufx",
-        });
-
     let plugin_id = moose_build::plugin_id(&config.vendor.id, &plugin.bundle_id);
 
-    let Some(resolved_fourcc) = plugin.fourcc.as_ref().or(plugin.au_subtype.as_ref()) else {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            format!(
-                "moose.toml: [[plugin]] entry `{}` requires `fourcc` or `au_subtype`",
-                plugin.crate_name
-            ),
-        )
-        .to_compile_error()
-        .into();
-    };
-    let au_manufacturer = &config.vendor.au_manufacturer;
-
-    let aax_category = if let Some(cat) = &plugin.aax_category {
-        quote! { Some(#cat) }
-    } else {
-        quote! { None }
-    };
     let vst3_subcategory = if let Some(sub) = &plugin.vst3_subcategory {
         quote! { Some(#sub) }
     } else {
@@ -255,23 +195,21 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let clap_support_url = opt_str(&plugin.clap_support_url);
     let vst3_name = opt_str(&plugin.vst3_name);
     let clap_name = opt_str(&plugin.clap_name);
-    let vst2_name = opt_str(&plugin.vst2_name);
-    let au_name = opt_str(&plugin.au_name);
-    let au3_name = opt_str(&plugin.au3_name);
-    let aax_name = opt_str(&plugin.aax_name);
-    let lv2_name = opt_str(&plugin.lv2_name);
+    let clap_features = &plugin.clap_features;
+    let clap_features = quote! { &[#(#clap_features),*] };
+    let preset_extension = moose_build::preset_extension(plugin);
+    if !preset_extension
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        let msg = format!(
+            "moose.toml: [plugin.presets] extension {preset_extension:?} must be ASCII \
+             letters, digits, `_` or `-` (no dot)"
+        );
+        return quote! { compile_error!(#msg); }.into();
+    }
     let mute_preview_output = plugin.mute_preview_output;
     let min_subblock_samples = config.automation.min_subblock_samples;
-
-    // `[plugin.legacy_state]` probe lists, baked as static slices.
-    let str_slice = |items: &[String]| -> proc_macro2::TokenStream {
-        quote! { &[#(#items),*] }
-    };
-    let legacy = plugin.legacy_state.as_ref();
-    let clap_features = str_slice(&plugin.clap_features);
-    let legacy_au_keys = str_slice(legacy.map_or(&[][..], |l| &l.au_keys));
-    let legacy_lv2_uris = str_slice(legacy.map_or(&[][..], |l| &l.lv2_uris));
-    let legacy_aax_chunk_ids = str_slice(legacy.map_or(&[][..], |l| &l.aax_chunk_ids));
 
     // `include_bytes!` registers `moose.toml` as a build-time dependency
     // through the compiler's normal dep-info tracking. Without it, edits
@@ -279,18 +217,6 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     // have no other way to declare external file dependencies.
     // Path is canonicalized in `try_resolve_plugin` so the literal is
     // stable across invocations.
-    // `info::fourcc` asserts a 4-byte code at runtime - which fires when
-    // the host first scans the plugin, so a 3-char or non-ASCII code
-    // compiles clean and just never loads in any DAW. These are string
-    // literals here, so validate at expansion time.
-    if let Some(msg) = fourcc_error(&[
-        ("fourcc / au_subtype", resolved_fourcc.as_str()),
-        ("au_type", au_type),
-        ("vendor au_manufacturer", au_manufacturer.as_str()),
-    ]) {
-        return quote! { compile_error!(#msg); }.into();
-    }
-
     let moose_toml_lit = moose_toml_path.to_string_lossy().into_owned();
     let expanded = quote! {
         {
@@ -314,27 +240,15 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
                 bundle_id: #bundle_id,
                 vst3_id: #plugin_id,
                 clap_id: #plugin_id,
-                fourcc: ::moose::core::info::fourcc(#resolved_fourcc.as_bytes()),
-                au_type: ::moose::core::info::fourcc(#au_type.as_bytes()),
-                au_manufacturer: ::moose::core::info::fourcc(#au_manufacturer.as_bytes()),
-                aax_id: None,
-                aax_category: #aax_category,
                 vst3_subcategory: #vst3_subcategory,
                 preset_user_dir: #preset_user_dir,
+                preset_extension: #preset_extension,
                 vst3_name: #vst3_name,
                 clap_name: #clap_name,
-                vst2_name: #vst2_name,
-                au_name: #au_name,
-                au3_name: #au3_name,
-                aax_name: #aax_name,
-                lv2_name: #lv2_name,
                 mute_preview_output: #mute_preview_output,
                 automation: ::moose::core::info::AutomationConfig {
                     min_subblock_samples: #min_subblock_samples,
                 },
-                legacy_au_keys: #legacy_au_keys,
-                legacy_lv2_uris: #legacy_lv2_uris,
-                legacy_aax_chunk_ids: #legacy_aax_chunk_ids,
             }
         }
     };
@@ -368,16 +282,14 @@ pub fn plugin_vst3_class_id(_input: TokenStream) -> TokenStream {
     }
 }
 
-/// Emit `manifest.ttl` + `plugin.ttl` for the plugin whose root params
-/// type is `<input>`. Invoked by `moose::plugin!`'s expansion. See
-/// [`lv2_emit::emit_root_impl`] for the gory details.
-///
-/// Doc-hidden because plugin authors never call it directly - it's
-/// part of the `moose::plugin!` machinery.
+/// Write the flattened `param_index.toml` for the plugin whose root
+/// params type is `<input>` (the `.preset` field-name table
+/// `cargo moose` reads). Invoked by `moose::plugin!`'s expansion; see
+/// [`param_index::emit_root_impl`].
 #[doc(hidden)]
 #[proc_macro]
-pub fn __moose_lv2_emit_root(input: TokenStream) -> TokenStream {
-    lv2_emit::emit_root_impl(input)
+pub fn __moose_param_index_root(input: TokenStream) -> TokenStream {
+    param_index::emit_root_impl(input)
 }
 
 /// Recognized parameter field types.
@@ -408,12 +320,6 @@ impl ParamField {
         self.attrs
             .id
             .expect("ParamField::id called before the auto-assignment block ran")
-    }
-
-    /// The inner `T` of an `EnumParam<T>`, used by the LV2 sidecar
-    /// writer to record which enum a range-less enum param refers to.
-    pub(crate) fn enum_type(&self) -> Option<&syn::Type> {
-        self.enum_type.as_ref()
     }
 }
 
@@ -965,7 +871,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
 /// historical 24-bit auto-ID space. Pure integer arithmetic
 /// over the name bytes, so the value is identical across toolchains,
 /// targets, and runs - the property a persisted parameter id needs.
-/// `pub(crate)` so the LV2 sidecar aggregator (`lv2_emit`) flattens
+/// `pub(crate)` so the param-index aggregator (`param_index`) flattens
 /// nested hash ids with the exact same arithmetic the runtime uses.
 pub(crate) fn name_hash_id(name: &str) -> u32 {
     const FNV_OFFSET: u32 = 0x811c_9dc5;
@@ -2064,25 +1970,20 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
     }
 
-    // --- Compile-time LV2 metadata sidecar ---
+    // --- Compile-time param-index sidecar ---
     //
-    // Each Params struct (root or nested, plugin crate or helper)
-    // writes `<target>/lv2-meta/<crate>/<struct>.params.toml` with its
-    // own params, meters, and #[nested] child type names. The final
-    // TTL render happens later via `__moose_lv2_emit_root!`, which
-    // `moose::plugin!` invokes with the root params type and which
-    // walks the sidecar tree to aggregate. Failures here are silent -
-    // they surface at TTL-emit time when the aggregator can't find
-    // the data it needs.
+    // Each Params struct writes `<target>/param-index/<crate>/<struct>
+    // .params.toml`; `__moose_param_index_root!` (from `moose::plugin!`)
+    // flattens the tree for the preset tooling. Failures here are
+    // silent - they surface when the root aggregates.
     let nested_for_sidecar: Vec<(syn::Ident, syn::Type, Option<u32>)> = nested_fields
         .iter()
         .map(|n| (n.ident.clone(), n.ty.clone(), n.base))
         .collect();
-    lv2_emit::write_struct_sidecar(
+    param_index::write_struct_sidecar(
         struct_name,
         scheme == IdScheme::Hash,
         &param_fields,
-        &meter_fields,
         &nested_for_sidecar,
     );
 
@@ -2144,12 +2045,9 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // --- param_infos_static ---
     // Same shape as `param_infos`, but each entry is the raw
     // `ParamInfo { ... }` literal (built by
-    // `gen_param_info_literal`) rather than a runtime `self.<f>.info`
-    // read. Lifted into a `LazyLock<Vec<ParamInfo>>` so format
-    // wrappers' `register_*` paths can read parameter metadata
-    // without constructing a plugin instance. AAX's `Describe` runs
-    // at C++ static-init time and can't safely allocate a plugin
-    // there, so the static path is mandatory for that format.
+    // `gen_param_info_literal`) rather than a runtime `self.<f>.info()`
+    // read, so format wrappers' `register_*` paths can read parameter
+    // metadata without constructing a plugin instance.
     let own_info_literals: Vec<proc_macro2::TokenStream> = param_fields
         .iter()
         .filter_map(gen_param_info_literal)
@@ -3160,13 +3058,6 @@ pub fn derive_param_enum(input: TokenStream) -> TokenStream {
             v.ident.to_string()
         })
         .collect();
-
-    // Record the variant count + display names so the LV2 aggregator can
-    // resolve `EnumParam<#enum_name>` ports that carry no explicit
-    // `#[param(range = "enum(N)")]` and render each value's scale-point
-    // label. Only knowable here, at the enum's own derive; the params
-    // sidecar references it by name.
-    lv2_emit::write_enum_sidecar(enum_name, &variant_names);
 
     // from_index match arms
     let from_index_arms: Vec<_> = variant_idents

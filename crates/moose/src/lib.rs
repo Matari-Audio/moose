@@ -24,7 +24,7 @@ mod plugin_macro;
 /// Re-exports used by the plugin! macro internals.
 #[doc(hidden)]
 pub mod __reexport {
-    pub use moose_derive::__moose_lv2_emit_root;
+    pub use moose_derive::__moose_param_index_root;
     pub use moose_loader::{export_plugin, export_static};
     pub use moose_plugin;
 

@@ -2,14 +2,12 @@
 name = "{vendor_name}"
 id = "{vendor_id}"
 url = "https://example.com"
-au_manufacturer = "{vendor_fourcc}"
 {{ for p in plugins }}
 [[plugin]]
 name = "{p.display}"
 bundle_id = "{p.bundle_id}"
 crate = "{p.crate_name}"
 category = "{p.category}"
-fourcc = "{p.fourcc}"
 # VST3 secondary subcategory — drives the Cubase plugin submenu.
 # Tighten to your effect kind: "Delay", "Distortion", "Dynamics",
 # "EQ", "Filter", "Mastering", "Modulation", "Pitch Shift",

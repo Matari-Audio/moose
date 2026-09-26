@@ -14,31 +14,29 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use base64::Engine as _;
-
 /// Container formats the codec understands, detected by file
 /// extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PresetFormat {
-    /// `.trucepreset` - moose's native container.
+    /// moose's native container: `.trucepreset`, or the plugin's
+    /// `[presets] extension`.
     MoosePreset,
     /// `.vstpreset` - Steinberg container, `Comp` chunk = envelope.
     Vst3,
-    /// `.aupreset` - Apple plist, `moose_state` data = envelope.
-    Au,
-    /// `.ttl` - LV2 preset, `state:state` base64 literal = envelope.
-    Lv2,
     /// `.preset` - the authored TOML source format.
     AuthoredToml,
 }
 
 impl PresetFormat {
-    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+    /// `native_ext` is the plugin's configured container extension
+    /// (`moose_build::preset_extension`); the default `trucepreset` is
+    /// always recognised too.
+    pub(crate) fn from_path(path: &Path, native_ext: &str) -> Option<Self> {
         match path.extension()?.to_str()? {
-            "trucepreset" => Some(Self::MoosePreset),
+            e if e == native_ext || e == moose_utils::preset::PRESET_FILE_EXT => {
+                Some(Self::MoosePreset)
+            }
             "vstpreset" => Some(Self::Vst3),
-            "aupreset" => Some(Self::Au),
-            "ttl" => Some(Self::Lv2),
             "preset" => Some(Self::AuthoredToml),
             _ => None,
         }
@@ -74,8 +72,6 @@ pub(crate) fn decode(format: PresetFormat, bytes: &[u8]) -> Option<DecodedPreset
             meta: None,
             blob,
         }),
-        PresetFormat::Au => parse_aupreset(bytes),
-        PresetFormat::Lv2 => parse_lv2_preset_ttl(std::str::from_utf8(bytes).ok()?),
         PresetFormat::AuthoredToml => None, // parsed via moose_build::presets instead
     }
 }
@@ -174,125 +170,18 @@ pub(crate) fn parse_vstpreset(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// AU (.aupreset)
-// ---------------------------------------------------------------------------
-
-/// Pack a 4-char code into the integer representation `.aupreset`
-/// plists carry (`'aufx'` → big-endian u32).
-pub(crate) fn fourcc_int(code: &str) -> Result<u32, crate::CargoMooseError> {
-    let bytes = code.as_bytes();
-    let four: [u8; 4] = bytes
-        .try_into()
-        .map_err(|_| format!("four-char code \"{code}\" is not exactly 4 bytes"))?;
-    Ok(u32::from_be_bytes(four))
-}
-
-/// Render one `.aupreset` XML plist. The standard identity keys let
-/// hosts match the preset to the component; the state itself rides
-/// the `moose_state` key - the slot `moose-au`'s `ClassInfo` property
-/// handler reads (and writes) the canonical envelope through.
-pub(crate) fn aupreset_xml(
-    au_type: u32,
-    subtype: u32,
-    manufacturer: u32,
-    name: &str,
-    blob: &[u8],
-) -> String {
-    // 0x0001_0000: matches both the AudioComponents version in the
-    // installed Info.plist and the registration descriptor.
-    const AU_VERSION: u32 = 0x0001_0000;
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>manufacturer</key>
-    <integer>{manufacturer}</integer>
-    <key>name</key>
-    <string>{}</string>
-    <key>subtype</key>
-    <integer>{subtype}</integer>
-    <key>moose_state</key>
-    <data>{}</data>
-    <key>type</key>
-    <integer>{au_type}</integer>
-    <key>version</key>
-    <integer>{AU_VERSION}</integer>
-</dict>
-</plist>
-"#,
-        xml_escape(name),
-        base64::engine::general_purpose::STANDARD.encode(blob),
-    )
-}
-
 /// Escape a string for XML text or a double-quoted attribute value.
 /// `&` must go first so the entities it emits aren't re-escaped.
 /// `"` / `'` are needed only inside attributes but are harmless in
-/// element text, so one helper is safe for both contexts.
+/// element text, so one helper is safe for both contexts. Only the
+/// macOS plist writers call it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-/// Extract name + envelope from an `.aupreset`. Goes through the
-/// `plist` crate so host-written binary plists (Logic saves those)
-/// parse the same as our XML emission.
-fn parse_aupreset(bytes: &[u8]) -> Option<DecodedPreset> {
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes)).ok()?;
-    let dict = value.as_dictionary()?;
-    let blob = dict.get("moose_state")?.as_data()?.to_vec();
-    let name = dict
-        .get("name")
-        .and_then(plist::Value::as_string)
-        .unwrap_or_default()
-        .to_string();
-    Some(DecodedPreset {
-        name,
-        meta: None,
-        blob,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// LV2 preset TTL
-// ---------------------------------------------------------------------------
-
-/// Extract name + envelope from an LV2 preset TTL: the
-/// `<urn:moose:state-blob>` property's base64 literal (the State
-/// extension key the runtime stores under), plus `rdfs:label` when
-/// present. Tolerant line-oriented scan rather than a Turtle parser:
-/// both our emitter and lilv (which writes host-saved user presets)
-/// keep the property and its literal on one statement.
-fn parse_lv2_preset_ttl(text: &str) -> Option<DecodedPreset> {
-    let after_key = text.split("<urn:moose:state-blob>").nth(1)?;
-    let b64 = extract_quoted(after_key)?;
-    let compact: String = b64.split_whitespace().collect();
-    let blob = base64::engine::general_purpose::STANDARD
-        .decode(compact)
-        .ok()?;
-
-    let name = text
-        .split("rdfs:label")
-        .nth(1)
-        .and_then(extract_quoted)
-        .unwrap_or_default()
-        .to_string();
-    Some(DecodedPreset {
-        name,
-        meta: None,
-        blob,
-    })
-}
-
-fn extract_quoted(s: &str) -> Option<&str> {
-    let start = s.find('"')? + 1;
-    let end = start + s.get(start..)?.find('"')?;
-    s.get(start..end)
 }
 
 #[cfg(test)]
@@ -362,39 +251,6 @@ mod tests {
     }
 
     #[test]
-    fn aupreset_round_trips_including_escapes() {
-        let blob = sample_blob();
-        let xml = aupreset_xml(
-            fourcc_int("aufx").unwrap(),
-            fourcc_int("TGan").unwrap(),
-            fourcc_int("Trce").unwrap(),
-            "Bright & <Saw>",
-            &blob,
-        );
-        assert!(xml.contains("<integer>1635083896</integer>")); // 'aufx'
-        let decoded = decode(PresetFormat::Au, xml.as_bytes()).unwrap();
-        assert_eq!(decoded.name, "Bright & <Saw>");
-        assert_eq!(decoded.blob, blob);
-    }
-
-    #[test]
-    fn lv2_ttl_round_trips() {
-        let blob = sample_blob();
-        let ttl = moose_build::lv2::render_preset_ttl(
-            "https://example.com/lv2/x",
-            "u-1",
-            "pad/Glass",
-            &blob,
-            &[("cutoff".to_string(), 8000.0), ("reso".to_string(), 0.5)],
-        );
-        let decoded = decode(PresetFormat::Lv2, ttl.as_bytes()).unwrap();
-        assert_eq!(decoded.name, "pad/Glass");
-        // The `state:state` blob still round-trips even with port
-        // values present (the decoder reads the chunk, ignoring ports).
-        assert_eq!(decoded.blob, blob);
-    }
-
-    #[test]
     fn trucepreset_round_trips_with_meta() {
         let blob = sample_blob();
         let meta = moose_utils::preset::PresetMeta {
@@ -411,11 +267,13 @@ mod tests {
 
     #[test]
     fn format_detection() {
-        let f = |p: &str| PresetFormat::from_path(Path::new(p));
+        let f = |p: &str| PresetFormat::from_path(Path::new(p), "kurvpreset");
         assert_eq!(f("a.vstpreset"), Some(PresetFormat::Vst3));
-        assert_eq!(f("a.aupreset"), Some(PresetFormat::Au));
         assert_eq!(f("a.trucepreset"), Some(PresetFormat::MoosePreset));
-        assert_eq!(f("a.ttl"), Some(PresetFormat::Lv2));
+        // A configured `[presets] extension` is the native container too.
+        assert_eq!(f("a.kurvpreset"), Some(PresetFormat::MoosePreset));
+        assert_eq!(f("a.aupreset"), None);
+        assert_eq!(f("a.ttl"), None);
         assert_eq!(f("a.preset"), Some(PresetFormat::AuthoredToml));
         assert_eq!(f("a.wav"), None);
     }

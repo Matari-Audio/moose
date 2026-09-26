@@ -83,7 +83,6 @@ const USER_PRESET_DIR: &str = "truce";
 /// | macOS | `~/Library/Audio/Presets/moose/<vendor>/<plugin>/` | `~/Library/Audio/Presets/Acme/MySynth/` |
 /// | Windows | `%APPDATA%\moose\<vendor>\<plugin>\presets\` | `%APPDATA%\Acme\MySynth\` |
 /// | Linux | `$XDG_DATA_HOME/moose/<vendor>/<plugin>/presets/` | `$XDG_DATA_HOME/moose/Acme/MySynth/` |
-/// | iOS | `<container>/Library/Application Support/moose/<vendor>/<plugin>/presets/` | `<container>/Library/Application Support/Acme/MySynth/` |
 ///
 /// (`$XDG_DATA_HOME` falls back to `~/.local/share` when unset.)
 /// The override replaces the whole default subpath and no `presets`
@@ -112,15 +111,6 @@ pub fn user_preset_root(
             .join(safe_filename(plugin_name))
     });
 
-    #[cfg(target_os = "ios")]
-    {
-        let app_support = ios_application_support_dir()?;
-        let mut root = app_support.join(subpath);
-        if !has_override {
-            root.push("presets");
-        }
-        Some(root)
-    }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var_os("HOME")?;
@@ -140,7 +130,7 @@ pub fn user_preset_root(
         }
         Some(root)
     }
-    #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -155,31 +145,6 @@ pub fn user_preset_root(
         }
         Some(root)
     }
-}
-
-#[cfg(target_os = "ios")]
-fn ios_application_support_dir() -> Option<PathBuf> {
-    ios_container_home(std::env::var_os("TMPDIR"), std::env::var_os("HOME"))
-        .map(|home| home.join("Library/Application Support"))
-}
-
-// An AUv3 app-extension sandbox has no reliable `HOME`, but its `TMPDIR`
-// is always `<container>/tmp/`, so the container root is that parent.
-// Anything else (no `TMPDIR`, or a non-appex shape) falls back to `HOME`.
-#[cfg(any(target_os = "ios", test))]
-fn ios_container_home(
-    tmpdir: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    if let Some(tmpdir) = tmpdir {
-        let tmpdir = PathBuf::from(tmpdir);
-        if tmpdir.file_name().and_then(|s| s.to_str()) == Some("tmp")
-            && let Some(parent) = tmpdir.parent()
-        {
-            return Some(parent.to_path_buf());
-        }
-    }
-    home.map(PathBuf::from)
 }
 
 /// Sanitize a `[plugin.presets]` `user_dir` override into a safe
@@ -276,8 +241,8 @@ pub fn mint_uuid() -> String {
     out
 }
 
-/// Recursively walk one scope root for `.trucepreset` files and
-/// parse each file's metadata block.
+/// Recursively walk one scope root for preset files (`*.<extension>`,
+/// normally [`PRESET_FILE_EXT`]) and parse each file's metadata block.
 ///
 /// Files that fail to read or parse are skipped - a corrupt preset
 /// shouldn't take down the host's scan, and the load path re-reports
@@ -291,12 +256,14 @@ pub fn enumerate_scope(
     vendor: &str,
     plugin_name: &str,
     plugin_id_hash: u64,
+    extension: &str,
 ) -> Vec<PresetRef> {
     let ctx = WalkScope {
         scope,
         vendor,
         plugin_name,
         plugin_id_hash,
+        extension,
     };
     let mut out = Vec::new();
     walk(root, root, &ctx, &mut out, 0);
@@ -309,6 +276,7 @@ struct WalkScope<'a> {
     vendor: &'a str,
     plugin_name: &'a str,
     plugin_id_hash: u64,
+    extension: &'a str,
 }
 
 /// Directory-recursion ceiling for the preset walk. Preset libraries
@@ -331,7 +299,7 @@ fn walk(root: &Path, dir: &Path, ctx: &WalkScope<'_>, out: &mut Vec<PresetRef>, 
         let path = entry.path();
         if path.is_dir() {
             walk(root, &path, ctx, out, depth + 1);
-        } else if path.extension().and_then(|e| e.to_str()) == Some(PRESET_FILE_EXT)
+        } else if path.extension().and_then(|e| e.to_str()) == Some(ctx.extension)
             && let Some(preset) = read_preset_ref(
                 Some(root),
                 &path,
@@ -472,6 +440,7 @@ pub struct PresetStore {
     plugin_id_hash: u64,
     factory_root: Option<PathBuf>,
     user_root: Option<PathBuf>,
+    extension: String,
 }
 
 impl PresetStore {
@@ -495,7 +464,16 @@ impl PresetStore {
             plugin_id_hash,
             factory_root: None,
             user_root: user_preset_root(vendor, plugin_name, user_dir),
+            extension: PRESET_FILE_EXT.to_string(),
         }
+    }
+
+    /// Use `extension` (no dot; `PluginInfo::preset_extension`) instead
+    /// of [`PRESET_FILE_EXT`] for enumeration and saves.
+    #[must_use]
+    pub fn with_extension(mut self, extension: &str) -> Self {
+        self.extension = extension.to_string();
+        self
     }
 
     #[must_use]
@@ -538,6 +516,7 @@ impl PresetStore {
                 &self.vendor,
                 &self.plugin_name,
                 self.plugin_id_hash,
+                &self.extension,
             ) {
                 if preset.uuid.is_empty() {
                     self.stamp_uuid(&mut preset);
@@ -557,6 +536,7 @@ impl PresetStore {
                 &self.vendor,
                 &self.plugin_name,
                 self.plugin_id_hash,
+                &self.extension,
             )
         });
 
@@ -686,7 +666,7 @@ impl PresetStore {
             } else {
                 user_root.join(safe_filename(&meta.category))
             };
-            dir.join(format!("{file_stem}.{PRESET_FILE_EXT}"))
+            dir.join(format!("{file_stem}.{}", self.extension))
         };
 
         let ids: Vec<u32> = params.iter().map(|(id, _)| *id).collect();
@@ -859,7 +839,14 @@ mod tests {
             TEST_HASH ^ 1,
         );
 
-        let refs = enumerate_scope(&tmp, PresetScope::Factory, "Acme", "Synth", TEST_HASH);
+        let refs = enumerate_scope(
+            &tmp,
+            PresetScope::Factory,
+            "Acme",
+            "Synth",
+            TEST_HASH,
+            PRESET_FILE_EXT,
+        );
         assert_eq!(refs.len(), 3);
         let by_uuid = |u: &str| refs.iter().find(|r| r.uuid == u).unwrap();
         assert_eq!(by_uuid("u1").category.as_deref(), Some("Lead"));
@@ -880,6 +867,7 @@ mod tests {
             "V",
             "P",
             TEST_HASH,
+            PRESET_FILE_EXT,
         );
         assert!(refs.is_empty());
     }
@@ -943,46 +931,6 @@ mod tests {
         assert!(overridden.ends_with("AcmeAudio/Synth"));
         // Unusable override falls back to the default path.
         assert_eq!(unusable, default);
-    }
-
-    #[test]
-    fn ios_container_home_prefers_tmpdir_container() {
-        let tmpdir = std::ffi::OsString::from(
-            "/private/var/mobile/Containers/Data/PluginKitPlugin/ABCDEF/tmp/",
-        );
-        let home = std::ffi::OsString::from("/var/mobile");
-
-        let root = ios_container_home(Some(tmpdir), Some(home)).unwrap();
-
-        assert_eq!(
-            root,
-            PathBuf::from("/private/var/mobile/Containers/Data/PluginKitPlugin/ABCDEF")
-        );
-    }
-
-    #[test]
-    fn ios_container_home_falls_back_to_home() {
-        let home =
-            std::ffi::OsString::from("/private/var/mobile/Containers/Data/Application/ABCDEF");
-
-        let root = ios_container_home(None, Some(home)).unwrap();
-
-        assert_eq!(
-            root,
-            PathBuf::from("/private/var/mobile/Containers/Data/Application/ABCDEF")
-        );
-    }
-
-    #[test]
-    fn ios_container_home_ignores_non_tmp_tmpdir() {
-        // A `TMPDIR` that isn't the appex `<container>/tmp/` shape must not
-        // be treated as a container anchor; fall back to `HOME`.
-        let tmpdir = std::ffi::OsString::from("/tmp/scratch/");
-        let home = std::ffi::OsString::from("/var/mobile");
-
-        let root = ios_container_home(Some(tmpdir), Some(home)).unwrap();
-
-        assert_eq!(root, PathBuf::from("/var/mobile"));
     }
 
     #[test]

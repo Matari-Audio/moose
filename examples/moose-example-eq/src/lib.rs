@@ -537,17 +537,6 @@ mod tests {
         moose_test::assert_state_round_trip::<Plugin>();
     }
 
-    // --- AU metadata ---
-
-    #[test]
-    fn au_type_codes_ascii() {
-        moose_test::assert_au_type_codes_ascii::<Plugin>();
-    }
-
-    #[test]
-    fn fourcc_roundtrip() {
-        moose_test::assert_fourcc_roundtrip::<Plugin>();
-    }
 
     #[test]
     fn bus_config_effect() {

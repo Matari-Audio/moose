@@ -2,10 +2,8 @@
 /// every format today; `Midi2` opts a port into MIDI 2.0 / UMP so the
 /// plugin receives the native 16/32-bit + per-note + group-addressed
 /// variants of [`crate::events::EventBody`] instead of the MIDI 1.0
-/// down-conversion. Formats with a UMP transport (CLAP, AU v3) honor
-/// `Midi2` both ways; VST3 carries the per-note subset via note
-/// expression. AAX exposes its native MIDI 1.0 carrier without converting
-/// MIDI 2.0 events; unrepresentable output is reported as unsupported.
+/// down-conversion. CLAP (UMP transport) honors `Midi2` both ways; VST3
+/// carries the per-note subset via note expression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum MidiDialect {
     #[default]
@@ -53,9 +51,8 @@ pub struct PluginInfo {
 
     /// Dialect the (single) MIDI input port speaks. Defaults to
     /// [`MidiDialect::Midi1`]; a plugin opts into MIDI 2.0 with the
-    /// `midi2` key in `moose.toml`. Honored by the UMP-transport formats
-    /// (CLAP, AU v3); VST3 maps the per-note subset to note expression;
-    /// the rest deliver MIDI 1.0 regardless.
+    /// `midi2` key in `moose.toml`. Honored by CLAP (UMP transport);
+    /// VST3 maps the per-note subset to note expression.
     pub midi_input_dialect: MidiDialect,
 
     /// Dialect the (single) MIDI output port speaks. See
@@ -75,22 +72,14 @@ pub struct PluginInfo {
     /// [`Self::midi_input_ports`]; mirrors [`Self::emits_midi`].
     pub midi_output_ports: u8,
 
-    /// Short identifier (`bundle_id` in `moose.toml`). Used to derive
-    /// the LV2 plugin URI (`{vendor.url}/lv2/{bundle_id}`); also a
-    /// stable, vendor-agnostic key for "this plugin" that doesn't
-    /// drift with display-name changes the way `clap_id` does.
+    /// Short identifier (`bundle_id` in `moose.toml`): a stable,
+    /// vendor-agnostic key for "this plugin" that doesn't drift with
+    /// display-name changes the way `clap_id` does.
     pub bundle_id: &'static str,
 
     // Format-specific IDs
     pub vst3_id: &'static str,
     pub clap_id: &'static str,
-    pub fourcc: [u8; 4],
-    pub au_type: [u8; 4],
-    pub au_manufacturer: [u8; 4],
-    pub aax_id: Option<&'static str>,
-    /// AAX plugin category string (e.g. "EQ", "Dynamics", "Reverb").
-    /// Maps to `AAX_ePlugInCategory` constants.
-    pub aax_category: Option<&'static str>,
     /// VST3 "Plugin Type Categories" secondary token. The wrapper
     /// emits this after the primary token (`Fx|<sub>`,
     /// `Instrument|<sub>`) so hosts like Cubase route to the right
@@ -101,19 +90,6 @@ pub struct PluginInfo {
     /// emitted and Cubase will fall back to "Other".
     pub vst3_subcategory: Option<&'static str>,
 
-    /// Per-format display-name overrides, populated by
-    /// `moose::plugin_info!()` from the matching `moose.toml` keys.
-    /// Format wrappers fall back to `name` when the override is `None`.
-    /// Baked at compile time so back-to-back plugin builds with
-    /// different overrides don't invalidate the format wrapper's
-    /// build fingerprint.
-    ///
-    /// `au3_name` is exposed for parity with the other formats and
-    /// for user introspection, but `moose-au`'s `resolved_plugin_name`
-    /// reads `au_name` for both v2 and v3 builds - the v3 host's
-    /// displayed label comes from the appex `Info.plist`'s `AUNAME`
-    /// (which `cargo moose install --au3` populates from `au3_name`),
-    /// not from `g_descriptor->name`.
     /// `[plugin.presets]` `user_dir` from `moose.toml`: replaces the
     /// `moose/<vendor>/<plugin>` subpath of the user-scope preset
     /// root. `moose_utils::presets::user_preset_root` documents
@@ -122,17 +98,20 @@ pub struct PluginInfo {
     /// user presets and packs.
     pub preset_user_dir: Option<&'static str>,
 
+    /// `[plugin.presets]` `extension` from `moose.toml`: the file
+    /// extension (no dot) of this plugin's preset containers. Defaults
+    /// to [`moose_utils::preset::PRESET_FILE_EXT`]. Like
+    /// `preset_user_dir`, effectively permanent once a plugin ships.
+    pub preset_extension: &'static str,
+
+    /// Per-format display-name overrides, populated by
+    /// `moose::plugin_info!()` from the matching `moose.toml` keys.
+    /// Format wrappers fall back to `name` when the override is `None`.
     pub vst3_name: Option<&'static str>,
     pub clap_name: Option<&'static str>,
-    pub vst2_name: Option<&'static str>,
-    pub au_name: Option<&'static str>,
-    pub au3_name: Option<&'static str>,
-    pub aax_name: Option<&'static str>,
-    pub lv2_name: Option<&'static str>,
 
     /// Standalone-only. Format wrappers MUST NOT read this - it
-    /// exists for preview hosts (moose-standalone, the iOS `AUv3`
-    /// container app) that need a TOML-driven way to mute the
+    /// exists for preview hosts (moose-standalone) that need a TOML-driven way to mute the
     /// plug-in's audio output while keeping `process()` ticking, so
     /// editors that visualise an input signal (analyzers, tuners,
     /// spectrum displays) update from mic / file input without
@@ -151,19 +130,6 @@ pub struct PluginInfo {
     /// table; defaults to [`AutomationConfig::DEFAULT`] when the
     /// table is absent.
     pub automation: AutomationConfig,
-
-    /// AU `ClassInfo` dictionary keys a pre-moose build stored its
-    /// state under. Probed by `moose-au` when moose's own data key is
-    /// absent; a hit feeds the plugin's `migrate_state` hook. From
-    /// `moose.toml`'s `[plugin.legacy_state]` `au_keys`; empty when
-    /// undeclared (no probing).
-    pub legacy_au_keys: &'static [&'static str],
-    /// LV2 state property URIs a pre-moose build stored its state
-    /// under. See [`Self::legacy_au_keys`].
-    pub legacy_lv2_uris: &'static [&'static str],
-    /// AAX chunk fourccs a pre-moose build stored its state under.
-    /// See [`Self::legacy_au_keys`].
-    pub legacy_aax_chunk_ids: &'static [&'static str],
 }
 
 /// Sample-accurate chunking tunables baked into [`PluginInfo`] at
@@ -229,18 +195,4 @@ pub const fn category_from_str(s: &str) -> PluginCategory {
         b"Tool" => PluginCategory::Tool,
         _ => PluginCategory::Effect,
     }
-}
-
-/// Helper to convert a 4-char string literal to `[u8; 4]` at compile time.
-/// Panics if the string is not exactly 4 ASCII bytes.
-///
-/// # Panics
-///
-/// Panics at compile time when used in a `const` context (preferred)
-/// or at runtime if `s.len() != 4`. ASCII-ness isn't checked here -
-/// callers that need it should validate separately.
-#[must_use]
-pub const fn fourcc(s: &[u8]) -> [u8; 4] {
-    assert!(s.len() == 4, "FourCC must be exactly 4 bytes");
-    [s[0], s[1], s[2], s[3]]
 }

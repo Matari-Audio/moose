@@ -206,8 +206,8 @@ unsafe extern "C" fn provider_init<P: PluginExport>(
 
         if let Some(declare_filetype) = indexer.declare_filetype {
             let name = c"moose preset";
-            let description = c"moose plugin preset (.trucepreset)";
-            let extension = CString::new(moose_core::presets::PRESET_FILE_EXT).unwrap_or_default();
+            let description = c"moose plugin preset";
+            let extension = CString::new(P::info().preset_extension).unwrap_or_default();
             let filetype = clap_preset_discovery_filetype {
                 name: name.as_ptr(),
                 description: description.as_ptr(),
@@ -307,7 +307,7 @@ unsafe extern "C" fn provider_get_metadata<P: PluginExport>(
     metadata_receiver: *const clap_preset_discovery_metadata_receiver,
 ) -> bool {
     // Parses attacker-controllable on-disk preset files (a malformed
-    // `.trucepreset` dropped into the user preset dir) and runs `P::info()`;
+    // preset file dropped into the user preset dir) and runs `P::info()`;
     // firewall so one bad file during a rescan degrades to "crawl failed"
     // instead of aborting the host across this `extern "C"` boundary.
     run_extern_callback_with::<P, bool>("CLAP", "preset_get_metadata", false, || {
@@ -335,7 +335,14 @@ unsafe extern "C" fn provider_get_metadata<P: PluginExport>(
             };
             let hash = shared_plugin_state_hash(&info);
             for preset in
-                moose_core::presets::enumerate_scope(path, scope, info.vendor, info.name, hash)
+                moose_core::presets::enumerate_scope(
+                    path,
+                    scope,
+                    info.vendor,
+                    info.name,
+                    hash,
+                    info.preset_extension,
+                )
             {
                 if !report_preset::<P>(receiver, metadata_receiver, &preset) {
                     return false;
