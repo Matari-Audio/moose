@@ -210,7 +210,7 @@ impl<P: Params + 'static> crate::window::EditorWindowHandler for GpuWindowHandle
     }
 
     fn on_event(&mut self, _window: &WindowContext, event: Event) -> EventStatus {
-        self.on_event_inner(event)
+        self.on_event_inner(&event)
     }
 
     fn resized(&mut self, _window: &WindowContext, size: baseview::WindowSize) {
@@ -249,10 +249,10 @@ impl<P: Params + 'static> crate::window::EditorWindowHandler for GpuWindowHandle
 }
 
 impl<P: Params + 'static> GpuWindowHandler<P> {
-    fn on_event_inner(&mut self, event: Event) -> EventStatus {
+    fn on_event_inner(&mut self, event: &Event) -> EventStatus {
         match event {
             Event::Mouse(_) => {
-                let Some(input) = self.translator.translate(&event, self.scale.get()) else {
+                let Some(input) = self.translator.translate(event, self.scale.get()) else {
                     return EventStatus::Ignored;
                 };
                 if let Ok(mut inner) = self.inner.lock() {
@@ -263,9 +263,9 @@ impl<P: Params + 'static> GpuWindowHandler<P> {
             Event::Window(baseview::WindowEvent::ScaleFactorChanged(os_scale)) => {
                 // DPI / monitor change; ignored once the host owns the
                 // scale. `on_frame` picks the change up.
-                self.scale.set_from_os(os_scale);
+                self.scale.set_from_os(*os_scale);
                 if self.scale.host_override().is_none() {
-                    crate::platform::note_linux_scale_factor(os_scale);
+                    crate::platform::note_linux_scale_factor(*os_scale);
                 }
                 EventStatus::Ignored
             }

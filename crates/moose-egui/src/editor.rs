@@ -1559,7 +1559,7 @@ fn convert_key(key: &keyboard_types::Key) -> Option<egui::Key> {
         Named(End) => egui::Key::End,
         Named(PageUp) => egui::Key::PageUp,
         Named(PageDown) => egui::Key::PageDown,
-        _ => return None,
+        Named(_) => return None,
     })
 }
 

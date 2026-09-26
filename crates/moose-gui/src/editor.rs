@@ -1061,7 +1061,10 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
             // (DPI / monitor moves) already resized the window.
             if let Some(host_scale) = editor.scale.host_override() {
                 let _ = window.set_scale_factor_override(Some(host_scale));
-                let _ = window.resize(baseview::dpi::LogicalSize::new(f64::from(lw), f64::from(lh)));
+                let _ = window.resize(baseview::dpi::LogicalSize::new(
+                    f64::from(lw),
+                    f64::from(lh),
+                ));
             }
         }
 
@@ -1269,74 +1272,74 @@ impl<P: Params + 'static> BuiltinWindowHandler<P> {
         let phys = size.physical;
         if editor.can_resize() {
             let scale = size.scale_factor;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let (lw, lh) = if scale > 0.0 {
-                    (
-                        (f64::from(phys.width) / scale).round() as u32,
-                        (f64::from(phys.height) / scale).round() as u32,
-                    )
-                } else {
-                    (phys.width, phys.height)
-                };
-                if lw > 0 && lh > 0 {
-                    // A host that resized the embed window directly
-                    // never ran the format's constraint preflight -
-                    // fit here and push the corrected size back.
-                    let ((fw, fh), correct) = self.resize_corrector.fit(
-                        lw,
-                        lh,
-                        editor.min_size(),
-                        editor.max_size(),
-                        editor.aspect_ratio(),
-                    );
-                    if (fw, fh) != editor.size() {
-                        editor.set_size(fw, fh);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let (lw, lh) = if scale > 0.0 {
+                (
+                    (f64::from(phys.width) / scale).round() as u32,
+                    (f64::from(phys.height) / scale).round() as u32,
+                )
+            } else {
+                (phys.width, phys.height)
+            };
+            if lw > 0 && lh > 0 {
+                // A host that resized the embed window directly
+                // never ran the format's constraint preflight -
+                // fit here and push the corrected size back.
+                let ((fw, fh), correct) = self.resize_corrector.fit(
+                    lw,
+                    lh,
+                    editor.min_size(),
+                    editor.max_size(),
+                    editor.aspect_ratio(),
+                );
+                if (fw, fh) != editor.size() {
+                    editor.set_size(fw, fh);
+                }
+                if let Some((rw, rh)) = correct {
+                    // On Linux, hosts that bypass size negotiation
+                    // (Bitwig) ignore this request and react by
+                    // *growing* the embed window - a resize loop.
+                    // Clamp the content (and counter-resize our child)
+                    // but never ask the host to resize its frame.
+                    // mac/windows honor it (and negotiate via
+                    // `checkSizeConstraint`) anyway.
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(ctx) = editor.context.as_ref() {
+                        let _ = ctx.request_resize(rw, rh);
                     }
-                    if let Some((rw, rh)) = correct {
-                        // On Linux, hosts that bypass size negotiation
-                        // (Bitwig) ignore this request and react by
-                        // *growing* the embed window - a resize loop.
-                        // Clamp the content (and counter-resize our child)
-                        // but never ask the host to resize its frame.
-                        // mac/windows honor it (and negotiate via
-                        // `checkSizeConstraint`) anyway.
-                        #[cfg(not(target_os = "linux"))]
-                        if let Some(ctx) = editor.context.as_ref() {
-                            let _ = ctx.request_resize(rw, rh);
-                        }
-                        #[cfg(target_os = "linux")]
-                        let _ = (rw, rh);
-                    }
+                    #[cfg(target_os = "linux")]
+                    let _ = (rw, rh);
                 }
             }
-            // Keep the swapchain covering the window's *actual*
-            // physical size. The WM (X11 resize-increment snap) or
-            // host sets that size, and it isn't bit-identical to the
-            // `to_physical_px(logical)` the `on_frame` resize paths
-            // configure the surface to - so without this the trailing
-            // edge of the window shows whatever is behind it. Driving
-            // the surface from the authoritative `info.physical_size()`
-            // here closes that gap; the blit letterboxes any ≤few-px
-            // difference to black on a pixel-snapped centre (no
-            // stretch), so a fixed editor under a host that wobbles
-            // the embed size ±1px stays crisp instead of shimmering.
-            if phys.width > 0
-                && phys.height > 0
-                && let Some(backend) = guard.as_mut()
-            {
-                backend.configure_surface(phys.width, phys.height);
-            }
-            // Always repaint on a `Resized`, even when the logical
-            // size is unchanged. Our own `set_size` -> `on_frame`
-            // resize is asynchronous on X11: `on_frame` reconfigures
-            // the surface and presents one frame *before* the
-            // `ConfigureNotify` actually grows the child window, then
-            // clears the dirty bit. The trailing `Resized` that
-            // reports the now-grown window carries a logical size
-            // that already matches `editor.size()`, so without this
-            // the gate short-circuits and the freshly exposed region
-            // is never painted - it shows whatever was behind the
-            // window until the next unrelated repaint.
+        }
+        // Keep the swapchain covering the window's *actual*
+        // physical size. The WM (X11 resize-increment snap) or
+        // host sets that size, and it isn't bit-identical to the
+        // `to_physical_px(logical)` the `on_frame` resize paths
+        // configure the surface to - so without this the trailing
+        // edge of the window shows whatever is behind it. Driving
+        // the surface from the authoritative `info.physical_size()`
+        // here closes that gap; the blit letterboxes any ≤few-px
+        // difference to black on a pixel-snapped centre (no
+        // stretch), so a fixed editor under a host that wobbles
+        // the embed size ±1px stays crisp instead of shimmering.
+        if phys.width > 0
+            && phys.height > 0
+            && let Some(backend) = guard.as_mut()
+        {
+            backend.configure_surface(phys.width, phys.height);
+        }
+        // Always repaint on a `Resized`, even when the logical
+        // size is unchanged. Our own `set_size` -> `on_frame`
+        // resize is asynchronous on X11: `on_frame` reconfigures
+        // the surface and presents one frame *before* the
+        // `ConfigureNotify` actually grows the child window, then
+        // clears the dirty bit. The trailing `Resized` that
+        // reports the now-grown window carries a logical size
+        // that already matches `editor.size()`, so without this
+        // the gate short-circuits and the freshly exposed region
+        // is never painted - it shows whatever was behind the
+        // window until the next unrelated repaint.
         editor.request_repaint();
     }
 }

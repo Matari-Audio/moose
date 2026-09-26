@@ -124,7 +124,11 @@ impl BaseviewTranslator {
 
 #[cfg(not(target_os = "ios"))]
 fn sanitize_scale(scale: f64) -> f64 {
-    if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
 }
 
 #[cfg(not(target_os = "ios"))]

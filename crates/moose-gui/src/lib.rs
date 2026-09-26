@@ -41,9 +41,9 @@ pub use editor_ios as editor;
 pub mod gpu_editor;
 pub mod interaction;
 pub mod platform;
+mod render_core;
 #[cfg(not(target_os = "ios"))]
 pub mod window;
-mod render_core;
 
 // `CpuBackend` (tiny-skia `RenderBackend` impl) + `font` (skrifa
 // glyph cache) live in the sibling `moose-cpu` crate so the CPU

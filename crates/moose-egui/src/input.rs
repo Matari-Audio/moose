@@ -4,7 +4,7 @@
 //! embedded child reports each event as captured to the host, so an editor can
 //! keep its own shortcuts without stealing the DAW's remaining keys.
 
-pub use keyboard_types::Key;
+pub use keyboard_types::{Key, NamedKey};
 
 /// Which keyboard events the editor consumes instead of returning to the host.
 #[derive(Clone, Debug, Default, PartialEq)]

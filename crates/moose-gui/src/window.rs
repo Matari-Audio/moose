@@ -76,18 +76,14 @@ impl<H: EditorWindowHandler> baseview::WindowHandler for Adapter<H> {
     }
 
     fn on_event(&self, event: Event) -> EventStatus {
-        match self.handler.try_borrow_mut() {
-            Ok(mut handler) => {
-                let status =
-                    firewall("on_event", || handler.on_event(&self.ctx, event)).unwrap_or(EventStatus::Ignored);
-                self.drain(&mut handler);
-                status
-            }
-            Err(_) => {
-                self.pending_events.borrow_mut().push_back(event);
-                EventStatus::Ignored
-            }
-        }
+        let Ok(mut handler) = self.handler.try_borrow_mut() else {
+            self.pending_events.borrow_mut().push_back(event);
+            return EventStatus::Ignored;
+        };
+        let status = firewall("on_event", || handler.on_event(&self.ctx, event))
+            .unwrap_or(EventStatus::Ignored);
+        self.drain(&mut handler);
+        status
     }
 }
 
@@ -121,6 +117,15 @@ impl EditorWindow {
     /// Close the window. Blocks until its handler is dropped.
     pub fn close(self) {
         self.0.close();
+    }
+
+    /// Run the window's event loop until it closes (top-level windows only).
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform error if the event loop fails.
+    pub fn run_until_closed(self) -> Result<(), baseview::Error> {
+        self.0.run_until_closed()
     }
 
     /// The underlying baseview window.

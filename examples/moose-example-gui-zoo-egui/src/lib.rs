@@ -7,7 +7,7 @@
 use moose::prelude::*;
 use moose_core::editor::PluginContext;
 use moose_egui::dialog::{DialogRequest, DialogResult, DialogService};
-use moose_egui::input::{Key, KeyCapture, file_drop_available, set_key_capture};
+use moose_egui::input::{Key, KeyCapture, NamedKey, file_drop_available, set_key_capture};
 use moose_egui::theme::{HEADER_BG, HEADER_TEXT};
 use moose_egui::widgets::{
     level_meter, param_dropdown, param_knob, param_slider, param_toggle, param_xy_pad,
@@ -177,7 +177,10 @@ fn zoo_ui(ui: &mut egui::Ui, state: &PluginContext<ZooParams>, dialogs: &mut Dia
         .ctx()
         .data_mut(|data| data.get_temp::<bool>(capture_policy_id()).unwrap_or(true));
     let policy = if capture_shortcuts {
-        KeyCapture::CaptureKeys(vec![Key::Character(" ".into()), Key::Escape])
+        KeyCapture::CaptureKeys(vec![
+            Key::Character(" ".into()),
+            Key::Named(NamedKey::Escape),
+        ])
     } else {
         KeyCapture::IgnoreAll
     };

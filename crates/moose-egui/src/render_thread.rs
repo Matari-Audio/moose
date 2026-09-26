@@ -191,7 +191,9 @@ impl Drop for RenderThread {
             drop(self.join.take());
         } else if let Some(join) = self.join.take() {
             if timeout.timed_out() {
-                log::warn!("egui render thread stalled and the module could not be pinned; joining");
+                log::warn!(
+                    "egui render thread stalled and the module could not be pinned; joining"
+                );
             }
             let _ = join.join();
         }

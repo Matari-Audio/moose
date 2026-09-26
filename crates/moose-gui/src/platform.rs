@@ -24,11 +24,16 @@ impl rwh::HasWindowHandle for ParentWindow {
             RawWindowHandle::UiKit(ptr) => rwh::RawWindowHandle::UiKit(
                 rwh::UiKitWindowHandle::new(std::ptr::NonNull::new(ptr).ok_or_else(null)?),
             ),
-            RawWindowHandle::Win32(ptr) => rwh::RawWindowHandle::Win32(
-                rwh::Win32WindowHandle::new(std::num::NonZeroIsize::new(ptr as isize).ok_or_else(null)?),
-            ),
+            RawWindowHandle::Win32(ptr) => {
+                rwh::RawWindowHandle::Win32(rwh::Win32WindowHandle::new(
+                    std::num::NonZeroIsize::new(ptr as isize).ok_or_else(null)?,
+                ))
+            }
             RawWindowHandle::X11(id) => {
-                let id = u32::try_from(id).ok().and_then(std::num::NonZeroU32::new).ok_or_else(null)?;
+                let id = u32::try_from(id)
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .ok_or_else(null)?;
                 rwh::RawWindowHandle::Xcb(rwh::XcbWindowHandle::new(id))
             }
         };
@@ -256,7 +261,7 @@ impl EditorScale {
     /// Record a content scale reported by the host (CLAP `set_scale`,
     /// VST3 `setContentScaleFactor`, `cargo moose screenshot --scale`).
     /// Where the platform takes host scales the host then owns the value;
-    /// on macOS (logical AppKit coordinates) it only seeds the value until
+    /// on macOS (logical `AppKit` coordinates) it only seeds the value until
     /// the window reports its backing scale.
     pub fn set_from_host(&self, scale: f64) {
         if host_scale_override(Some(scale)).is_some() {
@@ -278,9 +283,7 @@ impl EditorScale {
     /// announced one, else `None` (follow the OS).
     #[must_use]
     pub fn host_override(&self) -> Option<f64> {
-        self.host_set
-            .load(Ordering::Relaxed)
-            .then(|| self.get())
+        self.host_set.load(Ordering::Relaxed).then(|| self.get())
     }
 
     /// Read the current scale.
@@ -391,7 +394,7 @@ pub fn note_linux_scale_factor(scale: f64) {
 /// - Windows / Linux: the host scale wins when given (and is valid). Without
 ///   one, baseview uses the window DPI (Windows) or `Xft.dpi` (X11). The two
 ///   are never multiplied.
-/// - macOS: always `None`. AppKit coordinates are logical and the backing
+/// - macOS: always `None`. `AppKit` coordinates are logical and the backing
 ///   scale comes from the window; CLAP `set_scale` is refused there.
 #[must_use]
 pub fn host_scale_override(host_scale: Option<f64>) -> Option<f64> {
@@ -399,16 +402,6 @@ pub fn host_scale_override(host_scale: Option<f64>) -> Option<f64> {
         return None;
     }
     host_scale.filter(|s| s.is_finite() && *s > 0.0)
-}
-
-/// The effective editor scale under [`host_scale_override`]'s policy.
-#[must_use]
-pub fn effective_scale(host_scale: Option<f64>, os_scale: f64) -> f64 {
-    host_scale_override(host_scale).unwrap_or(if os_scale.is_finite() && os_scale > 0.0 {
-        os_scale
-    } else {
-        1.0
-    })
 }
 
 #[cfg(target_os = "linux")]
@@ -466,7 +459,12 @@ pub fn win32_client_size(window: &impl rwh::HasWindowHandle) -> Option<(u32, u32
     let rwh::RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else {
         return None;
     };
-    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     // SAFETY: pure state query on a window handle baseview owns for
     // the editor's lifetime, called from the GUI thread that owns the
     // HWND.
@@ -590,4 +588,53 @@ pub unsafe fn create_wgpu_surface_from_hwnd(
         raw_window_handle: wgpu::rwh::RawWindowHandle::Win32(win32),
     };
     unsafe { instance.create_surface_unsafe(surface_target).ok() }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)] // exact values in, exact values out
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_scale_policy() {
+        assert_eq!(host_scale_override(None), None);
+        assert_eq!(host_scale_override(Some(0.0)), None);
+        assert_eq!(host_scale_override(Some(f64::NAN)), None);
+        let expected = if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(1.5)
+        };
+        assert_eq!(host_scale_override(Some(1.5)), expected);
+    }
+
+    #[test]
+    fn host_scale_is_never_overwritten_by_os() {
+        let scale = EditorScale::new(1.0);
+        scale.set_from_os(2.0);
+        assert_eq!(scale.get(), 2.0);
+        assert_eq!(scale.host_override(), None);
+
+        scale.set_from_host(1.25);
+        assert_eq!(scale.get(), 1.25);
+        scale.set_from_os(2.0);
+        if cfg!(target_os = "macos") {
+            // macOS: the host only seeds the value; the backing scale wins.
+            assert_eq!(scale.host_override(), None);
+            assert_eq!(scale.get(), 2.0);
+        } else {
+            // One scale source, never host x OS.
+            assert_eq!(scale.host_override(), Some(1.25));
+            assert_eq!(scale.get(), 1.25);
+        }
+    }
+
+    #[test]
+    fn bad_scales_are_dropped() {
+        let scale = EditorScale::new(-1.0);
+        assert_eq!(scale.get(), 1.0);
+        scale.set_from_host(f64::INFINITY);
+        assert_eq!(scale.host_override(), None);
+        assert_eq!(scale.get(), 1.0);
+    }
 }
