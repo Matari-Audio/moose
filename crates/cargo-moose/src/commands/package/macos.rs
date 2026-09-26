@@ -633,17 +633,14 @@ fn parse_package_args(args: &[String]) -> Result<PackageArgs, crate::CargoMooseE
                 format_str = Some(crate::util::arg_value(args, &mut i, "--formats")?.to_string());
             }
             "--no-notarize" => no_notarize = true,
-            // Apple codesign on macOS is not skippable (we always pass
-            // through the configured identity, ad-hoc when none); accept
-            // `--no-sign` as a no-op so cross-platform scripts keep working.
-            "--no-sign" => {}
             "--user" => set_cli_scope(&mut cli_scope, PkgScope::User)?,
             "--system" => set_cli_scope(&mut cli_scope, PkgScope::System)?,
             "--ask" => set_cli_scope(&mut cli_scope, PkgScope::Ask)?,
-            // `--universal` is the default on macOS; `--no-installer` is a
-            // Windows-only flag. Accept both as no-ops so cross-platform CI
-            // scripts that also hit Windows keep working.
-            "--universal" | "--no-installer" => {}
+            // No-ops so cross-platform scripts keep working: Apple codesign
+            // isn't skippable (configured identity, ad-hoc when none),
+            // `--universal` is the macOS default, and `--no-installer` is
+            // Windows-only.
+            "--no-sign" | "--universal" | "--no-installer" => {}
             "--host-only" => host_only = true,
             "--target-cpu" => {
                 target_cpu_arg =

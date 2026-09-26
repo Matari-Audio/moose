@@ -4,10 +4,10 @@ name: Fuzz
 # preset container, MIDI/UMP decode, SysEx reassembly). Not a PR
 # gate - the deterministic corpus replay in miri.yml is the PR-side
 # check; this job grows the corpus and hunts new crashes weekly.
+# Schedule off: the harness repo below still targets truce-* crates,
+# so this can't build until MOOSE has its own fuzz harness repo.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 4 * * 1'
 
 permissions:
   contents: read

@@ -1331,6 +1331,7 @@ mod tests {
 
     #[test]
     fn runs_scheduled_tasks_off_thread() {
+        warm_pool(); // never lazy; Miri runs tests one at a time
         let latch = Arc::new(Latch::default());
         let sum = Arc::new(AtomicU32::new(0));
         let (l, s) = (Arc::clone(&latch), Arc::clone(&sum));
@@ -1373,6 +1374,7 @@ mod tests {
 
     #[test]
     fn panicking_task_does_not_kill_the_worker() {
+        warm_pool(); // never lazy; Miri runs tests one at a time
         let latch = Arc::new(Latch::default());
         let l = Arc::clone(&latch);
         let spawner = TaskSpawner::<bool>::new(move |should_panic| {
@@ -1388,6 +1390,7 @@ mod tests {
 
     #[test]
     fn coalescing_never_rejects() {
+        warm_pool(); // never lazy; Miri runs tests one at a time
         let last = Arc::new(AtomicU32::new(0));
         let l = Arc::clone(&last);
         let spawner = TaskSpawner::<u32>::new(move |n| {
@@ -1409,6 +1412,7 @@ mod tests {
         // One-slot mode: the handler must never run concurrently with
         // itself for this instance, and every FIFO task must still run.
         const N: u32 = 64;
+        warm_pool(); // never lazy; Miri runs tests one at a time
         let in_flight = Arc::new(AtomicU32::new(0));
         let peak = Arc::new(AtomicU32::new(0));
         let latch = Arc::new(Latch::default());

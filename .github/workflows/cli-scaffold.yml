@@ -148,11 +148,11 @@ jobs:
           path: |
             ~/.cargo/bin/clap-validator
             ~/.cargo/bin/clap-validator.exe
-          key: clap-validator-${{ matrix.os }}-2026-05-09
+          key: clap-validator-${{ matrix.os }}-2f716906
 
       - name: Install clap-validator
         if: steps.cache-clap-validator.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/free-audio/clap-validator clap-validator
+        run: cargo install --locked --git https://github.com/free-audio/clap-validator --rev 2f71690639a742ce805574ce42e31250e3147aa9 clap-validator
 
       - name: Validators on PATH
         shell: bash
