@@ -122,6 +122,13 @@ MOOSE is a hard fork. It does not track truce releases.
   `gain-vizia`, `gain-slint`, `gui-zoo-iced`, `gui-zoo-slint`,
   `midi-inspector`).
 - iOS CI, simulator tooling and iOS screenshot baselines.
+- Leftover metadata and codecs for those formats: `PluginInfo`'s
+  fourcc, AU type/manufacturer, AAX category, per-format display names
+  and legacy IDs; the LV2 TTL emitter; `.aupreset` and LV2 preset
+  import/export in `cargo moose preset`. Their `moose.toml` keys
+  (`au_manufacturer`, `fourcc`, `au_type`, `au_subtype`, `aax_category`,
+  `vst2_name`, `au_name`, `au3_name`, `aax_name`, `lv2_name`,
+  `legacy_state`) are ignored if present.
 
 ### Fixes carried on top of truce 6.3.0
 
@@ -150,6 +157,40 @@ IDs refer to Matari's internal fork inventory.
 - **B04** CLAP replays the host GUI scale into every newly created
   editor.
 - `moose-core` worker-pool test no longer depends on test ordering.
+- **From KURV's vendored truce:**
+  - K01 bounded host state I/O: CLAP and VST3 cap state reads at
+    32 MiB and reject negative or oversized reads; VST3 `getState`
+    loops on partial writes, and `setState` fails on an empty stream.
+  - K02 Windows VST3 DLLs don't import VCRUNTIME140 or libstdc++-6:
+    the shim matches the Rust CRT (`/MT` under `+crt-static`, which
+    `cargo moose` sets) and MinGW links libstdc++ statically.
+  - K04 runtime parameter names, groups and visibility
+    (`#[params(presentation = "…", presentation_revision = "…")]`),
+    announced by CLAP `CLAP_PARAM_RESCAN_INFO` and VST3
+    `kParamTitlesChanged`.
+  - K05 VST3 MIDI CC proxy parameters parse host-entered text.
+  - K06 CLAP keeps parameter events flushed while the transport is
+    stopped and replays them at the start of the next block.
+  - K07 CLAP sets the main-port flag by bus kind; outputs after the
+    first are auxiliary buses.
+  - K10 configurable preset container extension
+    (`[plugin.presets] extension`).
+  - K11 saved `#[persist]` state is validated before anything is
+    restored (`#[params(validate_persist = "…")]`), plus
+    `restore_state`, `post_load`, `pre_save` and `#[persist_missing]`
+    hooks.
+  - K12 parameters borrow their `ParamInfo` from a static table and
+    unsmoothed floats carry no smoother, shrinking every param.
+  - K13 host text entry works for every parameter: without a
+    `parse_fn` the derive round-trips the text through the param's
+    formatter.
+  - K14 hot-reload temp copies include the PID (no SIGBUS across
+    processes); the static shell boxes the DSP state.
+- **From asymmetry-rider's vendored truce:** S02 `default = FRAC_1_SQRT_2`
+  and other `std::f64::consts` values are emitted as paths (no
+  `approx_constant` lint in plugin crates), and `flags = "none"`.
+  S01 (a second host-text parser) was not taken: K13 covers it and
+  also round-trips enum names and custom formatters.
 
 ### Naming
 
@@ -163,7 +204,7 @@ IDs refer to Matari's internal fork inventory.
 | `TRUCE_NOTARY` keychain profile | `MOOSE_NOTARY` |
 
 Kept on purpose, so existing users' data keeps loading: the
-`.trucepreset` extension, `truce-preset://` URIs, the `truce/` user preset
+`.trucepreset` extension (the default; see K10), `truce-preset://` URIs, the `truce/` user preset
 folder, the state and preset blob magics, and the plugin ID derivation.
 
 ### Migrating a truce 6.3 plugin
