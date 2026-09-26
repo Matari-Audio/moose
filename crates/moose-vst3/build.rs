@@ -21,4 +21,10 @@ fn main() {
     }
 
     build.compile("vst3_shim");
+
+    // The shim's Windows idle timer calls SetTimer/KillTimer. Link user32
+    // ourselves rather than relying on some other dep in the graph to.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=user32");
+    }
 }
