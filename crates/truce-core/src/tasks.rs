@@ -1314,7 +1314,7 @@ mod tests {
         warm_pool();
         warm_pool();
         assert!(
-            !pool().workers.is_empty(),
+            !running_pool().expect("pool running").workers.is_empty(),
             "warming spawns at least one worker"
         );
     }
