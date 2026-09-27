@@ -46,8 +46,13 @@ pub fn db_to_linear_block(out: &mut [f32], src: &[f32]) {
         // exp per chunk.
         let scale = f32x8::splat(core::f32::consts::LN_10 / 20.0);
         let (head_out, tail_out) = out[..n].split_at_mut(n8);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(8).zip(src[..n8].chunks_exact(8)) {
-            let v = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src[..n8].as_chunks::<8>().0.iter())
+        {
+            let v = f32x8::from(*src_chunk);
             out_chunk.copy_from_slice((v * scale).exp().as_array_ref());
         }
         db_to_linear_block_scalar(tail_out, &src[n8..n]);
@@ -78,8 +83,13 @@ pub fn linear_to_db_block(out: &mut [f32], src: &[f32]) {
         let n8 = n / 8 * 8;
         let scale = f32x8::splat(TWENTY_OVER_LOG2_10);
         let (head_out, tail_out) = out[..n].split_at_mut(n8);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(8).zip(src[..n8].chunks_exact(8)) {
-            let v = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src[..n8].as_chunks::<8>().0.iter())
+        {
+            let v = f32x8::from(*src_chunk);
             out_chunk.copy_from_slice((v.log2() * scale).as_array_ref());
         }
         linear_to_db_block_scalar(tail_out, &src[n8..n]);
@@ -108,11 +118,16 @@ pub fn exp2_block(out: &mut [f32], src: &[f32]) {
         let n8 = n / 8 * 8;
         let ln2 = f32x8::splat(core::f32::consts::LN_2);
         let (head_out, tail_out) = out[..n].split_at_mut(n8);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(8).zip(src[..n8].chunks_exact(8)) {
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src[..n8].as_chunks::<8>().0.iter())
+        {
             // exp2(x) = exp(x * ln(2)). `wide` has `exp` natively
             // but no `exp2`; multiply-then-exp is the same cycle
             // count as a hypothetical direct `exp2`.
-            let v = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+            let v = f32x8::from(*src_chunk);
             out_chunk.copy_from_slice((v * ln2).exp().as_array_ref());
         }
         exp2_block_scalar(tail_out, &src[n8..n]);
@@ -140,8 +155,13 @@ pub fn log2_block(out: &mut [f32], src: &[f32]) {
         let n = out.len().min(src.len());
         let n8 = n / 8 * 8;
         let (head_out, tail_out) = out[..n].split_at_mut(n8);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(8).zip(src[..n8].chunks_exact(8)) {
-            let v = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src[..n8].as_chunks::<8>().0.iter())
+        {
+            let v = f32x8::from(*src_chunk);
             out_chunk.copy_from_slice(v.log2().as_array_ref());
         }
         log2_block_scalar(tail_out, &src[n8..n]);
@@ -180,8 +200,13 @@ pub fn tanh_block(out: &mut [f32], src: &[f32]) {
         let two = f32x8::splat(2.0);
         let one = f32x8::splat(1.0);
         let (head_out, tail_out) = out[..n].split_at_mut(n8);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(8).zip(src[..n8].chunks_exact(8)) {
-            let x = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src[..n8].as_chunks::<8>().0.iter())
+        {
+            let x = f32x8::from(*src_chunk);
             let x_clamped = x.fast_max(neg_bound).fast_min(bound);
             let e2x = (x_clamped * two).exp();
             let result = (e2x - one) / (e2x + one);

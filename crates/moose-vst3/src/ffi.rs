@@ -334,6 +334,12 @@ pub struct Vst3Callbacks {
     /// collection time - which would make a mid-block step audible from
     /// sample 0.
     pub param_is_chunked: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> i32,
+    /// `Params::parameter_presentation`: writes the runtime title into
+    /// `name` and returns 0 / 1 (hidden), or -1 for "no override".
+    pub param_presentation:
+        unsafe extern "C" fn(ctx: *mut c_void, id: u32, name: *mut c_char, capacity: u32) -> i32,
+    /// `Params::parameter_presentation_revision`.
+    pub param_presentation_revision: unsafe extern "C" fn(ctx: *mut c_void) -> u64,
 }
 
 unsafe extern "C" {

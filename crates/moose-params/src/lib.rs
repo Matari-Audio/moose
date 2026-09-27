@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 mod info;
+mod param_text;
 mod range;
 pub mod sample;
 mod smooth;
 mod types;
 
 pub use info::{MidiSource, ParamFlags, ParamInfo, ParamUnit, ParamValueKind, map_source_to_param};
+pub use param_text::parse_formatted_value;
 pub use range::ParamRange;
 pub use sample::{Float, Sample};
 pub use smooth::{Smoother, SmoothingStyle};
@@ -146,6 +148,17 @@ pub fn format_param_value(info: &ParamInfo, value: f64) -> String {
     }
 }
 
+/// Host-facing label and visibility for a parameter whose identity
+/// (ID, range, count) stays fixed. Returned by
+/// [`Params::parameter_presentation`]; format wrappers rescan names /
+/// visibility when [`Params::parameter_presentation_revision`] changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParameterPresentation {
+    pub name: String,
+    pub group: String,
+    pub hidden: bool,
+}
+
 /// Trait implemented by #[derive(Params)] on a struct.
 /// Format wrappers use this to enumerate, read, and write parameters.
 ///
@@ -157,6 +170,20 @@ pub fn format_param_value(info: &ParamInfo, value: f64) -> String {
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
 pub trait Params: __private::Sealed + Send + Sync + 'static {
+    /// Runtime name / group / visibility override for `id`, read on the
+    /// host main thread. `None` keeps the static [`ParamInfo`] label.
+    /// Derive: `#[params(presentation = "method")]`.
+    fn parameter_presentation(&self, _id: u32) -> Option<ParameterPresentation> {
+        None
+    }
+
+    /// Bump whenever any [`Self::parameter_presentation`] result changes;
+    /// wrappers poll it and ask the host to rescan parameter info.
+    /// Derive: `#[params(presentation_revision = "method")]`.
+    fn parameter_presentation_revision(&self) -> u64 {
+        0
+    }
+
     /// All parameter infos, in declaration order.
     fn param_infos(&self) -> Vec<ParamInfo>;
 
@@ -270,6 +297,29 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
 
     /// Restore parameter values from a list of (id, value) pairs.
     fn restore_values(&self, values: &[(u32, f64)]);
+
+    /// Restore a saved state's parameter values and `#[persist]` blob as
+    /// one operation. Every state-load path in `moose-core` calls this
+    /// (after [`Self::validate_persist`] accepted the blob), so a store
+    /// that must reconcile the two representations overrides it
+    /// (derive: `#[params(restore_state = "method")]`).
+    fn restore_state(&self, values: &[(u32, f64)], persist: &[u8]) {
+        self.restore_values(values);
+        self.load_persist(persist);
+    }
+
+    /// Check a saved `#[persist]` blob before anything is restored.
+    /// Returning `false` rejects the whole state load, so the store is
+    /// never left half-restored from a document it can't read. Runs on
+    /// the host thread. Default: accept everything (derive:
+    /// `#[params(validate_persist = "function")]`).
+    #[must_use]
+    fn validate_persist(_data: &[u8]) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
 
     /// Serialize this store's `#[persist]` fields into a keyed blob the
     /// host saves alongside the parameter values. Default: empty (no

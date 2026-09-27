@@ -41,7 +41,7 @@ use presets::FactoryPresets;
 /// missing one.
 ///
 /// `moose::plugin!` / `#[derive(Params)]` write
-/// `target/lv2-meta/<crate>/param_index.toml` as a compile-time side
+/// `target/param-index/<crate>/param_index.toml` as a compile-time side
 /// effect, but cargo doesn't track it: delete it (or `cargo clean` only
 /// that dir) while the crate stays cached and the next *incremental* build
 /// won't re-run the macro, leaving preset install to abort with "no param
@@ -55,9 +55,7 @@ fn ensure_preset_sidecars(plugins: &[&PluginDef], root: &Path) -> Res {
         if !ships_presets {
             continue;
         }
-        let sidecar = moose_build::target_dir(root)
-            .join("lv2-meta")
-            .join(&p.crate_name)
+        let sidecar = moose_build::param_index_dir(&moose_build::target_dir(root), &p.crate_name)
             .join("param_index.toml");
         if sidecar.exists() {
             continue;

@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Expr, Fields, Lit, Type, TypePath, UnOp};
 
-mod lv2_emit;
+mod param_index;
 
 /// Resolve `moose.toml` and pull out the `[[plugin]]` entry for the
 /// current crate. Routes every failure mode through `Result<…, String>`
@@ -105,30 +105,10 @@ fn resolve_midi(
     Ok((wiring, midi2_in, midi2_out))
 }
 
-/// Validate 4-ASCII-byte fourccs for `plugin_info!`. `Some(message)` on
-/// the first bad code. `info::fourcc` asserts this at runtime (during the
-/// host scan), so an invalid code otherwise compiles clean and the plugin
-/// never loads in any DAW.
-fn fourcc_error(codes: &[(&str, &str)]) -> Option<String> {
-    for (label, code) in codes {
-        if code.len() != 4 || !code.is_ascii() {
-            return Some(format!(
-                "`{label}` must be exactly 4 ASCII characters (a VST3/AU fourcc); \
-                 got {code:?} ({} bytes)",
-                code.len(),
-            ));
-        }
-    }
-    None
-}
-
-// `au_name` / `au3_name` (and similar `vst2_name` / `vst3_name`)
-// mirror the user-facing moose.toml keys; renaming would break the
-// 1:1 with the TOML schema.
 // Linear metadata assembly: one `let` per moose.toml field feeding a
 // single `PluginInfo` literal - splitting it would just thread the same
 // locals through helpers without aiding clarity.
-#[allow(clippy::similar_names, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 #[proc_macro]
 pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let (config, pkg_name, moose_toml_path) = match try_resolve_plugin() {
@@ -164,10 +144,8 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         .to_string();
 
     // Category-string vocabulary parsed by every consumer that reads
-    // `moose.toml`. Note-effect plugins (`midi` / `note_effect`) must
-    // map to a distinct variant from `Effect` so the LV2 MIDI input
-    // decode path stays open; collapsing them silently drops every
-    // host MIDI event.
+    // `moose.toml`. Note-effect plugins (`midi` / `note_effect`) map to
+    // a distinct variant from `Effect`.
     let category = match plugin.category.as_str() {
         "instrument" => quote! { ::moose::core::PluginCategory::Instrument },
         "midi" | "note_effect" => quote! { ::moose::core::PluginCategory::NoteEffect },
@@ -194,46 +172,8 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     };
     let midi_input_dialect = dialect_tokens(midi2_in);
     let midi_output_dialect = dialect_tokens(midi2_out);
-    // NoteEffect plugins map to `aumi` (Apple's MIDI Processor type).
-    // Pairs with empty `bus_layouts` at the plugin level: aumi
-    // plugins must not expose audio I/O. Logic routes `aumi` to the
-    // MIDI FX slot, which is where arpeggiators / transposers /
-    // note-shapers belong. A mismatch with the AU-type computed at
-    // install / package time causes auval to report "Class Data
-    // fields ... do not match component description".
-    // An audio effect that accepts MIDI input is an `aumf` MusicEffect,
-    // not a plain `aufx`: AU routes MIDI to a plugin by its component
-    // type, so an `aufx` would never be handed the events.
-    let au_type = plugin
-        .au_type
-        .as_deref()
-        .unwrap_or(match plugin.category.as_str() {
-            "instrument" => "aumu",
-            "midi" | "note_effect" => "aumi",
-            _ if accepts_midi_in => "aumf",
-            _ => "aufx",
-        });
-
     let plugin_id = moose_build::plugin_id(&config.vendor.id, &plugin.bundle_id);
 
-    let Some(resolved_fourcc) = plugin.fourcc.as_ref().or(plugin.au_subtype.as_ref()) else {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            format!(
-                "moose.toml: [[plugin]] entry `{}` requires `fourcc` or `au_subtype`",
-                plugin.crate_name
-            ),
-        )
-        .to_compile_error()
-        .into();
-    };
-    let au_manufacturer = &config.vendor.au_manufacturer;
-
-    let aax_category = if let Some(cat) = &plugin.aax_category {
-        quote! { Some(#cat) }
-    } else {
-        quote! { None }
-    };
     let vst3_subcategory = if let Some(sub) = &plugin.vst3_subcategory {
         quote! { Some(#sub) }
     } else {
@@ -255,23 +195,21 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let clap_support_url = opt_str(&plugin.clap_support_url);
     let vst3_name = opt_str(&plugin.vst3_name);
     let clap_name = opt_str(&plugin.clap_name);
-    let vst2_name = opt_str(&plugin.vst2_name);
-    let au_name = opt_str(&plugin.au_name);
-    let au3_name = opt_str(&plugin.au3_name);
-    let aax_name = opt_str(&plugin.aax_name);
-    let lv2_name = opt_str(&plugin.lv2_name);
+    let clap_features = &plugin.clap_features;
+    let clap_features = quote! { &[#(#clap_features),*] };
+    let preset_extension = moose_build::preset_extension(plugin);
+    if !preset_extension
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        let msg = format!(
+            "moose.toml: [plugin.presets] extension {preset_extension:?} must be ASCII \
+             letters, digits, `_` or `-` (no dot)"
+        );
+        return quote! { compile_error!(#msg); }.into();
+    }
     let mute_preview_output = plugin.mute_preview_output;
     let min_subblock_samples = config.automation.min_subblock_samples;
-
-    // `[plugin.legacy_state]` probe lists, baked as static slices.
-    let str_slice = |items: &[String]| -> proc_macro2::TokenStream {
-        quote! { &[#(#items),*] }
-    };
-    let legacy = plugin.legacy_state.as_ref();
-    let clap_features = str_slice(&plugin.clap_features);
-    let legacy_au_keys = str_slice(legacy.map_or(&[][..], |l| &l.au_keys));
-    let legacy_lv2_uris = str_slice(legacy.map_or(&[][..], |l| &l.lv2_uris));
-    let legacy_aax_chunk_ids = str_slice(legacy.map_or(&[][..], |l| &l.aax_chunk_ids));
 
     // `include_bytes!` registers `moose.toml` as a build-time dependency
     // through the compiler's normal dep-info tracking. Without it, edits
@@ -279,18 +217,6 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     // have no other way to declare external file dependencies.
     // Path is canonicalized in `try_resolve_plugin` so the literal is
     // stable across invocations.
-    // `info::fourcc` asserts a 4-byte code at runtime - which fires when
-    // the host first scans the plugin, so a 3-char or non-ASCII code
-    // compiles clean and just never loads in any DAW. These are string
-    // literals here, so validate at expansion time.
-    if let Some(msg) = fourcc_error(&[
-        ("fourcc / au_subtype", resolved_fourcc.as_str()),
-        ("au_type", au_type),
-        ("vendor au_manufacturer", au_manufacturer.as_str()),
-    ]) {
-        return quote! { compile_error!(#msg); }.into();
-    }
-
     let moose_toml_lit = moose_toml_path.to_string_lossy().into_owned();
     let expanded = quote! {
         {
@@ -314,27 +240,15 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
                 bundle_id: #bundle_id,
                 vst3_id: #plugin_id,
                 clap_id: #plugin_id,
-                fourcc: ::moose::core::info::fourcc(#resolved_fourcc.as_bytes()),
-                au_type: ::moose::core::info::fourcc(#au_type.as_bytes()),
-                au_manufacturer: ::moose::core::info::fourcc(#au_manufacturer.as_bytes()),
-                aax_id: None,
-                aax_category: #aax_category,
                 vst3_subcategory: #vst3_subcategory,
                 preset_user_dir: #preset_user_dir,
+                preset_extension: #preset_extension,
                 vst3_name: #vst3_name,
                 clap_name: #clap_name,
-                vst2_name: #vst2_name,
-                au_name: #au_name,
-                au3_name: #au3_name,
-                aax_name: #aax_name,
-                lv2_name: #lv2_name,
                 mute_preview_output: #mute_preview_output,
                 automation: ::moose::core::info::AutomationConfig {
                     min_subblock_samples: #min_subblock_samples,
                 },
-                legacy_au_keys: #legacy_au_keys,
-                legacy_lv2_uris: #legacy_lv2_uris,
-                legacy_aax_chunk_ids: #legacy_aax_chunk_ids,
             }
         }
     };
@@ -368,16 +282,14 @@ pub fn plugin_vst3_class_id(_input: TokenStream) -> TokenStream {
     }
 }
 
-/// Emit `manifest.ttl` + `plugin.ttl` for the plugin whose root params
-/// type is `<input>`. Invoked by `moose::plugin!`'s expansion. See
-/// [`lv2_emit::emit_root_impl`] for the gory details.
-///
-/// Doc-hidden because plugin authors never call it directly - it's
-/// part of the `moose::plugin!` machinery.
+/// Write the flattened `param_index.toml` for the plugin whose root
+/// params type is `<input>` (the `.preset` field-name table
+/// `cargo moose` reads). Invoked by `moose::plugin!`'s expansion; see
+/// [`param_index::emit_root_impl`].
 #[doc(hidden)]
 #[proc_macro]
-pub fn __moose_lv2_emit_root(input: TokenStream) -> TokenStream {
-    lv2_emit::emit_root_impl(input)
+pub fn __moose_param_index_root(input: TokenStream) -> TokenStream {
+    param_index::emit_root_impl(input)
 }
 
 /// Recognized parameter field types.
@@ -408,12 +320,6 @@ impl ParamField {
         self.attrs
             .id
             .expect("ParamField::id called before the auto-assignment block ran")
-    }
-
-    /// The inner `T` of an `EnumParam<T>`, used by the LV2 sidecar
-    /// writer to record which enum a range-less enum param refers to.
-    pub(crate) fn enum_type(&self) -> Option<&syn::Type> {
-        self.enum_type.as_ref()
     }
 }
 
@@ -831,6 +737,17 @@ fn has_persist_attr(field: &syn::Field) -> bool {
     field.attrs.iter().any(|a| a.path().is_ident("persist"))
 }
 
+/// `#[persist_missing]`: when a non-empty saved blob lacks this field's
+/// key, `load_persist` still calls its `persist_read` with an empty
+/// cursor so the field can migrate from older documents. Opt-in: empty
+/// input has no generic `PersistField` meaning.
+fn has_persist_missing_attr(field: &syn::Field) -> bool {
+    field
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("persist_missing"))
+}
+
 /// The `#[persist = "key"]` string key, or the field name when the
 /// attribute is bare (`#[persist]`). The key identifies the field in the
 /// saved blob so add / remove / reorder stays compatible.
@@ -868,39 +785,93 @@ enum IdScheme {
     Ordinal,
 }
 
-/// Read the struct-level `#[params(id_scheme = "hash" | "ordinal")]`.
-/// Defaults to [`IdScheme::Hash`]. Errors on an unknown key/value.
-fn parse_id_scheme(attrs: &[syn::Attribute]) -> Result<IdScheme, syn::Error> {
-    let mut scheme = IdScheme::Hash;
+/// Struct-level `#[params(...)]` settings.
+struct ParamsStructAttrs {
+    id_scheme: IdScheme,
+    /// Inherent `fn(&self)` run at the end of `load_persist`, after
+    /// values and persist fields are both restored (migrations).
+    post_load: Option<syn::Ident>,
+    /// Inherent `fn(&self)` run before `collect_values` /
+    /// `serialize_persist` (flush editor-side state into fields).
+    pre_save: Option<syn::Ident>,
+    /// Inherent `fn(&[u8]) -> bool` behind `Params::validate_persist`.
+    validate_persist: Option<syn::Ident>,
+    /// Inherent `fn(&self, &[(u32, f64)], &[u8])` behind
+    /// `Params::restore_state`.
+    restore_state: Option<syn::Ident>,
+    /// Inherent `fn(&self, u32) -> Option<ParameterPresentation>`.
+    presentation: Option<syn::Ident>,
+    /// Inherent `fn(&self) -> u64`.
+    presentation_revision: Option<syn::Ident>,
+}
+
+/// Read the struct-level `#[params(...)]` keys. `id_scheme` defaults
+/// to [`IdScheme::Hash`]; every hook key names an inherent method.
+/// Errors on an unknown key/value.
+fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAttrs, syn::Error> {
+    let mut parsed = ParamsStructAttrs {
+        id_scheme: IdScheme::Hash,
+        post_load: None,
+        pre_save: None,
+        validate_persist: None,
+        restore_state: None,
+        presentation: None,
+        presentation_revision: None,
+    };
     for attr in attrs {
         if !attr.path().is_ident("params") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("id_scheme") {
-                return Err(meta.error("unknown `#[params]` key (expected `id_scheme`)"));
-            }
+            let key = meta
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_default();
             let value: syn::LitStr = meta.value()?.parse()?;
-            scheme = match value.value().as_str() {
-                "hash" => IdScheme::Hash,
-                "ordinal" => IdScheme::Ordinal,
-                other => {
-                    return Err(meta.error(format!(
-                        "unknown `id_scheme` {other:?} (expected \"hash\" or \"ordinal\")"
-                    )));
+            if key == "id_scheme" {
+                parsed.id_scheme = match value.value().as_str() {
+                    "hash" => IdScheme::Hash,
+                    "ordinal" => IdScheme::Ordinal,
+                    other => {
+                        return Err(meta.error(format!(
+                            "unknown `id_scheme` {other:?} (expected \"hash\" or \"ordinal\")"
+                        )));
+                    }
+                };
+                return Ok(());
+            }
+            let slot = match key.as_str() {
+                "post_load" => &mut parsed.post_load,
+                "pre_save" => &mut parsed.pre_save,
+                "validate_persist" => &mut parsed.validate_persist,
+                "restore_state" => &mut parsed.restore_state,
+                "presentation" => &mut parsed.presentation,
+                "presentation_revision" => &mut parsed.presentation_revision,
+                _ => {
+                    return Err(meta.error(
+                        "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
+                         `validate_persist`, `restore_state`, `presentation`, or \
+                         `presentation_revision`)",
+                    ));
                 }
             };
+            *slot = Some(syn::parse_str::<syn::Ident>(&value.value()).map_err(|_| {
+                meta.error(format!(
+                    "`{key}` must name an inherent method on the Params struct"
+                ))
+            })?);
             Ok(())
         })?;
     }
-    Ok(scheme)
+    Ok(parsed)
 }
 
 /// Deterministic FNV-1a hash of a field name, masked into the
 /// historical 24-bit auto-ID space. Pure integer arithmetic
 /// over the name bytes, so the value is identical across toolchains,
 /// targets, and runs - the property a persisted parameter id needs.
-/// `pub(crate)` so the LV2 sidecar aggregator (`lv2_emit`) flattens
+/// `pub(crate)` so the param-index aggregator (`param_index`) flattens
 /// nested hash ids with the exact same arithmetic the runtime uses.
 pub(crate) fn name_hash_id(name: &str) -> u32 {
     const FNV_OFFSET: u32 = 0x811c_9dc5;
@@ -972,6 +943,31 @@ fn parse_default_expr(expr: &Expr) -> Option<f64> {
 /// Closed whitelist so the derive's downstream range / shape checks
 /// keep working with a concrete `f64` literal embedded in the
 /// expansion.
+const F64_CONSTS: [(f64, &str); 19] = {
+    use std::f64::consts as c;
+    [
+        (c::PI, "PI"),
+        (c::TAU, "TAU"),
+        (c::E, "E"),
+        (c::SQRT_2, "SQRT_2"),
+        (c::FRAC_1_SQRT_2, "FRAC_1_SQRT_2"),
+        (c::FRAC_PI_2, "FRAC_PI_2"),
+        (c::FRAC_PI_3, "FRAC_PI_3"),
+        (c::FRAC_PI_4, "FRAC_PI_4"),
+        (c::FRAC_PI_6, "FRAC_PI_6"),
+        (c::FRAC_PI_8, "FRAC_PI_8"),
+        (c::FRAC_1_PI, "FRAC_1_PI"),
+        (c::FRAC_2_PI, "FRAC_2_PI"),
+        (c::FRAC_2_SQRT_PI, "FRAC_2_SQRT_PI"),
+        (c::LN_2, "LN_2"),
+        (c::LN_10, "LN_10"),
+        (c::LOG2_E, "LOG2_E"),
+        (c::LOG10_E, "LOG10_E"),
+        (c::LOG2_10, "LOG2_10"),
+        (c::LOG10_2, "LOG10_2"),
+    ]
+};
+
 fn std_f64_const(path: &syn::Path) -> Option<f64> {
     let segs: Vec<String> = path
         .segments
@@ -990,28 +986,11 @@ fn std_f64_const(path: &syn::Path) -> Option<f64> {
     if !prefix_ok {
         return None;
     }
-    match segs.last()?.as_str() {
-        "PI" => Some(std::f64::consts::PI),
-        "TAU" => Some(std::f64::consts::TAU),
-        "E" => Some(std::f64::consts::E),
-        "SQRT_2" => Some(std::f64::consts::SQRT_2),
-        "FRAC_1_SQRT_2" => Some(std::f64::consts::FRAC_1_SQRT_2),
-        "FRAC_PI_2" => Some(std::f64::consts::FRAC_PI_2),
-        "FRAC_PI_3" => Some(std::f64::consts::FRAC_PI_3),
-        "FRAC_PI_4" => Some(std::f64::consts::FRAC_PI_4),
-        "FRAC_PI_6" => Some(std::f64::consts::FRAC_PI_6),
-        "FRAC_PI_8" => Some(std::f64::consts::FRAC_PI_8),
-        "FRAC_1_PI" => Some(std::f64::consts::FRAC_1_PI),
-        "FRAC_2_PI" => Some(std::f64::consts::FRAC_2_PI),
-        "FRAC_2_SQRT_PI" => Some(std::f64::consts::FRAC_2_SQRT_PI),
-        "LN_2" => Some(std::f64::consts::LN_2),
-        "LN_10" => Some(std::f64::consts::LN_10),
-        "LOG2_E" => Some(std::f64::consts::LOG2_E),
-        "LOG10_E" => Some(std::f64::consts::LOG10_E),
-        "LOG2_10" => Some(std::f64::consts::LOG2_10),
-        "LOG10_2" => Some(std::f64::consts::LOG10_2),
-        _ => None,
-    }
+    let name = segs.last()?;
+    F64_CONSTS
+        .iter()
+        .find(|(_, n)| n == name)
+        .map(|(value, _)| *value)
 }
 
 /// Collect parameter fields, nested fields, and meter fields from a struct.
@@ -1088,6 +1067,19 @@ fn collect_fields(fields: &Fields) -> CollectedFields {
 /// decimal form round-trips cleanly and matches the hand-written
 /// `0.0` / `1.0` literals the range-less default path emits.
 fn f64_lit(v: f64) -> proc_macro2::TokenStream {
+    // A `default = std::f64::consts::X` comes back out as the path: its
+    // shortest decimal is exact, but it trips clippy's `approx_constant`
+    // in every crate that expands the derive.
+    for (value, name) in F64_CONSTS {
+        if v.abs().to_bits() == value.to_bits() {
+            let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
+            return if v < 0.0 {
+                quote! { -::core::f64::consts::#ident }
+            } else {
+                quote! { ::core::f64::consts::#ident }
+            };
+        }
+    }
     if v < 0.0 {
         let abs = proc_macro2::Literal::f64_unsuffixed(-v);
         quote! { -#abs }
@@ -1487,7 +1479,7 @@ fn parse_flags_tokens(flags: &str) -> proc_macro2::TokenStream {
     for flag in flags.split('|').map(|s| s.trim().to_lowercase()) {
         match flag.as_str() {
             "automatable" => parts.push(quote! { ::moose::params::ParamFlags::AUTOMATABLE }),
-            "non_automatable" => {
+            "none" | "non_automatable" => {
                 parts.push(quote! { ::moose::params::ParamFlags::empty() });
             }
             "hidden" => parts.push(quote! { ::moose::params::ParamFlags::HIDDEN }),
@@ -1505,7 +1497,7 @@ fn parse_flags_tokens(flags: &str) -> proc_macro2::TokenStream {
             "" => {}
             other => {
                 let msg = format!(
-                    "unknown param flag `{other}` - supported: automatable, non_automatable, hidden, \
+                    "unknown param flag `{other}` - supported: none, automatable, non_automatable, hidden, \
                      readonly, bypass, modulatable, modulatable_per_note",
                 );
                 return quote! { compile_error!(#msg) };
@@ -1703,7 +1695,7 @@ fn gen_param_info_literal(f: &ParamField) -> Option<proc_macro2::TokenStream> {
 /// caller drives this via `assign_param_ids` first, but a future
 /// refactor that calls `gen_field_constructor` out of order panics
 /// with a precise message rather than producing colliding id=0 params.
-fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
+fn gen_field_constructor(f: &ParamField, slot: usize) -> proc_macro2::TokenStream {
     let a = &f.attrs;
     let name = a.name.as_deref().unwrap_or("Unnamed");
 
@@ -1752,7 +1744,7 @@ fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
         return quote! { compile_error!(#msg) };
     }
 
-    let Some(info) = gen_param_info_literal(f) else {
+    if gen_param_info_literal(f).is_none() {
         // Validation block above already returned a `compile_error!`
         // for every shape that `gen_param_info_literal` rejects.
         // Surface a fallback diagnostic so a future divergence
@@ -1760,7 +1752,10 @@ fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
         // emitting bad code.
         let msg = format!("invalid `#[param]` attributes on field `{name}`");
         return quote! { compile_error!(#msg) };
-    };
+    }
+    // The metadata lives in the struct's static table (see `new()`);
+    // the param borrows its slot and carries only its id.
+    let info = quote! { &__MOOSE_PARAM_INFOS[#slot] };
 
     match f.kind {
         ParamKind::Float => {
@@ -1787,7 +1782,10 @@ fn gen_field_constructor(f: &ParamField) -> proc_macro2::TokenStream {
 /// happens on syntactically broken input (rustc would already be
 /// rejecting the same file), so the panic surfaces a derive-internal
 /// regression rather than user error.
-#[proc_macro_derive(Params, attributes(param, nested, meter, skip, persist, params))]
+#[proc_macro_derive(
+    Params,
+    attributes(param, nested, meter, skip, persist, persist_missing, params)
+)]
 #[allow(clippy::too_many_lines)]
 pub fn derive_params(input: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(input).expect("Failed to parse input for Params derive");
@@ -1808,12 +1806,16 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // values (editor-editable config). Also present in `skip_fields` so
     // `new()` `Default`-constructs them; collected here (ident + key) for
     // the serialize/load-persist codegen.
-    let persist_fields: Vec<(syn::Ident, String)> = match fields {
+    let persist_fields: Vec<(syn::Ident, String, bool)> = match fields {
         Fields::Named(named) => named
             .named
             .iter()
             .filter(|f| has_persist_attr(f))
-            .filter_map(|f| f.ident.clone().map(|id| (id, persist_key(f))))
+            .filter_map(|f| {
+                f.ident
+                    .clone()
+                    .map(|id| (id, persist_key(f), has_persist_missing_attr(f)))
+            })
             .collect(),
         _ => Vec::new(),
     };
@@ -1832,10 +1834,11 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // ID per the struct's `id_scheme`: a stable hash of the field name
     // (default), or a sequential counter in field order (legacy
     // `#[params(id_scheme = "ordinal")]`). See `IdScheme`.
-    let scheme = match parse_id_scheme(&ast.attrs) {
-        Ok(s) => s,
+    let struct_attrs = match parse_params_struct_attrs(&ast.attrs) {
+        Ok(attrs) => attrs,
         Err(e) => return e.to_compile_error().into(),
     };
+    let scheme = struct_attrs.id_scheme;
     match scheme {
         IdScheme::Ordinal => {
             let explicit_ids: HashSet<u32> =
@@ -1950,7 +1953,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         let mut seen_keys = HashSet::new();
         let all_keys = persist_fields
             .iter()
-            .map(|(ident, key)| (ident, key.clone()))
+            .map(|(ident, key, _)| (ident, key.clone()))
             .chain(
                 nested_fields
                     .iter()
@@ -1967,25 +1970,20 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
     }
 
-    // --- Compile-time LV2 metadata sidecar ---
+    // --- Compile-time param-index sidecar ---
     //
-    // Each Params struct (root or nested, plugin crate or helper)
-    // writes `<target>/lv2-meta/<crate>/<struct>.params.toml` with its
-    // own params, meters, and #[nested] child type names. The final
-    // TTL render happens later via `__moose_lv2_emit_root!`, which
-    // `moose::plugin!` invokes with the root params type and which
-    // walks the sidecar tree to aggregate. Failures here are silent -
-    // they surface at TTL-emit time when the aggregator can't find
-    // the data it needs.
+    // Each Params struct writes `<target>/param-index/<crate>/<struct>
+    // .params.toml`; `__moose_param_index_root!` (from `moose::plugin!`)
+    // flattens the tree for the preset tooling. Failures here are
+    // silent - they surface when the root aggregates.
     let nested_for_sidecar: Vec<(syn::Ident, syn::Type, Option<u32>)> = nested_fields
         .iter()
         .map(|n| (n.ident.clone(), n.ty.clone(), n.base))
         .collect();
-    lv2_emit::write_struct_sidecar(
+    param_index::write_struct_sidecar(
         struct_name,
         scheme == IdScheme::Hash,
         &param_fields,
-        &meter_fields,
         &nested_for_sidecar,
     );
 
@@ -2012,7 +2010,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = &f.ident;
-            quote! { self.#ident.info.clone() }
+            quote! { self.#ident.info() }
         })
         .collect();
 
@@ -2047,12 +2045,9 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // --- param_infos_static ---
     // Same shape as `param_infos`, but each entry is the raw
     // `ParamInfo { ... }` literal (built by
-    // `gen_param_info_literal`) rather than a runtime `self.<f>.info`
-    // read. Lifted into a `LazyLock<Vec<ParamInfo>>` so format
-    // wrappers' `register_*` paths can read parameter metadata
-    // without constructing a plugin instance. AAX's `Describe` runs
-    // at C++ static-init time and can't safely allocate a plugin
-    // there, so the static path is mandatory for that format.
+    // `gen_param_info_literal`) rather than a runtime `self.<f>.info()`
+    // read, so format wrappers' `register_*` paths can read parameter
+    // metadata without constructing a plugin instance.
     let own_info_literals: Vec<proc_macro2::TokenStream> = param_fields
         .iter()
         .filter_map(gen_param_info_literal)
@@ -2205,7 +2200,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                 ParamKind::Enum => quote! { f64::from(self.#ident.index()) },
             };
             quote! {
-                x if x == self.#ident.id() => Some(self.#ident.info.range.normalize(#plain_expr)),
+                x if x == self.#ident.id() => Some(self.#ident.range().normalize(#plain_expr)),
             }
         })
         .collect();
@@ -2259,7 +2254,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             };
             quote! {
                 x if x == self.#ident.id() => {
-                    let plain = self.#ident.info.range.denormalize(value);
+                    let plain = self.#ident.range().denormalize(value);
                     #commit;
                 }
             }
@@ -2304,7 +2299,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                     }
                     _ => quote! {
                         x if x == self.#ident.id() => {
-                            Some(::moose::params::format_param_value(&self.#ident.info, value))
+                            Some(::moose::params::format_param_value(self.#ident.static_info(), value))
                         }
                     },
                 }
@@ -2324,34 +2319,61 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     };
 
     // --- parse_value ---
+    // A `parse_fn` wins; every other param round-trips its display text
+    // through `parse_formatted_value` with the same formatter
+    // `format_value` uses, so host text entry works for the whole set.
     let parse_value_arms: Vec<_> = param_fields
         .iter()
-        .filter_map(|f| {
-            let parse_fn = f.attrs.parse_fn.as_ref()?;
+        .map(|f| {
             let ident = &f.ident;
-            let parse_ident = syn::Ident::new(parse_fn, ident.span());
-            Some(quote! { x if x == self.#ident.id() => self.#parse_ident(text), })
+            if let Some(parse_fn) = f.attrs.parse_fn.as_ref() {
+                let parse_ident = syn::Ident::new(parse_fn, ident.span());
+                return quote! { x if x == self.#ident.id() => self.#parse_ident(text), };
+            }
+            let (format, lenient) = if let Some(format_fn) = f.attrs.format_fn.as_ref() {
+                let format_ident = syn::Ident::new(format_fn, ident.span());
+                (quote! { |value| self.#format_ident(value) }, false)
+            } else {
+                let format = match f.kind {
+                    ParamKind::Bool => quote! { |value: f64| {
+                        if value > 0.5 { "On".to_string() } else { "Off".to_string() }
+                    } },
+                    ParamKind::Enum => {
+                        let enum_ty = f
+                            .enum_type
+                            .as_ref()
+                            .expect("ParamKind::Enum field must have enum_type populated");
+                        quote! { |value| ::moose::params::EnumParam::<#enum_ty>::format_by_index(value) }
+                    }
+                    _ => quote! { |value| ::moose::params::format_param_value(self.#ident.static_info(), value) },
+                };
+                (format, true)
+            };
+            quote! {
+                x if x == self.#ident.id() => ::moose::params::parse_formatted_value(
+                    self.#ident.static_info(),
+                    text,
+                    #format,
+                    #lenient,
+                ),
+            }
         })
         .collect();
 
-    let parse_value_impl = if parse_value_arms.is_empty() && nested_fields.is_empty() {
-        quote! { None }
+    let nested_parse = if nested_fields.is_empty() {
+        quote! { _ => None, }
     } else {
-        let nested_parse = if nested_fields.is_empty() {
-            quote! { _ => None, }
-        } else {
-            quote! {
-                _ => {
-                    #(if let Some(v) = self.#nested_idents.parse_value(id, text) { return Some(v); })*
-                    None
-                }
-            }
-        };
         quote! {
-            match id {
-                #(#parse_value_arms)*
-                #nested_parse
+            _ => {
+                #(if let Some(v) = self.#nested_idents.parse_value(id, text) { return Some(v); })*
+                None
             }
+        }
+    };
+    let parse_value_impl = quote! {
+        match id {
+            #(#parse_value_arms)*
+            #nested_parse
         }
     };
 
@@ -2361,7 +2383,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .filter(|f| f.kind == ParamKind::Float)
         .map(|f| {
             let ident = &f.ident;
-            quote! { self.#ident.smoother.snap(self.#ident.raw_target()); }
+            quote! { self.#ident.snap_smoother(); }
         })
         .collect();
 
@@ -2371,7 +2393,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .filter(|f| f.kind == ParamKind::Float)
         .map(|f| {
             let ident = &f.ident;
-            quote! { self.#ident.smoother.set_sample_rate(sample_rate); }
+            quote! { self.#ident.set_sample_rate(sample_rate); }
         })
         .collect();
 
@@ -2388,12 +2410,35 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let new_impl = if generate_new {
         let param_inits: Vec<_> = param_fields
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(slot, f)| {
                 let ident = &f.ident;
-                let constructor = gen_field_constructor(f);
+                let constructor = gen_field_constructor(f, slot);
                 quote! { #ident: #constructor }
             })
             .collect();
+
+        // One shared metadata table per struct type: every instance
+        // (including each `#[nested]` slot reusing the type) borrows its
+        // `ParamInfo` from here and carries only its own rebased id.
+        // `LazyLock` because `default` / `range` may be non-const
+        // expressions (`variant_count()`, a const path).
+        let info_table = if param_fields.is_empty() {
+            quote! {}
+        } else {
+            let table_len = param_fields.len();
+            let literals = param_fields.iter().map(|f| {
+                gen_param_info_literal(f).unwrap_or_else(|| {
+                    let msg = format!("invalid `#[param]` attributes on field `{}`", f.ident);
+                    quote! { compile_error!(#msg) }
+                })
+            });
+            quote! {
+                static __MOOSE_PARAM_INFOS: ::std::sync::LazyLock<
+                    [::moose::params::ParamInfo; #table_len],
+                > = ::std::sync::LazyLock::new(|| [#(#literals),*]);
+            }
+        };
 
         let nested_inits: Vec<_> = nested_fields
             .iter()
@@ -2457,6 +2502,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         quote! {
             impl #struct_name {
                 pub fn new() -> Self {
+                    #info_table
                     #me_binding = Self {
                         #(#param_inits,)*
                         #(#nested_inits,)*
@@ -2496,10 +2542,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         impl #struct_name {
             #[doc(hidden)]
             pub fn offset_ids(&mut self, id_base: u32) {
-                #(self.#own_param_idents.info.id = ::moose::params::rebase_nested_param_id(
-                    self.#own_param_idents.info.id,
-                    id_base,
-                );)*
+                #(self.#own_param_idents.offset_id(id_base);)*
                 #(self.#nested_idents.offset_ids(id_base);)*
             }
         }
@@ -2595,7 +2638,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // sub-struct's own `serialize_persist` blob, so it recurses.
     let persist_write_stmts: Vec<proc_macro2::TokenStream> = persist_fields
         .iter()
-        .map(|(ident, key)| {
+        .map(|(ident, key, _)| {
             (
                 key.clone(),
                 quote! {
@@ -2626,14 +2669,23 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let persist_seen_idents: Vec<syn::Ident> = persist_fields
+        .iter()
+        .map(|(ident, _, _)| syn::Ident::new(&format!("__seen_{ident}"), ident.span()))
+        .collect();
     let persist_read_arms: Vec<proc_macro2::TokenStream> = persist_fields
         .iter()
-        .map(|(ident, key)| {
+        .zip(&persist_seen_idents)
+        .map(|((ident, key, missing), seen)| {
+            let mark = missing.then(|| quote! { #seen = true; });
             quote! {
-                #key => ::moose::core::custom_state::PersistField::persist_read(
-                    &self.#ident,
-                    &mut ::moose::core::custom_state::StateCursor::new(__value),
-                ),
+                #key => {
+                    #mark
+                    ::moose::core::custom_state::PersistField::persist_read(
+                        &self.#ident,
+                        &mut ::moose::core::custom_state::StateCursor::new(__value),
+                    );
+                }
             }
         })
         .chain(nested_idents.iter().map(|ident| {
@@ -2644,16 +2696,96 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }))
         .collect();
 
+    // `#[persist_missing]`: a non-empty blob without this key still
+    // reaches the field (empty cursor) so it can migrate old documents.
+    let persist_missing_stmts: Vec<proc_macro2::TokenStream> = persist_fields
+        .iter()
+        .zip(&persist_seen_idents)
+        .filter(|((_, _, missing), _)| *missing)
+        .map(|((ident, _, _), seen)| {
+            quote! {
+                if !__data.is_empty() && !#seen {
+                    ::moose::core::custom_state::PersistField::persist_read(
+                        &self.#ident,
+                        &mut ::moose::core::custom_state::StateCursor::new(&[]),
+                    );
+                }
+            }
+        })
+        .collect();
+
+    let persist_missing_seen: Vec<&syn::Ident> = persist_fields
+        .iter()
+        .zip(&persist_seen_idents)
+        .filter(|((_, _, missing), _)| *missing)
+        .map(|(_, seen)| seen)
+        .collect();
+
     #[allow(clippy::cast_possible_truncation)]
     let persist_count = (persist_fields.len() + nested_idents.len()) as u32;
 
+    // Struct-level hooks (`#[params(...)]`).
+    let pre_save = struct_attrs
+        .pre_save
+        .as_ref()
+        .map(|m| quote! { self.#m(); });
+    let post_load = struct_attrs
+        .post_load
+        .as_ref()
+        .map(|m| quote! { self.#m(); });
+    let validate_impl = struct_attrs.validate_persist.as_ref().map(|m| {
+        quote! {
+            fn validate_persist(data: &[u8]) -> bool where Self: Sized { Self::#m(data) }
+        }
+    });
+    let restore_impl = struct_attrs.restore_state.as_ref().map(|m| {
+        quote! {
+            fn restore_state(&self, values: &[(u32, f64)], persist: &[u8]) {
+                self.#m(values, persist);
+            }
+        }
+    });
+    let presentation_impl = struct_attrs.presentation.as_ref().map(|m| {
+        quote! {
+            fn parameter_presentation(&self, id: u32)
+                -> ::core::option::Option<::moose::params::ParameterPresentation>
+            {
+                self.#m(id)
+            }
+        }
+    });
+    let presentation_revision_impl = struct_attrs.presentation_revision.as_ref().map(|m| {
+        quote! {
+            fn parameter_presentation_revision(&self) -> u64 { self.#m() }
+        }
+    });
+
     // Nothing to carry: leave the empty-`Vec` trait default so a plugin
-    // without persisted config adds no bytes to its saved state.
+    // without persisted config adds no bytes to its saved state. A
+    // `pre_save` / `post_load` / `validate_persist` hook still needs the
+    // methods so the hook runs.
     let persist_impl = if persist_fields.is_empty() && nested_idents.is_empty() {
-        quote! {}
+        let save = pre_save.as_ref().map(|pre| {
+            quote! {
+                fn serialize_persist(&self) -> ::std::vec::Vec<u8> {
+                    #pre
+                    ::std::vec::Vec::new()
+                }
+            }
+        });
+        let load = (post_load.is_some() || validate_impl.is_some()).then(|| {
+            quote! {
+                fn load_persist(&self, __data: &[u8]) {
+                    if !<Self as ::moose::params::Params>::validate_persist(__data) { return; }
+                    #post_load
+                }
+            }
+        });
+        quote! { #save #load }
     } else {
         quote! {
         fn serialize_persist(&self) -> ::std::vec::Vec<u8> {
+            #pre_save
             let mut __buf: ::std::vec::Vec<u8> = ::std::vec::Vec::new();
             <u32 as ::moose::core::custom_state::StateField>::write_field(&#persist_count, &mut __buf);
             #(#persist_write_stmts)*
@@ -2661,32 +2793,40 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
 
         fn load_persist(&self, __data: &[u8]) {
-            let mut __cursor = ::moose::core::custom_state::StateCursor::new(__data);
-            let ::core::option::Option::Some(__count) =
-                <u32 as ::moose::core::custom_state::StateField>::read_field(&mut __cursor)
-            else {
-                return;
-            };
-            for _ in 0..__count {
-                let ::core::option::Option::Some(__key) =
-                    <::std::string::String as ::moose::core::custom_state::StateField>::read_field(&mut __cursor)
+            if !<Self as ::moose::params::Params>::validate_persist(__data) { return; }
+            #(let mut #persist_missing_seen = false;)*
+            // Early exits on a truncated blob still run the
+            // missing-field migrations and `post_load` below.
+            '__read: {
+                let mut __cursor = ::moose::core::custom_state::StateCursor::new(__data);
+                let ::core::option::Option::Some(__count) =
+                    <u32 as ::moose::core::custom_state::StateField>::read_field(&mut __cursor)
                 else {
-                    return;
+                    break '__read;
                 };
-                let ::core::option::Option::Some(__len_bytes) = __cursor.read_bytes(4) else {
-                    return;
-                };
-                let __len = u32::from_le_bytes(
-                    __len_bytes.try_into().expect("read_bytes(4) yields 4 bytes"),
-                ) as usize;
-                let ::core::option::Option::Some(__value) = __cursor.read_bytes(__len) else {
-                    return;
-                };
-                match __key.as_str() {
-                    #(#persist_read_arms)*
-                    _ => {}
+                for _ in 0..__count {
+                    let ::core::option::Option::Some(__key) =
+                        <::std::string::String as ::moose::core::custom_state::StateField>::read_field(&mut __cursor)
+                    else {
+                        break '__read;
+                    };
+                    let ::core::option::Option::Some(__len_bytes) = __cursor.read_bytes(4) else {
+                        break '__read;
+                    };
+                    let __len = u32::from_le_bytes(
+                        __len_bytes.try_into().expect("read_bytes(4) yields 4 bytes"),
+                    ) as usize;
+                    let ::core::option::Option::Some(__value) = __cursor.read_bytes(__len) else {
+                        break '__read;
+                    };
+                    match __key.as_str() {
+                        #(#persist_read_arms)*
+                        _ => {}
+                    }
                 }
             }
+            #(#persist_missing_stmts)*
+            #post_load
         }
         }
     };
@@ -2710,6 +2850,11 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #append_infos_impl
 
             #param_infos_static_impl
+
+            #presentation_impl
+            #presentation_revision_impl
+            #validate_impl
+            #restore_impl
 
             fn count(&self) -> usize {
                 #count_expr
@@ -2769,6 +2914,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn collect_values(&self) -> (Vec<u32>, Vec<f64>) {
+                #pre_save
                 let mut ids: Vec<u32> = vec![#(#collect_ids),*];
                 let mut values: Vec<f64> = ids
                     .iter()
@@ -2912,13 +3058,6 @@ pub fn derive_param_enum(input: TokenStream) -> TokenStream {
             v.ident.to_string()
         })
         .collect();
-
-    // Record the variant count + display names so the LV2 aggregator can
-    // resolve `EnumParam<#enum_name>` ports that carry no explicit
-    // `#[param(range = "enum(N)")]` and render each value's scale-point
-    // label. Only knowable here, at the enum's own derive; the params
-    // sidecar references it by name.
-    lv2_emit::write_enum_sidecar(enum_name, &variant_names);
 
     // from_index match arms
     let from_index_arms: Vec<_> = variant_idents
@@ -3327,7 +3466,7 @@ mod snake_to_pascal_tests {
 
 #[cfg(test)]
 mod parse_default_tests {
-    use super::parse_default_expr;
+    use super::{f64_lit, parse_default_expr, parse_flags_tokens};
 
     fn eval(src: &str) -> Option<f64> {
         let expr: syn::Expr = syn::parse_str(src).expect("test input must parse as Expr");
@@ -3342,6 +3481,23 @@ mod parse_default_tests {
         assert_eq!(eval("-0.25"), Some(-0.25));
         assert_eq!(eval("true"), Some(1.0));
         assert_eq!(eval("false"), Some(0.0));
+    }
+
+    #[test]
+    fn f64_lit_emits_std_consts_as_paths() {
+        let lit = |v: f64| f64_lit(v).to_string().replace(' ', "");
+        assert_eq!(
+            lit(std::f64::consts::FRAC_1_SQRT_2),
+            "::core::f64::consts::FRAC_1_SQRT_2"
+        );
+        assert_eq!(lit(-std::f64::consts::PI), "-::core::f64::consts::PI");
+        assert_eq!(lit(0.5), "0.5");
+    }
+
+    #[test]
+    fn flags_none_is_empty() {
+        let tokens = parse_flags_tokens("none").to_string().replace(' ', "");
+        assert_eq!(tokens, "::moose::params::ParamFlags::empty()");
     }
 
     #[test]

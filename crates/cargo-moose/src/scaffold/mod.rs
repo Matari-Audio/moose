@@ -17,7 +17,6 @@
 
 mod case;
 mod context;
-mod fourcc;
 mod kind;
 mod layout;
 mod render;
@@ -34,7 +33,6 @@ use layout::{ProjectLayout, WorkspaceLayout};
 use render::{Renderer, tpl};
 
 pub use case::to_pascal_case;
-pub use fourcc::{resolve_fourccs, to_fourcc};
 pub use kind::PluginKind;
 pub use spec::{DepForm, FeatureSet, PluginSpec, VendorInfo};
 pub use statefulness::Statefulness;
@@ -102,9 +100,8 @@ impl Scaffolder {
     ///
     /// # Errors
     ///
-    /// Propagates any I/O error from writing files under `root`,
-    /// fourcc-collision errors from [`resolve_fourccs`], or template
-    /// render failures.
+    /// Propagates any I/O error from writing files under `root`, or
+    /// template render failures.
     pub fn single(
         &self,
         root: &Path,
@@ -128,8 +125,7 @@ impl Scaffolder {
         )?;
 
         let plugins = std::slice::from_ref(plugin);
-        let fourcc_map = resolve_fourccs(plugins)?;
-        let moose_ctx = MooseTomlContext::new(vendor, plugins, &plugin.name, &fourcc_map, false);
+        let moose_ctx = MooseTomlContext::new(vendor, plugins, &plugin.name, false);
         let moose_path = layout.moose_toml();
         write(
             &moose_path,
@@ -144,9 +140,8 @@ impl Scaffolder {
     ///
     /// # Errors
     ///
-    /// Propagates any I/O error from writing files under `root`,
-    /// fourcc-collision errors from [`resolve_fourccs`], or template
-    /// render failures.
+    /// Propagates any I/O error from writing files under `root`, or
+    /// template render failures.
     pub fn workspace(
         &self,
         root: &Path,
@@ -172,8 +167,7 @@ impl Scaffolder {
             self.renderer.render(tpl::WORKSPACE_CARGO_TOML, &ws_ctx),
         )?;
 
-        let fourcc_map = resolve_fourccs(plugins)?;
-        let moose_ctx = MooseTomlContext::new(vendor, plugins, workspace_name, &fourcc_map, true);
+        let moose_ctx = MooseTomlContext::new(vendor, plugins, workspace_name, true);
         write(
             &ws_layout.moose_toml(),
             self.renderer.render(tpl::MOOSE_TOML, &moose_ctx),

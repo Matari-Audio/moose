@@ -222,8 +222,10 @@ impl PluginLogic for Eq {
             return None;
         }
         let mut values = payload
-            .chunks_exact(8)
-            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)")));
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| f64::from_le_bytes(*chunk));
         let mut next = || values.next().expect("length checked above");
         let p = EqParams::new();
         let params = vec![
@@ -533,18 +535,6 @@ mod tests {
     #[test]
     fn state_round_trips() {
         moose_test::assert_state_round_trip::<Plugin>();
-    }
-
-    // --- AU metadata ---
-
-    #[test]
-    fn au_type_codes_ascii() {
-        moose_test::assert_au_type_codes_ascii::<Plugin>();
-    }
-
-    #[test]
-    fn fourcc_roundtrip() {
-        moose_test::assert_fourcc_roundtrip::<Plugin>();
     }
 
     #[test]

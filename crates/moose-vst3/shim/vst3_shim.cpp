@@ -524,6 +524,11 @@ struct Vst3Callbacks {
     // block, so process_chunked applies each point at its sample offset
     // instead of the end value landing from sample 0.
     int32_t (*param_is_chunked)(void*, uint32_t);
+    // Runtime title for a param: -1 = none (keep the static info),
+    // otherwise 0 / 1 = hidden. Writes the NUL-terminated title.
+    int32_t (*param_presentation)(void*, uint32_t, char*, uint32_t);
+    // Bumped whenever any param_presentation result changes.
+    uint64_t (*param_presentation_revision)(void*);
 };
 
 // ---------------------------------------------------------------------------
@@ -688,6 +693,88 @@ class MooseComponent;     // forward declaration for ctx mapping
 struct MoosePlugView;     // forward decl - full def lives below in the
                           // GUI section; MooseComponent only needs a
                           // pointer to it for the `plugView` field.
+
+// ---------------------------------------------------------------------------
+// Bounded host state streams
+// ---------------------------------------------------------------------------
+
+// IBStream vtable: queryInterface, addRef, release, read, write, seek, tell.
+struct IBStreamVtbl {
+    tresult (*queryInterface)(void*, const TUID, void**);
+    uint32  (*addRef)(void*);
+    uint32  (*release)(void*);
+    tresult (*read)(void*, void*, int32, int32*);
+    tresult (*write)(void*, void*, int32, int32*);
+    tresult (*seek)(void*, int64_t, int32, int64_t*);
+    tresult (*tell)(void*, int64_t*);
+};
+
+// Largest state blob accepted from, or handed to, a host stream.
+static constexpr int32 kMaxHostStateBytes = 32 * 1024 * 1024;
+
+extern "C" {
+
+// Read one bounded state blob from a host IBStream. Returns a malloc'd
+// buffer (caller frees) and its length, or nullptr when the stream is
+// empty, errors before any data, reports a byte count outside the
+// request, or runs past kMaxHostStateBytes. A short final read is
+// valid. Exported so the Rust tests can drive it with a fake stream.
+uint8_t* moose_vst3_read_state_stream(void* stream, int32* outLen) {
+    *outLen = 0;
+    if (!stream) return nullptr;
+    auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
+    uint8_t buf[4096];
+    uint8_t* data = nullptr;
+    int32 total = 0;
+    int32 capacity = 0;
+    for (;;) {
+        int32 bytesRead = 0;
+        tresult r = vtbl->read(stream, buf, (int32)sizeof(buf), &bytesRead);
+        if (bytesRead < 0 || bytesRead > (int32)sizeof(buf)) { free(data); return nullptr; }
+        if (bytesRead == 0) break;
+        if (total > kMaxHostStateBytes - bytesRead) { free(data); return nullptr; }
+        const int32 nextTotal = total + bytesRead;
+        if (nextTotal > capacity) {
+            // Geometric growth: one realloc per doubling, not per chunk.
+            int32 nextCapacity = capacity == 0 ? (int32)sizeof(buf) : capacity;
+            while (nextCapacity < nextTotal) {
+                nextCapacity = nextCapacity > kMaxHostStateBytes / 2
+                    ? kMaxHostStateBytes : nextCapacity * 2;
+            }
+            auto* grown = (uint8_t*)realloc(data, (size_t)nextCapacity);
+            if (!grown) { free(data); return nullptr; }
+            data = grown;
+            capacity = nextCapacity;
+        }
+        memcpy(data + total, buf, (size_t)bytesRead);
+        total = nextTotal;
+        if (r != kResultOk) break;
+    }
+    if (total == 0) { free(data); return nullptr; }
+    *outLen = total;
+    return data;
+}
+
+// Write a whole state blob to a host IBStream, looping over partial
+// writes. Returns 1 when every byte landed, 0 when the blob is empty or
+// oversized, or the stream reports no progress, a count outside the
+// request, or an error before the blob is complete.
+int32_t moose_vst3_write_state_stream(void* stream, const uint8_t* data, uint32_t len) {
+    if (!stream || !data || len == 0 || len > (uint32_t)kMaxHostStateBytes) return 0;
+    auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
+    uint32_t offset = 0;
+    while (offset < len) {
+        const int32 request = (int32)(len - offset);
+        int32 written = 0;
+        tresult r = vtbl->write(stream, (void*)(data + offset), request, &written);
+        if (written <= 0 || written > request) return 0;
+        offset += (uint32_t)written;
+        if (r != kResultOk && offset < len) return 0;
+    }
+    return 1;
+}
+
+} // extern "C"
 
 // Global ctx→component mapping for extern "C" host-notification callbacks
 static constexpr int kMaxInstances = 64;
@@ -1119,7 +1206,7 @@ public:
                 : 0;
             const bool aux = kinds && kinds[index] != 0;
             const char* nm = (dir == kInput) ? (aux ? "Sidechain" : "Input")
-                                             : "Output";
+                                             : (aux ? "Aux Output" : "Output");
             str_to_char16(bus->name, nm, 128);
             bus->busType = aux ? kAux : kMain;
             // kDefaultActive is truthful per role: the main path is live on a
@@ -1183,39 +1270,14 @@ public:
 
     tresult setState(void* stream) {
         if (!stream || !g_cb || !ctx) return kResultFalse;
-        // IBStream vtable: queryInterface, addRef, release, read, write, seek, tell
-        struct IBStreamVtbl {
-            tresult (*queryInterface)(void*, const TUID, void**);
-            uint32  (*addRef)(void*);
-            uint32  (*release)(void*);
-            tresult (*read)(void*, void*, int32, int32*);
-            tresult (*write)(void*, void*, int32, int32*);
-            tresult (*seek)(void*, int64_t, int32, int64_t*);
-            tresult (*tell)(void*, int64_t*);
-        };
-        auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
-
-        // Read all available data from the stream
-        uint8_t buf[4096];
-        uint8_t* data = nullptr;
         int32 total = 0;
-        for (;;) {
-            int32 bytesRead = 0;
-            tresult r = vtbl->read(stream, buf, (int32)sizeof(buf), &bytesRead);
-            if (bytesRead <= 0) break;
-            auto* prev = data;
-            data = (uint8_t*)realloc(data, total + bytesRead);
-            if (!data) { free(prev); return kResultFalse; }
-            memcpy(data + total, buf, bytesRead);
-            total += bytesRead;
-            if (r != kResultOk) break;
+        uint8_t* data = moose_vst3_read_state_stream(stream, &total);
+        tresult result = kResultFalse;
+        if (data) {
+            if (g_cb->state_load(ctx, data, (uint32_t)total))
+                result = kResultOk;
+            free(data);
         }
-        tresult result = kResultOk;
-        if (data && total > 0) {
-            if (!g_cb->state_load(ctx, data, (uint32_t)total))
-                result = kResultFalse;
-        }
-        free(data);
         stateLoaded = true;
         // If the editor was attached before state was loaded, open it now
         if (deferredParent) {
@@ -1227,27 +1289,13 @@ public:
 
     tresult getState(void* stream) {
         if (!stream || !g_cb || !ctx) return kResultFalse;
-        struct IBStreamVtbl {
-            tresult (*queryInterface)(void*, const TUID, void**);
-            uint32  (*addRef)(void*);
-            uint32  (*release)(void*);
-            tresult (*read)(void*, void*, int32, int32*);
-            tresult (*write)(void*, void*, int32, int32*);
-            tresult (*seek)(void*, int64_t, int32, int64_t*);
-            tresult (*tell)(void*, int64_t*);
-        };
-        auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
-
         uint8_t* blob = nullptr;
         uint32_t len = 0;
         g_cb->state_save(ctx, &blob, &len);
-        if (blob && len > 0) {
-            int32 written = 0;
-            vtbl->write(stream, blob, (int32)len, &written);
-            g_cb->state_free(blob, len);
-            if (written != (int32)len) return kResultFalse;
-        }
-        return kResultOk;
+        if (!blob) return kResultFalse;
+        const int32_t ok = moose_vst3_write_state_stream(stream, blob, len);
+        g_cb->state_free(blob, len);
+        return ok ? kResultOk : kResultFalse;
     }
 
     // --- IAudioProcessor ---
@@ -1862,6 +1910,17 @@ public:
         info->defaultNormalizedValue = p.default_normalized;
         info->unitId = ((uint32_t)index < 4096) ? g_param_unit_id[index] : 0;
         info->flags = p.flags;
+        if (g_cb && ctx) {
+            char title[512] = {};
+            int32 hidden = g_cb->param_presentation(ctx, p.id, title, sizeof(title));
+            if (hidden >= 0) {
+                str_to_char16(info->title, title, 128);
+                str_to_char16(info->shortTitle, title, 128);
+                // ParameterFlags: kCanAutomate=1, kIsReadOnly=2, kIsHidden=16.
+                // The SDK defines hidden as read-only and not automatable.
+                if (hidden) info->flags = (info->flags | 2 | 16) & ~1;
+            }
+        }
         return kResultOk;
     }
 
@@ -1929,7 +1988,14 @@ public:
     // main-thread callbacks (param reads, edit gestures), so the call
     // lands on the UI thread as VST3 wants. IComponentHandler vtable:
     //   [3] beginEdit [4] performEdit [5] endEdit [6] restartComponent
+    uint64_t presentationRevision = 0;
     void flushPendingRestart() {
+        if (!componentHandler) return;
+        uint64_t revision = (g_cb && ctx) ? g_cb->param_presentation_revision(ctx) : 0;
+        if (revision != presentationRevision) {
+            presentationRevision = revision;
+            pendingRestart.fetch_or(1 << 4, std::memory_order_release); // kParamTitlesChanged
+        }
         int32 flags = pendingRestart.exchange(0, std::memory_order_acq_rel);
         if (!flags || !componentHandler) return;
         auto restart = (tresult (*)(void*, int32))(*(void***)componentHandler)[6];

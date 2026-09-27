@@ -65,7 +65,7 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
     CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info, clap_plugin_params,
 };
-use clap_sys::ext::params::{CLAP_PARAM_RESCAN_VALUES, clap_host_params};
+use clap_sys::ext::params::{CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, clap_host_params};
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
     clap_plugin_preset_load,
@@ -100,7 +100,7 @@ use clap_sys::version::CLAP_VERSION;
 
 use moose_core::TransportSlot;
 use moose_core::buffer::AudioBuffer;
-use moose_core::bus::ChannelConfig;
+use moose_core::bus::{BusConfig, BusKind, ChannelConfig};
 use moose_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 use moose_core::cast::{len_u32, size_of_u32};
 use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
@@ -286,6 +286,8 @@ struct ClapPluginData<P: PluginExport> {
     render_mode: AtomicU8,
     /// Flag: GUI changed params, need rescan on main thread.
     needs_rescan: Arc<AtomicBool>,
+    /// Last `Params::parameter_presentation_revision` the host saw.
+    presentation_revision: AtomicU64,
     /// Shared transport slot: audio thread writes each block, editor reads.
     transport_slot: Arc<TransportSlot>,
     /// Host-reported GUI scale (via `clap_plugin_gui::set_scale`).
@@ -340,6 +342,12 @@ struct ClapAudio<P: PluginExport> {
     /// capacity as `event_list` so steady-state operation stays
     /// allocation-free.
     sub_event_scratch: EventList,
+    /// Param changes a stopped-transport `params_flush` applied, kept
+    /// latest-wins per id and replayed at offset 0 of the next process
+    /// block, so the plugin sees the host's explicit events (including
+    /// same-value ones) rather than only a changed snapshot. Capacity is
+    /// the param count, so it never grows.
+    deferred_params: Vec<(u32, f64)>,
     /// Current sample rate.
     sample_rate: f64,
     /// Current max block size.
@@ -880,12 +888,25 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        if data.needs_rescan.swap(false, Ordering::Relaxed)
+        // Runtime names / groups / hidden flags (`parameter_presentation`)
+        // are re-read by the host on RESCAN_INFO, which CLAP allows while
+        // active.
+        let revision = data.params_arc.parameter_presentation_revision();
+        let info_changed = data.presentation_revision.swap(revision, Ordering::Relaxed) != revision;
+        let values_changed = data.needs_rescan.swap(false, Ordering::Relaxed);
+        if (values_changed || info_changed)
             && !data.host_params.is_null()
             && !data.host.is_null()
             && let Some(rescan) = (*data.host_params).rescan
         {
-            rescan(data.host, CLAP_PARAM_RESCAN_VALUES);
+            let mut flags = 0;
+            if values_changed {
+                flags |= CLAP_PARAM_RESCAN_VALUES;
+            }
+            if info_changed {
+                flags |= CLAP_PARAM_RESCAN_INFO;
+            }
+            rescan(data.host, flags);
         }
 
         // Latency changed on the audio thread: tell the host here, off
@@ -2109,6 +2130,33 @@ fn declared_input_port(port: u16, count: u8) -> Option<u8> {
     (port < u16::from(count)).then(|| u8::try_from(port).ok())?
 }
 
+/// Record a `params_flush` param change for replay in the next process
+/// block, latest value per id. Bounded by the vec's capacity (the param
+/// count), so an id the plugin doesn't declare can't grow it.
+fn defer_param_change(deferred: &mut Vec<(u32, f64)>, id: u32, value: f64) {
+    if let Some(slot) = deferred.iter_mut().find(|(d, _)| *d == id) {
+        slot.1 = value;
+    } else if deferred.len() < deferred.capacity() {
+        deferred.push((id, value));
+    }
+}
+
+/// Push the deferred flush changes at offset 0 ahead of the block's own
+/// events, then forget them. A state load discards them: they predate
+/// the recalled state, like the live param events it drops.
+fn replay_deferred_params(
+    list: &mut EventList,
+    deferred: &mut Vec<(u32, f64)>,
+    state_loaded: bool,
+) {
+    if !state_loaded {
+        for &(id, value) in deferred.iter() {
+            list.push(Event::new(0, EventBody::ParamChange { id, value }));
+        }
+    }
+    deferred.clear();
+}
+
 #[allow(clippy::too_many_lines)]
 unsafe fn convert_input_events<P: PluginExport>(
     scr: &mut ClapAudio<P>,
@@ -2120,6 +2168,11 @@ unsafe fn convert_input_events<P: PluginExport>(
 ) {
     unsafe {
         scr.event_list.clear();
+        // Process path only (`params_flush` passes no frame count):
+        // stopped-transport param events precede this block's events.
+        if frames_count.is_some() {
+            replay_deferred_params(&mut scr.event_list, &mut scr.deferred_params, state_loaded);
+        }
 
         if in_events.is_null() {
             return;
@@ -3412,7 +3465,8 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
             }
             _ => {}
         }
-        out.flags = flags;
+        let presentation = data.params_arc.parameter_presentation(info.id);
+        out.flags = presented_flags(flags, presentation.as_ref());
 
         out.min_value = info.range.min();
         out.max_value = info.range.max();
@@ -3420,15 +3474,59 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
 
         // Name
         out.name = [0; CLAP_NAME_SIZE];
-        copy_str_to_buf(&mut out.name, info.name);
+        copy_str_to_buf(
+            &mut out.name,
+            presentation.as_ref().map_or(info.name, |p| p.name.as_str()),
+        );
 
         // Module path (use group if non-empty)
         out.module = [0; CLAP_PATH_SIZE];
-        if !info.group.is_empty() {
-            copy_str_to_buf(&mut out.module, info.group);
-        }
+        copy_str_to_buf(
+            &mut out.module,
+            presentation
+                .as_ref()
+                .map_or(info.group, |p| p.group.as_str()),
+        );
 
         true
+    }
+}
+
+/// A runtime presentation's `hidden` overrides the static flag.
+fn presented_flags(flags: u32, presentation: Option<&moose_params::ParameterPresentation>) -> u32 {
+    match presentation {
+        Some(p) if p.hidden => flags | CLAP_PARAM_IS_HIDDEN,
+        Some(_) => flags & !CLAP_PARAM_IS_HIDDEN,
+        None => flags,
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    use moose_params::ParameterPresentation;
+
+    #[test]
+    fn presentation_hidden_overrides_static_flag() {
+        let shown = ParameterPresentation {
+            name: "A".into(),
+            group: String::new(),
+            hidden: false,
+        };
+        let hidden = ParameterPresentation {
+            hidden: true,
+            ..shown.clone()
+        };
+        let base = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_HIDDEN;
+        assert_eq!(presented_flags(base, None), base);
+        assert_eq!(
+            presented_flags(base, Some(&shown)),
+            CLAP_PARAM_IS_AUTOMATABLE
+        );
+        assert_eq!(
+            presented_flags(CLAP_PARAM_IS_AUTOMATABLE, Some(&hidden)),
+            base
+        );
     }
 }
 
@@ -3531,6 +3629,7 @@ unsafe extern "C" fn params_flush<P: PluginExport>(
         for ev in scr.event_list.iter() {
             if let EventBody::ParamChange { id, value } = ev.body {
                 params.set_plain(id, value);
+                defer_param_change(&mut scr.deferred_params, id, value);
             }
         }
         let _ = flush_gui_changes::<P>(data, out_events);
@@ -3733,6 +3832,30 @@ unsafe extern "C" fn state_save<P: PluginExport>(
     })
 }
 
+/// Largest state blob a host stream may hand us. Anything bigger is a
+/// misbehaving stream (or an unrelated file), not a moose state.
+const MAX_HOST_STATE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Drain a host `clap_istream` into one bounded blob. `read` fills the
+/// buffer and returns the host's byte count: `0` is end of stream, a
+/// negative count is a read error. A count larger than the buffer, or a
+/// stream past [`MAX_HOST_STATE_BYTES`], fails the load before any
+/// further allocation.
+fn read_host_state(mut read: impl FnMut(&mut [u8]) -> i64) -> Option<Vec<u8>> {
+    let mut blob = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = usize::try_from(read(&mut buf)).ok()?;
+        if n == 0 {
+            return Some(blob);
+        }
+        if n > buf.len() || blob.len() + n > MAX_HOST_STATE_BYTES {
+            return None;
+        }
+        blob.extend_from_slice(&buf[..n]);
+    }
+}
+
 unsafe extern "C" fn state_load<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_istream,
@@ -3747,20 +3870,11 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
-        // Read all data from stream
-        let mut blob = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let read = read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64);
-            if read <= 0 {
-                break;
-            }
-            // `read > 0` checked above; CLAP plugin state blob fits
-            // in usize on every supported target.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let n = read as usize;
-            blob.extend_from_slice(&buf[..n]);
-        }
+        let Some(blob) = read_host_state(|buf| {
+            read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64)
+        }) else {
+            return false;
+        };
 
         if blob.is_empty() {
             return false;
@@ -3966,6 +4080,17 @@ unsafe extern "C" fn audio_ports_count<P: PluginExport>(
     }
 }
 
+/// CLAP allows one main port per direction, at index 0. Take the role
+/// from the bus kind so a layout whose first enabled bus is a sidechain
+/// (its main bus disabled) doesn't advertise the sidechain as main.
+fn audio_port_main_flag(index: u32, kind: BusKind) -> u32 {
+    if index == 0 && kind == BusKind::Main {
+        CLAP_AUDIO_PORT_IS_MAIN
+    } else {
+        0
+    }
+}
+
 unsafe extern "C" fn audio_ports_get<P: PluginExport>(
     plugin: *const clap_plugin,
     index: u32,
@@ -3994,11 +4119,7 @@ unsafe extern "C" fn audio_ports_get<P: PluginExport>(
         out.name = [0; CLAP_NAME_SIZE];
         copy_str_to_buf(&mut out.name, bus.name);
         out.channel_count = bus.channels.channel_count();
-        out.flags = if index == 0 {
-            CLAP_AUDIO_PORT_IS_MAIN
-        } else {
-            0
-        };
+        out.flags = audio_port_main_flag(index, bus.kind);
         // f64 plugins take the host's 64-bit wire directly (zero
         // copy, no precision loss at the boundary); the process loop
         // reads whichever of data32/data64 the host picked per port.
@@ -4031,6 +4152,13 @@ unsafe extern "C" fn audio_ports_config_count<P: PluginExport>(_plugin: *const c
     len_u32(P::bus_layouts().len())
 }
 
+fn main_bus(buses: &[BusConfig]) -> Option<&BusConfig> {
+    buses
+        .iter()
+        .find(|bus| bus.enabled)
+        .filter(|bus| bus.kind == BusKind::Main)
+}
+
 unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
     _plugin: *const clap_plugin,
     index: u32,
@@ -4053,28 +4181,17 @@ unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
         copy_str_to_buf(&mut out.name, &name);
         out.input_port_count = len_u32(layout.inputs.iter().filter(|bus| bus.enabled).count());
         out.output_port_count = len_u32(layout.outputs.iter().filter(|bus| bus.enabled).count());
-        out.has_main_input = layout.inputs.iter().any(|bus| bus.enabled);
-        out.main_input_channel_count = layout
-            .inputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(0, |b| b.channels.channel_count());
-        out.main_input_port_type = layout
-            .inputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
-        out.has_main_output = layout.outputs.iter().any(|bus| bus.enabled);
-        out.main_output_channel_count = layout
-            .outputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(0, |b| b.channels.channel_count());
-        out.main_output_port_type = layout
-            .outputs
-            .iter()
-            .find(|bus| bus.enabled)
-            .map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
+        // The main port is the first enabled bus, and only if it is Main.
+        let main_input = main_bus(&layout.inputs);
+        out.has_main_input = main_input.is_some();
+        out.main_input_channel_count = main_input.map_or(0, |b| b.channels.channel_count());
+        out.main_input_port_type =
+            main_input.map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
+        let main_output = main_bus(&layout.outputs);
+        out.has_main_output = main_output.is_some();
+        out.main_output_channel_count = main_output.map_or(0, |b| b.channels.channel_count());
+        out.main_output_port_type =
+            main_output.map_or(ptr::null(), |b| clap_port_type_ptr(b.channels));
         true
     }
 }
@@ -5108,6 +5225,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let info = P::info();
         let plugin_id_hash = state::hash_plugin_id(info.clap_id);
         let param_infos = instance.params().param_infos();
+        let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let meter_store = instance.meter_store();
         let snapshot = instance.snapshot_slot();
@@ -5157,16 +5275,18 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             active: AtomicBool::new(false),
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
             needs_rescan: Arc::new(AtomicBool::new(false)),
+            presentation_revision: AtomicU64::new(0),
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),
             window_scale: AtomicU64::new(0),
             pending_resize: AtomicU64::new(0),
             extensions: Extensions::<P>::new(),
             audio: PluginCell::new(ClapAudio {
-                event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                event_list: EventList::with_capacity(EVENT_LIST_PREALLOC + param_count),
                 sounding_notes: SoundingNotes::new(midi_input_ports),
                 output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
-                sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC + param_count),
+                deferred_params: Vec::with_capacity(param_count),
                 sample_rate: 44100.0,
                 max_block_size: 1024,
                 input_slices: Vec::with_capacity(max_in),
@@ -5673,5 +5793,105 @@ mod remote_controls_tests {
             remote_controls_page_id("EQ", 0),
             remote_controls_page_id("DYN", 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod host_state_tests {
+    use super::{MAX_HOST_STATE_BYTES, read_host_state};
+
+    #[test]
+    fn reads_until_end_of_stream() {
+        let mut chunks = vec![3_i64, 2, 0].into_iter();
+        let blob = read_host_state(|buf| {
+            let n = chunks.next().unwrap();
+            buf[..usize::try_from(n).unwrap()].fill(7);
+            n
+        });
+        assert_eq!(blob, Some(vec![7; 5]));
+    }
+
+    #[test]
+    fn rejects_read_errors_and_overlong_counts() {
+        assert_eq!(read_host_state(|_| -1), None);
+        // A host claiming more bytes than the buffer holds is lying.
+        assert_eq!(
+            read_host_state(|buf| i64::try_from(buf.len()).unwrap() + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_streams_past_the_cap() {
+        let mut total = 0usize;
+        let blob = read_host_state(|buf| {
+            total += buf.len();
+            assert!(total <= MAX_HOST_STATE_BYTES + buf.len(), "kept reading");
+            i64::try_from(buf.len()).unwrap()
+        });
+        assert_eq!(blob, None);
+    }
+}
+
+#[cfg(test)]
+mod deferred_param_tests {
+    use super::{Event, EventBody, EventList, defer_param_change, replay_deferred_params};
+
+    fn change(offset: u32, id: u32, value: f64) -> Event {
+        Event::new(offset, EventBody::ParamChange { id, value })
+    }
+
+    #[test]
+    fn flushed_changes_are_latest_wins_and_bounded() {
+        let mut deferred = Vec::with_capacity(2);
+        defer_param_change(&mut deferred, 7, 0.2);
+        defer_param_change(&mut deferred, 7, 0.6);
+        defer_param_change(&mut deferred, 8, 0.1);
+        defer_param_change(&mut deferred, 9, 0.9); // over capacity: dropped
+        assert_eq!(deferred, vec![(7, 0.6), (8, 0.1)]);
+    }
+
+    #[test]
+    fn replayed_changes_precede_the_block_and_sort_stays_stable() {
+        let mut deferred = vec![(7, 0.6)];
+        let mut list = EventList::with_capacity(8);
+        replay_deferred_params(&mut list, &mut deferred, false);
+        list.push(change(32, 7, 0.7));
+        list.push(change(0, 8, 0.1));
+        list.ensure_sorted_by_offset();
+        let seen: Vec<_> = list
+            .iter()
+            .map(|e| match e.body {
+                EventBody::ParamChange { id, value } => (e.sample_offset, id, value),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(seen, vec![(0, 7, 0.6), (0, 8, 0.1), (32, 7, 0.7)]);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn state_load_discards_deferred_changes() {
+        let mut deferred = vec![(7, 0.6)];
+        let mut list = EventList::with_capacity(8);
+        replay_deferred_params(&mut list, &mut deferred, true);
+        assert_eq!(list.iter().count(), 0);
+        assert!(deferred.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bus_kind_tests {
+    use super::{BusKind, CLAP_AUDIO_PORT_IS_MAIN, audio_port_main_flag};
+
+    #[test]
+    fn only_a_main_bus_at_index_zero_is_clap_main() {
+        assert_eq!(
+            audio_port_main_flag(0, BusKind::Main),
+            CLAP_AUDIO_PORT_IS_MAIN
+        );
+        // Main bus disabled: the first enabled port is the sidechain.
+        assert_eq!(audio_port_main_flag(0, BusKind::Sidechain), 0);
+        assert_eq!(audio_port_main_flag(1, BusKind::Sidechain), 0);
     }
 }

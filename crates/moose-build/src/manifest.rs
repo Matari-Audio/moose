@@ -37,12 +37,12 @@ pub struct BundleEntry {
     pub plugin_crate: String,
     pub plugin_name: String,
     pub plugin_bundle_id: String,
-    /// Format slug: `"clap"`, `"vst3"`, `"vst2"`, `"lv2"`, `"au2"`,
-    /// `"au3"`, or `"aax"`. Stable across the manifest schema.
+    /// Format slug: `"clap"` or `"vst3"`. Stable across the manifest
+    /// schema.
     pub format: String,
     /// Bundle filename relative to the manifest's enclosing dir
     /// (i.e. `target/bundles/`). May be a directory bundle
-    /// (`Foo.clap/`) or a bare file (`Foo.so` for Linux VST2).
+    /// (`Foo.clap/`) or a bare file.
     pub filename: String,
 }
 

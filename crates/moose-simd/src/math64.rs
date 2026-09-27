@@ -34,8 +34,13 @@ pub fn db_to_linear_block(out: &mut [f64], src: &[f64]) {
         // per chunk.
         let scale = f64x4::splat(core::f64::consts::LN_10 / 20.0);
         let (head_out, tail_out) = out[..n].split_at_mut(n4);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(4).zip(src[..n4].chunks_exact(4)) {
-            let v = f64x4::from(<[f64; 4]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src[..n4].as_chunks::<4>().0.iter())
+        {
+            let v = f64x4::from(*src_chunk);
             out_chunk.copy_from_slice((v * scale).exp().as_array_ref());
         }
         db_to_linear_block_scalar(tail_out, &src[n4..n]);
@@ -64,8 +69,13 @@ pub fn linear_to_db_block(out: &mut [f64], src: &[f64]) {
         let n4 = n / 4 * 4;
         let scale = f64x4::splat(TWENTY_OVER_LOG2_10);
         let (head_out, tail_out) = out[..n].split_at_mut(n4);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(4).zip(src[..n4].chunks_exact(4)) {
-            let v = f64x4::from(<[f64; 4]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src[..n4].as_chunks::<4>().0.iter())
+        {
+            let v = f64x4::from(*src_chunk);
             out_chunk.copy_from_slice((v.log2() * scale).as_array_ref());
         }
         linear_to_db_block_scalar(tail_out, &src[n4..n]);
@@ -94,10 +104,15 @@ pub fn exp2_block(out: &mut [f64], src: &[f64]) {
         let n4 = n / 4 * 4;
         let ln2 = f64x4::splat(core::f64::consts::LN_2);
         let (head_out, tail_out) = out[..n].split_at_mut(n4);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(4).zip(src[..n4].chunks_exact(4)) {
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src[..n4].as_chunks::<4>().0.iter())
+        {
             // exp2(x) = exp(x * ln(2)); `wide` has `exp` but no
             // direct `exp2`, same as the f32 path.
-            let v = f64x4::from(<[f64; 4]>::try_from(src_chunk).unwrap_or_default());
+            let v = f64x4::from(*src_chunk);
             out_chunk.copy_from_slice((v * ln2).exp().as_array_ref());
         }
         exp2_block_scalar(tail_out, &src[n4..n]);
@@ -125,8 +140,13 @@ pub fn log2_block(out: &mut [f64], src: &[f64]) {
         let n = out.len().min(src.len());
         let n4 = n / 4 * 4;
         let (head_out, tail_out) = out[..n].split_at_mut(n4);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(4).zip(src[..n4].chunks_exact(4)) {
-            let v = f64x4::from(<[f64; 4]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src[..n4].as_chunks::<4>().0.iter())
+        {
+            let v = f64x4::from(*src_chunk);
             out_chunk.copy_from_slice(v.log2().as_array_ref());
         }
         log2_block_scalar(tail_out, &src[n4..n]);
@@ -162,8 +182,13 @@ pub fn tanh_block(out: &mut [f64], src: &[f64]) {
         let two = f64x4::splat(2.0);
         let one = f64x4::splat(1.0);
         let (head_out, tail_out) = out[..n].split_at_mut(n4);
-        for (out_chunk, src_chunk) in head_out.chunks_exact_mut(4).zip(src[..n4].chunks_exact(4)) {
-            let x = f64x4::from(<[f64; 4]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in head_out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src[..n4].as_chunks::<4>().0.iter())
+        {
+            let x = f64x4::from(*src_chunk);
             let x_clamped = x.fast_max(neg_bound).fast_min(bound);
             let e2x = (x_clamped * two).exp();
             let result = (e2x - one) / (e2x + one);

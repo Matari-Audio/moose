@@ -27,8 +27,8 @@ pub fn gain_block(buf: &mut [f32], gain: f32) {
         let n = buf.len();
         let n8 = n / 8 * 8;
         let (head, tail) = buf.split_at_mut(n8);
-        for chunk in head.chunks_exact_mut(8) {
-            let v = f32x8::from(<[f32; 8]>::try_from(&chunk[..]).unwrap_or_default());
+        for chunk in head.as_chunks_mut::<8>().0.iter_mut() {
+            let v = f32x8::from(*chunk);
             chunk.copy_from_slice((v * g).as_array_ref());
         }
         gain_block_scalar(tail, gain);
@@ -61,8 +61,13 @@ pub fn scale_block(out: &mut [f32], src: &[f32], scale: f32) {
         let (out_v, out_tail) = out[..n].split_at_mut(n8);
         let src_v = &src[..n8];
         let src_tail = &src[n8..n];
-        for (out_chunk, src_chunk) in out_v.chunks_exact_mut(8).zip(src_v.chunks_exact(8)) {
-            let v = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in out_v
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src_v.as_chunks::<8>().0.iter())
+        {
+            let v = f32x8::from(*src_chunk);
             out_chunk.copy_from_slice((v * g).as_array_ref());
         }
         scale_block_scalar(out_tail, src_tail, scale);
@@ -94,14 +99,16 @@ pub fn mul_block(out: &mut [f32], a: &[f32], b: &[f32]) {
         let a_tail = &a[n8..n];
         let b_tail = &b[n8..n];
         for ((out_chunk, a_chunk), b_chunk) in out_v
-            .chunks_exact_mut(8)
-            .zip(a_v.chunks_exact(8))
-            .zip(b_v.chunks_exact(8))
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(a_v.as_chunks::<8>().0.iter())
+            .zip(b_v.as_chunks::<8>().0.iter())
         {
-            // chunks_exact guarantees length == 8, so the array
-            // conversions are infallible by construction.
-            let av = f32x8::from(<[f32; 8]>::try_from(a_chunk).unwrap_or_default());
-            let bv = f32x8::from(<[f32; 8]>::try_from(b_chunk).unwrap_or_default());
+            // as_chunks yields [f32; 8] arrays, so the
+            // conversions are plain copies.
+            let av = f32x8::from(*a_chunk);
+            let bv = f32x8::from(*b_chunk);
             let mv = av * bv;
             out_chunk.copy_from_slice(mv.as_array_ref());
         }
@@ -132,9 +139,14 @@ pub fn mac_block(out: &mut [f32], src: &[f32], scale: f32) {
         let src_v = &src[..n8];
         let src_tail = &src[n8..n];
         let s = f32x8::splat(scale);
-        for (out_chunk, src_chunk) in out_v.chunks_exact_mut(8).zip(src_v.chunks_exact(8)) {
-            let ov = f32x8::from(<[f32; 8]>::try_from(&out_chunk[..]).unwrap_or_default());
-            let sv = f32x8::from(<[f32; 8]>::try_from(src_chunk).unwrap_or_default());
+        for (out_chunk, src_chunk) in out_v
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(src_v.as_chunks::<8>().0.iter())
+        {
+            let ov = f32x8::from(*out_chunk);
+            let sv = f32x8::from(*src_chunk);
             let r = ov + sv * s;
             out_chunk.copy_from_slice(r.as_array_ref());
         }
@@ -170,12 +182,14 @@ pub fn mix_block(out: &mut [f32], a: &[f32], gain_a: f32, b: &[f32], gain_b: f32
         let ga = f32x8::splat(gain_a);
         let gb = f32x8::splat(gain_b);
         for ((out_chunk, a_chunk), b_chunk) in out_v
-            .chunks_exact_mut(8)
-            .zip(a_v.chunks_exact(8))
-            .zip(b_v.chunks_exact(8))
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(a_v.as_chunks::<8>().0.iter())
+            .zip(b_v.as_chunks::<8>().0.iter())
         {
-            let av = f32x8::from(<[f32; 8]>::try_from(a_chunk).unwrap_or_default());
-            let bv = f32x8::from(<[f32; 8]>::try_from(b_chunk).unwrap_or_default());
+            let av = f32x8::from(*a_chunk);
+            let bv = f32x8::from(*b_chunk);
             let r = av * ga + bv * gb;
             out_chunk.copy_from_slice(r.as_array_ref());
         }

@@ -81,12 +81,11 @@ macro_rules! plugin {
 #[macro_export]
 macro_rules! __plugin_impl {
     ($logic:ty, $params:ty, $(tasks: [$($task:ty),+],)?) => {
-        // Compile-time param sidecar emission. Walks the params type's
-        // sidecar tree (written by `derive(Params)`) under
-        // `target/lv2-meta/`; cargo-moose's preset pipeline reads
-        // `param_index.toml` from there. (The LV2 TTL output it also
-        // writes is unused since LV2 was removed.)
-        $crate::__reexport::__moose_lv2_emit_root!($params);
+        // Compile-time param index: walks the params type's sidecar
+        // tree (written by `derive(Params)`) under `target/param-index/`
+        // and writes the `param_index.toml` cargo-moose's preset
+        // pipeline reads.
+        $crate::__reexport::__moose_param_index_root!($params);
 
         // Always export the PluginLogic for dylib use (shell-mode or
         // testing). Static-mode shells ignore these exports.

@@ -4,7 +4,7 @@
 //! file per preset, in a `presets/` directory next to the plugin
 //! crate (first directory level = category). `cargo moose install`
 //! reads them here, then re-envelopes each one into the per-format
-//! native files (`.trucepreset`, `.vstpreset`, `.aupreset`, LV2 TTL).
+//! native files (the preset container and `.vstpreset`).
 //!
 //! ```toml
 //! name = "Bright Saw"
@@ -330,7 +330,7 @@ pub struct ParamAnnotation {
 }
 
 /// Read the param-name / unit table from the `derive(Params)`
-/// sidecars at `<target>/lv2-meta/<crate>/*.params.toml`. Returns an
+/// sidecars in [`crate::param_index_dir`] (`*.params.toml`). Returns an
 /// empty map when the plugin hasn't been built yet (annotations are
 /// a nicety, not a requirement). Sidecars exist per params struct,
 /// including helpers; ids are unique within a plugin, so a plain
@@ -390,58 +390,6 @@ pub fn read_param_annotations(
                 },
             );
         }
-    }
-    out
-}
-
-/// Render the `id -> lv2:symbol` table (from
-/// [`crate::lv2::resolved_param_symbols`]) as the `symbols.toml`
-/// sidecar the derive macro writes next to `plugin.ttl`. The install
-/// step reads it back with [`read_param_symbols`] to emit a preset's
-/// `lv2:port` / `pset:value` entries with the exact symbols the
-/// manifest declared (collision resolution needs the full param list,
-/// which only exists at manifest-aggregation time).
-#[must_use]
-pub fn render_param_symbols(symbols: &[(u32, String)]) -> String {
-    use std::fmt::Write as _;
-    let mut buf = String::new();
-    for (id, symbol) in symbols {
-        let _ = writeln!(buf, "[[symbol]]");
-        let _ = writeln!(buf, "id = {id}");
-        let _ = writeln!(buf, "symbol = \"{}\"\n", toml_escape(symbol));
-    }
-    buf
-}
-
-/// Read the `id -> lv2:symbol` table written by [`render_param_symbols`]
-/// from `<sidecar_dir>/symbols.toml`. Empty when the file is missing
-/// (plugin built before this existed - rebuild to refresh) or
-/// unparseable; the caller then falls back to a `state:state`-only
-/// preset.
-#[must_use]
-pub fn read_param_symbols(sidecar_dir: &Path) -> std::collections::BTreeMap<u32, String> {
-    let mut out = std::collections::BTreeMap::new();
-    let Ok(content) = std::fs::read_to_string(sidecar_dir.join("symbols.toml")) else {
-        return out;
-    };
-    let Ok(doc) = content.parse::<toml::Table>() else {
-        return out;
-    };
-    let Some(symbols) = doc.get("symbol").and_then(toml::Value::as_array) else {
-        return out;
-    };
-    for s in symbols {
-        let Some(id) = s
-            .get("id")
-            .and_then(toml::Value::as_integer)
-            .and_then(|i| u32::try_from(i).ok())
-        else {
-            continue;
-        };
-        let Some(symbol) = s.get("symbol").and_then(toml::Value::as_str) else {
-            continue;
-        };
-        out.insert(id, symbol.to_string());
     }
     out
 }

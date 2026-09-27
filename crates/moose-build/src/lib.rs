@@ -10,7 +10,6 @@
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
-pub mod lv2;
 pub mod manifest;
 pub mod presets;
 pub use manifest::{BundleEntry, BundleManifest, host_triple};
@@ -89,8 +88,8 @@ pub struct MidiWiring {
 /// `midi_input` / `midi_output` / `midi_input_ports` /
 /// `midi_output_ports` moose.toml keys. Shared by `moose-derive`
 /// (bakes the result onto `PluginInfo`, which every Rust wrapper
-/// reads), the LV2 TTL emitter, and `cargo-moose` (AU component
-/// type), so every format-facing declaration agrees.
+/// reads) and `cargo-moose`, so every format-facing declaration
+/// agrees.
 ///
 /// Defaults: instruments and note effects accept MIDI input; only
 /// note effects emit MIDI; one port per enabled direction. A port
@@ -252,16 +251,14 @@ pub struct VendorConfig {
     pub id: String,
     #[serde(default)]
     pub url: String,
-    pub au_manufacturer: String,
 }
 
 /// Shared TOML schema for a `[[plugin]]` entry.
 ///
 /// Lives in `moose-build` so both the `#[derive(Params)]` /
 /// `plugin_info!()` proc macros and `cargo-moose`'s install-time
-/// logic read the same definition. Install-time tooling extends this
-/// with extra fields like `au3_subtype` / `au_tag` via
-/// `#[serde(flatten)]`.
+/// logic read the same definition. Unknown keys (such as the AU / AAX /
+/// LV2 keys of a pre-7.0 `moose.toml` / `truce.toml`) are ignored.
 #[derive(Deserialize, Debug)]
 pub struct PluginDef {
     pub name: String,
@@ -276,10 +273,9 @@ pub struct PluginDef {
     #[serde(default)]
     pub version: Option<String>,
     /// User-facing one-paragraph description shown in distribution
-    /// surfaces - the iOS container app's "About" pane, App Store
-    /// description, generated docs. Optional; absent → callers
-    /// generate a category-aware default ("A moose effect", "A
-    /// moose instrument", …).
+    /// surfaces (format descriptors, generated docs). Optional; absent
+    /// → callers generate a category-aware default ("A moose effect",
+    /// "A moose instrument", …).
     #[serde(default)]
     pub description: Option<String>,
     /// CLAP descriptor URL for the plugin's manual. When omitted the
@@ -294,15 +290,7 @@ pub struct PluginDef {
     /// An empty list keeps the category-derived defaults.
     #[serde(default)]
     pub clap_features: Vec<String>,
-    #[serde(default)]
-    pub fourcc: Option<String>,
     pub category: String,
-    #[serde(default)]
-    pub au_type: Option<String>,
-    #[serde(default)]
-    pub au_subtype: Option<String>,
-    #[serde(default)]
-    pub aax_category: Option<String>,
     /// VST3 "Plugin Type Categories" secondary token. The wrapper
     /// emits this after the primary token (`Fx|<sub>`,
     /// `Instrument|<sub>`) so hosts like Cubase can route the
@@ -324,18 +312,8 @@ pub struct PluginDef {
     pub vst3_name: Option<String>,
     #[serde(default)]
     pub clap_name: Option<String>,
-    #[serde(default)]
-    pub vst2_name: Option<String>,
-    #[serde(default)]
-    pub au_name: Option<String>,
-    #[serde(default)]
-    pub au3_name: Option<String>,
-    #[serde(default)]
-    pub aax_name: Option<String>,
-    #[serde(default)]
-    pub lv2_name: Option<String>,
-    /// Silence the audio output in *preview* hosts (moose-standalone,
-    /// the iOS `AUv3` container app). `process()` keeps running on the
+    /// Silence the audio output in *preview* hosts (moose-standalone).
+    /// `process()` keeps running on the
     /// usual cadence so plug-ins whose editor visualises an input
     /// signal (analyzers, tuners, spectrum displays) still update -
     /// but the signal never reaches the speakers, so a mic-fed analyzer
@@ -377,7 +355,7 @@ pub struct PluginDef {
     pub midi2_output: Option<bool>,
     /// Number of MIDI input ports. Absent -> one port when the plugin
     /// accepts MIDI input, none otherwise. Set `>1` for a multi-port
-    /// plugin; only CLAP / VST3 / LV2 carry more than one, others clamp
+    /// plugin; only CLAP / VST3 carry more than one, others clamp
     /// to one and log a skip.
     #[serde(default)]
     pub midi_input_ports: Option<u8>,
@@ -389,13 +367,6 @@ pub struct PluginDef {
     /// directory next to the plugin crate if one exists.
     #[serde(default)]
     pub presets: Option<PresetsConfig>,
-    /// Optional `[plugin.legacy_state]` table - where the keyed
-    /// formats should look for a pre-moose build's state when moose's
-    /// own entry is absent, feeding the plugin's `migrate_state`
-    /// hook. Stream formats (CLAP / VST3 / VST2) need no
-    /// declaration: the wrapper already holds the foreign bytes.
-    #[serde(default)]
-    pub legacy_state: Option<LegacyStateConfig>,
 }
 
 #[derive(Deserialize)]
@@ -435,9 +406,12 @@ where
     }
 
     let mut bytes = [0; 16];
-    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        *byte = u8::from_str_radix(std::str::from_utf8(pair).expect("validated ASCII"), 16)
-            .expect("validated hexadecimal digits");
+    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+        *byte = u8::from_str_radix(
+            std::str::from_utf8(pair.as_slice()).expect("validated ASCII"),
+            16,
+        )
+        .expect("validated hexadecimal digits");
     }
     Ok(Some(bytes))
 }
@@ -468,25 +442,6 @@ pub fn load_vst3_class_ids(path: &Path) -> Result<Vec<(String, [u8; 16])>, Strin
         .collect())
 }
 
-/// `[plugin.legacy_state]` - foreign-state probe declarations for the
-/// keyed containers. A legacy build stored its state under *its* own
-/// key / URI / chunk id, which moose never reads; only the developer
-/// knows those, so they're declared here and embedded into
-/// `PluginInfo` at proc-macro expansion time.
-#[derive(Deserialize, Debug, Default)]
-pub struct LegacyStateConfig {
-    /// AU `ClassInfo` dictionary keys to probe when moose's data key
-    /// is absent (e.g. `"jucePluginState"` for a JUCE-era AU).
-    #[serde(default)]
-    pub au_keys: Vec<String>,
-    /// LV2 state property URIs.
-    #[serde(default)]
-    pub lv2_uris: Vec<String>,
-    /// AAX chunk fourccs.
-    #[serde(default)]
-    pub aax_chunk_ids: Vec<String>,
-}
-
 /// `[plugin.presets]` - factory-preset emission settings.
 #[derive(Deserialize, Debug)]
 pub struct PresetsConfig {
@@ -504,6 +459,39 @@ pub struct PresetsConfig {
     /// presets.
     #[serde(default)]
     pub user_dir: Option<String>,
+    /// File extension (no dot) of this plugin's preset containers.
+    /// Defaults to `trucepreset`. Pick once, before first release:
+    /// changing it later hides previously saved presets.
+    #[serde(default)]
+    pub extension: Option<String>,
+}
+
+impl PresetsConfig {
+    /// The configured preset file extension, or the default.
+    #[must_use]
+    pub fn extension(&self) -> &str {
+        self.extension
+            .as_deref()
+            .filter(|e| !e.is_empty())
+            .unwrap_or(moose_utils::preset::PRESET_FILE_EXT)
+    }
+}
+
+/// The plugin's preset file extension from its optional
+/// `[plugin.presets]` table (default `trucepreset`).
+#[must_use]
+pub fn preset_extension(plugin: &PluginDef) -> &str {
+    plugin.presets.as_ref().map_or(
+        moose_utils::preset::PRESET_FILE_EXT,
+        PresetsConfig::extension,
+    )
+}
+
+/// Where `derive(Params)` writes a plugin crate's param sidecars and
+/// the flattened `param_index.toml` the preset tooling reads.
+#[must_use]
+pub fn param_index_dir(target_dir: &Path, crate_name: &str) -> PathBuf {
+    target_dir.join("param-index").join(crate_name)
 }
 
 fn default_presets_dir() -> String {

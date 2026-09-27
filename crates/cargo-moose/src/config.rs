@@ -150,7 +150,6 @@ pub(crate) struct VendorConfig {
     #[serde(default)]
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) url: Option<String>,
-    pub(crate) au_manufacturer: String,
 }
 
 /// Install-time view of a `[[plugin]]` entry.
@@ -191,41 +190,6 @@ impl std::ops::Deref for PluginDef {
 }
 
 impl PluginDef {
-    pub(crate) fn resolved_fourcc(&self) -> &str {
-        self.fourcc
-            .as_deref()
-            .or(self.au_subtype.as_deref())
-            .expect("moose.toml: each [[plugin]] requires `fourcc` or `au_subtype`")
-    }
-    pub(crate) fn resolved_au_type(&self) -> &str {
-        // Keep in sync with `moose-derive::plugin_info`. NoteEffect →
-        // `aumi` (Apple's MIDI Processor); an audio effect that accepts
-        // MIDI input → `aumf` (MusicEffect), since AU routes MIDI by
-        // component type. `aumi` plugins declare no audio buses per
-        // Apple spec - wrappers that can't express that (AAX)
-        // synthesize dummy audio I/O internally.
-        if let Some(t) = self.au_type.as_deref() {
-            return t;
-        }
-        match self.category.as_str() {
-            "instrument" => "aumu",
-            "midi" | "note_effect" => "aumi",
-            _ => {
-                // `load_config` rejected contradictory MIDI keys, so
-                // the resolver can't fail here; the `aufx` fallback
-                // only guards hand-built test configs.
-                let accepts_midi_in = moose_build::midi_wiring(
-                    &self.category,
-                    self.midi_input,
-                    self.midi_output,
-                    self.midi_input_ports,
-                    self.midi_output_ports,
-                )
-                .is_ok_and(|w| w.accepts_midi_in);
-                if accepts_midi_in { "aumf" } else { "aufx" }
-            }
-        }
-    }
     /// Filesystem-safe form of the plugin's display name. Use this
     /// for every path component derived from the name (bundle
     /// directories, executable filenames inside Mach-O bundles, the
@@ -487,22 +451,13 @@ mod suite_tests {
                 crate_name: crate_name.into(),
                 version: None,
                 description: None,
-                fourcc: None,
                 category: "effect".into(),
-                au_type: None,
-                au_subtype: None,
-                aax_category: None,
                 vst3_subcategory: None,
                 vst3_name: None,
                 clap_name: None,
                 clap_manual_url: None,
                 clap_support_url: None,
                 clap_features: Vec::new(),
-                vst2_name: None,
-                au_name: None,
-                au3_name: None,
-                aax_name: None,
-                lv2_name: None,
                 mute_preview_output: false,
                 midi_input: None,
                 midi_output: None,
@@ -512,7 +467,6 @@ mod suite_tests {
                 midi_input_ports: None,
                 midi_output_ports: None,
                 presets: None,
-                legacy_state: None,
             },
             windows_icon: None,
             macos_icon: None,
@@ -617,27 +571,5 @@ mod suite_tests {
             Ok(_) => panic!("expected resolve to error"),
         };
         assert!(err.contains("zero plugins"), "got: {err}");
-    }
-
-    #[test]
-    fn au_type_promotes_midi_effect_to_aumf() {
-        let mut p = plugin("fx", "fx");
-        // Plain audio effect stays aufx.
-        assert_eq!(p.resolved_au_type(), "aufx");
-        // Opting into MIDI input promotes it to MusicEffect.
-        p.shared.midi_input = Some(true);
-        assert_eq!(p.resolved_au_type(), "aumf");
-        // An explicit au_type override still wins.
-        p.shared.au_type = Some("aufx".into());
-        assert_eq!(p.resolved_au_type(), "aufx");
-    }
-
-    #[test]
-    fn au_type_category_defaults() {
-        let mut p = plugin("p", "p");
-        p.shared.category = "instrument".into();
-        assert_eq!(p.resolved_au_type(), "aumu");
-        p.shared.category = "note_effect".into();
-        assert_eq!(p.resolved_au_type(), "aumi");
     }
 }

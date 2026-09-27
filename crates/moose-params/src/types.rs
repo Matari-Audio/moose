@@ -1,8 +1,55 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::info::ParamInfo;
+use crate::range::ParamRange;
 use crate::sample::Float;
 use crate::smooth::{Smoother, SmoothingStyle};
+
+/// Metadata accessors shared by every parameter type.
+///
+/// Each instance borrows its `&'static ParamInfo` from the declaring
+/// struct's table (emitted once by `#[derive(Params)]`) and carries
+/// only its own id, which nesting rebases per instance.
+macro_rules! shared_param_meta {
+    () => {
+        /// Parameter metadata carrying this instance's (rebased) id.
+        #[must_use]
+        pub fn info(&self) -> ParamInfo {
+            ParamInfo {
+                id: self.id,
+                ..*self.info
+            }
+        }
+
+        /// The declaring struct's static metadata. Its `id` is the
+        /// struct-local id; use [`Self::id`] for the id the host sees.
+        #[must_use]
+        pub fn static_info(&self) -> &'static ParamInfo {
+            self.info
+        }
+
+        /// The declared value range.
+        #[must_use]
+        #[inline]
+        pub fn range(&self) -> &'static ParamRange {
+            &self.info.range
+        }
+
+        /// Parameter ID.
+        #[must_use]
+        #[inline]
+        pub fn id(&self) -> u32 {
+            self.id
+        }
+
+        /// Internal: fold a nested group's base into the id. Called by
+        /// the derive's `offset_ids` after construction.
+        #[doc(hidden)]
+        pub fn offset_id(&mut self, id_base: u32) {
+            self.id = crate::rebase_nested_param_id(self.id, id_base);
+        }
+    };
+}
 
 /// Atomic f64 - wraps `AtomicU64` with f64 load/store.
 pub struct AtomicF64 {
@@ -28,15 +75,24 @@ impl AtomicF64 {
 }
 
 /// A continuous floating-point parameter.
+///
+/// Metadata is borrowed from the declaring struct's static table and the
+/// smoother is only allocated when the field asks for one, so a param is
+/// a pointer, an id, an atomic and an optional box. Plugins with
+/// hundreds of params (or pools of nested groups) stay inside a host's
+/// stack budget for the state struct.
 pub struct FloatParam {
-    pub info: ParamInfo,
+    info: &'static ParamInfo,
+    id: u32,
     value: AtomicF64,
-    pub smoother: Smoother,
+    smoother: Option<Box<Smoother>>,
 }
 
 impl FloatParam {
+    shared_param_meta!();
+
     #[must_use]
-    pub fn new(info: ParamInfo, smoothing: SmoothingStyle) -> Self {
+    pub fn new(info: &'static ParamInfo, smoothing: SmoothingStyle) -> Self {
         let default = info.default_plain;
         // Surface a mis-ordered or non-finite range (a `Linear { min: 6,
         // max: -60 }` typo) at construction, where it's obvious, rather than
@@ -65,12 +121,40 @@ impl FloatParam {
         } else {
             lo.min(hi)
         };
-        let smoother = Smoother::new(smoothing);
-        smoother.snap(default);
+        let smoother = (!matches!(smoothing, SmoothingStyle::None)).then(|| {
+            let smoother = Box::new(Smoother::new(smoothing));
+            smoother.snap(default);
+            smoother
+        });
         Self {
             info,
+            id: info.id,
             value: AtomicF64::new(default),
             smoother,
+        }
+    }
+
+    /// The smoother, when the field declared one (`smooth = "..."`).
+    /// `SmoothingStyle::None` fields have none; their smoothed reads
+    /// return the target directly.
+    #[must_use]
+    pub fn smoother(&self) -> Option<&Smoother> {
+        self.smoother.as_deref()
+    }
+
+    /// Jump the smoother to the current target (state restore, or a
+    /// sample-rate change that would otherwise glide from stale state).
+    #[inline]
+    pub fn snap_smoother(&self) {
+        if let Some(smoother) = &self.smoother {
+            smoother.snap(self.value.load());
+        }
+    }
+
+    /// Re-derive the smoother's coefficients for `sample_rate`.
+    pub fn set_sample_rate(&self, sample_rate: f64) {
+        if let Some(smoother) = &self.smoother {
+            smoother.set_sample_rate(sample_rate);
         }
     }
 
@@ -122,7 +206,10 @@ impl FloatParam {
     #[inline]
     pub fn raw_smoothed_next(&self) -> f32 {
         let target = self.value.load();
-        self.smoother.next(target)
+        match &self.smoother {
+            Some(smoother) => smoother.next(target),
+            None => f32::from_f64(target),
+        }
     }
 
     /// Internal: current smoother value at `f32`. See
@@ -130,7 +217,10 @@ impl FloatParam {
     #[doc(hidden)]
     #[inline]
     pub fn raw_smoothed_current(&self) -> f32 {
-        self.smoother.current()
+        match &self.smoother {
+            Some(smoother) => smoother.current(),
+            None => f32::from_f64(self.value.load()),
+        }
     }
 
     /// Internal: advance the smoother by `out.len()` samples,
@@ -141,7 +231,10 @@ impl FloatParam {
     #[inline]
     pub fn raw_smoothed_next_into(&self, out: &mut [f32]) {
         let target = self.value.load();
-        self.smoother.next_into(target, out);
+        match &self.smoother {
+            Some(smoother) => smoother.next_into(target, out),
+            None => out.fill(f32::from_f64(target)),
+        }
     }
 
     /// Internal: advance the smoother by `n_samples` and return only
@@ -152,7 +245,10 @@ impl FloatParam {
     #[inline]
     pub fn raw_smoothed_next_after(&self, n_samples: usize) -> f32 {
         let target = self.value.load();
-        self.smoother.next_after(target, n_samples)
+        match &self.smoother {
+            Some(smoother) => smoother.next_after(target, n_samples),
+            None => f32::from_f64(target),
+        }
     }
 
     /// Read the value rounded to the nearest non-negative `usize`.
@@ -209,12 +305,9 @@ impl FloatParam {
     #[inline]
     #[must_use]
     pub fn is_smoothing(&self) -> bool {
-        !self.smoother.is_converged(self.value.load())
-    }
-
-    /// Parameter ID.
-    pub fn id(&self) -> u32 {
-        self.info.id
+        self.smoother
+            .as_ref()
+            .is_some_and(|smoother| !smoother.is_converged(self.value.load()))
     }
 }
 
@@ -367,11 +460,14 @@ impl FloatParamReadF64 for FloatParam {
 
 /// A boolean parameter.
 pub struct BoolParam {
-    pub info: ParamInfo,
+    info: &'static ParamInfo,
+    id: u32,
     value: AtomicBool,
 }
 
 impl BoolParam {
+    shared_param_meta!();
+
     /// # Panics
     ///
     /// Panics if `info.default_plain` isn't exactly `0.0` or `1.0`.
@@ -379,7 +475,7 @@ impl BoolParam {
     /// `1.0` only, so this fires only when a user constructs a
     /// `BoolParam` from hand-rolled `ParamInfo`.
     #[must_use]
-    pub fn new(info: ParamInfo) -> Self {
+    pub fn new(info: &'static ParamInfo) -> Self {
         let default = match info.default_plain {
             0.0 => false,
             1.0 => true,
@@ -391,6 +487,7 @@ impl BoolParam {
         };
         Self {
             info,
+            id: info.id,
             value: AtomicBool::new(default),
         }
     }
@@ -402,19 +499,18 @@ impl BoolParam {
     pub fn set_value(&self, v: bool) {
         self.value.store(v, Ordering::Relaxed);
     }
-
-    pub fn id(&self) -> u32 {
-        self.info.id
-    }
 }
 
 /// An integer parameter.
 pub struct IntParam {
-    pub info: ParamInfo,
+    info: &'static ParamInfo,
+    id: u32,
     value: AtomicI64,
 }
 
 impl IntParam {
+    shared_param_meta!();
+
     /// # Panics
     ///
     /// Panics if `info.default_plain` is non-finite or doesn't
@@ -434,7 +530,7 @@ impl IntParam {
         clippy::cast_precision_loss
     )]
     #[must_use]
-    pub fn new(info: ParamInfo) -> Self {
+    pub fn new(info: &'static ParamInfo) -> Self {
         let default = info.default_plain;
         assert!(
             default.is_finite(),
@@ -461,6 +557,7 @@ impl IntParam {
         );
         Self {
             info,
+            id: info.id,
             value: AtomicI64::new(truncated),
         }
     }
@@ -520,10 +617,6 @@ impl IntParam {
         self.value
             .store(v.clamp(lo.min(hi), lo.max(hi)), Ordering::Relaxed);
     }
-
-    pub fn id(&self) -> u32 {
-        self.info.id
-    }
 }
 
 /// Trait for enums used as parameters.
@@ -537,12 +630,15 @@ pub trait ParamEnum: crate::__private::Sealed + Clone + Copy + Send + Sync + 'st
 
 /// An enum parameter.
 pub struct EnumParam<E: ParamEnum> {
-    pub info: ParamInfo,
+    info: &'static ParamInfo,
+    id: u32,
     value: AtomicU32,
     _phantom: std::marker::PhantomData<E>,
 }
 
 impl<E: ParamEnum> EnumParam<E> {
+    shared_param_meta!();
+
     /// # Panics
     ///
     /// Panics if `info.default_plain` is non-finite, negative, or
@@ -560,7 +656,7 @@ impl<E: ParamEnum> EnumParam<E> {
         clippy::cast_sign_loss
     )]
     #[must_use]
-    pub fn new(info: ParamInfo) -> Self {
+    pub fn new(info: &'static ParamInfo) -> Self {
         let default = info.default_plain;
         let count = E::variant_count();
         assert!(
@@ -594,6 +690,7 @@ impl<E: ParamEnum> EnumParam<E> {
         );
         Self {
             info,
+            id: info.id,
             value: AtomicU32::new(idx),
             _phantom: std::marker::PhantomData,
         }
@@ -632,10 +729,6 @@ impl<E: ParamEnum> EnumParam<E> {
 
     pub fn index(&self) -> u32 {
         self.value.load(Ordering::Relaxed)
-    }
-
-    pub fn id(&self) -> u32 {
-        self.info.id
     }
 
     /// Format a plain value (index as f64) to the variant name string.
@@ -703,8 +796,12 @@ mod tests {
     use crate::info::{ParamFlags, ParamUnit, ParamValueKind};
     use crate::range::ParamRange;
 
-    fn info(name: &'static str, range: ParamRange, default_plain: f64) -> ParamInfo {
-        ParamInfo {
+    /// Keeps every leaked test `ParamInfo` reachable from a static, so
+    /// Miri's leak check doesn't flag the intentional `Box::leak`.
+    static INFOS: std::sync::Mutex<Vec<&'static ParamInfo>> = std::sync::Mutex::new(Vec::new());
+
+    fn info(name: &'static str, range: ParamRange, default_plain: f64) -> &'static ParamInfo {
+        let info = Box::leak(Box::new(ParamInfo {
             id: 0,
             name,
             short_name: name,
@@ -716,7 +813,33 @@ mod tests {
             kind: ParamValueKind::Float,
             midi_map: None,
             midi_channel: None,
-        }
+        }));
+        INFOS.lock().unwrap().push(info);
+        info
+    }
+
+    #[test]
+    fn float_param_is_pointer_sized_metadata() {
+        // The borrowed-info layout: a param must not carry `ParamInfo`
+        // (or an unused smoother) inline.
+        assert!(std::mem::size_of::<FloatParam>() <= 32);
+        let p = float(0.0, 1.0);
+        assert!(p.smoother().is_none(), "no smoother without a style");
+        p.set_value(0.5);
+        assert!(!p.is_smoothing());
+        assert!((p.raw_smoothed_next() - 0.5).abs() < 1e-6);
+        let mut out = [0.0_f32; 4];
+        p.raw_smoothed_next_into(&mut out);
+        assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn offset_id_rebases_only_the_instance() {
+        let mut p = float(0.0, 1.0);
+        p.offset_id(512);
+        assert_eq!(p.id(), 512);
+        assert_eq!(p.info().id, 512, "info() carries the rebased id");
+        assert_eq!(p.static_info().id, 0, "the shared table is untouched");
     }
 
     #[derive(Clone, Copy)]

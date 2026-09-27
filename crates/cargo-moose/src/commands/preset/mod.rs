@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::commands::install::presets::{authored_presets_dir, resolved_name};
-use crate::preset_codec::{PresetFormat, aupreset_xml, decode, fourcc_int, vstpreset_bytes};
+use crate::preset_codec::{PresetFormat, decode, vstpreset_bytes};
 use crate::util::fs_ctx;
 use crate::{Config, PluginDef, Res, load_config, project_root};
 
@@ -76,11 +76,11 @@ USAGE:
   cargo moose preset export  <out.zip> [-p <crate>]
   cargo moose preset pull    [--category <c>] [--new] [--watch] [-p <crate>]
 
-FORMATS (by extension): .preset (authored TOML), .trucepreset,
-  .vstpreset, .aupreset, .ttl (LV2)
+FORMATS (by extension): .preset (authored TOML), .trucepreset (or the
+  plugin's [presets] extension), .vstpreset
 
 `pull` scans the OS preset locations hosts save into (Library/Audio/
-Presets, VST3 Presets, ~/.lv2, the moose user root) for presets
+Presets, VST3 Presets, the moose user root) for presets
 belonging to the plugin, and converts them into the authored library.
 A library preset with the same display name is updated in place
 (keeping its uuid; regenerating the file drops hand-written
@@ -115,20 +115,18 @@ impl PluginCtx<'_> {
     }
 
     fn annotations(&self) -> BTreeMap<u32, ParamAnnotation> {
-        let sidecars = moose_build::target_dir(&self.root)
-            .join("lv2-meta")
-            .join(&self.p.crate_name);
+        let sidecars =
+            moose_build::param_index_dir(&moose_build::target_dir(&self.root), &self.p.crate_name);
         moose_build::presets::read_param_annotations(&sidecars)
     }
 
-    /// `id -> lv2:symbol` from the build sidecar, for LV2 preset
-    /// `pset:value` port entries. Empty when the plugin hasn't been
-    /// built since `symbols.toml` landed.
-    fn symbols(&self) -> BTreeMap<u32, String> {
-        let sidecars = moose_build::target_dir(&self.root)
-            .join("lv2-meta")
-            .join(&self.p.crate_name);
-        moose_build::presets::read_param_symbols(&sidecars)
+    /// The plugin's native preset container extension.
+    fn native_ext(&self) -> &str {
+        moose_build::preset_extension(self.p)
+    }
+
+    fn format(&self, path: &Path) -> Option<PresetFormat> {
+        PresetFormat::from_path(path, self.native_ext())
     }
 
     fn store(&self) -> PresetStore {
@@ -138,6 +136,7 @@ impl PluginCtx<'_> {
             self.plugin_id_hash,
             self.p.presets.as_ref().and_then(|c| c.user_dir.as_deref()),
         )
+        .with_extension(self.native_ext())
     }
 
     fn library(&self) -> Result<Vec<AuthoredPreset>, crate::CargoMooseError> {
@@ -307,7 +306,8 @@ fn cmd_convert(args: &[String]) -> Res {
 /// Decode any supported input into `(meta, params, extra)`, with the
 /// envelope validated against the plugin's identity hash.
 fn read_native(ctx: &PluginCtx<'_>, path: &Path) -> Result<PresetParts, crate::CargoMooseError> {
-    let format = PresetFormat::from_path(path)
+    let format = ctx
+        .format(path)
         .ok_or_else(|| format!("unsupported preset extension: {}", path.display()))?;
 
     if format == PresetFormat::AuthoredToml {
@@ -357,7 +357,8 @@ fn encode_native(
     params: &[(u32, f64)],
     extra: &[u8],
 ) -> Result<Vec<u8>, crate::CargoMooseError> {
-    let format = PresetFormat::from_path(output)
+    let format = ctx
+        .format(output)
         .ok_or_else(|| format!("unsupported preset extension: {}", output.display()))?;
     let ids: Vec<u32> = params.iter().map(|(id, _)| *id).collect();
     let values: Vec<f64> = params.iter().map(|(_, v)| *v).collect();
@@ -370,30 +371,6 @@ fn encode_native(
     Ok(match format {
         PresetFormat::MoosePreset => moose_utils::preset::write_preset_file(&meta, &blob),
         PresetFormat::Vst3 => vstpreset_bytes(&ctx.config.vst3_cid(ctx.p), &blob),
-        PresetFormat::Au => {
-            let au_type = fourcc_int(ctx.p.resolved_au_type())?;
-            let subtype = fourcc_int(ctx.p.resolved_fourcc())?;
-            let manufacturer = fourcc_int(&ctx.config.vendor.au_manufacturer)?;
-            aupreset_xml(au_type, subtype, manufacturer, &meta.name, &blob).into_bytes()
-        }
-        PresetFormat::Lv2 => {
-            let uri = moose_build::lv2::plugin_uri(
-                ctx.config.vendor.url.as_deref().unwrap_or(""),
-                &ctx.p.bundle_id,
-            );
-            let label = if meta.category.is_empty() {
-                meta.name.clone()
-            } else {
-                format!("{}/{}", meta.category, meta.name)
-            };
-            let symbols = ctx.symbols();
-            let ports: Vec<(String, f64)> = params
-                .iter()
-                .filter_map(|(id, v)| symbols.get(id).map(|sym| (sym.clone(), *v)))
-                .collect();
-            moose_build::lv2::render_preset_ttl(&uri, &meta.uuid, &label, &blob, &ports)
-                .into_bytes()
-        }
         PresetFormat::AuthoredToml => {
             render_preset_toml(&meta, params, extra, &ctx.annotations()).into_bytes()
         }
@@ -547,8 +524,8 @@ fn cmd_import(args: &[String]) -> Res {
     Ok(())
 }
 
-/// Unzip a pack's `.trucepreset` tree into the user pack directory.
-/// Other per-format trees in the pack (`.vstpreset` / `.aupreset`)
+/// Unzip a pack's native-container tree into the user pack directory.
+/// Other per-format trees in the pack (`.vstpreset`)
 /// are host-side conveniences; they're counted and left to the user
 /// to place, keeping `import` from writing into host directories
 /// unasked.
@@ -580,12 +557,15 @@ fn import_pack(ctx: &PluginCtx<'_>, file: &Path) -> Res {
         if entry.is_dir() {
             continue;
         }
-        if rel.extension().and_then(|e| e.to_str()) != Some("trucepreset") {
+        if ctx.format(&rel) != Some(PresetFormat::MoosePreset) {
             skipped += 1;
             continue;
         }
-        // Strip the conventional `trucepreset/` top-level tree name.
-        let rel: PathBuf = match rel.strip_prefix("trucepreset") {
+        // Strip the conventional `<ext>/` top-level tree name.
+        let rel: PathBuf = match rel
+            .strip_prefix(ctx.native_ext())
+            .or_else(|_| rel.strip_prefix(moose_utils::preset::PRESET_FILE_EXT))
+        {
             Ok(stripped) => stripped.to_path_buf(),
             Err(_) => rel.clone(),
         };
@@ -599,7 +579,7 @@ fn import_pack(ctx: &PluginCtx<'_>, file: &Path) -> Res {
         installed += 1;
     }
     eprintln!(
-        "pack \"{pack_name}\": {installed} preset(s) -> {} ({skipped} non-trucepreset entries left in the zip)",
+        "pack \"{pack_name}\": {installed} preset(s) -> {} ({skipped} other entries left in the zip)",
         dest.display()
     );
     Ok(())
@@ -626,9 +606,7 @@ fn cmd_export(args: &[String]) -> Res {
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default();
     let zip_err = |e: zip::result::ZipError| format!("{out}: {e}");
-    // `id -> lv2:symbol` for the LV2 presets' `pset:value` port entries
-    // (read once for the whole pack).
-    let symbols = ctx.symbols();
+    let ext = ctx.native_ext();
 
     for preset in &presets {
         let blob = preset.state_blob(ctx.plugin_id_hash);
@@ -640,54 +618,17 @@ fn cmd_export(args: &[String]) -> Res {
         };
         let display = safe_filename(&preset.meta.name);
 
-        zip.start_file(
-            format!("trucepreset/{dir}{}.trucepreset", preset.stem),
-            options,
-        )
-        .map_err(zip_err)?;
+        zip.start_file(format!("{ext}/{dir}{}.{ext}", preset.stem), options)
+            .map_err(zip_err)?;
         zip.write_all(&moose_utils::preset::write_preset_file(&preset.meta, &blob))?;
 
         zip.start_file(format!("vstpreset/{dir}{display}.vstpreset"), options)
             .map_err(zip_err)?;
         zip.write_all(&vstpreset_bytes(&ctx.config.vst3_cid(ctx.p), &blob))?;
-
-        zip.start_file(format!("aupreset/{dir}{display}.aupreset"), options)
-            .map_err(zip_err)?;
-        let au = aupreset_xml(
-            fourcc_int(ctx.p.resolved_au_type())?,
-            fourcc_int(ctx.p.resolved_fourcc())?,
-            fourcc_int(&ctx.config.vendor.au_manufacturer)?,
-            &preset.meta.name,
-            &blob,
-        );
-        zip.write_all(au.as_bytes())?;
-
-        zip.start_file(format!("lv2/{}.ttl", preset.stem), options)
-            .map_err(zip_err)?;
-        let uri = moose_build::lv2::plugin_uri(
-            ctx.config.vendor.url.as_deref().unwrap_or(""),
-            &ctx.p.bundle_id,
-        );
-        let label = if preset.meta.category.is_empty() {
-            preset.meta.name.clone()
-        } else {
-            format!("{}/{}", preset.meta.category, preset.meta.name)
-        };
-        let ports: Vec<(String, f64)> =
-            deserialize_state(&blob, ctx.plugin_id_hash).map_or_else(Vec::new, |s| {
-                s.params
-                    .iter()
-                    .filter_map(|(id, v)| symbols.get(id).map(|sym| (sym.clone(), *v)))
-                    .collect()
-            });
-        zip.write_all(
-            moose_build::lv2::render_preset_ttl(&uri, &preset.meta.uuid, &label, &blob, &ports)
-                .as_bytes(),
-        )?;
     }
     zip.finish().map_err(zip_err)?;
     eprintln!(
-        "{} preset(s) x 4 formats -> {}",
+        "{} preset(s) x 2 formats -> {}",
         presets.len(),
         out_path.display()
     );
@@ -748,7 +689,7 @@ fn pull_once(
 ) -> Result<u32, crate::CargoMooseError> {
     let mut imported = 0u32;
     for path in host_preset_files(ctx) {
-        let Some(format) = PresetFormat::from_path(&path) else {
+        let Some(format) = ctx.format(&path) else {
             continue;
         };
         let Ok(bytes) = std::fs::read(&path) else {
@@ -757,8 +698,8 @@ fn pull_once(
         let Some(decoded) = decode(format, &bytes) else {
             continue;
         };
-        // The identity hash is the gate: shared directories (and the
-        // ~/.lv2 sweep) hold other plugins' presets.
+        // The identity hash is the gate: shared directories hold other
+        // plugins' presets.
         let Some(state) = deserialize_state(&decoded.blob, ctx.plugin_id_hash) else {
             continue;
         };
@@ -797,12 +738,12 @@ fn host_preset_files(ctx: &PluginCtx<'_>) -> Vec<PathBuf> {
     let vendor = safe_filename(&ctx.config.vendor.name);
 
     // Plugin-scoped host locations, per display name the host
-    // groups under (VST3 + AU share the macOS tree).
-    let mut names: Vec<String> = vec![
-        safe_filename(resolved_name(ctx.p.vst3_name.as_deref(), &ctx.p.name)),
-        safe_filename(resolved_name(ctx.p.au_name.as_deref(), &ctx.p.name)),
-    ];
-    names.dedup();
+    // groups under.
+    let names = [safe_filename(resolved_name(
+        ctx.p.vst3_name.as_deref(),
+        &ctx.p.name,
+    ))];
+    let ext = ctx.native_ext();
 
     #[cfg(target_os = "macos")]
     if let Some(home) = crate::dirs::home_dir() {
@@ -810,12 +751,10 @@ fn host_preset_files(ctx: &PluginCtx<'_>) -> Vec<PathBuf> {
             collect_files(
                 &home.join("Library/Audio/Presets").join(&vendor).join(name),
                 3,
+                ext,
                 &mut files,
             );
         }
-        // Host-saved LV2 user presets (lilv writes one bundle per
-        // preset); plugin-agnostic dir, the hash check filters.
-        collect_files(&home.join(".lv2"), 2, &mut files);
     }
     #[cfg(target_os = "windows")]
     if let Some(profile) = std::env::var_os("USERPROFILE") {
@@ -827,6 +766,7 @@ fn host_preset_files(ctx: &PluginCtx<'_>) -> Vec<PathBuf> {
                     .join(&vendor)
                     .join(name),
                 3,
+                ext,
                 &mut files,
             );
         }
@@ -838,16 +778,16 @@ fn host_preset_files(ctx: &PluginCtx<'_>) -> Vec<PathBuf> {
             collect_files(
                 &home.join(".vst3/presets").join(&vendor).join(name),
                 3,
+                ext,
                 &mut files,
             );
         }
-        collect_files(&home.join(".lv2"), 2, &mut files);
     }
 
     // The moose user root: presets saved through the CRUD API /
     // future in-editor menus.
     if let Some(user_root) = ctx.store().user_root() {
-        collect_files(user_root, 3, &mut files);
+        collect_files(user_root, 3, ext, &mut files);
     }
 
     files.sort();
@@ -855,7 +795,7 @@ fn host_preset_files(ctx: &PluginCtx<'_>) -> Vec<PathBuf> {
     files
 }
 
-fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn collect_files(dir: &Path, depth: usize, native_ext: &str, out: &mut Vec<PathBuf>) {
     if depth == 0 {
         return;
     }
@@ -865,8 +805,10 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            collect_files(&path, depth - 1, out);
-        } else if PresetFormat::from_path(&path).is_some_and(|f| f != PresetFormat::AuthoredToml) {
+            collect_files(&path, depth - 1, native_ext, out);
+        } else if PresetFormat::from_path(&path, native_ext)
+            .is_some_and(|f| f != PresetFormat::AuthoredToml)
+        {
             out.push(path);
         }
     }

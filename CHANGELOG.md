@@ -12,6 +12,39 @@ First release as MOOSE, a hard fork of truce 6.3.0. See the README's
 - CLAP rescans parameter values after state and preset loads; CLAP replays the host GUI scale into newly created editors.
 - VST3 interface IDs for `IUnitInfo`, `IEditControllerHostEditing` and `IProcessContextRequirements` are corrected.
 
+### Fixes carried from vendored truce copies
+
+- CLAP and VST3 cap host state reads at 32 MiB and reject negative or oversized reads. VST3 `getState` retries partial writes and fails on a bad write count; `setState` fails on an empty stream instead of resetting the plugin. (K01)
+- Windows VST3 DLLs link the C++ runtime to match Rust: `/MT` under `+crt-static` (which `cargo moose` now passes for `*-windows-msvc`), static libstdc++ on MinGW. Hosts that load plugins without the plugin's folder on the DLL search path (FL Studio's scanner) no longer fail on VCRUNTIME140 or libstdc++-6. Plain `cargo build` for MSVC without `+crt-static` prints a build warning. (K02)
+- Parameters can change their name, group and visibility at runtime: `#[params(presentation = "fn", presentation_revision = "fn")]` or `Params::parameter_presentation` / `parameter_presentation_revision`. CLAP announces a change with `CLAP_PARAM_RESCAN_INFO`, VST3 with `kParamTitlesChanged`; hidden VST3 params are read-only and not automatable. (K04)
+- VST3 MIDI CC proxy parameters accept host-entered text. (K05)
+- CLAP keeps parameter events flushed while the transport is stopped (latest value per id) and delivers them at the start of the next process block. (K06)
+- CLAP sets `CLAP_AUDIO_PORT_IS_MAIN` only on a main bus, and outputs after the first are aux buses. (K07)
+- The native preset container extension is configurable with `extension = "…"` under `[plugin.presets]` (default `trucepreset`). It reaches `PluginInfo::preset_extension`, CLAP preset discovery, `PresetStore::with_extension` and every `cargo moose` preset path. (K10)
+- Saved `#[persist]` data is validated before any of the state is restored: `#[params(validate_persist = "fn")]` (`fn(&[u8]) -> bool`). A rejected blob leaves every parameter untouched. New struct hooks: `restore_state`, `post_load`, `pre_save`; new field attribute `#[persist_missing]` runs a field's reader with empty data when an older blob lacks its key. (K11)
+- Parameters borrow their `ParamInfo` from a static table built once per params struct, and a float without smoothing carries no smoother. (K12)
+- Host text entry works for every derived parameter: without a `parse_fn`, the text is matched against the param's own formatter (enum names, custom `format_fn`, units such as `kHz`, `ms`, `%`, pan `L`/`R`/`C`). Built-in formatters also accept a bare number. (K13; chosen over S01, which needs unit suffixes and doesn't round-trip enum names or custom formatters.)
+- Hot-reload temp copies include the process ID, so two hosts reloading one dylib no longer SIGBUS each other; the static shell boxes the DSP state. (K14)
+- `#[param(default = std::f64::consts::FRAC_1_SQRT_2)]` and the other `std::f64::consts` values are emitted as paths, so plugin crates don't trip `clippy::approx_constant`; `flags = "none"` means no flags. (S02)
+- Win32 imports go through one `windows-sys` version (0.61, a workspace dependency).
+- Clean under `cargo clippy --workspace --all-targets -- -D warnings` on Rust 1.98.
+
+### Breaking changes and migration (7.0.0 fixes)
+
+- **Param fields became accessors (K12).** `p.gain.info` → `p.gain.info()` (owned, id already rebased) or `p.gain.static_info()` (`&'static`); `p.gain.info.range` → `p.gain.range()`; `p.gain.smoother` → `p.gain.smoother()` (`Option<&Smoother>`, `None` for `SmoothingStyle::None`), plus `snap_smoother()` and `set_sample_rate()`. `FloatParam::new`, `IntParam::new`, `BoolParam::new` and `EnumParam::new` take `&'static ParamInfo`; hand-written `Params` impls keep their infos in a `static` / `LazyLock` (or `Box::leak`). `#[derive(Params)]` users need no change.
+- **Extra outputs are aux buses (K07).** A layout with several `with_output` calls now has one main output; later outputs are `BusKind::Sidechain`, which VST3 hosts start inactive. Code that matched `BusKind::Main` on those outputs must treat them as aux.
+- **Host text parsing is on by default (K13).** `Params::parse_value` returns a value for every derived parameter instead of `None`. Keep a `parse_fn` where the formatter-based parse is wrong for your notation.
+- **State restore can refuse (K11).** With `validate_persist`, a rejected blob fails the whole load (`RestoreError::Invalid` from `restore_plugin`; CLAP/VST3 report the load as failed).
+- **VST3 `setState` on an empty stream fails (K01)** instead of loading defaults.
+- **`PluginInfo`** lost `fourcc`, `au_type`, `au_manufacturer`, `aax_id`, `aax_category`, `vst2_name`, `au_name`, `au3_name`, `aax_name`, `lv2_name`, the `legacy_*` ids and `PluginInfo::fourcc()`, and gained `preset_extension: &'static str`. Struct literals must drop the old fields and set the new one (`moose_utils::preset::PRESET_FILE_EXT` for the default).
+- **`moose.toml`**: `au_manufacturer`, `fourcc`, `au_type`, `au_subtype`, `aax_category`, `vst2_name`, `au_name`, `au3_name`, `aax_name`, `lv2_name` and `[plugin.legacy_state]` are ignored; delete them at leisure.
+- **`moose-build`**: the `lv2` module, `presets::read_param_symbols` / `render_param_symbols`, `LegacyStateConfig` and the removed `PluginDef` / `VendorConfig` fields are gone. New: `preset_extension(&PluginDef)`, `param_index_dir(target, crate)`.
+- **Param index sidecars** moved from `target/lv2-meta/<crate>/` to `target/param-index/<crate>/`; tests that read them should call `moose_build::param_index_dir`. The hidden macro `__moose_lv2_emit_root!` is now `__moose_param_index_root!`.
+- **`moose-utils`**: `presets::enumerate_scope` takes the container extension as a new last argument; the iOS app-group preset root is gone.
+- **`moose-core`**: `wrapper::max_io_channels`, `wrapper::first_bus_layout` and `wrapper::log_midi_ports_clamped` (AU/AAX/VST2 helpers) are removed.
+- **`moose-test`**: `assert_au_type_codes_ascii` and `assert_fourcc_roundtrip` are removed; `assert_valid_info` checks `preset_extension` instead.
+- **`cargo moose preset`** no longer reads or writes `.aupreset` or LV2 `.ttl`; `export` packs hold the native container and `.vstpreset`.
+
 ### Inherited from the truce 7.0.0 fork line
 
 Breaking: move every direct `truce*` dependency in a plugin to 7.0 together. `truce-egui` now uses egui and egui-wgpu 0.35, so plugins that name egui types in their editor code must also update their direct `egui` dependency to 0.35; the `EguiEditor`, `EditorUi`, and widget APIs otherwise keep the same shape.

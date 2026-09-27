@@ -690,12 +690,37 @@ impl<S: Sample> NativeLoader<S> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("plugin");
-        let temp = std::env::temp_dir().join(format!(
-            "moose-hot-{stem}-{}-{}.{ext}",
-            self.instance_id, self.load_counter
+        let temp = std::env::temp_dir().join(hot_temp_name(
+            stem,
+            ext,
+            self.instance_id,
+            self.load_counter,
         ));
         std::fs::copy(&self.dylib_path, &temp)?;
         Ok(temp)
+    }
+}
+
+/// Temp-copy file name for one reload attempt. The PID keeps two host
+/// processes (or a host plus its sandboxed scanner) from overwriting a
+/// copy the other still has mapped, which faults with SIGBUS: the
+/// instance id and counter are only unique inside one process.
+fn hot_temp_name(stem: &str, ext: &str, instance_id: u64, counter: u64) -> String {
+    format!(
+        "moose-hot-{stem}-{}-{instance_id}-{counter}.{ext}",
+        std::process::id()
+    )
+}
+
+#[cfg(test)]
+mod temp_name_tests {
+    #[test]
+    fn hot_temp_name_is_unique_per_process() {
+        let name = super::hot_temp_name("gain", "so", 3, 7);
+        assert_eq!(
+            name,
+            format!("moose-hot-gain-{}-3-7.so", std::process::id())
+        );
     }
 }
 

@@ -63,15 +63,15 @@ fn make_param() -> FloatParam {
         midi_map: None,
         midi_channel: None,
     };
-    let p = FloatParam::new(info, SmoothingStyle::Exponential(5.0));
-    p.smoother.set_sample_rate(SR);
+    let p = FloatParam::new(Box::leak(Box::new(info)), SmoothingStyle::Exponential(5.0));
+    p.set_sample_rate(SR);
     p.set_value(3.0);
     p
 }
 
 fn make_converged_param() -> FloatParam {
     let p = make_param();
-    p.smoother.snap(f64::from(p.value()));
+    p.snap_smoother();
     p
 }
 

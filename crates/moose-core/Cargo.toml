@@ -44,5 +44,9 @@ crossbeam-queue = "0.3"
 # off-by-default `loom` feature (see `[features]`).
 loom = { version = "0.7", optional = true }
 
+# `pin_current_module` (tasks) pins the plugin DLL via GetModuleHandleExW.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
 [lints]
 workspace = true
