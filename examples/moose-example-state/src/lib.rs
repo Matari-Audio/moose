@@ -374,6 +374,7 @@ mod tests {
                     name: "Drive".into(),
                     group: String::new(),
                     hidden: false,
+                    available: true,
                 })
             }
             fn revision(&self) -> u64 {
