@@ -778,6 +778,9 @@ class MooseAUAudioUnit: AUAudioUnit {
             if result == UInt32(AU_OUTPUT_END) { break }
             if result == UInt32(AU_OUTPUT_UNSUPPORTED) {
                 outputStatus = UInt32(AU_OUTPUT_UNSUPPORTED)
+                // No host MIDI receiver: drop the events (the plugin sees
+                // Unsupported) but let the audio render succeed.
+                if carrierMask == 0 { break }
                 return kAudioUnitErr_FormatNotSupported
             }
             if result == UInt32(AU_OUTPUT_INVALID) {

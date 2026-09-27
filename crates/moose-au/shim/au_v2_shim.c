@@ -1941,6 +1941,10 @@ static OSStatus au_v2_render(void *self_,
      * Apple AU boundary owns any host-protocol conversion. */
     OSStatus midiOutputStatus = noErr;
     bool hostRefusedOutput = false;
+    /* Events emitted with no host receiver (auval, or a host with no MIDI
+     * out connected) are dropped: the plugin sees Unsupported, but the
+     * audio render still succeeds. */
+    bool noReceiver = false;
     const bool umpTimeValid =
         (inTimeStamp->mFlags & kAudioTimeStampSampleTimeValid) &&
         isfinite(inTimeStamp->mSampleTime) &&
@@ -2058,7 +2062,7 @@ static OSStatus au_v2_render(void *self_,
         if (status == AU_OUTPUT_INVALID)
             midiOutputStatus = kAudioUnitErr_InvalidParameter;
         else if (status != AU_OUTPUT_END)
-            midiOutputStatus = kAudioUnitErr_FormatNotSupported;
+            noReceiver = true;
     }
 
     if (midiOutputStatus == noErr) {
@@ -2075,7 +2079,7 @@ static OSStatus au_v2_render(void *self_,
         uint32_t status = AU_OUTPUT_EMITTED;
         if (hostRefusedOutput || midiOutputStatus == kAudioUnitErr_MIDIOutputBufferFull)
             status = AU_OUTPUT_QUEUE_FULL;
-        else if (midiOutputStatus == kAudioUnitErr_FormatNotSupported)
+        else if (noReceiver || midiOutputStatus == kAudioUnitErr_FormatNotSupported)
             status = AU_OUTPUT_UNSUPPORTED;
         else if (midiOutputStatus != noErr)
             status = AU_OUTPUT_INVALID;
