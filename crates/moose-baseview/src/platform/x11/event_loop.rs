@@ -5,6 +5,7 @@ use std::result::Result;
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::host::HostMainThreadCaller;
+use crate::platform::frame_rate::frame_interval;
 use crate::platform::x11::error::FatalError;
 use crate::platform::x11::window_thread::{
     HostCallback, WindowThreadRequest, WindowThreadResponseMessage,
@@ -24,6 +25,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::errors::ConnectionError;
+use x11rb::protocol::randr::{ConnectionExt as _, ModeFlag, ModeInfo};
 use x11rb::protocol::xproto::{ConnectionExt as _, EventMask, KeyPressEvent, KeyReleaseEvent};
 use x11rb::protocol::Event as XEvent;
 use x11rb::CURRENT_TIME;
@@ -60,6 +62,12 @@ pub(crate) struct EventLoop {
     new_parent_size: Option<PhysicalSize<u16>>,
     exposed: bool,
 
+    /// `on_frame` pacing: the refresh period of the monitor under the window (MOOSE).
+    frame_interval: Duration,
+    /// Set by `ConfigureNotify`: the window may have moved to another monitor.
+    refresh_rate_stale: bool,
+    refresh_rate_queried_at: Instant,
+
     loop_signal: LoopSignal,
 
     drag_n_drop: DragNDropState,
@@ -87,7 +95,8 @@ impl EventLoop {
     ) -> Result<Self, PlatformError> {
         let loop_handle = inner.handle();
 
-        Self::setup_fallback_frame_timer(&loop_handle)?;
+        let frame_interval = frame_interval(query_refresh_hz(&window));
+        Self::setup_frame_timer(&loop_handle, frame_interval)?;
 
         loop_handle
             .insert_source(
@@ -110,6 +119,9 @@ impl EventLoop {
             new_size: None,
             new_parent_size: None,
             exposed: false,
+            frame_interval,
+            refresh_rate_stale: false,
+            refresh_rate_queried_at: Instant::now(),
             drag_n_drop: DragNDropState::NoCurrentSession,
             xkb_state: XkbcommonState::new(&window.connection),
             run_error: None,
@@ -159,33 +171,32 @@ impl EventLoop {
         Ok(event_received)
     }
 
-    fn setup_fallback_frame_timer(
-        loop_handle: &LoopHandle<'_, Self>,
+    fn setup_frame_timer(
+        loop_handle: &LoopHandle<'_, Self>, interval: Duration,
     ) -> Result<(), calloop::Error> {
-        const FRAME_INTERVAL: Duration = Duration::from_millis(15);
-
         fn handle_frame(evloop: &mut EventLoop, previous_deadline: Instant) -> TimeoutAction {
             evloop.exposed = true;
 
-            // We'll try to keep a consistent frame pace. If the last frame couldn't be processed in
-            // the expected frame time, this will throttle down to prevent multiple frames from
-            // being queued up.
-
-            let now = Instant::now();
-
-            let Some(next_deadline) = previous_deadline.checked_add(FRAME_INTERVAL) else {
-                return TimeoutAction::ToDuration(FRAME_INTERVAL);
-            };
-
-            if next_deadline >= now {
-                return TimeoutAction::ToDuration(FRAME_INTERVAL);
+            // A window drag sends a ConfigureNotify per step: re-query a few times a second at most.
+            if evloop.refresh_rate_stale
+                && evloop.refresh_rate_queried_at.elapsed() >= Duration::from_millis(250)
+            {
+                evloop.refresh_rate_stale = false;
+                evloop.refresh_rate_queried_at = Instant::now();
+                evloop.frame_interval = frame_interval(query_refresh_hz(&evloop.window));
             }
 
-            TimeoutAction::ToInstant(next_deadline)
+            // Keep a steady cadence. If a frame overran its slot, restart the cadence from now
+            // instead of queueing catch-up frames.
+            let interval = evloop.frame_interval;
+            match previous_deadline.checked_add(interval) {
+                Some(next) if next > Instant::now() => TimeoutAction::ToInstant(next),
+                _ => TimeoutAction::ToDuration(interval),
+            }
         }
 
         loop_handle
-            .insert_source(Timer::from_duration(FRAME_INTERVAL), |i, _, e| handle_frame(e, i))
+            .insert_source(Timer::from_duration(interval), |i, _, e| handle_frame(e, i))
             .map_err(|e| e.error)?;
 
         Ok(())
@@ -459,6 +470,8 @@ impl EventLoop {
             }
 
             XEvent::ConfigureNotify(event) => {
+                // Our window, an ancestor or any top-level moved: maybe onto another monitor.
+                self.refresh_rate_stale = true;
                 // These are coalesced and then handled asynchronously at the end of the event loop
                 if event.window == self.window.raw_id() {
                     self.new_size = Some(PhysicalSize::new(event.width, event.height));
@@ -656,6 +669,43 @@ impl EventLoop {
     }
 }
 
+/// Refresh rate of the RandR CRTC under the window's centre, `None` when RandR is missing or
+/// the window is off every CRTC (MOOSE).
+fn query_refresh_hz(window: &WindowInner) -> Option<f64> {
+    let conn = window.connection.conn.xcb_connection();
+    let root = window.connection.conn.default_screen().root;
+    let origin = conn.translate_coordinates(window.raw_id(), root, 0, 0).ok()?.reply().ok()?;
+    let size = window.get_size();
+    let x = i32::from(origin.dst_x).saturating_add(i32::from(size.width / 2));
+    let y = i32::from(origin.dst_y).saturating_add(i32::from(size.height / 2));
+
+    let resources = conn.randr_get_screen_resources_current(root).ok()?.reply().ok()?;
+    let crtcs: Vec<_> = resources
+        .crtcs
+        .iter()
+        .filter_map(|&crtc| conn.randr_get_crtc_info(crtc, resources.config_timestamp).ok())
+        .collect();
+    let crtc = crtcs.into_iter().filter_map(|cookie| cookie.reply().ok()).find(|crtc| {
+        let (cx, cy) = (i32::from(crtc.x), i32::from(crtc.y));
+        crtc.mode != 0
+            && (cx..cx.saturating_add(crtc.width.into())).contains(&x)
+            && (cy..cy.saturating_add(crtc.height.into())).contains(&y)
+    })?;
+    mode_refresh_hz(resources.modes.iter().find(|mode| mode.id == crtc.mode)?)
+}
+
+fn mode_refresh_hz(mode: &ModeInfo) -> Option<f64> {
+    let mut lines = f64::from(mode.vtotal);
+    if mode.mode_flags.contains(ModeFlag::DOUBLE_SCAN) {
+        lines *= 2.0;
+    }
+    if mode.mode_flags.contains(ModeFlag::INTERLACE) {
+        lines /= 2.0;
+    }
+    let pixels = f64::from(mode.htotal) * lines;
+    (pixels > 0.0).then(|| f64::from(mode.dot_clock) / pixels)
+}
+
 fn is_auto_repeat_pair(release: &KeyReleaseEvent, press: &KeyPressEvent) -> bool {
     release.detail == press.detail && release.time == press.time && release.event == press.event
 }
@@ -668,5 +718,40 @@ fn mouse_id(id: u8) -> MouseButton {
         8 => MouseButton::Back,
         9 => MouseButton::Forward,
         id => MouseButton::Other(id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mode_refresh_hz;
+    use x11rb::protocol::randr::{ModeFlag, ModeInfo};
+
+    fn mode(dot_clock: u32, htotal: u16, vtotal: u16, flags: ModeFlag) -> ModeInfo {
+        ModeInfo {
+            id: 1,
+            width: 0,
+            height: 0,
+            dot_clock,
+            hsync_start: 0,
+            hsync_end: 0,
+            htotal,
+            hskew: 0,
+            vsync_start: 0,
+            vsync_end: 0,
+            vtotal,
+            name_len: 0,
+            mode_flags: flags,
+        }
+    }
+
+    #[test]
+    fn refresh_rate_from_mode_timings() {
+        // CVT 1920x1080@60 reduced blanking: 138.5 MHz, 2080x1111.
+        let hz = mode_refresh_hz(&mode(138_500_000, 2080, 1111, ModeFlag::from(0u32)));
+        assert!((hz.unwrap_or_default() - 59.934).abs() < 0.001);
+        let double = mode_refresh_hz(&mode(100, 1, 1, ModeFlag::DOUBLE_SCAN));
+        assert_eq!(double, Some(50.0));
+        assert_eq!(mode_refresh_hz(&mode(100, 1, 1, ModeFlag::INTERLACE)), Some(200.0));
+        assert_eq!(mode_refresh_hz(&mode(100, 0, 0, ModeFlag::from(0u32))), None);
     }
 }

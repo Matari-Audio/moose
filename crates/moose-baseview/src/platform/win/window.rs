@@ -7,12 +7,20 @@ use windows_sys::Win32::{
 use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
 use crate::{warn, EventStatus, HandlerError, WindowHandler};
 use std::cell::{Cell, OnceCell};
-use std::num::{NonZeroU32, NonZeroUsize};
-use windows_sys::Win32::Foundation::POINT;
+use crate::platform::frame_rate::frame_interval;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{HWND, POINT};
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 
 pub(crate) const BV_WINDOW_MUST_CLOSE: u32 = WM_USER + 1;
 /// MOOSE: posted by `set_keyboard_capture` to move focus outside of handler callbacks.
 pub(crate) const BV_KEYBOARD_CAPTURE_FOCUS: u32 = WM_USER + 2;
+/// MOOSE: posted by the [`FramePacer`] thread once per compositor frame.
+const BV_FRAME: u32 = WM_USER + 3;
 
 use super::drop_target::DropTarget;
 use super::*;
@@ -37,10 +45,60 @@ fn lo_word(lparam: LPARAM) -> u16 {
     (lparam & 0xffff) as u16
 }
 
-const WIN_FRAME_TIMER: NonZeroUsize = match NonZeroUsize::new(4242) {
-    Some(x) => x,
-    None => unreachable!(),
-};
+/// MOOSE: drives `on_frame` at the display's refresh rate. A helper thread waits on `DwmFlush`
+/// (the next desktop composition) and posts [`BV_FRAME`]; `pending` keeps at most one frame
+/// message queued, and is only cleared once `on_frame` returns so input is never starved.
+/// A minimised window is paced at 20 Hz. Nothing here touches the process timer resolution.
+struct FramePacer {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl FramePacer {
+    fn start(hwnd: HWND, pending: Arc<AtomicBool>) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let hwnd = hwnd as usize;
+        let thread = std::thread::Builder::new().name("baseview-frame-pacer".into()).spawn(
+            move || {
+                let hwnd = hwnd as HWND;
+                let fallback = frame_interval(None);
+                let mut last_frame = Instant::now();
+                while !thread_stop.load(Ordering::Acquire) {
+                    // SAFETY: plain queries; a stale handle just fails.
+                    if unsafe { IsIconic(GetAncestor(hwnd, GA_ROOT)) } != 0 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    // DwmFlush fails without composition and can return at once when the
+                    // desktop is idle; a sleep keeps either case from spinning.
+                    // SAFETY: no arguments.
+                    let flushed = unsafe { DwmFlush() } >= 0;
+                    if !flushed || last_frame.elapsed() < Duration::from_millis(1) {
+                        std::thread::sleep(fallback);
+                    }
+                    last_frame = Instant::now();
+                    // SAFETY: posting to a destroyed window fails harmlessly.
+                    if !pending.swap(true, Ordering::AcqRel)
+                        && unsafe { PostMessageW(hwnd, BV_FRAME, 0, 0) } == 0
+                    {
+                        pending.store(false, Ordering::Release);
+                    }
+                }
+            },
+        )?;
+        Ok(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for FramePacer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 pub struct WindowHandle {
     init: Cell<Option<WindowInitializer>>,
@@ -227,6 +285,8 @@ pub struct BaseviewWindow {
     _keyboard_hook: Cell<Option<hook::KeyboardHookHandle>>,
     _drop_target: Cell<Option<ComObject<DropTarget>>>,
     ole_initialized: Cell<bool>,
+    frame_pacer: Cell<Option<FramePacer>>,
+    frame_pending: Arc<AtomicBool>,
 
     #[cfg(feature = "opengl")]
     pub gl_config: Option<crate::gl::GlConfig>,
@@ -264,6 +324,8 @@ impl BaseviewWindow {
 
                     _drop_target: None.into(),
                     ole_initialized: false.into(),
+                    frame_pacer: None.into(),
+                    frame_pending: Arc::new(AtomicBool::new(false)),
                     _keyboard_hook: None.into(),
 
                     #[cfg(feature = "opengl")]
@@ -275,13 +337,6 @@ impl BaseviewWindow {
         let rect = dpi_ctx.client_area_to_nc_area(window_size.into(), style, None)?;
         let title = HSTRING::from(init.settings.title);
         let window = create_window(&title, style, rect.size(), parent, &dpi_ctx, initializer)?;
-
-        // FIXME: this SetTimer call could be in after_create, but for some reason it changes the ordering
-        // for a parent+child window situation, which results in the parent drawing over the child.
-        // This timer should be replaced by proper window redrawing/damage/vsync handling, but this
-        // would be a breaking change, so we'll do that later.
-        // TODO: create a new timer instead of hard-coding a specific ID
-        window.set_timer(WIN_FRAME_TIMER, 15)?;
 
         Ok(window)
     }
@@ -407,6 +462,10 @@ impl WindowImpl for BaseviewWindow {
         };
         let Ok(()) = self.handler.set(handler) else { unreachable!() };
 
+        let pacer = FramePacer::start(window.as_raw(), Arc::clone(&self.frame_pending))
+            .map_err(windows_core::Error::from)?;
+        self.frame_pacer.set(Some(pacer));
+
         Ok(())
     }
 
@@ -417,6 +476,7 @@ impl WindowImpl for BaseviewWindow {
     }
 
     fn before_destroy(&self, window: HWnd) {
+        drop(self.frame_pacer.take());
         if let Some(drop_target) = self._drop_target.take() {
             let _ = window.revoke_drag_drop();
             drop(drop_target);
@@ -552,11 +612,9 @@ unsafe fn wnd_proc_inner(
 
             None
         }
-        WM_TIMER => {
-            if wparam == WIN_FRAME_TIMER.get() {
-                window_bv.handle_on_frame()
-            }
-
+        BV_FRAME => {
+            window_bv.handle_on_frame();
+            window_bv.frame_pending.store(false, Ordering::Release);
             Some(0)
         }
         WM_CLOSE => {
