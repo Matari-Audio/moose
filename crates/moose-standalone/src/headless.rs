@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use moose_core::export::PluginExport;
-use moose_core::info::PluginCategory;
 
 use crate::audio;
 use crate::cli::Options;
@@ -33,7 +32,7 @@ pub fn run<P: PluginExport>(opts: &Options) {
         Arc::clone(&handles.pending),
     );
 
-    let is_instrument = P::info().category != PluginCategory::Effect;
+    let is_instrument = !handles.is_effect;
     vlog!("Plugin: {}", P::info().name);
     if is_instrument && opts.midi_inputs.is_empty() {
         // Soft warning - actionable, so always print.

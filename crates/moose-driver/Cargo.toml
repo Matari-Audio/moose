@@ -23,3 +23,6 @@ wav = ["dep:hound"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+moose = { workspace = true, default-features = false }

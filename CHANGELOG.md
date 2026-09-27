@@ -2,6 +2,12 @@
 
 Notable changes per release.
 
+## Unreleased
+
+- Preserve distinct same-name object files when deduplicating macOS bundle archives (Truce #224).
+- Feed declared audio inputs to Analyzer/Tool plugins in the offline driver and standalone host, independent of category (Truce #223).
+- Track Truce issues, PRs and main commits with a daily upstream review report.
+
 ## 7.0.0 (MOOSE)
 
 First release as MOOSE, a hard fork of truce 6.3.0. See the README's

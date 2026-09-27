@@ -57,7 +57,6 @@ use moose_core::events::{
     EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus, TransportInfo,
 };
 use moose_core::export::PluginExport;
-use moose_core::info::PluginCategory;
 use moose_core::plugin::PluginRuntime;
 use moose_core::state::restore_plugin;
 use moose_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
@@ -901,7 +900,13 @@ impl<P: PluginExport> PluginDriver<P> {
             f(&mut plugin, &ctx);
         }
 
-        let is_effect = P::info().category == PluginCategory::Effect;
+        // Audio routing follows the declared main bus, not the product category.
+        let is_effect = P::bus_layouts().iter().any(|layout| {
+            layout
+                .inputs
+                .first()
+                .is_some_and(|bus| bus.enabled && bus.channels.channel_count() > 0)
+        });
         let total_frames = sample_count_usize(self.duration.as_secs_f64() * self.sample_rate);
 
         // Sidechain (non-main) input width. Every enabled sidechain bus is
@@ -1453,5 +1458,132 @@ mod tests {
     fn no_sidechain_bus_is_zero() {
         let layouts = [BusLayout::stereo()];
         assert_eq!(default_sidechain_channels(&layouts, 2), 0);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use moose_core::{
+        buffer::AudioBuffer,
+        meters::MeterStore,
+        process::{ProcessContext, ProcessStatus},
+        snapshot::SnapshotSlot,
+    };
+    use moose_core::{
+        info::{PluginCategory, PluginInfo},
+        plugin::PluginRuntime,
+    };
+    use std::sync::Arc;
+
+    #[derive(moose::Params)]
+    struct TestParams {
+        #[param(default = false)]
+        bypass: moose::params::BoolParam,
+    }
+    struct Probe<const KIND: u8>(Arc<TestParams>, Arc<MeterStore>, Arc<SnapshotSlot>);
+    impl<const KIND: u8> PluginRuntime for Probe<KIND> {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            PluginInfo {
+                name: "routing-test",
+                vendor: "routing-test",
+                url: "routing-test",
+                version: "routing-test",
+                category: match KIND {
+                    0 => PluginCategory::Effect,
+                    1 => PluginCategory::Analyzer,
+                    2 => PluginCategory::Tool,
+                    _ => PluginCategory::Instrument,
+                },
+                description: None,
+                clap_manual_url: None,
+                clap_support_url: None,
+                clap_features: &[],
+                accepts_midi_in: false,
+                emits_midi: false,
+                midi_input_dialect: Default::default(),
+                midi_output_dialect: Default::default(),
+                midi_input_ports: Default::default(),
+                midi_output_ports: Default::default(),
+                bundle_id: "routing-test",
+                vst3_id: "routing-test",
+                clap_id: "routing-test",
+                fourcc: *b"Test",
+                au_type: *b"Test",
+                au_manufacturer: *b"Test",
+                vst3_subcategory: None,
+                preset_user_dir: None,
+                preset_extension: "routing-test",
+                vst3_name: None,
+                clap_name: None,
+                au_name: None,
+                au3_name: None,
+                mute_preview_output: false,
+                automation: Default::default(),
+                legacy_au_keys: &[],
+            }
+        }
+        fn bus_layouts() -> Vec<BusLayout> {
+            if KIND == 3 {
+                vec![BusLayout::new().with_output("Out", moose_core::bus::ChannelConfig::Stereo)]
+            } else {
+                vec![BusLayout::stereo()]
+            }
+        }
+        fn reset(&mut self, _: &AudioConfig) {}
+        fn process(
+            &mut self,
+            buffer: &mut AudioBuffer,
+            _: &EventList,
+            _: &mut ProcessContext,
+        ) -> ProcessStatus {
+            assert_eq!(buffer.num_input_channels(), if KIND == 3 { 0 } else { 2 });
+            if KIND == 3 {
+                buffer.output(0).fill(0.25);
+                buffer.output(1).fill(0.25);
+            } else {
+                buffer.for_each_stereo_frame(|input, output| *output = *input);
+            }
+            ProcessStatus::Normal
+        }
+    }
+    impl<const KIND: u8> PluginExport for Probe<KIND> {
+        type Params = TestParams;
+        fn create() -> Self {
+            Self(
+                Arc::new(TestParams::default()),
+                MeterStore::new(),
+                SnapshotSlot::new(),
+            )
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            Arc::clone(&self.1)
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            Arc::clone(&self.2)
+        }
+        fn params(&self) -> &TestParams {
+            &self.0
+        }
+        fn params_arc(&self) -> Arc<TestParams> {
+            Arc::clone(&self.0)
+        }
+    }
+    fn check<const KIND: u8>() {
+        let result = PluginDriver::<Probe<KIND>>::new()
+            .duration(Duration::from_millis(10))
+            .input(InputSource::Constant(0.5))
+            .run();
+        let expected = if KIND == 3 { 0.25 } else { 0.5 };
+        assert!(!result.output[0].is_empty());
+        assert!(result.output.iter().flatten().all(|&x| x == expected));
+    }
+    #[test]
+    fn audio_inputs_follow_buses_for_effect_analyzer_tool_and_instrument() {
+        check::<0>();
+        check::<1>();
+        check::<2>();
+        check::<3>();
     }
 }

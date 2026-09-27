@@ -14,6 +14,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod archive;
 mod build;
 #[cfg(target_os = "macos")]
 mod bundle_link;
@@ -997,7 +999,7 @@ pub(crate) fn tmp_scripts() -> PathBuf {
 
 /// `tmp/verify/` - scratch dirs for post-build artifact verification
 /// (pkgutil --expand targets, validator inputs).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn tmp_verify() -> PathBuf {
     let dir = tmp_dir().join("verify");
     let _ = fs::create_dir_all(&dir);
