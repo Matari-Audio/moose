@@ -46,7 +46,9 @@ Behaviour:
 - X11: core auto-repeat pairs become one repeated key-down (MOOSE X01);
   ignored key events are forwarded to the embed parent, with synthesized
   key-ups on focus loss and close (KURV K26); `Xft.dpi` clamped to 0.5-4
-  (KURV K25); override and fallback scale honoured at creation.
+  (KURV K25); override and fallback scale honoured at creation. XDND limits
+  property sizes, verifies selection replies, and parses URI lines before
+  percent decoding.
 - macOS: the backing scale is re-read when the view moves into a window, so a
   view created before the host attached it gets its real scale.
 

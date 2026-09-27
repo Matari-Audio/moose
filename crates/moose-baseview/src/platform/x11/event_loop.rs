@@ -456,7 +456,7 @@ impl EventLoop {
             }
 
             XEvent::SelectionNotify(event) => {
-                if event.property == self.window.connection.atoms.XdndSelection {
+                if event.selection == self.window.connection.atoms.XdndSelection {
                     self.drag_n_drop.handle_selection_notify_event(
                         &self.window,
                         &*self.handler,
