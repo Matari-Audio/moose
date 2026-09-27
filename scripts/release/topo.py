@@ -105,6 +105,7 @@ forced_order = [
     "moose-standalone",
     "moose-clap",
     "moose-vst3",
+    "moose-au",
     "moose",
     "cargo-moose",
 ]
