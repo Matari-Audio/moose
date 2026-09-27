@@ -31,7 +31,8 @@ use crate::vlog;
 pub fn store<P: PluginExport>(presets_dir: Option<&std::path::Path>) -> PresetStore {
     let info = P::info();
     let hash = hash_plugin_id(info.clap_id);
-    let mut store = PresetStore::new(info.vendor, info.name, hash, info.preset_user_dir);
+    let mut store = PresetStore::new(info.vendor, info.name, hash, info.preset_user_dir)
+        .with_extension(info.preset_extension);
     if let Some(root) = presets_dir
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
@@ -235,6 +236,8 @@ struct PresetControllerInner {
     save_meta: SaveMetaFn,
     /// Prompt for a destination and write a new user preset.
     save_as: SaveAsFn,
+    /// The plugin's preset file extension (`PluginInfo::preset_extension`).
+    extension: &'static str,
 }
 
 impl PresetController {
@@ -290,6 +293,7 @@ impl PresetController {
                 load,
                 save_meta,
                 save_as,
+                extension: P::info().preset_extension,
             }),
         }
     }
@@ -307,7 +311,7 @@ impl PresetController {
             Some(name) => format!(
                 "Save Preset ({}.{})",
                 safe_filename(&name),
-                moose_utils::preset::PRESET_FILE_EXT
+                self.inner.extension
             ),
             None => "Save Preset".to_string(),
         }
@@ -488,8 +492,8 @@ fn save_as_dialog<P: PluginExport>(
     let blob = snapshot(plugin, hash)?;
     let mut dialog = rfd::FileDialog::new()
         .set_title(format!("Save preset for {}", P::info().name))
-        .add_filter("moose preset", &[moose_utils::preset::PRESET_FILE_EXT])
-        .set_file_name(format!("Preset.{}", moose_utils::preset::PRESET_FILE_EXT));
+        .add_filter("moose preset", &[P::info().preset_extension])
+        .set_file_name(format!("Preset.{}", P::info().preset_extension));
     if let Some(dir) = user_root {
         let _ = std::fs::create_dir_all(dir);
         dialog = dialog.set_directory(dir);
@@ -523,10 +527,7 @@ fn save_as_dialog<P: PluginExport>(
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let path = dir.join(format!(
-        "Untitled {ts}.{}",
-        moose_utils::preset::PRESET_FILE_EXT
-    ));
+    let path = dir.join(format!("Untitled {ts}.{}", P::info().preset_extension));
     let name = write_preset_at(&path, &blob)?;
     saved_user_uri::<P>(&name)
 }
@@ -561,6 +562,7 @@ mod tests {
                 }),
                 save_meta: Box::new(|_| None),
                 save_as: Box::new(|| None),
+                extension: moose_utils::preset::PRESET_FILE_EXT,
             }),
         }
     }
