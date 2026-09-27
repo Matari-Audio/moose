@@ -14,7 +14,7 @@ pub use sample::{Float, Sample};
 pub use smooth::{Smoother, SmoothingStyle};
 pub use types::{
     BoolParam, EnumParam, FloatParam, FloatParamReadF32, FloatParamReadF64, IntParam, MeterSlot,
-    ParamEnum,
+    ParamEnum, bump_edit_epoch, edit_epoch,
 };
 
 /// Largest host-visible parameter ID. The signed-positive 31-bit

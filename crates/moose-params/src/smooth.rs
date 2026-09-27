@@ -109,6 +109,12 @@ impl Smoother {
         self.ramp_target.store(f64::NAN);
     }
 
+    /// Whether this smoother holds the target exactly, with no work left.
+    #[inline]
+    pub(crate) fn settled_at(&self, target: f64) -> bool {
+        self.current.load().to_bits() == target.to_bits()
+    }
+
     /// Arm (or re-arm) the `Linear` ramp toward `target` and return its
     /// constant per-sample increment.
     ///
@@ -363,6 +369,10 @@ impl Smoother {
             return;
         }
         let mut current = self.current.load();
+        if current.to_bits() == target.to_bits() {
+            out.fill(target as f32);
+            return;
+        }
         let coeff = self.coeff.load();
 
         match self.style {
@@ -410,6 +420,12 @@ impl Smoother {
             }
         }
 
+        // One-pole ramps otherwise approach forever. Once their remaining
+        // difference is below f32 resolution, land on the exact target so
+        // later blocks can use the constant path.
+        if (target - current).abs() <= (target.abs() * 1e-7).max(1e-12) {
+            current = target;
+        }
         self.current.store(current);
     }
 }
