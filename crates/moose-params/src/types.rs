@@ -796,8 +796,12 @@ mod tests {
     use crate::info::{ParamFlags, ParamUnit, ParamValueKind};
     use crate::range::ParamRange;
 
+    /// Keeps every leaked test `ParamInfo` reachable from a static, so
+    /// Miri's leak check doesn't flag the intentional `Box::leak`.
+    static INFOS: std::sync::Mutex<Vec<&'static ParamInfo>> = std::sync::Mutex::new(Vec::new());
+
     fn info(name: &'static str, range: ParamRange, default_plain: f64) -> &'static ParamInfo {
-        Box::leak(Box::new(ParamInfo {
+        let info = Box::leak(Box::new(ParamInfo {
             id: 0,
             name,
             short_name: name,
@@ -809,7 +813,9 @@ mod tests {
             kind: ParamValueKind::Float,
             midi_map: None,
             midi_channel: None,
-        }))
+        }));
+        INFOS.lock().unwrap().push(info);
+        info
     }
 
     #[test]
