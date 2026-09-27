@@ -12,11 +12,17 @@ use crate::platform::{HostScale, ParentWindow};
 use crate::window::{self, Requests, Shared, View, lock};
 
 type Build<P> = Box<dyn FnMut(&mut Ui, &mut Bridge<P>) -> El + Send>;
+type Changed = Box<dyn FnMut() -> bool + Send>;
 
 /// The model half: the app's build closure and the parameters it binds.
 pub(crate) struct Session<P: Params> {
     pub(crate) bridge: Bridge<P>,
     build: Build<P>,
+    /// [`MuiEditor::changed`]: model state outside the bridge.
+    changed: Option<Changed>,
+    /// The size `build` was designed at, fitted to the window; `None` is
+    /// [`MuiEditor::fixed_zoom`].
+    design: Option<Size>,
 }
 
 impl<P: Params> View for Session<P> {
@@ -26,7 +32,13 @@ impl<P: Params> View for Session<P> {
         root
     }
     fn changed(&mut self) -> bool {
-        self.bridge.changed()
+        // Both run every tick: the bridge snapshots values as it compares.
+        self.bridge.changed() | self.changed.as_mut().is_some_and(|f| f())
+    }
+    fn zoom(&self, window: Size) -> f64 {
+        self.design.map_or(1.0, |d| {
+            (window.width / d.width).min(window.height / d.height)
+        })
     }
     fn request_resize(&mut self, width: u32, height: u32) -> bool {
         self.bridge
@@ -40,6 +52,16 @@ impl<P: Params> View for Session<P> {
 /// State the editor keeps between frames lives in the closure's captures;
 /// it and the `Ui` survive a close and reopen.
 ///
+/// The editor redraws when the bridge sees a moose parameter or meter move.
+/// Model state outside those -- meters, status, anything in the plugin's own
+/// atomics -- must report through [`MuiEditor::changed`], or it only repaints
+/// when the mouse moves; `.changed(|| true)` rebuilds every tick.
+///
+/// A resized window scales the whole tree to fit the `size` it was designed
+/// at (`min` of the two axes' ratios, so 1.0 at that size); the spare axis
+/// gets the extra room. [`MuiEditor::fixed_zoom`] keeps it at 1.0 instead,
+/// so the tree lays out into the new size unscaled.
+///
 /// ```ignore
 /// fn editor(params: Arc<GainParams>) -> Box<dyn Editor> {
 ///     let ui = Ui::default().font(font);
@@ -47,6 +69,8 @@ impl<P: Params> View for Session<P> {
 ///         bridge.bind(ui, P::Gain, |ui, id, v| knob(ui, id, "Gain", v, 0.0..=1.0))
 ///     })
 ///     .resizable((240, 160))
+///     // The audio thread sets `dirty` when a meter moves.
+///     .changed(move || dirty.swap(false, Ordering::Relaxed))
 ///     .into_editor()
 /// }
 /// ```
@@ -99,15 +123,18 @@ impl<P: Params> MuiEditor<P> {
         size: impl Into<Size>,
         build: impl FnMut(&mut Ui, &mut Bridge<P>) -> El + Send + 'static,
     ) -> Self {
+        let size = size.into();
         let session = Session {
             bridge: Bridge::new(Arc::clone(&params)),
             build: Box::new(build),
+            changed: None,
+            design: Some(size),
         };
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
             requests: Arc::default(),
             params,
-            size: points(size.into()),
+            size: points(size),
             min: None,
             scale: HostScale::default(),
             window: None,
@@ -118,6 +145,22 @@ impl<P: Params> MuiEditor<P> {
     #[must_use]
     pub fn resizable(mut self, min: impl Into<Size>) -> Self {
         self.min = Some(points(min.into()));
+        self
+    }
+
+    /// Poll `f` every display tick alongside the parameters: `true` means
+    /// the model moved (a meter, a status) and the tree rebuilds.
+    #[must_use]
+    pub fn changed(self, f: impl FnMut() -> bool + Send + 'static) -> Self {
+        lock(&self.shared).view.changed = Some(Box::new(f));
+        self
+    }
+
+    /// Keep the zoom at 1.0 when the window resizes: the tree lays out into
+    /// the new size instead of scaling to fit its design size.
+    #[must_use]
+    pub fn fixed_zoom(self) -> Self {
+        lock(&self.shared).view.design = None;
         self
     }
 
