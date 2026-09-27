@@ -266,7 +266,10 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let min_subblock_samples = config.automation.min_subblock_samples;
 
     // `[plugin.legacy_state]` AU probe keys, baked as a static slice.
-    let legacy_au_keys = plugin.legacy_state.as_ref().map_or(&[][..], |l| &l.au_keys[..]);
+    let legacy_au_keys = plugin
+        .legacy_state
+        .as_ref()
+        .map_or(&[][..], |l| &l.au_keys[..]);
     let legacy_au_keys = quote! { &[#(#legacy_au_keys),*] };
 
     // `include_bytes!` registers `moose.toml` as a build-time dependency

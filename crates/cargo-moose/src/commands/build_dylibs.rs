@@ -88,7 +88,9 @@ pub(crate) fn build_format_dylibs(
     // the caller's "if format_selected { build }" needs no cfg arms.
     #[cfg(not(target_os = "macos"))]
     if format == BuildFormat::Au2 {
-        crate::log_skip("AU v2: not supported on this platform. Audio Unit is macOS-only.".to_string());
+        crate::log_skip(
+            "AU v2: not supported on this platform. Audio Unit is macOS-only.".to_string(),
+        );
         return Ok(());
     }
 
@@ -187,14 +189,11 @@ pub(crate) fn build_format_dylibs(
         // keeps the cdylib, and `clang -bundle` can't relink a foreign-arch
         // static archive anyway.
         #[cfg(target_os = "macos")]
-        if matches!(
-            format,
-            BuildFormat::Clap | BuildFormat::Vst3
-        ) && crate::target_os_of(target.unwrap_or_else(|| moose_build::host_triple())) == "macos"
+        if matches!(format, BuildFormat::Clap | BuildFormat::Vst3)
+            && crate::target_os_of(target.unwrap_or_else(|| moose_build::host_triple())) == "macos"
         {
             link_macos_bundle_for_plugin(root, p, format, target)?;
         }
-
     }
 
     Ok(())

@@ -183,14 +183,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
 
         for &(selected, format) in format_selection {
             if selected {
-                build_format_dylibs(
-                    format,
-                    &plugins,
-                    &extra_features,
-                    &root,
-                    dt,
-                    plan.target,
-                )?;
+                build_format_dylibs(format, &plugins, &extra_features, &root, dt, plan.target)?;
             }
         }
 

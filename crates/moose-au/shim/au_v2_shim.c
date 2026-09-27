@@ -1640,13 +1640,17 @@ static OSStatus au_v2_schedule_parameters(void *self_,
                 events[i].eventValues.immediate.value,
                 events[i].eventValues.immediate.bufferOffset);
         } else if (events[i].eventType == kParameterEvent_Ramped) {
-            /* Deliver the ramp's end value at its start offset. Moose's
-             * per-param smoother interpolates from the current value
-             * toward the target; this isn't sample-accurate AU ramp
+            /* Deliver the ramp's end value at the start of this slice.
+             * Moose's per-param smoother interpolates from the current
+             * value toward the target; this isn't sample-accurate AU ramp
              * reproduction but matches how moose-vst3 treats VST3
-             * parameter ramps (target value at the queue point). */
+             * parameter ramps. startBufferOffset is signed and may be
+             * negative (ramp began in an earlier slice) or past this
+             * slice, so it can't be used as an in-block offset (auval's
+             * ramped-scheduling test fails otherwise). ponytail: ramp lands at
+             * offset 0, honor startBufferOffset if ramp timing matters. */
             AudioUnitParameterValue value = events[i].eventValues.ramp.endValue;
-            UInt32 offset = events[i].eventValues.ramp.startBufferOffset;
+            UInt32 offset = 0;
             g_callbacks->param_set_value(inst->rustCtx,
                 events[i].parameter, (double)value);
             enqueue_param_event(inst, events[i].parameter, value, offset);

@@ -16,8 +16,7 @@ use crate::{
     CLAP_EXPORTS, Config, MacArch, PluginDef, Res, VST3_EXPORTS, cargo_build_multi_arch,
     cargo_build_multi_arch_with_profile, copy_dir_recursive, deployment_target,
     detect_default_features, link_macos_bundle, lipo_into, load_config, project_root,
-    read_workspace_version, release_bundle_bin, release_lib_for_target,
-    release_static_for_target,
+    read_workspace_version, release_bundle_bin, release_lib_for_target, release_static_for_target,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
