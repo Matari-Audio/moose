@@ -184,10 +184,17 @@ impl Drop for RenderThread {
             .wait_timeout_while(slot, std::time::Duration::from_secs(1), |s| !s.exited)
             .unwrap_or_else(PoisonError::into_inner);
         drop(slot);
-        if timeout.timed_out() {
+        // Detach only once the module is pinned, so the host unloading
+        // the plug-in can't pull code out from under the thread (K17).
+        if timeout.timed_out() && baseview::pin_current_image_for_detached_work() {
             log::warn!("egui render thread did not exit within 1s (driver stall?); detaching");
             drop(self.join.take());
         } else if let Some(join) = self.join.take() {
+            if timeout.timed_out() {
+                log::warn!(
+                    "egui render thread stalled and the module could not be pinned; joining"
+                );
+            }
             let _ = join.join();
         }
     }
@@ -195,13 +202,12 @@ impl Drop for RenderThread {
 
 /// Extract the Win32 HWND from a baseview window, as a `Send`-able
 /// integer the render thread can build its surface from.
-pub fn hwnd_for(window: &baseview::Window) -> Option<isize> {
-    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
-    let RawWindowHandle::Win32(handle) = window.raw_window_handle() else {
+pub fn hwnd_for(window: &impl raw_window_handle::HasWindowHandle) -> Option<isize> {
+    let raw_window_handle::RawWindowHandle::Win32(handle) = window.window_handle().ok()?.as_raw()
+    else {
         return None;
     };
-    let hwnd = handle.hwnd as isize;
-    (hwnd != 0).then_some(hwnd)
+    Some(handle.hwnd.get())
 }
 
 /// Render thread body: init, then consume the slot until shutdown.

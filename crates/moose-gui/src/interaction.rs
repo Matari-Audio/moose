@@ -20,15 +20,13 @@ const WHEEL_LINE_PX: f32 = 20.0;
 /// platform-agnostic [`InputEvent`] stream.
 #[cfg(not(target_os = "ios"))]
 ///
-/// Exists because baseview emits logical-point mouse positions on every
-/// platform (macOS via Cocoa points; X11 and Windows via explicit
-/// `to_logical`) but does not carry a position on `ButtonPressed` /
+/// Exists because baseview does not carry a position on `ButtonPressed` /
 /// `ButtonReleased` nor synthesize double-clicks.
 ///
-/// Emitted `InputEvent`s carry **logical** coordinates unchanged from
-/// baseview. The rendering backend (e.g. `WgpuBackend`) handles the
-/// logical→physical conversion at raster time; callers must not
-/// pre-multiply by `scale`.
+/// baseview reports cursor positions in **physical** pixels. The
+/// translator divides them by the scale the editor renders at, so emitted
+/// `InputEvent`s carry **logical** coordinates that always line up with
+/// what was drawn, whatever scale baseview itself believes in.
 // All fields share a `last_` prefix because the struct's whole purpose
 // is to remember the previous cursor / click - the prefix is meaningful,
 // not redundant.
@@ -54,19 +52,21 @@ impl BaseviewTranslator {
     /// Convert a baseview event into an [`InputEvent`]. Returns `None`
     /// for events moose-gui doesn't consume (keyboard, non-L/R/M mouse
     /// buttons, window lifecycle).
-    pub fn translate(&mut self, event: &baseview::Event) -> Option<InputEvent> {
+    ///
+    /// `scale` is the editor's render scale (physical pixels per point).
+    pub fn translate(&mut self, event: &baseview::Event, scale: f64) -> Option<InputEvent> {
         let baseview::Event::Mouse(m) = event else {
             return None;
         };
         match m {
             baseview::MouseEvent::CursorMoved { position, .. } => {
-                // baseview reports cursor in f64 logical points; the
-                // hit-test math is f32. Window dimensions never reach
+                let logical = position.to_logical::<f64>(sanitize_scale(scale));
+                // The hit-test math is f32. Window dimensions never reach
                 // 2^23, so the narrowing is invisible.
                 #[allow(clippy::cast_possible_truncation)]
-                let x = position.x as f32;
+                let x = logical.x as f32;
                 #[allow(clippy::cast_possible_truncation)]
-                let y = position.y as f32;
+                let y = logical.y as f32;
                 self.last_cursor = (x, y);
                 Some(InputEvent::MouseMove {
                     pointer_id: moose_gui_types::interaction::SINGLE_POINTER,
@@ -123,11 +123,43 @@ impl BaseviewTranslator {
 }
 
 #[cfg(not(target_os = "ios"))]
+fn sanitize_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
 fn map_button(b: baseview::MouseButton) -> Option<MouseButton> {
     match b {
         baseview::MouseButton::Left => Some(MouseButton::Left),
         baseview::MouseButton::Right => Some(MouseButton::Right),
         baseview::MouseButton::Middle => Some(MouseButton::Middle),
         _ => None,
+    }
+}
+
+#[cfg(all(test, not(target_os = "ios")))]
+mod translator_tests {
+    use super::*;
+
+    #[test]
+    fn physical_positions_become_logical() {
+        let mut t = BaseviewTranslator::default();
+        let ev = baseview::Event::Mouse(baseview::MouseEvent::CursorMoved {
+            position: baseview::dpi::PhysicalPosition::new(300.0, 150.0),
+            modifiers: keyboard_types::Modifiers::empty(),
+        });
+        let Some(InputEvent::MouseMove { x, y, .. }) = t.translate(&ev, 1.5) else {
+            panic!("expected MouseMove");
+        };
+        assert!((x - 200.0).abs() < 1e-4 && (y - 100.0).abs() < 1e-4);
+        // A bogus scale falls back to 1:1 instead of dividing by zero.
+        let Some(InputEvent::MouseMove { x, .. }) = t.translate(&ev, 0.0) else {
+            panic!("expected MouseMove");
+        };
+        assert!((x - 300.0).abs() < 1e-4);
     }
 }

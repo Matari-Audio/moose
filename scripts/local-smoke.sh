@@ -3,7 +3,7 @@
 # moose. Installs cargo-moose from the checkout and patches every local
 # moose crate into the scaffolded project, so nothing comes from crates.io.
 # Run under bash. Usage: local-smoke.sh [moose-dir]
-#   env: BASEVIEW_DIR (also patch baseview-truce), RUN_SECS=N (CI auto-close), KEEP=1
+#   env: RUN_SECS=N (CI auto-close), KEEP=1
 set -euo pipefail
 
 RUN_SECS="${RUN_SECS:-}"
@@ -53,7 +53,6 @@ PROJ="$WORK/smoketest"
       moose*) printf '%s = { path = "%s" }\n' "$name" "$(dirname "$toml")" ;;
     esac
   done
-  [ -n "${BASEVIEW_DIR:-}" ] && printf 'baseview-truce = { path = "%s" }\n' "$(cd "$BASEVIEW_DIR" && pwd)"
 } >> "$PROJ/Cargo.toml"
 ok "patched moose deps -> $MOOSE_DIR"
 

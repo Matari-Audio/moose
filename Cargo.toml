@@ -28,6 +28,7 @@ members = [
     "crates/moose-simd",
     "crates/moose-font",
     "crates/moose-utils",
+    "crates/moose-baseview",
     "examples/moose-example-gain",
     "examples/moose-example-gain-inplace",
     "examples/moose-example-block-gain",
@@ -149,14 +150,11 @@ base64 = "0.22"
 # `moose-gpu/Cargo.toml`, then unified across the workspace.
 wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 
-# The owned fork carries the Pro Tools close-path fix
-# (responder / tracking-area / layer-contents cleanup) and X11 repeat
-# normalization for stable host key ownership. Pin the reviewed revision
-# until the next `baseview-truce` release; the `package =` rename keeps every
-# `use baseview::*` in the GUI crates compiling unchanged. GUI crates
-# consume this via `baseview = { workspace = true }` so the registry
-# pin lives in exactly one place.
-baseview = { package = "baseview-truce", git = "https://github.com/DerpcatMusic/baseview.git", rev = "15cf1fe518e7ad53ec0c7d1fd98fbbd9091a0866" }
+# moose-baseview is upstream baseview 0.3.4 plus MOOSE's additive patches
+# (see crates/moose-baseview/README.md). The `package =` rename keeps every
+# `use baseview::*` in the GUI crates compiling unchanged; GUI crates consume
+# this via `baseview = { workspace = true }`.
+baseview = { package = "moose-baseview", path = "crates/moose-baseview", version = "0.3.4-moose.1" }
 
 # Custom profile for shell-mode (hot-reload) builds. `cargo moose
 # install --shell` invokes `cargo build --profile shell --features

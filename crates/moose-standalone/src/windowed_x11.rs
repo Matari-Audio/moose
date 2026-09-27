@@ -41,7 +41,10 @@ pub fn pin_size(display_handle: RawDisplayHandle, window_handle: &XlibWindowHand
     let RawDisplayHandle::Xlib(display) = display_handle else {
         return;
     };
-    let display_ptr = display.display.cast::<xlib::Display>();
+    let display_ptr = display
+        .display
+        .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+        .cast::<xlib::Display>();
     if display_ptr.is_null() {
         return;
     }
@@ -102,7 +105,7 @@ pub fn pin_size(display_handle: RawDisplayHandle, window_handle: &XlibWindowHand
 /// Give the outer baseview window an opaque-black background so the
 /// X server auto-fills any region the editor child doesn't cover.
 ///
-/// baseview-truce creates the outer window on a 32-bit ARGB visual
+/// baseview creates the outer window on a 32-bit ARGB visual
 /// with no `background_pixel` set, so its background is `None`: when a
 /// resizable editor is maximized past its own max bounds (the WM
 /// ignores max size hints in the maximized state) the uncovered margin
@@ -124,7 +127,10 @@ pub fn set_background_black(display_handle: RawDisplayHandle, window_handle: &Xl
     let RawDisplayHandle::Xlib(display) = display_handle else {
         return;
     };
-    let display_ptr = display.display.cast::<xlib::Display>();
+    let display_ptr = display
+        .display
+        .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+        .cast::<xlib::Display>();
     if display_ptr.is_null() {
         return;
     }
@@ -171,7 +177,10 @@ pub fn center_child(display_handle: RawDisplayHandle, outer_handle: &XlibWindowH
     let RawDisplayHandle::Xlib(display) = display_handle else {
         return;
     };
-    let display_ptr = display.display.cast::<xlib::Display>();
+    let display_ptr = display
+        .display
+        .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+        .cast::<xlib::Display>();
     if display_ptr.is_null() {
         return;
     }
@@ -302,7 +311,10 @@ pub fn disable_maximize(display_handle: RawDisplayHandle, window_handle: &XlibWi
     let RawDisplayHandle::Xlib(display) = display_handle else {
         return;
     };
-    let display_ptr = display.display.cast::<xlib::Display>();
+    let display_ptr = display
+        .display
+        .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+        .cast::<xlib::Display>();
     if display_ptr.is_null() {
         return;
     }
@@ -402,7 +414,10 @@ pub fn set_resize_hints(
     let RawDisplayHandle::Xlib(display) = display_handle else {
         return;
     };
-    let display_ptr = display.display.cast::<xlib::Display>();
+    let display_ptr = display
+        .display
+        .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+        .cast::<xlib::Display>();
     if display_ptr.is_null() {
         return;
     }

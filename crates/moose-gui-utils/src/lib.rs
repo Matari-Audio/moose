@@ -9,6 +9,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use raw_window_handle::HasWindowHandle;
+
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -33,6 +35,15 @@ struct NsRect {
     size: NsSize,
 }
 
+/// The `NSView` behind an `AppKit` window handle.
+#[cfg(target_os = "macos")]
+fn ns_view(window: &impl HasWindowHandle) -> Option<*mut std::ffi::c_void> {
+    match window.window_handle().ok()?.as_raw() {
+        raw_window_handle::RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
+        _ => None,
+    }
+}
+
 /// Re-anchor the editor's `NSView` to the **top** of its superview
 /// in unflipped Cocoa coordinates.
 ///
@@ -50,16 +61,12 @@ struct NsRect {
 /// Call this on macOS each frame (e.g. from `WindowHandler::on_frame`)
 /// so the child's origin tracks its size. No-op on non-macOS.
 #[cfg(target_os = "macos")]
-pub fn reanchor_to_superview_top(handle: raw_window_handle::RawWindowHandle) {
+pub fn reanchor_to_superview_top(window: &impl HasWindowHandle) {
     use objc::{msg_send, sel, sel_impl};
 
-    let view_ptr = match handle {
-        raw_window_handle::RawWindowHandle::AppKit(h) => h.ns_view,
-        _ => return,
-    };
-    if view_ptr.is_null() {
+    let Some(view_ptr) = ns_view(window) else {
         return;
-    }
+    };
 
     unsafe {
         let view = view_ptr.cast::<objc::runtime::Object>();
@@ -82,7 +89,7 @@ pub fn reanchor_to_superview_top(handle: raw_window_handle::RawWindowHandle) {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn reanchor_to_superview_top(_handle: raw_window_handle::RawWindowHandle) {}
+pub fn reanchor_to_superview_top(_window: &impl HasWindowHandle) {}
 
 /// Whether a GUI backend's per-frame `on_frame` should skip all work
 /// this tick.
@@ -113,16 +120,12 @@ pub fn reanchor_to_superview_top(_handle: raw_window_handle::RawWindowHandle) {}
 /// (REAPER, etc.) responsive while its FX window is closed.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn should_skip_frame(handle: raw_window_handle::RawWindowHandle) -> bool {
+pub fn should_skip_frame(window: &impl HasWindowHandle) -> bool {
     use objc::{msg_send, sel, sel_impl};
 
-    let view_ptr = match handle {
-        raw_window_handle::RawWindowHandle::AppKit(h) => h.ns_view,
-        _ => return false,
+    let Some(view_ptr) = ns_view(window) else {
+        return false;
     };
-    if view_ptr.is_null() {
-        return true;
-    }
 
     unsafe {
         let view = view_ptr.cast::<objc::runtime::Object>();
@@ -140,19 +143,16 @@ pub fn should_skip_frame(handle: raw_window_handle::RawWindowHandle) -> bool {
 
 #[cfg(target_os = "windows")]
 #[must_use]
-pub fn should_skip_frame(handle: raw_window_handle::RawWindowHandle) -> bool {
-    unsafe extern "system" {
-        fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
-        fn IsIconic(hwnd: *mut std::ffi::c_void) -> i32;
-    }
+pub fn should_skip_frame(window: &impl HasWindowHandle) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
 
-    let hwnd = match handle {
-        raw_window_handle::RawWindowHandle::Win32(h) => h.hwnd,
-        _ => return false,
+    let Ok(handle) = window.window_handle() else {
+        return false;
     };
-    if hwnd.is_null() {
-        return true;
-    }
+    let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd = h.hwnd.get() as windows_sys::Win32::Foundation::HWND;
     // SAFETY: both are pure state queries on a window handle baseview
     // owns for the editor's lifetime; no aliasing or threading concerns,
     // and they're called from the GUI thread that owns the HWND.
@@ -161,7 +161,7 @@ pub fn should_skip_frame(handle: raw_window_handle::RawWindowHandle) -> bool {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[must_use]
-pub fn should_skip_frame(_handle: raw_window_handle::RawWindowHandle) -> bool {
+pub fn should_skip_frame(_window: &impl HasWindowHandle) -> bool {
     false
 }
 

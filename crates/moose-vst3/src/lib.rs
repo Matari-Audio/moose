@@ -163,13 +163,19 @@ struct Vst3Instance<P: PluginExport> {
     /// interior mutability through the shared `&Inst` those callbacks
     /// hold.
     midi_proxy_values: Vec<AtomicU64>,
-    /// Content scale from `setContentScaleFactor` (f64 bits, 1.0 default);
-    /// converts the editor's logical size to physical pixels for `getSize`.
+    /// Content scale from `setContentScaleFactor` (f64 bits, `0` until the
+    /// host sends one; ignored on macOS); converts the editor's logical size
+    /// to physical pixels for `getSize`.
     /// GUI-thread-only, but atomic so the host-thread GUI callbacks and the
     /// `request_resize` closure reach it through the shared `&Inst` without a
     /// `&mut *ctx` - and so it stays outside the `gui` cell, which the
     /// resize closure would otherwise re-enter while `cb_gui_open` holds it.
     host_scale: AtomicU64,
+    /// The open editor's own window scale (`Editor::window_scale`, f64 bits,
+    /// `0` = none), refreshed by the size callbacks. Converts sizes while the
+    /// host never sent a content scale, so `getSize` matches the child window
+    /// the editor created at the monitor DPI / `Xft.dpi`.
+    window_scale: AtomicU64,
     /// Editor resize the plugin requested through `PluginContext::request_resize`
     /// that landed back in a GUI callback (`onSize` → `cb_gui_set_size`)
     /// synchronously while the `gui` cell was already held - the wrapper stashes
@@ -193,8 +199,33 @@ struct Vst3Instance<P: PluginExport> {
 }
 
 impl<P: PluginExport> Vst3Instance<P> {
+    /// The scale between the host's physical pixels and the editor's logical
+    /// size: the host's content scale, else the open editor's window scale,
+    /// else `1.0`. Never both multiplied.
     fn host_scale(&self) -> f64 {
-        f64::from_bits(self.host_scale.load(Ordering::Relaxed))
+        self.reported_host_scale()
+            .or_else(|| match self.window_scale.load(Ordering::Relaxed) {
+                0 => None,
+                bits => Some(f64::from_bits(bits)),
+            })
+            .unwrap_or(1.0)
+    }
+
+    /// The last content scale the host sent, if it ever did.
+    fn reported_host_scale(&self) -> Option<f64> {
+        match self.host_scale.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f64::from_bits(bits)),
+        }
+    }
+
+    /// Cache `editor`'s window scale for [`Self::host_scale`].
+    fn note_window_scale(&self, editor: &dyn Editor) {
+        let bits = editor
+            .window_scale()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map_or(0, f64::to_bits);
+        self.window_scale.store(bits, Ordering::Relaxed);
     }
 
     fn set_host_scale(&self, scale: f64) {
@@ -605,7 +636,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 tail_cache,
                 midi_proxy_ids,
                 midi_proxy_values,
-                host_scale: AtomicU64::new(1.0f64.to_bits()),
+                host_scale: AtomicU64::new(0),
+                window_scale: AtomicU64::new(0),
                 pending_resize: AtomicU64::new(0),
                 audio: PluginCell::new(Vst3Scratch {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
@@ -2822,15 +2854,11 @@ unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(ctx: *mut std::ffi::c_vo
             gui.editor = (inst.editor_builder)(inst.params_arc.clone());
             // Replay a content scale the host reported before the editor
             // existed (a valid VST3 ordering - `setContentScaleFactor`
-            // can precede the editor object). macOS drives Retina through
-            // AppKit, not this callback, so `host_scale` stays 1.0 there;
-            // pinning it would force 1x rendering, so skip macOS.
-            #[cfg(not(target_os = "macos"))]
-            {
-                let scale = inst.host_scale();
-                if let Some(ref mut editor) = gui.editor {
-                    editor.set_scale_factor(scale);
-                }
+            // can precede the editor object). Only a scale the host really
+            // sent: replaying a default would pin the editor to it instead
+            // of the OS scale. macOS never stores one (AppKit drives Retina).
+            if let (Some(scale), Some(editor)) = (inst.reported_host_scale(), gui.editor.as_mut()) {
+                editor.set_scale_factor(scale);
             }
         }
         i32::from(gui.editor.is_some())
@@ -2864,6 +2892,9 @@ unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
         // Apply a resize the plugin requested re-entrantly (stashed by
         // `cb_gui_set_size` because the cell was busy) before reporting.
         let packed = inst.pending_resize.swap(0, Ordering::Relaxed);
+        if let Some(editor) = gui.editor.as_deref() {
+            inst.note_window_scale(editor);
+        }
         if packed != 0
             && let Some(editor) = gui.editor.as_mut()
         {
@@ -2910,7 +2941,9 @@ unsafe extern "C" fn cb_gui_set_content_scale<P: PluginExport>(
 ) {
     // `Editor::set_scale_factor` is author code; firewall it.
     run_extern_callback_with::<P, ()>("vst3", "gui_set_content_scale", (), || unsafe {
-        if ctx.is_null() || !scale.is_finite() || scale <= 0.0 {
+        // macOS: `ViewRect` is in logical points and AppKit applies the
+        // backing scale; a stored scale would only mis-convert host sizes.
+        if cfg!(target_os = "macos") || ctx.is_null() || !scale.is_finite() || scale <= 0.0 {
             return;
         }
         // Clamp to the same range the GUI cluster's `EditorScale`
@@ -2919,6 +2952,7 @@ unsafe extern "C" fn cb_gui_set_content_scale<P: PluginExport>(
         // multiplies its logical size to physical pixels.
         let scale = scale.clamp(0.25, 8.0);
         let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let changed = inst.reported_host_scale() != Some(scale);
         inst.set_host_scale(scale);
         // `try_enter`, not `enter`: a host can deliver `setContentScaleFactor`
         // synchronously while an outer GUI callback holds the cell - on
@@ -2927,10 +2961,21 @@ unsafe extern "C" fn cb_gui_set_content_scale<P: PluginExport>(
         // second aliasing `&mut` in release. When busy, skip the editor call:
         // `host_scale` is already persisted above, and `cb_gui_open` re-syncs
         // the editor's scale from it once `open` returns.
-        if let Some(mut gui) = inst.gui.try_enter()
-            && let Some(ref mut editor) = gui.editor
-        {
-            editor.set_scale_factor(scale);
+        let Some(mut gui) = inst.gui.try_enter() else {
+            return;
+        };
+        let Some(editor) = gui.editor.as_mut() else {
+            return;
+        };
+        editor.set_scale_factor(scale);
+        // The view's physical size follows the new scale; tell the host
+        // (`IPlugFrame::resizeView`) so its frame matches the child. Not a
+        // no-op re-send: skipped when the scale didn't change.
+        let (lw, lh) = editor.size();
+        drop(gui);
+        if changed && lw > 0 && lh > 0 {
+            let (pw, ph) = logical_to_phys(lw, lh, scale);
+            ffi::moose_vst3_request_resize(ctx, pw, ph);
         }
     });
 }
@@ -2982,6 +3027,7 @@ unsafe extern "C" fn cb_gui_check_size_constraint<P: PluginExport>(
         let Some(ref editor) = gui.editor else {
             return;
         };
+        inst.note_window_scale(editor.as_ref());
         let host_scale = inst.host_scale();
         if editor.can_resize() {
             // Physical -> logical, fit, logical -> physical. Fit the largest
@@ -3023,7 +3069,6 @@ unsafe extern "C" fn cb_gui_set_size<P: PluginExport>(ctx: *mut std::ffi::c_void
             return;
         }
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let host_scale = inst.host_scale();
         // A host answering a plugin `request_resize` (resizeView) synchronously
         // lands `onSize` here while an outer GUI callback still holds the cell.
         // `try_enter` avoids the same-thread aliasing re-entry: apply when free,
@@ -3031,7 +3076,8 @@ unsafe extern "C" fn cb_gui_set_size<P: PluginExport>(ctx: *mut std::ffi::c_void
         match inst.gui.try_enter() {
             Some(mut gui) => {
                 if let Some(editor) = gui.editor.as_mut() {
-                    apply_physical_resize(editor.as_mut(), w, h, host_scale);
+                    inst.note_window_scale(editor.as_ref());
+                    apply_physical_resize(editor.as_mut(), w, h, inst.host_scale());
                 }
             }
             None => {

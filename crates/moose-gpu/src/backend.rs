@@ -2232,7 +2232,7 @@ impl WgpuBackend {
         // same convention `moose-slint::screenshot::render_with_state` uses.
         // Un-premultiply here so the GPU readback matches the headless
         // contract instead of leaking the GPU's internal format.
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             let a = px[3];
             if a == 0 || a == 255 {
                 continue;

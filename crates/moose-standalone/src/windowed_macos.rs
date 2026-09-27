@@ -1,11 +1,8 @@
 //! macOS helpers for the standalone window's resize affordance.
 //!
-//! `baseview-truce` 0.1.1-truce.6 creates its `NSWindow` with the
-//! `Titled | Closable | Miniaturizable` style mask only; without
-//! `Resizable` the window has no drag-the-edge affordance and
-//! `AppKit` refuses drag-resize attempts. When the plugin's editor
-//! opts into resizing we OR the bit in here, after baseview has
-//! finished its own window setup. baseview is unchanged.
+//! baseview sets the `Resizable` style bit from `with_resizable`;
+//! `make_resizable` re-asserts it, and the rest pins the content
+//! limits, zoom and child layout baseview doesn't manage.
 
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
@@ -14,15 +11,21 @@ use objc::{msg_send, sel, sel_impl};
 /// `<AppKit/NSWindow.h>` as `NSWindowStyleMaskResizable = 1 << 3`.
 const NS_WINDOW_STYLE_MASK_RESIZABLE: u64 = 1 << 3;
 
-/// Add the `Resizable` bit to the standalone's `NSWindow`.
+/// The `NSWindow *` hosting `ns_view`, or null if it has none yet.
 ///
-/// `ns_window` is the raw `NSWindow *` baseview populates on
-/// `RawWindowHandle::AppKit::ns_window` for its parentless (i.e.
-/// standalone) windows. We deliberately avoid `[ns_view window]`
-/// here because baseview calls `setContentView:` *after* the
-/// `Window::open_blocking` build closure runs, so the view's
-/// window association is nil at the moment standalone wants to
-/// adjust the style mask.
+/// # Safety
+///
+/// Must run on the main thread; `ns_view` must be a live `NSView *`.
+pub unsafe fn window_of(ns_view: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    if ns_view.is_null() {
+        return std::ptr::null_mut();
+    }
+    let window: *mut Object = unsafe { msg_send![ns_view.cast::<Object>(), window] };
+    window.cast()
+}
+
+/// Add the `Resizable` bit to the standalone's `NSWindow`
+/// (`ns_window`, see [`window_of`]).
 ///
 /// # Safety
 ///
@@ -212,16 +215,10 @@ pub unsafe fn install_subview_centering(ns_view: *mut std::ffi::c_void) {
     if ns_view.is_null() {
         return;
     }
-    // The caller hands us baseview's standalone `NSView` (not the
-    // `NSWindow`). `Window::open_blocking` sets baseview's view as
-    // the `NSWindow.contentView` *after* the build closure returns
-    // - while we're inside the build closure, the `NSWindow`'s
-    // contentView is still its default vanilla view, so walking
-    // `[ns_window contentView].subviews` finds nothing. baseview's
-    // own view, however, is already the parent of the editor's
-    // child by the time `editor.open()` returns (baseview's
-    // `open_parented` calls `parent_view.addSubview(&new_ns_view)`
-    // synchronously). Walking *that* view's subviews finds the
+    // The caller hands us baseview's standalone `NSView` (the
+    // window's content view). baseview's view is the parent of the editor's
+    // child by the time `editor.open()` returns (baseview adds a
+    // parented view with `addSubview:` synchronously). Walking *that* view's subviews finds the
     // editor's NSView reliably.
     let parent = ns_view.cast::<Object>();
     let subviews: *mut Object = unsafe { msg_send![parent, subviews] };
@@ -333,12 +330,9 @@ struct NsRect {
 }
 
 /// Read the standalone `NSWindow`'s content frame size in logical
-/// points. baseview-truce 0.1.1-truce.6 only fires `Resized` for
-/// `viewDidChangeBackingProperties` (DPI changes); user-driven OS
-/// window drags never reach the `WindowHandler`. Polling
-/// `[ns_window contentLayoutRect]` from `on_frame` lets the outer
-/// `StandaloneHandler` detect those drags and forward to
-/// `editor.set_size`. Returns `None` if the window pointer is null
+/// points. Polling `[ns_window contentLayoutRect]` from `on_frame`
+/// lets the outer `StandaloneHandler` catch drags and programmatic
+/// frame changes that no `resized` call reported. Returns `None` if the window pointer is null
 /// or the call fails to produce a usable size.
 ///
 /// # Safety

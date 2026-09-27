@@ -51,7 +51,6 @@ multiple-versions = "warn"
 
 [sources]
 unknown-registry = "deny"
-# The only git-sourced dep is the pinned baseview fork (see the root
-# Cargo.toml); any other git source is unexpected.
+# No git-sourced deps: baseview is vendored as crates/moose-baseview.
 unknown-git = "deny"
-allow-git = ["https://github.com/DerpcatMusic/baseview.git"]
+allow-git = []

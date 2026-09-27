@@ -1,61 +1,44 @@
 //! Platform window bridging for baseview.
 //!
-//! Bridges moose's `RawWindowHandle` to baseview's `HasRawWindowHandle`
-//! (raw-window-handle 0.5), and provides scale factor querying and
-//! wgpu surface creation.
+//! Bridges moose's `RawWindowHandle` to raw-window-handle 0.6 (what
+//! baseview takes), and provides the scale policy, scale factor querying
+//! and wgpu surface creation.
 
-// `HasRawDisplayHandle` / `RwhRawDisplayHandle` are only touched on
-// the Linux (X11) arm of `HasRawWindowHandle for ParentWindow`;
-// silence the macOS/Windows dead-import warning.
 use moose_core::editor::RawWindowHandle;
-#[allow(unused_imports)]
-use raw_window_handle::{
-    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle as RwhRawDisplayHandle,
-    RawWindowHandle as RwhRawWindowHandle,
-};
+use raw_window_handle as rwh;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Newtype bridging moose's `RawWindowHandle` to baseview's
-/// `HasRawWindowHandle` (raw-window-handle 0.5).
+/// Newtype bridging moose's `RawWindowHandle` to a raw-window-handle 0.6
+/// window handle (what baseview takes as a parent).
 pub struct ParentWindow(pub RawWindowHandle);
 
-unsafe impl HasRawWindowHandle for ParentWindow {
-    fn raw_window_handle(&self) -> RwhRawWindowHandle {
-        match self.0 {
-            RawWindowHandle::AppKit(ptr) => {
-                let mut handle = raw_window_handle::AppKitWindowHandle::empty();
-                handle.ns_view = ptr;
-                RwhRawWindowHandle::AppKit(handle)
-            }
-            RawWindowHandle::UiKit(ptr) => {
-                // baseview doesn't host on iOS - the iOS editor
-                // path attaches a UIView directly without going
-                // through this bridge. We surface the handle for
-                // completeness (and so future iOS-aware backends
-                // can read it) but in practice no caller on iOS
-                // reaches this arm.
-                let mut handle = raw_window_handle::UiKitWindowHandle::empty();
-                handle.ui_view = ptr;
-                RwhRawWindowHandle::UiKit(handle)
-            }
+impl rwh::HasWindowHandle for ParentWindow {
+    fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        let null = || rwh::HandleError::Unavailable;
+        let raw = match self.0 {
+            RawWindowHandle::AppKit(ptr) => rwh::RawWindowHandle::AppKit(
+                rwh::AppKitWindowHandle::new(std::ptr::NonNull::new(ptr).ok_or_else(null)?),
+            ),
+            RawWindowHandle::UiKit(ptr) => rwh::RawWindowHandle::UiKit(
+                rwh::UiKitWindowHandle::new(std::ptr::NonNull::new(ptr).ok_or_else(null)?),
+            ),
             RawWindowHandle::Win32(ptr) => {
-                let mut handle = raw_window_handle::Win32WindowHandle::empty();
-                handle.hwnd = ptr;
-                RwhRawWindowHandle::Win32(handle)
+                rwh::RawWindowHandle::Win32(rwh::Win32WindowHandle::new(
+                    std::num::NonZeroIsize::new(ptr as isize).ok_or_else(null)?,
+                ))
             }
-            RawWindowHandle::X11(window_id) => {
-                let mut handle = raw_window_handle::XlibWindowHandle::empty();
-                // rwh 0.5 field type is c_ulong: u64 on Linux/macOS, u32 on Windows.
-                // The Windows narrowing is the lossy edge - `XID` is 32-bit there.
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    handle.window = window_id as _;
-                }
-                RwhRawWindowHandle::Xlib(handle)
+            RawWindowHandle::X11(id) => {
+                let id = u32::try_from(id)
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .ok_or_else(null)?;
+                rwh::RawWindowHandle::Xcb(rwh::XcbWindowHandle::new(id))
             }
-        }
+        };
+        // SAFETY: the host keeps the parent alive while the editor is open.
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw) })
     }
 }
 
@@ -252,6 +235,10 @@ impl PaintPacer {
 #[derive(Clone)]
 pub struct EditorScale {
     inner: Arc<AtomicU64>,
+    /// Set once the host announced a content scale that the platform
+    /// honours (see [`host_scale_override`]). From then on the host owns
+    /// the value and OS scale reports no longer overwrite it.
+    host_set: Arc<AtomicBool>,
 }
 
 impl EditorScale {
@@ -267,7 +254,43 @@ impl EditorScale {
         };
         Self {
             inner: Arc::new(AtomicU64::new(v.to_bits())),
+            host_set: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record a content scale reported by the host (CLAP `set_scale`,
+    /// VST3 `setContentScaleFactor`, `cargo moose screenshot --scale`).
+    /// Where the platform takes host scales the host then owns the value;
+    /// on macOS (logical `AppKit` coordinates) it only seeds the value until
+    /// the window reports its backing scale.
+    pub fn set_from_host(&self, scale: f64) {
+        if host_scale_override(Some(scale)).is_some() {
+            self.host_set.store(true, Ordering::Relaxed);
+        }
+        self.set(scale);
+    }
+
+    /// Record a scale reported by the OS for the editor's window (initial
+    /// window scale, DPI / monitor change). Ignored once the host owns the
+    /// scale, so the host value is never overwritten by the window DPI.
+    pub fn set_from_os(&self, scale: f64) {
+        if !self.host_set.load(Ordering::Relaxed) {
+            self.set(scale);
+        }
+    }
+
+    /// The scale baseview should be pinned to: the host scale once the host
+    /// announced one, else `None` (follow the OS).
+    #[must_use]
+    pub fn host_override(&self) -> Option<f64> {
+        self.host_set.load(Ordering::Relaxed).then(|| self.get())
+    }
+
+    /// [`moose_core::editor::Editor::window_scale`] for an editor whose
+    /// window is `open`: the current scale, except on macOS.
+    #[must_use]
+    pub fn window_scale(&self, open: bool) -> Option<f64> {
+        (open && !cfg!(target_os = "macos")).then(|| self.get())
     }
 
     /// Read the current scale.
@@ -370,45 +393,22 @@ pub fn note_linux_scale_factor(scale: f64) {
     }
 }
 
-/// Decide the content-scale policy for an editor's baseview child window.
+/// The scale policy for an editor window: the host's content scale when it
+/// sent one, otherwise the OS scale. Returns the value to pin baseview to
+/// (`WindowSettings::with_scale_factor_override`), or `None` to follow the
+/// OS scale.
 ///
-/// Returns `Some(scale)` when the caller should open with
-/// `WindowScalePolicy::ScaleFactor(scale)` (and render at `scale`), or
-/// `None` when it should keep `WindowScalePolicy::SystemScaleFactor` and
-/// query the OS backing/DPI scale as usual.
-///
-/// The distinction only bites on Linux. There `SystemScaleFactor` reads
-/// `Xft.dpi` - the *desktop* scale - which is the right signal for the
-/// standalone app's own top-level window but wrong for a plugin embedded
-/// in a host: a non-DPI-aware host (Bitwig on X11) runs at 1x and
-/// allocates a 1x container regardless of desktop scaling, so honoring
-/// `Xft.dpi` builds a window twice the size of its allocated rect. For an
-/// embedded editor we therefore drive scale from the host's content-scale
-/// callback (default `1.0`; `host_scale_set` flips true once the host
-/// announces one via `set_scale_factor`) rather than the desktop.
-/// macOS/Windows always keep `SystemScaleFactor`: the OS reports a
-/// reliable per-window scale there.
+/// - Windows / Linux: the host scale wins when given (and is valid). Without
+///   one, baseview uses the window DPI (Windows) or `Xft.dpi` (X11). The two
+///   are never multiplied.
+/// - macOS: always `None`. `AppKit` coordinates are logical and the backing
+///   scale comes from the window; CLAP `set_scale` is refused there.
 #[must_use]
-pub fn editor_window_scale(
-    uses_system_scale: bool,
-    host_scale_set: bool,
-    host_scale: f64,
-) -> Option<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        if uses_system_scale {
-            None
-        } else if host_scale_set && host_scale.is_finite() && host_scale > 0.0 {
-            Some(host_scale)
-        } else {
-            Some(1.0)
-        }
+pub fn host_scale_override(host_scale: Option<f64>) -> Option<f64> {
+    if cfg!(target_os = "macos") {
+        return None;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (uses_system_scale, host_scale_set, host_scale);
-        None
-    }
+    host_scale.filter(|s| s.is_finite() && *s > 0.0)
 }
 
 #[cfg(target_os = "linux")]
@@ -436,25 +436,15 @@ pub fn main_screen_scale() -> f64 {
 /// If `hwnd` is non-null, queries per-window DPI; otherwise queries the system DPI.
 #[cfg(target_os = "windows")]
 fn win32_dpi_scale(hwnd: *mut std::ffi::c_void) -> f64 {
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
     // Default DPI is 96; scale = actual_dpi / 96.
     const DEFAULT_DPI: u32 = 96;
 
-    unsafe extern "system" {
-        fn GetDpiForWindow(hwnd: *mut std::ffi::c_void) -> u32;
-        fn GetDpiForSystem() -> u32;
-    }
-
-    let dpi = if hwnd.is_null() {
-        unsafe { GetDpiForSystem() }
-    } else {
-        let d = unsafe { GetDpiForWindow(hwnd) };
-        if d == 0 {
-            unsafe { GetDpiForSystem() }
-        } else {
-            d
-        }
+    // SAFETY: pure queries; a stale HWND makes GetDpiForWindow return 0.
+    let dpi = match unsafe { GetDpiForWindow(hwnd) } {
+        0 => unsafe { GetDpiForSystem() },
+        d => d,
     };
-
     if dpi == 0 {
         1.0
     } else {
@@ -467,28 +457,16 @@ fn win32_dpi_scale(hwnd: *mut std::ffi::c_void) -> f64 {
 /// the swapchain have to cover" - unlike `to_physical_px(logical,
 /// scale)`, which is a prediction that can diverge from what the host
 /// actually sized the child window to. `None` for non-Win32 handles,
-/// a null/dead HWND, or an empty rect.
+/// a dead HWND, or an empty rect.
 #[cfg(target_os = "windows")]
 #[must_use]
-pub fn win32_client_size(handle: RwhRawWindowHandle) -> Option<(u32, u32)> {
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-    unsafe extern "system" {
-        fn GetClientRect(hwnd: *mut std::ffi::c_void, rect: *mut Rect) -> i32;
-    }
+pub fn win32_client_size(window: &impl rwh::HasWindowHandle) -> Option<(u32, u32)> {
+    use windows_sys::Win32::{Foundation::RECT, UI::WindowsAndMessaging::GetClientRect};
 
-    let RwhRawWindowHandle::Win32(h) = handle else {
+    let rwh::RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else {
         return None;
     };
-    if h.hwnd.is_null() {
-        return None;
-    }
-    let mut rect = Rect {
+    let mut rect = RECT {
         left: 0,
         top: 0,
         right: 0,
@@ -497,7 +475,7 @@ pub fn win32_client_size(handle: RwhRawWindowHandle) -> Option<(u32, u32)> {
     // SAFETY: pure state query on a window handle baseview owns for
     // the editor's lifetime, called from the GUI thread that owns the
     // HWND.
-    if unsafe { GetClientRect(h.hwnd, &raw mut rect) } == 0 {
+    if unsafe { GetClientRect(h.hwnd.get() as _, &raw mut rect) } == 0 {
         return None;
     }
     // Client coordinates put left/top at 0; right/bottom are the size.
@@ -511,14 +489,11 @@ pub fn win32_client_size(handle: RwhRawWindowHandle) -> Option<(u32, u32)> {
 
 #[cfg(target_os = "windows")]
 fn current_module_hinstance() -> Option<std::num::NonZeroIsize> {
-    unsafe extern "system" {
-        fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
-    }
-    // SAFETY: `GetModuleHandleW(NULL)` is documented to return the running
-    // EXE's HMODULE without acquiring a refcount; no threading or aliasing
-    // concerns. Returns 0 only in pathological cases (kernel32 missing).
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: `GetModuleHandleW(NULL)` returns the running EXE's HMODULE
+    // without taking a reference.
     let hmodule = unsafe { GetModuleHandleW(std::ptr::null()) };
-    std::num::NonZeroIsize::new(hmodule)
+    std::num::NonZeroIsize::new(hmodule as isize)
 }
 
 /// wgpu backends to use for an editor that presents into a
@@ -561,76 +536,40 @@ pub fn editor_instance_descriptor() -> wgpu::InstanceDescriptor {
     desc
 }
 
-/// Bridge a baseview raw-window-handle 0.5 to a wgpu-compatible
-/// `SurfaceTargetUnsafe` using rwh 0.6 types.
+/// Create a wgpu surface for a baseview window.
 ///
-/// Both `moose-gui`'s blit pipeline (cpu mode) and
-/// `moose_gpu::WgpuBackend::from_window` (gpu mode, used by
-/// `GpuEditor`) need this bridge; the two crates can't share a
-/// canonical copy without forming a dep cycle, so each carries its
-/// own ~100 LOC version. The two are kept in sync by inspection.
+/// baseview and wgpu both speak raw-window-handle 0.6, so this is a
+/// straight hand-off, except on Windows, where the surface is created from
+/// the HWND (see `create_wgpu_surface_from_hwnd`, Windows-only).
 ///
 /// # Safety
-/// The window handle must be valid for the lifetime of the returned surface.
+/// The window must outlive the returned surface.
 #[cfg(not(target_os = "ios"))]
 #[must_use]
 pub unsafe fn create_wgpu_surface(
     instance: &wgpu::Instance,
-    window: &baseview::Window,
+    window: &(impl rwh::HasWindowHandle + rwh::HasDisplayHandle),
 ) -> Option<wgpu::Surface<'static>> {
+    let raw_window_handle = window.window_handle().ok()?.as_raw();
     #[cfg(target_os = "windows")]
     {
-        let RwhRawWindowHandle::Win32(handle) = window.raw_window_handle() else {
+        let rwh::RawWindowHandle::Win32(handle) = raw_window_handle else {
             return None;
         };
-        unsafe { create_wgpu_surface_from_hwnd(instance, handle.hwnd as isize) }
+        unsafe { create_wgpu_surface_from_hwnd(instance, handle.hwnd.get()) }
     }
     #[cfg(not(target_os = "windows"))]
     unsafe {
-        let rwh = window.raw_window_handle();
-        let surface_target = match rwh {
-            #[cfg(target_os = "macos")]
-            RwhRawWindowHandle::AppKit(handle) => {
-                let ns_view = handle.ns_view;
-                if ns_view.is_null() {
-                    return None;
-                }
-                let rwh6_window = wgpu::rwh::RawWindowHandle::AppKit(
-                    wgpu::rwh::AppKitWindowHandle::new(std::ptr::NonNull::new(ns_view)?),
-                );
-                let rwh6_display =
-                    wgpu::rwh::RawDisplayHandle::AppKit(wgpu::rwh::AppKitDisplayHandle::new());
-                wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(rwh6_display),
-                    raw_window_handle: rwh6_window,
-                }
-            }
-            #[cfg(target_os = "linux")]
-            RwhRawWindowHandle::Xlib(handle) => {
-                let RwhRawDisplayHandle::Xlib(display_handle) = window.raw_display_handle() else {
-                    return None;
-                };
-                let display_ptr = std::ptr::NonNull::new(display_handle.display);
-                let rwh6_window = wgpu::rwh::RawWindowHandle::Xlib(
-                    wgpu::rwh::XlibWindowHandle::new(handle.window),
-                );
-                let rwh6_display = wgpu::rwh::RawDisplayHandle::Xlib(
-                    wgpu::rwh::XlibDisplayHandle::new(display_ptr, display_handle.screen),
-                );
-                wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(rwh6_display),
-                    raw_window_handle: rwh6_window,
-                }
-            }
-            _ => return None,
+        let surface_target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(window.display_handle().ok()?.as_raw()),
+            raw_window_handle,
         };
-
         instance.create_surface_unsafe(surface_target).ok()
     }
 }
 
 /// Windows-only variant of [`create_wgpu_surface`] that takes the raw
-/// HWND value instead of a `&baseview::Window`. An `isize` is `Send`,
+/// HWND value instead of a window reference. An `isize` is `Send`,
 /// so callers can create the surface on a worker thread and keep the
 /// host's GUI thread free while the graphics driver initializes (a
 /// wedged driver can block device/surface creation indefinitely).
@@ -648,8 +587,6 @@ pub unsafe fn create_wgpu_surface_from_hwnd(
     let mut win32 = wgpu::rwh::Win32WindowHandle::new(std::num::NonZeroIsize::new(hwnd)?);
     // wgpu's Vulkan backend requires `hinstance` to be set
     // (`vkCreateWin32SurfaceKHR` rejects a null HINSTANCE).
-    // baseview leaves the rwh 0.5 `hinstance` field at null,
-    // so populate it here with the running module's HMODULE.
     win32.hinstance = current_module_hinstance();
     let surface_target = wgpu::SurfaceTargetUnsafe::RawHandle {
         raw_display_handle: Some(wgpu::rwh::RawDisplayHandle::Windows(
@@ -658,4 +595,65 @@ pub unsafe fn create_wgpu_surface_from_hwnd(
         raw_window_handle: wgpu::rwh::RawWindowHandle::Win32(win32),
     };
     unsafe { instance.create_surface_unsafe(surface_target).ok() }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)] // exact values in, exact values out
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_scale_policy() {
+        assert_eq!(host_scale_override(None), None);
+        assert_eq!(host_scale_override(Some(0.0)), None);
+        assert_eq!(host_scale_override(Some(f64::NAN)), None);
+        let expected = if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(1.5)
+        };
+        assert_eq!(host_scale_override(Some(1.5)), expected);
+    }
+
+    #[test]
+    fn host_scale_is_never_overwritten_by_os() {
+        let scale = EditorScale::new(1.0);
+        scale.set_from_os(2.0);
+        assert_eq!(scale.get(), 2.0);
+        assert_eq!(scale.host_override(), None);
+
+        scale.set_from_host(1.25);
+        assert_eq!(scale.get(), 1.25);
+        scale.set_from_os(2.0);
+        if cfg!(target_os = "macos") {
+            // macOS: the host only seeds the value; the backing scale wins.
+            assert_eq!(scale.host_override(), None);
+            assert_eq!(scale.get(), 2.0);
+        } else {
+            // One scale source, never host x OS.
+            assert_eq!(scale.host_override(), Some(1.25));
+            assert_eq!(scale.get(), 1.25);
+        }
+    }
+
+    #[test]
+    fn window_scale_only_while_open_off_macos() {
+        let scale = EditorScale::new(1.5);
+        assert_eq!(scale.window_scale(false), None);
+        let expected = if cfg!(target_os = "macos") {
+            None
+        } else {
+            Some(1.5)
+        };
+        assert_eq!(scale.window_scale(true), expected);
+    }
+
+    #[test]
+    fn bad_scales_are_dropped() {
+        let scale = EditorScale::new(-1.0);
+        assert_eq!(scale.get(), 1.0);
+        scale.set_from_host(f64::INFINITY);
+        assert_eq!(scale.host_override(), None);
+        assert_eq!(scale.get(), 1.0);
+    }
 }
