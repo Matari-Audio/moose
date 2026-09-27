@@ -895,7 +895,10 @@ mod tests {
         p.raw_smoothed_next_into(&mut out);
         assert_eq!(p.settled_value(), Some(0.8_f32));
         p.raw_smoothed_next_into(&mut out);
-        assert!(out.iter().all(|&sample| sample == 0.8_f32));
+        assert!(
+            out.iter()
+                .all(|&sample| sample.to_bits() == 0.8_f32.to_bits())
+        );
     }
 
     #[test]
