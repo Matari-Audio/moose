@@ -1,0 +1,277 @@
+name: CLI end-to-end
+
+# One job per OS: build cargo-moose once, then drive every user-facing
+# pipeline through it against real validators.
+#   1. doctor, then install -> validate -> uninstall moose-example-gain
+#      (macOS: --system scope + MH_BUNDLE check; Linux/Windows: --user)
+#   2. package moose-example-synth (clap,vst3,standalone) + preset checks
+#   3. for every scaffold shape: new -> fmt -> clippy pedantic -> install
+#      -> validate -> package -> uninstall (pure/stateful: Linux only, they
+#      only change the generated lib.rs)
+#   4. rt-paranoid allocation check on the scaffolded effect
+#
+# Everything, scaffolds included, shares one CARGO_TARGET_DIR (the
+# checkout's target/), so the moose-* crates and third-party deps compile
+# once per job and rust-cache keeps them warm across runs.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  PLUGINVAL_VERSION: v1.0.4
+  CLAP_VALIDATOR_REV: 2f71690639a742ce805574ce42e31250e3147aa9
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    name: cli e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            shapes: effect instrument workspace-mixed pure stateful
+          - os: macos-14
+            shapes: effect instrument workspace-mixed
+          - os: windows-latest
+            shapes: effect instrument workspace-mixed
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-e2e
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev mesa-vulkan-drivers \
+            libwayland-dev \
+            libasound2-dev libjack-jackd2-dev \
+            libfontconfig1-dev libfreetype-dev \
+            xvfb
+
+      # ISCC.exe lands where cargo-moose's `locate_iscc` looks first.
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      # pluginval: prebuilt release. clap-validator: pinned to a 2024 git
+      # rev. Its 0.4.x releases changed the CLI (no --test-filter) and
+      # added stricter process-audio checks, so it can't be swapped in
+      # here; build the pinned rev once and cache the binary by rev.
+      - name: Cache clap-validator
+        id: cache-cv
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/clap-validator
+          key: clap-validator-${{ runner.os }}-${{ env.CLAP_VALIDATOR_REV }}
+
+      - name: Build clap-validator (cache miss)
+        if: steps.cache-cv.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --git https://github.com/free-audio/clap-validator \
+            --rev "$CLAP_VALIDATOR_REV" --root "$RUNNER_TEMP/clap-validator" clap-validator
+
+      - name: Validators on PATH
+        run: |
+          set -euo pipefail
+          echo "$RUNNER_TEMP/clap-validator/bin" >> "$GITHUB_PATH"
+          bin="$RUNNER_TEMP/pluginval"; mkdir -p "$bin"
+          case "$RUNNER_OS" in
+            Linux)   zip=pluginval_Linux.zip ;;
+            macOS)   zip=pluginval_macOS.zip ;;
+            Windows) zip=pluginval_Windows.zip ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/pv.zip" \
+            "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/$zip"
+          if [ "$RUNNER_OS" = macOS ]; then
+            unzip -oq "$RUNNER_TEMP/pv.zip" -d /Applications/
+          else
+            unzip -oq "$RUNNER_TEMP/pv.zip" -d "$bin"
+            chmod +x "$bin"/pluginval*
+            echo "$bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build cargo-moose
+        run: |
+          cargo build -p cargo-moose
+          exe=""; [ "$RUNNER_OS" = Windows ] && exe=.exe
+          echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose$exe" >> "$GITHUB_ENV"
+          # Scaffolds build into the same target dir (see header).
+          echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
+
+      - name: Pre-flight - validators present
+        run: |
+          command -v clap-validator
+          if [ "$RUNNER_OS" = macOS ]; then
+            test -x /Applications/pluginval.app/Contents/MacOS/pluginval
+          else
+            command -v pluginval
+          fi
+
+      - name: cargo moose doctor
+        run: $CARGO_MOOSE doctor
+
+      # ── moose-example-gain: install -> validate -> uninstall ──────────
+      # macOS runners have passwordless sudo, so macOS exercises the
+      # /Library/Audio/Plug-Ins system scope; the scaffolds below cover
+      # --user there.
+      - name: install moose-example-gain
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = macOS ]; then
+            sudo "$CARGO_MOOSE" install --system --clap --vst3 -p moose-example-gain
+            # The sudo build left root-owned files in target/ and ~/.cargo;
+            # hand them back so the later (non-root) builds can write.
+            sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
+            for fmt in "CLAP/Moose Gain.clap" "VST3/Moose Gain.vst3"; do
+              otool -hv "/Library/Audio/Plug-Ins/$fmt/Contents/MacOS/Moose Gain" | tee /tmp/hdr.txt
+              grep -q "BUNDLE" /tmp/hdr.txt || { echo "::error::$fmt expected MH_BUNDLE"; exit 1; }
+            done
+            $CARGO_MOOSE status
+          else
+            $CARGO_MOOSE install --user --clap --vst3 -p moose-example-gain
+          fi
+          case "$RUNNER_OS" in
+            Linux)   ls -la "$HOME/.clap/" "$HOME/.vst3/" ;;
+            Windows) ls -la "$LOCALAPPDATA/Programs/Common/CLAP/" "$LOCALAPPDATA/Programs/Common/VST3/" ;;
+          esac
+
+      - name: validate moose-example-gain
+        run: |
+          set -e -o pipefail
+          run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
+          $run "$CARGO_MOOSE" validate --clap --pluginval -p moose-example-gain 2>&1 | tee validate.log
+          if grep -E "SKIP|not found" validate.log >/dev/null; then
+            echo "::error::validate skipped a step - failing"; exit 1
+          fi
+
+      - name: uninstall moose-example-gain
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = macOS ]; then
+            sudo "$CARGO_MOOSE" uninstall --system --yes -p moose-example-gain
+            sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
+            root=/Library/Audio/Plug-Ins; clap=CLAP; vst3=VST3
+          elif [ "$RUNNER_OS" = Linux ]; then
+            "$CARGO_MOOSE" uninstall --user --yes -p moose-example-gain
+            root=$HOME; clap=.clap; vst3=.vst3
+          else
+            "$CARGO_MOOSE" uninstall --user --yes -p moose-example-gain
+            root=$LOCALAPPDATA/Programs/Common; clap=CLAP; vst3=VST3
+          fi
+          for p in "$clap/Moose Gain.clap" "$vst3/Moose Gain.vst3"; do
+            [ ! -e "$root/$p" ] || { echo "::error::uninstall left $p behind"; exit 1; }
+          done
+
+      # ── moose-example-synth: package + factory-preset checks ─────────
+      # macOS: productbuild .pkg (ad-hoc signed, --no-notarize: no Apple
+      # creds in CI). Linux: tarball + install.sh. Windows: unsigned Inno
+      # Setup .exe. verify-package-presets.sh asserts the presets ship and,
+      # on Linux/Windows, that the VST3 merge never wipes a user preset.
+      - name: package moose-example-synth
+        run: |
+          set -e
+          extra=""; [ "$RUNNER_OS" = macOS ] && extra=--no-notarize
+          $CARGO_MOOSE package --formats clap,vst3,standalone $extra -p moose-example-synth
+          ls -la target/dist/
+          case "$RUNNER_OS" in
+            macOS)   ls target/dist/moose-example-synth-*-macos.pkg ;;
+            Linux)   ls target/dist/moose-example-synth-*-linux-*.tar.gz ;;
+            Windows) ls target/dist/moose-example-synth-*-windows.exe ;;
+          esac
+          bash scripts/ci/verify-package-presets.sh "$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+
+      - name: upload synth package
+        uses: actions/upload-artifact@v4
+        with:
+          name: moose-example-synth-${{ runner.os }}
+          path: |
+            target/dist/moose-example-synth-*.pkg
+            target/dist/moose-example-synth-*.tar.gz
+            target/dist/moose-example-synth-*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      # ── scaffold shapes ───────────────────────────────────────────────
+      # Catches templates that build but trip a downstream packager
+      # (workspace bundle-id derivation, instrument vs effect routing), and
+      # holds generated code to the workspace bar (fmt + pedantic clippy).
+      # Deps are rewritten to this checkout by rewrite-scaffold-deps.py.
+      - name: scaffold round-trips (${{ matrix.shapes }})
+        run: |
+          set -euo pipefail
+          run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
+          nz=""; [ "$RUNNER_OS" = macOS ] && nz=--no-notarize
+          mkdir -p "$RUNNER_TEMP/scaffold"
+          for shape in ${{ matrix.shapes }}; do
+            case $shape in
+              effect)          set -- acme-fx ;;
+              instrument)      set -- acme-synth --instrument ;;
+              workspace-mixed) set -- acme --workspace fx synth midi --type:synth=instrument --type:midi=midi ;;
+              pure)            set -- acme-pure --pure ;;
+              stateful)        set -- acme-stateful --stateful ;;
+            esac
+            dir=$1
+            echo "::group::$shape: new + fmt + clippy"
+            (cd "$RUNNER_TEMP/scaffold" && "$CARGO_MOOSE" new "$@" --vendor Acme --vendor-id com.acme.test)
+            SCAFFOLD_DIR="$RUNNER_TEMP/scaffold/$dir" python3 scripts/ci/rewrite-scaffold-deps.py
+            cd "$RUNNER_TEMP/scaffold/$dir"
+            cargo fmt --check
+            cargo clippy --all-targets -- -D warnings -W clippy::pedantic
+            echo "::endgroup::"
+            echo "::group::$shape: install + validate + package + uninstall"
+            "$CARGO_MOOSE" install --user --clap --vst3
+            $run "$CARGO_MOOSE" validate --clap --pluginval 2>&1 | tee validate.log
+            if grep -E "SKIP|not found" validate.log >/dev/null; then
+              echo "::error::$shape: validate skipped a step"; exit 1
+            fi
+            "$CARGO_MOOSE" package --formats clap,vst3 $nz
+            "$CARGO_MOOSE" uninstall --user --yes
+            echo "::endgroup::"
+            cd "$GITHUB_WORKSPACE"
+          done
+
+      # A freshly scaffolded plugin must be allocation-free on the audio
+      # thread, and its shipped rt-paranoid wiring must work. The scaffold
+      # ships no tests by design; add a test dep + the alloc check.
+      - name: rt-paranoid on the scaffolded effect
+        working-directory: ${{ runner.temp }}/scaffold/acme-fx
+        run: |
+          set -e
+          # Forward slashes keep the TOML path valid on Windows.
+          ws="${GITHUB_WORKSPACE//\\//}"
+          printf '\n[dev-dependencies]\nmoose-test = { path = "%s/crates/moose-test" }\n' "$ws" >> Cargo.toml
+          cat "$ws/scripts/ci/rt-paranoid-scaffold-test.rs" >> src/lib.rs
+          cargo test --features rt-paranoid --lib

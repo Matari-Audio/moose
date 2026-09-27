@@ -24,6 +24,8 @@ jobs:
   build:
     name: cargo doc
     runs-on: ubuntu-24.04
+    outputs:
+      pages: ${{ steps.pages.outputs.enabled }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +39,7 @@ jobs:
         with:
           key: docs-ubuntu-24.04
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Linux system deps
         run: |
@@ -53,22 +56,38 @@ jobs:
       - name: cargo doc
         run: cargo doc --workspace --no-deps
 
-      - name: redirect index.html → moose
+      # Publishing needs GitHub Pages enabled with "GitHub Actions" as the
+      # source (Settings -> Pages). Until it is, configure-pages 404s and
+      # failed the whole job even though `cargo doc` passed; skip the
+      # publish steps instead, so this job gates on rustdoc alone.
+      - name: Pages enabled?
+        id: pages
         if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/pages" --silent 2>/dev/null; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::GitHub Pages is not enabled for this repo; skipping the docs deploy."
+          fi
+
+      - name: redirect index.html → moose
+        if: steps.pages.outputs.enabled == 'true'
         run: echo '<meta http-equiv="refresh" content="0; url=moose/">' > target/doc/index.html
 
       - uses: actions/configure-pages@v5
-        if: github.event_name != 'pull_request'
+        if: steps.pages.outputs.enabled == 'true'
 
       - uses: actions/upload-pages-artifact@v3
-        if: github.event_name != 'pull_request'
+        if: steps.pages.outputs.enabled == 'true'
         with:
           path: target/doc
 
   deploy:
     name: deploy to Pages
     needs: build
-    if: github.event_name != 'pull_request'
+    if: needs.build.outputs.pages == 'true'
     runs-on: ubuntu-24.04
     environment:
       name: github-pages

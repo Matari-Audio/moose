@@ -24,13 +24,9 @@ on:
         type: string
         default: "linux,macos,windows"
         required: false
-  # Run on every PR so reviewers can grab the just-rendered PNGs as
-  # an artifact — useful for intentional GUI changes (preview the
-  # new look) and for regen after a failing screenshot test (the
-  # dev downloads the artifact, replaces the references, commits).
-  # The artifact is produced regardless of test pass/fail; gating
-  # still happens via `cargo test` in the per-platform CI workflows.
-  pull_request:
+  # Manual only: it gates nothing (screenshot tests in ci.yml do), and
+  # three full release builds per PR were pure cost. Dispatch it on a
+  # branch to grab freshly rendered PNGs for a GUI change or a re-bake.
 
 permissions:
   contents: read
@@ -75,9 +71,7 @@ env:
 
 jobs:
   linux:
-    # On `pull_request` (and any other non-dispatch trigger) `inputs`
-    # is null, so the platform filter only applies to manual runs.
-    if: github.event_name != 'workflow_dispatch' || contains(inputs.platforms, 'linux')
+    if: contains(inputs.platforms, 'linux')
     name: bake (ubuntu-24.04)
     runs-on: ubuntu-24.04
     steps:
@@ -130,7 +124,7 @@ jobs:
           retention-days: 30
 
   macos:
-    if: github.event_name != 'workflow_dispatch' || contains(inputs.platforms, 'macos')
+    if: contains(inputs.platforms, 'macos')
     name: bake (macos-14)
     runs-on: macos-14
     steps:
@@ -184,7 +178,7 @@ jobs:
           retention-days: 30
 
   windows:
-    if: github.event_name != 'workflow_dispatch' || contains(inputs.platforms, 'windows')
+    if: contains(inputs.platforms, 'windows')
     name: bake (windows-latest)
     runs-on: windows-latest
     steps:

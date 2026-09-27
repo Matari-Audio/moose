@@ -56,11 +56,13 @@ fn cargo_moose_bin() -> PathBuf {
 
 /// Shared cargo target dir across every e2e test in this run. First
 /// test compiles moose-* from source (~30s cold); subsequent tests
-/// reuse the artifacts (~1–5s each).
+/// reuse the artifacts (~1–5s each). Lives under the workspace
+/// `target/tmp/` (`CARGO_TARGET_TMPDIR`) rather than the OS temp dir so
+/// CI's target-dir cache keeps the scaffold deps warm between runs.
 fn shared_target() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let p = std::env::temp_dir().join("moose-scaffold-e2e-target");
+        let p = Path::new(env!("CARGO_TARGET_TMPDIR")).join("moose-scaffold-e2e-target");
         std::fs::create_dir_all(&p).unwrap();
         p
     })
@@ -84,6 +86,16 @@ fn fresh_tempdir(label: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+/// Per-test home for the staged-bundles snapshot. Must sit on the same
+/// volume as `shared_target()` so `moose_subcommand`'s `rename` stays
+/// atomic (the OS temp dir can be another drive, e.g. C: vs D: on
+/// Windows CI).
+fn snapshot_dir(run_dir: &Path) -> PathBuf {
+    shared_target()
+        .join("bundle-snapshots")
+        .join(run_dir.file_name().expect("fresh_tempdir has a name"))
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +124,7 @@ impl Scaffold {
     fn new(label: &str, name: &str) -> Self {
         let run_dir = fresh_tempdir(label);
         let generated = run_dir.join(name);
-        let bundles_snapshot = run_dir.join("bundles-out");
+        let bundles_snapshot = snapshot_dir(&run_dir);
         Self {
             label: label.into(),
             run_dir,
@@ -127,7 +139,7 @@ impl Scaffold {
     fn new_workspace(label: &str, ws: &str, plugins: &[&str]) -> Self {
         let run_dir = fresh_tempdir(label);
         let generated = run_dir.join(ws);
-        let bundles_snapshot = run_dir.join("bundles-out");
+        let bundles_snapshot = snapshot_dir(&run_dir);
         let mut args = vec!["new".into(), ws.into(), "--workspace".into()];
         args.extend(plugins.iter().map(std::string::ToString::to_string));
         Self {
@@ -378,10 +390,13 @@ impl Scaffold {
         // `<shared-target>/bundles` from racing this test's
         // assertions: by the time the lock is released, our copy
         // lives at `self.bundles_snapshot` and no other test touches
-        // it. Rename is atomic on the same volume (temp dir).
+        // it. Rename is atomic on the same volume (see `snapshot_dir`).
         let _ = std::fs::remove_dir_all(&self.bundles_snapshot);
         let staged = shared_target().join("bundles");
         if staged.is_dir() {
+            if let Some(parent) = self.bundles_snapshot.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             std::fs::rename(&staged, &self.bundles_snapshot).map_err(|e| {
                 format!(
                     "[{}] snapshot bundles {} -> {}: {e}",

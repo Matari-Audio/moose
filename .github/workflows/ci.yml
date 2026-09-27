@@ -1,0 +1,139 @@
+name: CI
+
+# Core workspace gate: fmt (Linux), clippy, every test (unit, integration,
+# doc, screenshot, scaffold_e2e) and the SIMD perf guard, on all three OSes.
+# Install / validate / package round-trips live in cli-e2e.yml.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Trim debug info: keeps target/ under the runners' disk ceiling and
+  # cuts link time (the MSVC linker + PDBs dominated the Windows job).
+  # line-tables-only still gives file:line in panic backtraces. CI-only.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image ships several Xcodes + simulator runtimes (~40 GB) this job
+      # never touches, and the debug target can peak past the free space.
+      - name: Free runner disk
+        if: runner.os == 'macOS'
+        run: |
+          sudo xcrun simctl runtime delete all 2>/dev/null || true
+          keep="$(xcode-select -p)"; keep="${keep%/Contents/Developer}"
+          for x in /Applications/Xcode*.app; do
+            [ "$(readlink -f "$x")" = "$(readlink -f "$keep")" ] || sudo rm -rf "$x" &
+          done
+          wait
+          df -h /
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      # `cache-bin: false` keeps the rustup proxies out of the cache (a
+      # restored stale `rustup-init` once shadowed `cargo`). Only main saves:
+      # PRs restore main's entry, so per-PR copies don't evict it from the
+      # 10 GB repo cache. ci-rt-paranoid.yml and the gui-window job below
+      # restore this same entry via `shared-key`.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: core-${{ matrix.os }}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev mesa-vulkan-drivers \
+            libwayland-dev \
+            libasound2-dev libjack-jackd2-dev \
+            libfontconfig1-dev libfreetype-dev \
+            alsa-utils
+          sudo tee /etc/asound.conf >/dev/null <<'EOF'
+          pcm.!default { type null }
+          ctl.!default { type null }
+          EOF
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # One test build instead of `build --all-targets` + `test` (which
+      # compiled the workspace twice). `--all-targets` links every lib,
+      # bin, example, test and bench (benches run once in test mode);
+      # doctests need their own pass since `--all-targets` skips them.
+      #
+      # Screenshot tests run here too. They used to be split cpu/gpu
+      # because moose-example-eq opted into `moose-gui/gpu`, which would
+      # have unified the GpuEditor onto every cpu example. Nothing enables
+      # `gpu` any more (eq is `features = ["cpu"]`), so one invocation
+      # builds the same cpu-only graph the baselines were baked with. If a
+      # crate opts into `moose-gui/gpu` again, test it with its own `-p`
+      # invocation and `--exclude` it here.
+      - name: test
+        run: cargo test --workspace --all-targets
+      - name: doctests
+        run: cargo test --workspace --doc
+
+      # Ratio guard: gain_simd_fast must run >= 5x faster than the naive
+      # gain shape on the same runner (~22x locally).
+      - name: perf regression (gain vs gain-simd)
+        run: cargo test --release -p moose-simd --test gain_perf_regression -- --ignored --nocapture
+
+      - name: upload failing screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-screenshots-${{ runner.os }}
+          path: target/screenshots/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  gui-window:
+    # Newest macOS on purpose: the baseview hitTest: crash was an AppKit
+    # isa-swizzling regression that only surfaced on a new OS.
+    name: gui hitTest (windowed, newest macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui-window
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: windowed hitTest smoke
+        run: ./scripts/gui-window-test.sh

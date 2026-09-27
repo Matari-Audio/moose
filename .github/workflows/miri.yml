@@ -6,7 +6,9 @@ name: Miri
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**']
   # The toolchain's borrow-model evolves independently of the code;
   # a weekly run surfaces new Miri findings against an idle repo.
   schedule:
@@ -39,6 +41,7 @@ jobs:
         with:
           key: miri
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Default borrow model (Stacked Borrows) - the suite is green
       # under it; a switch to tree borrows should be a deliberate,

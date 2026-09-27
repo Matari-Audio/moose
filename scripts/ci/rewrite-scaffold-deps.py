@@ -21,7 +21,7 @@ Handles both scaffold dep forms:
                             ↓
       moose-* = { path = "<crates>/<name>"[, ...] }
 
-Used by `.github/workflows/cli-scaffold.yml` (scaffold + build with
+Used by `.github/workflows/cli-e2e.yml` (scaffold + build with
 current cargo-moose — exercises the registry path) and
 `.github/workflows/cli-backcompat.yml` (scaffold with the
 LAST released cargo-moose, then build against moose HEAD —

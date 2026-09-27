@@ -3,31 +3,36 @@ name: rt-paranoid (audio-thread allocation check)
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**']
 
 permissions:
   contents: read
 
+# Must match ci.yml's env exactly: rust-cache hashes CARGO_* vars into
+# the key, and this job restores ci.yml's `core-<os>` entry.
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Builds the DSP-distinct example plugins with the `rt-paranoid` feature
 # and runs their `assert_no_audio_alloc` tests, so any allocation the audio
-# thread makes inside `process` fails the build. Also proves a freshly
-# `cargo moose new`-scaffolded plugin is allocation-free and that its
-# scaffolded rt-paranoid wiring works.
+# thread makes inside `process` fails the build. The scaffolded-plugin
+# variant of this check runs in cli-e2e.yml.
 #
 # Runs on all three OSes: an audio-thread allocation can be platform-
 # specific (a std primitive that boxes lazily on one OS but not another),
 # so the check only catches it where it happens.
 jobs:
   examples:
-    name: examples (${{ matrix.os }})
+    name: rt-paranoid (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -38,9 +43,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Restore-only: reuses ci.yml's third-party deps, never saves its own
+      # copy (keeps the 10 GB repo cache from thrashing).
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ci-rt-paranoid-examples-${{ matrix.os }}
+          shared-key: core-${{ matrix.os }}
+          cache-bin: false
+          save-if: false
 
       - name: Linux system deps
         if: runner.os == 'Linux'
@@ -57,79 +66,3 @@ jobs:
       - name: rt-paranoid check on example plugins
         shell: bash
         run: ./scripts/ci/rt-paranoid.sh
-
-  scaffold:
-    name: scaffolded plugin (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, ubuntu-24.04, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ci-rt-paranoid-scaffold-${{ matrix.os }}
-
-      - name: Linux system deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
-            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev \
-            libgl1-mesa-dev libvulkan-dev mesa-vulkan-drivers \
-            libasound2-dev libjack-jackd2-dev \
-            libfontconfig1-dev libfreetype-dev
-
-      - name: Build cargo-moose (its template wires in rt-paranoid)
-        run: cargo build -p cargo-moose
-
-      # Windows needs the `.exe` suffix; store the resolved path so every
-      # later bash step uses the same string.
-      - name: Resolve cargo-moose path
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose.exe" >> "$GITHUB_ENV"
-          else
-            echo "CARGO_MOOSE=$GITHUB_WORKSPACE/target/debug/cargo-moose" >> "$GITHUB_ENV"
-          fi
-
-      - name: Scaffold a plugin
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "$RUNNER_TEMP/scaffold"
-          cd "$RUNNER_TEMP/scaffold"
-          "$CARGO_MOOSE" new probe-fx --vendor Probe --vendor-id com.probe.test
-
-      # Point the scaffolded git/registry moose deps at this checkout.
-      # Shared with cli-scaffold.yml / cli-backcompat.yml; runs in the
-      # default shell so `python3` + pathlib handle Windows paths.
-      - name: Rewrite git deps to local paths
-        env:
-          SCAFFOLD_DIR: ${{ runner.temp }}/scaffold/probe-fx
-        run: python3 scripts/ci/rewrite-scaffold-deps.py
-
-      - name: Add a test dependency and the alloc check, then run it
-        shell: bash
-        working-directory: ${{ runner.temp }}/scaffold/probe-fx
-        run: |
-          set -e
-          # Forward-slash the workspace path so the value is a valid Cargo
-          # path on Windows too (backslashes would break the TOML string).
-          ws="${GITHUB_WORKSPACE//\\//}"
-          # The scaffold ships neither tests nor a test dependency by
-          # design; add both to exercise the rt-paranoid wiring it ships.
-          {
-            echo ""
-            echo "[dev-dependencies]"
-            echo "moose-test = { path = \"$ws/crates/moose-test\" }"
-          } >> Cargo.toml
-          cat "$ws/scripts/ci/rt-paranoid-scaffold-test.rs" >> src/lib.rs
-          cargo test --features rt-paranoid --lib
