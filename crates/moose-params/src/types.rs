@@ -51,6 +51,29 @@ macro_rules! shared_param_meta {
     };
 }
 
+/// Process-wide signal that at least one stored parameter value changed.
+static EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Equal reads mean no parameter setter (or explicit custom-state edit) ran.
+/// The counter is shared by all plugin instances in this process.
+#[inline]
+pub fn edit_epoch() -> u64 {
+    EDIT_EPOCH.load(Ordering::Acquire)
+}
+
+/// Mark an edit made outside the parameter setters, such as custom state.
+#[inline]
+pub fn bump_edit_epoch() {
+    EDIT_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+#[inline]
+fn note_edit(changed: bool) {
+    if changed {
+        bump_edit_epoch();
+    }
+}
+
 /// Atomic f64 - wraps `AtomicU64` with f64 load/store.
 pub struct AtomicF64 {
     bits: AtomicU64,
@@ -186,7 +209,7 @@ impl FloatParam {
         } else {
             clamped
         };
-        self.value.store(value);
+        note_edit(self.value.bits.swap(value.to_bits(), Ordering::Relaxed) != value.to_bits());
     }
 
     /// Internal: raw target value at `f64` precision (host-side
@@ -221,6 +244,19 @@ impl FloatParam {
             Some(smoother) => smoother.current(),
             None => f32::from_f64(self.value.load()),
         }
+    }
+
+    /// Constant smoothed output once the smoother has landed on its target.
+    /// Returns `None` while a ramp still needs to advance.
+    #[inline]
+    #[must_use]
+    pub fn settled_value(&self) -> Option<f32> {
+        let target = self.value.load();
+        let settled = self
+            .smoother
+            .as_ref()
+            .is_none_or(|smoother| smoother.settled_at(target));
+        (settled && target.is_finite()).then(|| f32::from_f64(target))
     }
 
     /// Internal: advance the smoother by `out.len()` samples,
@@ -497,7 +533,7 @@ impl BoolParam {
     }
 
     pub fn set_value(&self, v: bool) {
-        self.value.store(v, Ordering::Relaxed);
+        note_edit(self.value.swap(v, Ordering::Relaxed) != v);
     }
 }
 
@@ -614,8 +650,8 @@ impl IntParam {
     #[allow(clippy::cast_possible_truncation)]
     pub fn set_value(&self, v: i64) {
         let (lo, hi) = (self.info.range.min() as i64, self.info.range.max() as i64);
-        self.value
-            .store(v.clamp(lo.min(hi), lo.max(hi)), Ordering::Relaxed);
+        let v = v.clamp(lo.min(hi), lo.max(hi));
+        note_edit(self.value.swap(v, Ordering::Relaxed) != v);
     }
 }
 
@@ -710,7 +746,7 @@ impl<E: ParamEnum> EnumParam<E> {
         // would mean a > 4-billion-variant enum.
         #[allow(clippy::cast_possible_truncation)]
         let idx = v.to_index() as u32;
-        self.value.store(idx, Ordering::Relaxed);
+        note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
     }
 
     pub fn set_index(&self, idx: u32) {
@@ -724,7 +760,8 @@ impl<E: ParamEnum> EnumParam<E> {
         // guards the underflow regardless.
         #[allow(clippy::cast_possible_truncation)]
         let max = (E::variant_count() as u32).saturating_sub(1);
-        self.value.store(idx.min(max), Ordering::Relaxed);
+        let idx = idx.min(max);
+        note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
     }
 
     pub fn index(&self) -> u32 {
@@ -831,6 +868,34 @@ mod tests {
         let mut out = [0.0_f32; 4];
         p.raw_smoothed_next_into(&mut out);
         assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn changed_value_advances_edit_epoch() {
+        let p = float(0.0, 1.0);
+        let before = edit_epoch();
+        p.set_value(0.5);
+        assert!(edit_epoch() > before);
+        let before = edit_epoch();
+        bump_edit_epoch();
+        assert!(edit_epoch() > before);
+    }
+
+    #[test]
+    fn settled_value_requires_a_finished_ramp() {
+        let p = FloatParam::new(
+            info("smoothed", ParamRange::Linear { min: 0.0, max: 1.0 }, 0.0),
+            SmoothingStyle::Exponential(1.0),
+        );
+        p.set_sample_rate(48_000.0);
+        assert_eq!(p.settled_value(), Some(0.0));
+        p.set_value(0.8);
+        assert_eq!(p.settled_value(), None);
+        let mut out = [0.0; 4096];
+        p.raw_smoothed_next_into(&mut out);
+        assert_eq!(p.settled_value(), Some(0.8_f32));
+        p.raw_smoothed_next_into(&mut out);
+        assert!(out.iter().all(|&sample| sample == 0.8_f32));
     }
 
     #[test]
