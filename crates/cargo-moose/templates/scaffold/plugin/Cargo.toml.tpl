@@ -36,6 +36,12 @@ rt-paranoid = ["moose/rt-paranoid"]
 
 [dependencies]
 moose = \{ {dep_args | unescaped} }
+# A MUI editor (`features = ["mui"]`): MUI takes moose-baseview from
+# `git = "https://github.com/Matari-Audio/moose"` with no tag. To link one
+# baseview, take every moose crate from that same unpinned git URL
+# (Cargo.lock pins the commit), or `[patch."https://github.com/Matari-Audio/moose"]
+# moose-baseview = \{ path = "<moose checkout>/crates/moose-baseview" }`.
+# A tag, branch or rev on moose here is a second copy.
 # Lightweight types for layout / theme / widget descriptions.
 moose-gui-types = \{ {dep_args | unescaped} }
 # Built-in renderer. Plugins that supply their own editor (egui)

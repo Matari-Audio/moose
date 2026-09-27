@@ -166,6 +166,11 @@ wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 # this via `baseview = { workspace = true }`.
 baseview = { package = "moose-baseview", path = "crates/moose-baseview", version = "0.3.4-moose.1" }
 
+# MUI's mui-baseview depends on moose-baseview by git; point that at the
+# path copy so the workspace links one baseview and the window types match.
+[patch."https://github.com/Matari-Audio/moose"]
+moose-baseview = { path = "crates/moose-baseview" }
+
 # Custom profile for shell-mode (hot-reload) builds. `cargo moose
 # install --shell` invokes `cargo build --profile shell --features
 # ...,shell`, so the shell binary lands at `target/shell/lib<crate>.dylib`
