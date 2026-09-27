@@ -3,7 +3,9 @@ name: scaffold backwards-compat
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**']
 
 permissions:
   contents: read
@@ -147,6 +149,7 @@ jobs:
         with:
           key: cli-backcompat-${{ matrix.shape.id }}
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Same Linux dep set the other CI workflows install. The
       # scaffolded plugin pulls moose-standalone (cpal → alsa-sys
@@ -201,7 +204,7 @@ jobs:
       # to `{ path = "<workspace>/crates/<name>" }` so the older
       # scaffold consumes THIS commit of moose instead of the
       # published tag it was generated against. Shared with
-      # `cli-scaffold.yml`.
+      # `cli-e2e.yml`.
       - name: Rewrite git deps to local moose HEAD
         env:
           SCAFFOLD_DIR: ${{ runner.temp }}/scaffold/${{ matrix.shape.project_dir }}
@@ -211,7 +214,7 @@ jobs:
       # workflow guards: catches removed / renamed public items the
       # scaffold template uses. Build / link is downstream and out of
       # scope for backwards-compat (the install + package CI in
-      # `cli-install.yml` already exercises those against current
+      # `cli-e2e.yml` already exercises those against current
       # templates).
       - name: cargo check against moose HEAD
         shell: bash

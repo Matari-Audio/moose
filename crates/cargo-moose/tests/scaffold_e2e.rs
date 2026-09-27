@@ -56,11 +56,13 @@ fn cargo_moose_bin() -> PathBuf {
 
 /// Shared cargo target dir across every e2e test in this run. First
 /// test compiles moose-* from source (~30s cold); subsequent tests
-/// reuse the artifacts (~1–5s each).
+/// reuse the artifacts (~1–5s each). Lives under the workspace
+/// `target/tmp/` (`CARGO_TARGET_TMPDIR`) rather than the OS temp dir so
+/// CI's target-dir cache keeps the scaffold deps warm between runs.
 fn shared_target() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let p = std::env::temp_dir().join("moose-scaffold-e2e-target");
+        let p = Path::new(env!("CARGO_TARGET_TMPDIR")).join("moose-scaffold-e2e-target");
         std::fs::create_dir_all(&p).unwrap();
         p
     })
