@@ -28,8 +28,8 @@ use std::marker::PhantomData;
 use std::mem::transmute;
 use std::path::Path;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::events::{
@@ -65,14 +65,16 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
     CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info, clap_plugin_params,
 };
-use clap_sys::ext::params::{CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, clap_host_params};
+use clap_sys::ext::params::{
+    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, clap_host_params,
+};
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
     clap_plugin_preset_load,
 };
 use clap_sys::ext::remote_controls::{
     CLAP_EXT_REMOTE_CONTROLS, CLAP_EXT_REMOTE_CONTROLS_COMPAT, CLAP_REMOTE_CONTROLS_COUNT,
-    clap_plugin_remote_controls, clap_remote_controls_page,
+    clap_host_remote_controls, clap_plugin_remote_controls, clap_remote_controls_page,
 };
 use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, clap_plugin_render, clap_plugin_render_mode,
@@ -233,6 +235,9 @@ struct ClapPluginData<P: PluginExport> {
     audio: PluginCell<ClapAudio<P>>,
     /// Cached parameter infos (built once at init).
     param_infos: Vec<ParamInfo>,
+    /// Visible CLAP indices; backing parameter IDs and storage stay fixed.
+    exposed_param_indices: Mutex<Vec<usize>>,
+    parameter_restart_pending: AtomicBool,
     /// Cached plugin info. Read by the chunker each block for
     /// `automation.min_subblock_samples` and otherwise unused; the
     /// rest of the wrapper consumes `PluginInfo` from the C ABI
@@ -685,6 +690,9 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
             let mut instance = enter_plugin(&data.plugin);
             instance.init();
             data.param_infos = instance.params().param_infos();
+            data.exposed_param_indices = Mutex::new(parameter_indices(&data.param_infos, |id| {
+                data.params_arc.parameter_presentation(id)
+            }));
         }
         // Query host params extension for request_flush support
         if !data.host.is_null()
@@ -839,6 +847,8 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
     run_extern_callback_with::<P, ()>("CLAP", "deactivate", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.active.store(false, Ordering::Relaxed);
+        data.parameter_restart_pending
+            .store(false, Ordering::Relaxed);
         // A `state_load` while active queues its blob for the audio thread
         // to drain at the top of the next block. If the host deactivates
         // before that block runs (sample-rate / buffer change, offline
@@ -851,6 +861,13 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
             let mut instance = enter_plugin(&data.plugin);
             state::apply_state(&mut *instance, &deserialized);
             instance.republish_snapshot();
+        }
+        if refresh_parameter_list(data)
+            && !data.host_params.is_null()
+            && !data.host.is_null()
+            && let Some(rescan) = (*data.host_params).rescan
+        {
+            rescan(data.host, CLAP_PARAM_RESCAN_ALL);
         }
     });
 }
@@ -888,18 +905,22 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        // Runtime names / groups / hidden flags (`parameter_presentation`)
-        // are re-read by the host on RESCAN_INFO, which CLAP allows while
-        // active.
+        // Runtime presentation metadata is re-read on RESCAN_INFO. A change
+        // to the exposed list requests a restart and is published inactive.
         let revision = data.params_arc.parameter_presentation_revision();
         let info_changed = data.presentation_revision.swap(revision, Ordering::Relaxed) != revision;
+        let list_changed = info_changed && refresh_parameter_list(data);
         let values_changed = data.needs_rescan.swap(false, Ordering::Relaxed);
         if (values_changed || info_changed)
             && !data.host_params.is_null()
             && !data.host.is_null()
             && let Some(rescan) = (*data.host_params).rescan
         {
-            let mut flags = 0;
+            let mut flags = if list_changed {
+                CLAP_PARAM_RESCAN_ALL
+            } else {
+                0
+            };
             if values_changed {
                 flags |= CLAP_PARAM_RESCAN_VALUES;
             }
@@ -3396,10 +3417,71 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
 // Extension: params
 // ---------------------------------------------------------------------------
 
+fn parameter_indices(
+    infos: &[ParamInfo],
+    mut presentation: impl FnMut(u32) -> Option<moose_params::ParameterPresentation>,
+) -> Vec<usize> {
+    infos
+        .iter()
+        .enumerate()
+        .filter_map(|(index, info)| {
+            presentation(info.id)
+                .is_none_or(|p| p.available)
+                .then_some(index)
+        })
+        .collect()
+}
+
+// Main thread only. Active instances keep their published index list until
+// the host restarts them; the parameter IDs and backing storage never change.
+unsafe fn refresh_parameter_list<P: PluginExport>(data: &ClapPluginData<P>) -> bool {
+    let next = parameter_indices(&data.param_infos, |id| {
+        data.params_arc.parameter_presentation(id)
+    });
+    let mut indices = data
+        .exposed_param_indices
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *indices == next {
+        return false;
+    }
+    if data.active.load(Ordering::Relaxed) {
+        drop(indices);
+        if !data.parameter_restart_pending.swap(true, Ordering::Relaxed)
+            && !data.host.is_null()
+            && let Some(restart) = unsafe { (*data.host).request_restart }
+        {
+            unsafe { restart(data.host) };
+        }
+        return false;
+    }
+    *indices = next;
+    drop(indices);
+    data.parameter_restart_pending
+        .store(false, Ordering::Relaxed);
+    if !data.host.is_null()
+        && let Some(get_extension) = unsafe { (*data.host).get_extension }
+    {
+        let extension = unsafe { get_extension(data.host, CLAP_EXT_REMOTE_CONTROLS.as_ptr()) }
+            .cast::<clap_host_remote_controls>();
+        if !extension.is_null()
+            && let Some(changed) = unsafe { (*extension).changed }
+        {
+            unsafe { changed(data.host) };
+        }
+    }
+    true
+}
+
 unsafe extern "C" fn params_count<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        len_u32(data.param_infos.len())
+        len_u32(
+            data.exposed_param_indices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        )
     }
 }
 
@@ -3412,11 +3494,14 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
         let data = data_from_plugin::<P>(plugin);
         let infos = &data.param_infos;
 
-        if param_index as usize >= infos.len() {
-            return false;
-        }
-
-        let info = &infos[param_index as usize];
+        let index = data
+            .exposed_param_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(param_index as usize)
+            .copied();
+        let Some(index) = index else { return false };
+        let info = &infos[index];
         let out = &mut *out;
 
         out.id = info.id;
@@ -3512,6 +3597,7 @@ mod presentation_tests {
             name: "A".into(),
             group: String::new(),
             hidden: false,
+            available: true,
         };
         let hidden = ParameterPresentation {
             hidden: true,
@@ -3676,7 +3762,9 @@ fn split_group(group: &str) -> (&str, &str) {
 /// param) and these slots - so grouping a hidden param for tidiness must
 /// not silently burn one of the user's knobs on something they can't
 /// see or move.
-fn remote_control_pages(infos: &[ParamInfo]) -> Vec<(&str, Vec<u32>)> {
+fn remote_control_pages<'a>(
+    infos: impl IntoIterator<Item = &'a ParamInfo>,
+) -> Vec<(&'a str, Vec<u32>)> {
     let mut pages: Vec<(&str, Vec<u32>)> = Vec::new();
     for info in infos {
         if info.group.is_empty()
@@ -3719,7 +3807,11 @@ fn remote_controls_page_id(group: &str, chunk_index: usize) -> clap_id {
 unsafe extern "C" fn remote_controls_count<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        len_u32(remote_control_pages(&data.param_infos).len())
+        let indices = data
+            .exposed_param_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        len_u32(remote_control_pages(indices.iter().map(|&i| &data.param_infos[i])).len())
     }
 }
 
@@ -3730,7 +3822,11 @@ unsafe extern "C" fn remote_controls_get<P: PluginExport>(
 ) -> bool {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let pages = remote_control_pages(&data.param_infos);
+        let indices = data
+            .exposed_param_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pages = remote_control_pages(indices.iter().map(|&i| &data.param_infos[i]));
         let page_index = page_index as usize;
         if page_index >= pages.len() {
             return false;
@@ -5227,6 +5323,9 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let param_infos = instance.params().param_infos();
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
+        let exposed_param_indices = Mutex::new(parameter_indices(&param_infos, |id| {
+            params_arc.parameter_presentation(id)
+        }));
         let meter_store = instance.meter_store();
         let snapshot = instance.snapshot_slot();
         let task_spawner = instance.task_spawner();
@@ -5263,6 +5362,8 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             tail_cache,
             selected_config: AtomicU32::new(0),
             param_infos,
+            exposed_param_indices,
+            parameter_restart_pending: AtomicBool::new(false),
             info,
             plugin_id_hash,
             host,
@@ -5702,10 +5803,10 @@ mod note_address_tests {
 #[cfg(test)]
 mod remote_controls_tests {
     use super::{
-        ParamFlags, ParamInfo, ParamRange, remote_control_pages, remote_controls_page_id,
-        split_group,
+        ParamFlags, ParamInfo, ParamRange, parameter_indices, remote_control_pages,
+        remote_controls_page_id, split_group,
     };
-    use moose_params::{ParamUnit, ParamValueKind};
+    use moose_params::{ParamUnit, ParamValueKind, ParameterPresentation};
 
     fn info(id: u32, group: &'static str) -> ParamInfo {
         ParamInfo {
@@ -5727,6 +5828,22 @@ mod remote_controls_tests {
     fn ungrouped_params_produce_no_page() {
         let infos = vec![info(0, ""), info(1, "")];
         assert!(remote_control_pages(&infos).is_empty());
+    }
+
+    #[test]
+    fn unavailable_params_leave_stable_ids_out_of_clap_enumeration() {
+        let infos = [info(10, "EQ"), info(11, "EQ"), info(12, "EQ")];
+        let indices = parameter_indices(&infos, |id| {
+            (id == 11).then(|| ParameterPresentation {
+                available: false,
+                ..ParameterPresentation::default()
+            })
+        });
+        assert_eq!(indices, [0, 2]);
+        assert_eq!(
+            remote_control_pages(indices.iter().map(|&i| &infos[i])),
+            [("EQ", vec![10, 12])]
+        );
     }
 
     #[test]

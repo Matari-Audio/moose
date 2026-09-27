@@ -148,15 +148,29 @@ pub fn format_param_value(info: &ParamInfo, value: f64) -> String {
     }
 }
 
-/// Host-facing label and visibility for a parameter whose identity
-/// (ID, range, count) stays fixed. Returned by
-/// [`Params::parameter_presentation`]; format wrappers rescan names /
-/// visibility when [`Params::parameter_presentation_revision`] changes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Host-facing label and visibility for a parameter whose ID, range and
+/// backing storage stay fixed. Dynamic-list formats may omit unavailable
+/// parameters. Returned by [`Params::parameter_presentation`]; format
+/// wrappers rescan when [`Params::parameter_presentation_revision`] changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParameterPresentation {
     pub name: String,
     pub group: String,
     pub hidden: bool,
+    /// Whether formats with a dynamic parameter list should enumerate it.
+    /// The parameter ID and storage remain fixed for other formats.
+    pub available: bool,
+}
+
+impl Default for ParameterPresentation {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            group: String::new(),
+            hidden: false,
+            available: true,
+        }
+    }
 }
 
 /// Trait implemented by #[derive(Params)] on a struct.
@@ -170,7 +184,7 @@ pub struct ParameterPresentation {
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
 pub trait Params: __private::Sealed + Send + Sync + 'static {
-    /// Runtime name / group / visibility override for `id`, read on the
+    /// Runtime name / group / visibility / availability for `id`, read on the
     /// host main thread. `None` keeps the static [`ParamInfo`] label.
     /// Derive: `#[params(presentation = "method")]`.
     fn parameter_presentation(&self, _id: u32) -> Option<ParameterPresentation> {
@@ -178,7 +192,7 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     }
 
     /// Bump whenever any [`Self::parameter_presentation`] result changes;
-    /// wrappers poll it and ask the host to rescan parameter info.
+    /// wrappers poll it and ask the host to rescan parameters.
     /// Derive: `#[params(presentation_revision = "method")]`.
     fn parameter_presentation_revision(&self) -> u64 {
         0
