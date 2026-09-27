@@ -221,27 +221,6 @@ jobs:
             [ ! -e "$root/$p" ] || { echo "::error::uninstall left $p behind"; exit 1; }
           done
 
-      # ── every example: AU v2 install + auval (macOS) ─────────────────
-      # auval only scans the system Components dir reliably, so install
-      # --system. Build as the runner user first so the sudo install
-      # (--no-build) leaves no root-owned build output. `validate --auval`
-      # fails the step on any auval failure.
-      - name: auval every example plugin
-        if: runner.os == 'macOS'
-        run: |
-          set -e -o pipefail
-          "$CARGO_MOOSE" build --au2
-          sudo "$CARGO_MOOSE" install --system --au2 --no-build
-          sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
-          "$CARGO_MOOSE" reset-au --yes
-          sleep 5
-          "$CARGO_MOOSE" validate --auval 2>&1 | tee auval.log
-          if grep -E "SKIP|not found" auval.log >/dev/null; then
-            echo "::error::auval skipped a plugin - failing"; exit 1
-          fi
-          echo "auval PASS count: $(grep -c ' PASS$' auval.log)"
-          sudo "$CARGO_MOOSE" uninstall --system --au2 --yes
-
       # ── moose-example-synth: package + factory-preset checks ─────────
       # macOS: productbuild .pkg (ad-hoc signed, --no-notarize: no Apple
       # creds in CI). Linux: tarball + install.sh. Windows: unsigned Inno
@@ -274,9 +253,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ── macOS AU: auval slot ─────────────────────────────────────────
-      # The AU restore (stage2/au) adds its auval job here, macOS only,
-      # after the example plugins and before the scaffold shapes.
+      # ── every example: AU v2 install + auval (macOS) ─────────────────
+      # auval only scans the system Components dir reliably, so install
+      # --system. Build as the runner user first so the sudo install
+      # (--no-build) leaves no root-owned build output. `validate --auval`
+      # fails the step on any auval failure.
+      - name: auval every example plugin
+        if: runner.os == 'macOS'
+        run: |
+          set -e -o pipefail
+          "$CARGO_MOOSE" build --au2
+          sudo "$CARGO_MOOSE" install --system --au2 --no-build
+          sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
+          "$CARGO_MOOSE" reset-au --yes
+          sleep 5
+          "$CARGO_MOOSE" validate --auval 2>&1 | tee auval.log
+          if grep -E "SKIP|not found" auval.log >/dev/null; then
+            echo "::error::auval skipped a plugin - failing"; exit 1
+          fi
+          echo "auval PASS count: $(grep -c ' PASS$' auval.log)"
+          sudo "$CARGO_MOOSE" uninstall --system --au2 --yes
 
       # ── scaffold shapes ───────────────────────────────────────────────
       # Catches templates that build but trip a downstream packager
