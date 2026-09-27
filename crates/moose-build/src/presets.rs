@@ -15,6 +15,7 @@
 //! tags = ["analog", "lead"]                      # optional
 //! default = false       # optional; at most one preset may set true
 //! extra = "aGVsbG8="    # optional; base64 of the plugin's save_state() bytes
+//! persist = "aGVsbG8="  # optional; base64 of the plugin's #[persist] bytes
 //!
 //! [params]
 //! # param-id = plain value (the same domain the param declares)
@@ -40,6 +41,8 @@ pub struct AuthoredPreset {
     pub params: Vec<(u32, f64)>,
     /// Decoded `extra` bytes (the plugin's `save_state()` payload).
     pub extra: Vec<u8>,
+    /// Decoded `#[persist]` bytes.
+    pub persist: Vec<u8>,
     /// Source file stem - the stable on-disk name per-format
     /// emitters reuse for their own files.
     pub stem: String,
@@ -55,7 +58,13 @@ impl AuthoredPreset {
     pub fn state_blob(&self, plugin_id_hash: u64) -> Vec<u8> {
         let ids: Vec<u32> = self.params.iter().map(|(id, _)| *id).collect();
         let values: Vec<f64> = self.params.iter().map(|(_, v)| *v).collect();
-        moose_utils::state::serialize_state(plugin_id_hash, &ids, &values, &self.extra, &[])
+        moose_utils::state::serialize_state(
+            plugin_id_hash,
+            &ids,
+            &values,
+            &self.extra,
+            &self.persist,
+        )
     }
 }
 
@@ -76,6 +85,8 @@ struct PresetFile {
     default: bool,
     #[serde(default)]
     extra: String,
+    #[serde(default)]
+    persist: String,
     #[serde(default)]
     params: BTreeMap<String, toml::Value>,
 }
@@ -251,16 +262,16 @@ fn read_preset_file(
         params.push((id, plain));
     }
 
-    let extra = if parsed.extra.is_empty() {
-        Vec::new()
-    } else {
+    let decode = |raw: &str, field: &str| -> Result<Vec<u8>, String> {
         // Authors paste base64 from other tools, often line-wrapped;
         // strip whitespace before the strict decode.
-        let compact: String = parsed.extra.split_whitespace().collect();
+        let compact: String = raw.split_whitespace().collect();
         base64::engine::general_purpose::STANDARD
             .decode(compact)
-            .map_err(|e| format!("{}: `extra` is not valid base64: {e}", path.display()))?
+            .map_err(|e| format!("{}: `{field}` is not valid base64: {e}", path.display()))
     };
+    let extra = decode(&parsed.extra, "extra")?;
+    let persist = decode(&parsed.persist, "persist")?;
 
     // Explicit category wins; otherwise the parent directory name
     // within the library root (a file at the root has no category).
@@ -294,6 +305,7 @@ fn read_preset_file(
         },
         params,
         extra,
+        persist,
         stem,
         path: path.to_path_buf(),
     })
@@ -496,6 +508,19 @@ pub fn render_preset_toml(
     extra: &[u8],
     annotations: &std::collections::BTreeMap<u32, ParamAnnotation>,
 ) -> String {
+    render_preset_toml_with_persist(meta, params, extra, &[], annotations)
+}
+
+/// Render a preset including its `#[persist]` state. The older
+/// [`render_preset_toml`] entry point remains for plugins without it.
+#[must_use]
+pub fn render_preset_toml_with_persist(
+    meta: &PresetMeta,
+    params: &[(u32, f64)],
+    extra: &[u8],
+    persist: &[u8],
+    annotations: &std::collections::BTreeMap<u32, ParamAnnotation>,
+) -> String {
     use base64::Engine as _;
     use std::fmt::Write as _;
 
@@ -527,6 +552,13 @@ pub fn render_preset_toml(
             out,
             "extra = \"{}\"",
             base64::engine::general_purpose::STANDARD.encode(extra)
+        );
+    }
+    if !persist.is_empty() {
+        let _ = writeln!(
+            out,
+            "persist = \"{}\"",
+            base64::engine::general_purpose::STANDARD.encode(persist)
         );
     }
 
@@ -583,6 +615,7 @@ author = "JK"
 tags = ["analog", "lead"]
 default = true
 extra = "aGk="
+persist = "cGF0Y2g="
 
 [params]
 0 = 0.75
@@ -599,6 +632,7 @@ extra = "aGk="
         assert_eq!(p.meta.category, "lead");
         assert_eq!(p.params, vec![(0, 0.75), (2, 1.0), (5, 1.0)]);
         assert_eq!(p.extra, b"hi");
+        assert_eq!(p.persist, b"patch");
         assert!(p.meta.default);
         assert_eq!(p.stem, "bright-saw");
 
@@ -606,6 +640,7 @@ extra = "aGk="
         let state = moose_utils::state::deserialize_state(&blob, 42).unwrap();
         assert_eq!(state.params, p.params);
         assert_eq!(state.extra.as_deref(), Some(&b"hi"[..]));
+        assert_eq!(state.persist, b"patch");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -627,6 +662,7 @@ extra = "aGk="
         let second = read_presets_dir(&dir, false, None).unwrap();
         assert_eq!(second[0].meta.uuid, stamped);
         assert_eq!(second[0].meta.name, "Init");
+        assert!(second[0].persist.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -679,7 +715,13 @@ extra = "aGk="
                 unit: "Hz".into(),
             },
         );
-        let toml = render_preset_toml(&meta, &[(0, 1.0), (1, 8200.0)], b"xs", &annotations);
+        let toml = render_preset_toml_with_persist(
+            &meta,
+            &[(0, 1.0), (1, 8200.0)],
+            b"xs",
+            b"patch",
+            &annotations,
+        );
         assert!(toml.contains("cutoff = 8200   # Cutoff (Hz)"));
         std::fs::create_dir_all(dir.join("lead")).unwrap();
         std::fs::write(dir.join("lead/pulled.preset"), &toml).unwrap();
@@ -694,6 +736,9 @@ extra = "aGk="
         params.sort_by_key(|(id, _)| *id);
         assert_eq!(params, vec![(0, 1.0), (1, 8200.0)]);
         assert_eq!(p.extra, b"xs");
+        assert_eq!(p.persist, b"patch");
+        let state = moose_utils::state::deserialize_state(&p.state_blob(42), 42).unwrap();
+        assert_eq!(state.persist, b"patch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -768,6 +813,17 @@ extra = "aGk="
             ..Default::default()
         };
         let toml = render_preset_toml(&meta, &[(1, 8200.0), (5, 0.5)], &[], &annotations);
+        assert_eq!(
+            toml,
+            render_preset_toml_with_persist(
+                &meta,
+                &[(1, 8200.0), (5, 0.5)],
+                &[],
+                &[],
+                &annotations
+            )
+        );
+        assert!(!toml.contains("persist ="));
         assert!(
             toml.contains("cutoff = 8200   # Filter Cutoff (Hz)"),
             "{toml}"

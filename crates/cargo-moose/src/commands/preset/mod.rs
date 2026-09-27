@@ -28,17 +28,18 @@ use crate::util::fs_ctx;
 use crate::{Config, PluginDef, Res, load_config, project_root};
 
 use moose_build::presets::{
-    AuthoredPreset, ParamAnnotation, ParamNameMap, read_presets_dir, render_preset_toml,
+    AuthoredPreset, ParamAnnotation, ParamNameMap, read_presets_dir,
+    render_preset_toml_with_persist,
 };
 use moose_utils::preset::PresetMeta;
 use moose_utils::presets::{PresetStore, mint_uuid};
 use moose_utils::state::{deserialize_state, hash_plugin_id, serialize_state};
 use moose_utils::{safe_filename, slugify};
 
-/// `(meta, params, extra)` for one decoded preset.
-type PresetParts = (PresetMeta, Vec<(u32, f64)>, Vec<u8>);
-/// `(params, extra)` straight out of a state envelope.
-type StateParts = (Vec<(u32, f64)>, Vec<u8>);
+/// `(meta, params, extra, persist)` for one decoded preset.
+type PresetParts = (PresetMeta, Vec<(u32, f64)>, Vec<u8>, Vec<u8>);
+/// `(params, extra, persist)` straight out of a state envelope.
+type StateParts = (Vec<(u32, f64)>, Vec<u8>, Vec<u8>);
 
 pub(crate) fn cmd_preset(args: &[String]) -> Res {
     let Some(sub) = args.first().map(String::as_str) else {
@@ -293,8 +294,8 @@ fn cmd_convert(args: &[String]) -> Res {
 
     let input = Path::new(input);
     let output = PathBuf::from(output);
-    let (meta, params, extra) = read_native(&ctx, input)?;
-    let bytes = encode_native(&ctx, &output, &meta, &params, &extra)?;
+    let (meta, params, extra, persist) = read_native(&ctx, input)?;
+    let bytes = encode_native(&ctx, &output, &meta, &params, &extra, &persist)?;
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs_ctx::create_dir_all(parent)?;
     }
@@ -303,7 +304,7 @@ fn cmd_convert(args: &[String]) -> Res {
     Ok(())
 }
 
-/// Decode any supported input into `(meta, params, extra)`, with the
+/// Decode any supported input into `(meta, params, extra, persist)`, with the
 /// envelope validated against the plugin's identity hash.
 fn read_native(ctx: &PluginCtx<'_>, path: &Path) -> Result<PresetParts, crate::CargoMooseError> {
     let format = ctx
@@ -313,13 +314,18 @@ fn read_native(ctx: &PluginCtx<'_>, path: &Path) -> Result<PresetParts, crate::C
     if format == PresetFormat::AuthoredToml {
         let names = ParamNameMap::from_annotations(&ctx.annotations());
         let authored = moose_build::presets::read_single_preset(path, Some(&names))?;
-        return Ok((authored.meta, authored.params, authored.extra));
+        return Ok((
+            authored.meta,
+            authored.params,
+            authored.extra,
+            authored.persist,
+        ));
     }
 
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let decoded = decode(format, &bytes)
         .ok_or_else(|| format!("{}: not a recognisable preset container", path.display()))?;
-    let (params, extra) = blob_to_parts(ctx, &decoded.blob, path)?;
+    let (params, extra, persist) = blob_to_parts(ctx, &decoded.blob, path)?;
     let mut meta = decoded.meta.unwrap_or_default();
     if meta.name.is_empty() {
         meta.name = if decoded.name.is_empty() {
@@ -330,7 +336,7 @@ fn read_native(ctx: &PluginCtx<'_>, path: &Path) -> Result<PresetParts, crate::C
             decoded.name
         };
     }
-    Ok((meta, params, extra))
+    Ok((meta, params, extra, persist))
 }
 
 fn blob_to_parts(
@@ -345,10 +351,10 @@ fn blob_to_parts(
             ctx.p.name
         )
     })?;
-    Ok((state.params, state.extra.unwrap_or_default()))
+    Ok((state.params, state.extra.unwrap_or_default(), state.persist))
 }
 
-/// Encode `(meta, params, extra)` into the format `output`'s
+/// Encode `(meta, params, extra, persist)` into the format `output`'s
 /// extension selects.
 fn encode_native(
     ctx: &PluginCtx<'_>,
@@ -356,13 +362,14 @@ fn encode_native(
     meta: &PresetMeta,
     params: &[(u32, f64)],
     extra: &[u8],
+    persist: &[u8],
 ) -> Result<Vec<u8>, crate::CargoMooseError> {
     let format = ctx
         .format(output)
         .ok_or_else(|| format!("unsupported preset extension: {}", output.display()))?;
     let ids: Vec<u32> = params.iter().map(|(id, _)| *id).collect();
     let values: Vec<f64> = params.iter().map(|(_, v)| *v).collect();
-    let blob = serialize_state(ctx.plugin_id_hash, &ids, &values, extra, &[]);
+    let blob = serialize_state(ctx.plugin_id_hash, &ids, &values, extra, persist);
     let mut meta = meta.clone();
     if meta.uuid.is_empty() {
         meta.uuid = mint_uuid();
@@ -378,7 +385,8 @@ fn encode_native(
             aupreset_xml(au_type, subtype, manufacturer, &meta.name, &blob).into_bytes()
         }
         PresetFormat::AuthoredToml => {
-            render_preset_toml(&meta, params, extra, &ctx.annotations()).into_bytes()
+            render_preset_toml_with_persist(&meta, params, extra, persist, &ctx.annotations())
+                .into_bytes()
         }
     })
 }
@@ -405,14 +413,15 @@ fn same_library_slot(meta: &PresetMeta, name: &str, category: &str) -> bool {
 
 /// Land one decoded preset in the authored library. A library preset
 /// with the same display name is regenerated in place (uuid and
-/// metadata preserved, params / extra replaced) unless `always_new`;
-/// an exact params + extra match is a no-op.
+/// metadata preserved, state replaced) unless `always_new`;
+/// an exact state match is a no-op.
 fn import_into_library(
     ctx: &PluginCtx<'_>,
     name: &str,
     src_meta: Option<&PresetMeta>,
     params: &[(u32, f64)],
     extra: &[u8],
+    persist: &[u8],
     category: &str,
     always_new: bool,
 ) -> Result<ImportOutcome, crate::CargoMooseError> {
@@ -429,12 +438,18 @@ fn import_into_library(
             }
             let mut have: Vec<(u32, f64)> = existing.params.clone();
             have.sort_by_key(|(id, _)| *id);
-            if have == sorted && existing.extra == extra {
+            if have == sorted && existing.extra == extra && existing.persist == persist {
                 return Ok(ImportOutcome::Unchanged);
             }
             // Same display name, new values: the in-DAW edit loop.
             // Regenerating drops hand comments; uuid + metadata stay.
-            let toml = render_preset_toml(&existing.meta, &sorted, extra, &ctx.annotations());
+            let toml = render_preset_toml_with_persist(
+                &existing.meta,
+                &sorted,
+                extra,
+                persist,
+                &ctx.annotations(),
+            );
             fs_ctx::write(&existing.path, &toml)?;
             return Ok(ImportOutcome::Updated(existing.path.clone()));
         }
@@ -469,7 +484,7 @@ fn import_into_library(
         n += 1;
     }
 
-    let toml = render_preset_toml(&meta, &sorted, extra, &ctx.annotations());
+    let toml = render_preset_toml_with_persist(&meta, &sorted, extra, persist, &ctx.annotations());
     fs_ctx::create_dir_all(&dir)?;
     fs_ctx::write(&path, &toml)?;
     Ok(ImportOutcome::Created(path))
@@ -510,13 +525,14 @@ fn cmd_import(args: &[String]) -> Res {
         return import_pack(&ctx, &file);
     }
 
-    let (meta, params, extra) = read_native(&ctx, &file)?;
+    let (meta, params, extra, persist) = read_native(&ctx, &file)?;
     let outcome = import_into_library(
         &ctx,
         &meta.name.clone(),
         Some(&meta),
         &params,
         &extra,
+        &persist,
         &category,
         false,
     )?;
@@ -736,6 +752,7 @@ fn pull_once(
             decoded.meta.as_ref(),
             &state.params,
             &state.extra.unwrap_or_default(),
+            &state.persist,
             category,
             always_new,
         )?;
@@ -834,9 +851,13 @@ fn collect_files(dir: &Path, depth: usize, native_ext: &str, out: &mut Vec<PathB
 
 #[cfg(test)]
 mod tests {
-    use moose_utils::preset::PresetMeta;
+    use std::path::Path;
 
-    use super::same_library_slot;
+    use moose_utils::preset::PresetMeta;
+    use moose_utils::state::{deserialize_state, hash_plugin_id, serialize_state};
+
+    use super::{PluginCtx, blob_to_parts, encode_native, same_library_slot};
+    use crate::preset_codec::{PresetFormat, decode};
 
     fn meta(name: &str, category: &str) -> PresetMeta {
         PresetMeta {
@@ -860,5 +881,53 @@ mod tests {
         // matches a preset whose backfilled category is the sanitized
         // `A-B` subdirectory name.
         assert!(same_library_slot(&meta("Warm", "A-B"), "Warm", "A/B"));
+    }
+
+    #[test]
+    fn native_conversion_preserves_persist_bytes() {
+        let config: crate::Config = toml::from_str(
+            r#"
+[vendor]
+name = "Test"
+id = "com.test"
+au_manufacturer = "Test"
+
+[[plugin]]
+name = "Synth"
+bundle_id = "synth"
+crate = "test_synth"
+category = "instrument"
+fourcc = "Tst1"
+"#,
+        )
+        .unwrap();
+        let ctx = PluginCtx {
+            p: &config.plugin[0],
+            config: &config,
+            root: Path::new("").to_path_buf(),
+            plugin_id_hash: hash_plugin_id("com.test.synth"),
+        };
+        let source = serialize_state(ctx.plugin_id_hash, &[7], &[0.5], b"extra", b"patch");
+        let (params, extra, persist) =
+            blob_to_parts(&ctx, &source, Path::new("source.trucepreset")).unwrap();
+        for (path, format) in [
+            ("dest.trucepreset", PresetFormat::MoosePreset),
+            ("dest.vstpreset", PresetFormat::Vst3),
+        ] {
+            let encoded = encode_native(
+                &ctx,
+                Path::new(path),
+                &meta("Warm", "Lead"),
+                &params,
+                &extra,
+                &persist,
+            )
+            .unwrap();
+            let blob = decode(format, &encoded).unwrap().blob;
+            let restored = deserialize_state(&blob, ctx.plugin_id_hash).unwrap();
+            assert_eq!(restored.params, vec![(7, 0.5)]);
+            assert_eq!(restored.extra.as_deref(), Some(&b"extra"[..]));
+            assert_eq!(restored.persist, b"patch", "{path}");
+        }
     }
 }

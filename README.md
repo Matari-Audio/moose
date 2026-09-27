@@ -42,6 +42,9 @@ Put a `presets/` directory of `.preset` TOML files next to your crate and
 `cargo moose install` ships them as CLAP preset-discovery entries,
 `.vstpreset` files and AU factory presets / `.aupreset` files. `cargo moose preset list | pull | convert | init` is
 the authoring toolbox.
+The optional `persist = "<base64>"` field carries `#[persist]` state. Use a
+`cargo-moose` build with `persist` support when converting or packaging such
+presets: older builds silently ignore the field and discard that state.
 
 ## Minimal Example
 
