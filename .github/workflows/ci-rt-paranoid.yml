@@ -27,7 +27,7 @@ concurrency:
 # thread makes inside `process` fails the build. The scaffolded-plugin
 # variant of this check runs in cli-e2e.yml.
 #
-# Runs on all three OSes: an audio-thread allocation can be platform-
+# Runs on all three OSes (macOS inside ci.yml): an audio-thread allocation can be platform-
 # specific (a std primitive that boxes lazily on one OS but not another),
 # so the check only catches it where it happens.
 jobs:
@@ -36,10 +36,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04, windows-latest]
+        # macOS runs inside ci.yml's macOS test job (one fewer macOS slot).
+        os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
 
       - uses: dtolnay/rust-toolchain@stable
 

@@ -34,6 +34,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14, windows-latest]
+        include:
+          # Windows runs cargo-moose's tests (scaffold_e2e: ~6 min of
+          # scaffolded cargo builds) in the parallel `cargo-moose tests (windows-latest)`
+          # job below; Linux/macOS keep them here.
+          - os: windows-latest
+            exclude: --exclude cargo-moose
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +56,7 @@ jobs:
           done
           wait
           df -h /
+
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -91,10 +98,10 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # One test build instead of `build --all-targets` + `test` (which
-      # compiled the workspace twice). `--all-targets` links every lib,
-      # bin, example, test and bench (benches run once in test mode);
-      # doctests need their own pass since `--all-targets` skips them.
+      # One test build: lib/bin/test/example targets plus doctests (the
+      # old `build --all-targets` + `test` pair compiled everything twice).
+      # Benches are the one target `cargo test` skips; only moose-simd has
+      # any, so build and smoke-run them on their own.
       #
       # Screenshot tests run here too. They used to be split cpu/gpu
       # because moose-example-eq opted into `moose-gui/gpu`, which would
@@ -104,14 +111,21 @@ jobs:
       # crate opts into `moose-gui/gpu` again, test it with its own `-p`
       # invocation and `--exclude` it here.
       - name: test
-        run: cargo test --workspace --all-targets
-      - name: doctests
-        run: cargo test --workspace --doc
+        run: cargo test --workspace ${{ matrix.exclude }}
+      - name: benches (test mode)
+        run: cargo test -p moose-simd --benches
 
       # Ratio guard: gain_simd_fast must run >= 5x faster than the naive
       # gain shape on the same runner (~22x locally).
       - name: perf regression (gain vs gain-simd)
         run: cargo test --release -p moose-simd --test gain_perf_regression -- --ignored --nocapture
+
+      # macOS runs the rt-paranoid example check here instead of in its own
+      # job (ci-rt-paranoid.yml covers Linux/Windows): macOS queue slots are
+      # the scarce resource, and this job already has the deps compiled.
+      - name: rt-paranoid (macOS)
+        if: runner.os == 'macOS'
+        run: ./scripts/ci/rt-paranoid.sh
 
       - name: upload failing screenshots
         if: failure()
@@ -121,6 +135,22 @@ jobs:
           path: target/screenshots/
           if-no-files-found: ignore
           retention-days: 14
+
+  cargo-moose-windows:
+    # cargo-moose's own tests on Windows, split out of `test (windows)` to
+    # run in parallel: scaffold_e2e scaffolds and builds real projects.
+    name: cargo-moose tests (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-moose
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test -p cargo-moose
+        run: cargo test -p cargo-moose
 
   gui-window:
     # Newest macOS on purpose: the baseview hitTest: crash was an AppKit
