@@ -67,17 +67,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Windows: put target/ on a ReFS Dev Drive (VHD mounted over the
-      # target dir, so every path and the rust-cache config stay the same).
-      # Dev Drives skip the filter-driver/Defender overhead that makes
-      # cargo's many small-file writes slow on the default NTFS volume.
-      - name: Dev Drive for target/
-        if: runner.os == 'Windows'
-        uses: samypr100/setup-dev-drive@v4
-        with:
-          drive-size: 40GB
-          drive-type: Dynamic
-          mount-path: ${{ github.workspace }}/target
 
       - uses: dtolnay/rust-toolchain@stable
         with:
