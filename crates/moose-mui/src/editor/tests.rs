@@ -110,7 +110,7 @@ fn at(h: &mut Handler<Session<Synth>>, p: Point) {
     mouse(
         h,
         MouseEvent::CursorMoved {
-            position: baseview::Point::new(p.x, p.y),
+            position: baseview::dpi::PhysicalPosition::new(p.x, p.y),
             modifiers: Modifiers::default(),
         },
     );
