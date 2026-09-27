@@ -30,7 +30,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PLUGINVAL_VERSION: v1.0.4
-  CLAP_VALIDATOR_VERSION: 0.4.1
+  CLAP_VALIDATOR_REV: 2f71690639a742ce805574ce42e31250e3147aa9
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -86,39 +86,42 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress --yes
 
-      # Prebuilt release binaries, no `cargo install` compile.
-      - name: Validators (pluginval + clap-validator)
+      # pluginval: prebuilt release. clap-validator: pinned to a 2024 git
+      # rev. Its 0.4.x releases changed the CLI (no --test-filter) and
+      # added stricter process-audio checks, so it can't be swapped in
+      # here; build the pinned rev once and cache the binary by rev.
+      - name: Cache clap-validator
+        id: cache-cv
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/clap-validator
+          key: clap-validator-${{ runner.os }}-${{ env.CLAP_VALIDATOR_REV }}
+
+      - name: Build clap-validator (cache miss)
+        if: steps.cache-cv.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --git https://github.com/free-audio/clap-validator \
+            --rev "$CLAP_VALIDATOR_REV" --root "$RUNNER_TEMP/clap-validator" clap-validator
+
+      - name: Validators on PATH
         run: |
           set -euo pipefail
-          bin="$RUNNER_TEMP/validators"; mkdir -p "$bin"
-          pv=https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION
+          echo "$RUNNER_TEMP/clap-validator/bin" >> "$GITHUB_PATH"
+          bin="$RUNNER_TEMP/pluginval"; mkdir -p "$bin"
           case "$RUNNER_OS" in
-            Linux)   cvzip=ubuntu-22.04;     pvzip=pluginval_Linux.zip ;;
-            macOS)   cvzip=macos-universal;  pvzip=pluginval_macOS.zip ;;
-            Windows) cvzip=windows;          pvzip=pluginval_Windows.zip ;;
+            Linux)   zip=pluginval_Linux.zip ;;
+            macOS)   zip=pluginval_macOS.zip ;;
+            Windows) zip=pluginval_Windows.zip ;;
           esac
-          # Asset names carry a git-describe suffix. The zip holds a
-          # tarball (Linux/macOS, to keep the exec bit) or the bare .exe.
-          gh release download "$CLAP_VALIDATOR_VERSION" --repo free-audio/clap-validator \
-            --pattern "*-$cvzip.zip" --output "$RUNNER_TEMP/cv.zip"
-          curl -fsSL -o "$RUNNER_TEMP/pv.zip" "$pv/$pvzip"
-          unzip -oq "$RUNNER_TEMP/cv.zip" -d "$RUNNER_TEMP/cv"
-          for t in "$RUNNER_TEMP"/cv/*.tar*; do
-            if [ -e "$t" ]; then tar -xf "$t" -C "$RUNNER_TEMP/cv"; fi
-          done
+          curl -fsSL -o "$RUNNER_TEMP/pv.zip" \
+            "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/$zip"
           if [ "$RUNNER_OS" = macOS ]; then
             unzip -oq "$RUNNER_TEMP/pv.zip" -d /Applications/
           else
             unzip -oq "$RUNNER_TEMP/pv.zip" -d "$bin"
+            chmod +x "$bin"/pluginval*
+            echo "$bin" >> "$GITHUB_PATH"
           fi
-          cvbin=$(find "$RUNNER_TEMP/cv" -type f \( -name clap-validator -o -name clap-validator.exe \) | head -1)
-          chmod +x "$cvbin" "$bin"/pluginval* 2>/dev/null || true
-          echo "CLAP_VALIDATOR=$cvbin" >> "$GITHUB_ENV"
-          echo "$bin" >> "$GITHUB_PATH"
-          echo "$(dirname "$cvbin")" >> "$GITHUB_PATH"
-          "$cvbin" --help >/dev/null
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Build cargo-moose
         run: |
