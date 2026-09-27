@@ -51,7 +51,11 @@ case "$OS" in
     # `Contents/Resources/Presets/` (the path the installed app resolves).
     grep -qE '\.app/Contents/Resources/Presets/.*\.trucepreset' <<<"$files" \
       || fail "no standalone .app presets in .pkg"
-    pass "macOS .pkg carries CLAP + $n VST3 + standalone presets (component present)"
+    # AU v2 factory presets are sealed into the `.component` bundle,
+    # where the shim's factory-presets property enumerates them.
+    grep -qE '\.component/Contents/Resources/Presets/.*\.trucepreset' <<<"$files" \
+      || fail "no AU v2 .component presets in .pkg"
+    pass "macOS .pkg carries CLAP + AU + $n VST3 + standalone presets (component present)"
     ;;
 
   linux)

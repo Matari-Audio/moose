@@ -90,6 +90,11 @@ pub(crate) fn cmd_doctor(args: &[String]) -> Res {
         eprintln!();
         eprintln!("  macOS");
         check_cmd("xcode-select", &[OsStr::new("-p")], "Xcode CLI tools");
+        check_cmd(
+            "xcodebuild",
+            &[OsStr::new("-version")],
+            "xcodebuild (AU v3)",
+        );
         check_cmd("codesign", &[OsStr::new("--help")], "codesign");
         // Universal packaging (default for `cargo moose package`) needs both
         // Apple Rust targets. Missing targets are a warning, not an error -
@@ -160,6 +165,10 @@ pub(crate) fn cmd_doctor(args: &[String]) -> Res {
     // Validation tools
     eprintln!();
     eprintln!("  Validation Tools");
+    // `auval` ships with Audio Toolbox on macOS; no equivalent exists on
+    // Linux / Windows, so the check would always FAIL on those hosts.
+    #[cfg(target_os = "macos")]
+    check_cmd("auval", &[OsStr::new("-h")], "auval");
     check_which_with_env("pluginval", Some("PLUGINVAL"));
     check_which_with_env("clap-validator", Some("CLAP_VALIDATOR"));
 
@@ -210,6 +219,10 @@ const PATH_FORMATS_MACOS: &[PathFormat] = &[
         format: Format::Vst3,
         ext: "vst3",
     },
+    PathFormat {
+        format: Format::Au2,
+        ext: "component",
+    },
 ];
 
 const PATH_FORMATS_WINDOWS: &[PathFormat] = &[
@@ -244,8 +257,12 @@ fn show_scope_paths() {
     };
 
     for f in formats {
-        let user_path = f.format.dir(InstallScope::User);
-        let system_path = f.format.dir(InstallScope::System);
+        let (Some(user_path), Some(system_path)) = (
+            f.format.dir(InstallScope::User),
+            f.format.dir(InstallScope::System),
+        ) else {
+            continue;
+        };
         report_scope_line(f, "user", InstallScope::User, &user_path);
         // Linux's user and system dirs resolve to the same path -
         // skip the duplicate row to keep the matrix readable.

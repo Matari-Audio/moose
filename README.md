@@ -2,8 +2,8 @@
 
 **Matari's Own Open Sound Engine.** A Rust audio-plugin framework for
 Matari Audio, forked from [truce](https://github.com/truce-audio/truce)
-at v6.3.0 (`25791270`). Build CLAP, VST3 and standalone plugins from
-one Rust codebase.
+at v6.3.0 (`25791270`). Build CLAP, VST3, AU (v2 and v3, macOS) and
+standalone plugins from one Rust codebase.
 
 ## Quick Start
 
@@ -15,6 +15,7 @@ cargo moose new my-plugin && cd my-plugin
 cargo moose run                  # standalone, no DAW needed
 cargo moose install --clap       # build + install CLAP
 cargo moose install --vst3       # build + install VST3
+cargo moose install --au2        # build + install AU v2 (macOS)
 ```
 
 Every `cargo moose` command builds in **release** mode by default; pass
@@ -25,20 +26,21 @@ cargo moose build                # bundle every enabled format into target/bundl
 cargo moose build --clap --vst3  # a subset
 cargo moose build --shell        # hot-reload shell build
 cargo moose screenshot --out screenshots/main.png
-cargo moose validate             # pluginval + clap-validator on installed plugins
+cargo moose validate             # auval + pluginval + clap-validator on installed plugins
 cargo moose package              # signed .pkg (macOS) or Inno Setup .exe (Windows)
 cargo moose doctor               # environment health
 ```
 
-Scaffolded plugins default to **CLAP + VST3 + standalone**. On Windows,
+Scaffolded plugins default to **CLAP + VST3 + AU + standalone** (AU is
+skipped with a note off macOS). On Windows,
 `cargo moose install` must run from an Administrator prompt (plugin
 directories are system-wide).
 
 ## Presets
 
 Put a `presets/` directory of `.preset` TOML files next to your crate and
-`cargo moose install` ships them as CLAP preset-discovery entries and
-`.vstpreset` files. `cargo moose preset list | pull | convert | init` is
+`cargo moose install` ships them as CLAP preset-discovery entries,
+`.vstpreset` files and AU factory presets / `.aupreset` files. `cargo moose preset list | pull | convert | init` is
 the authoring toolbox.
 
 ## Minimal Example
@@ -113,23 +115,31 @@ MOOSE is a hard fork. It does not track truce releases.
 
 ### Removed
 
-- **Formats:** AU v2, AU v3 (macOS and iOS), AAX (with `aax-bridge`),
-  VST2 and LV2, with their wrapper crates, `cargo moose` flags
-  (`--au2`, `--au3`, `--ios`, `--ios-device`, `--aax`, `--vst2`,
-  `--lv2`), packaging paths, validators (auval, AAX validator) and
-  scaffold templates.
+- **Formats:** AAX (with `aax-bridge`), VST2, LV2 and AU v3 on iOS,
+  with their wrapper crates, `cargo moose` flags (`--ios`,
+  `--ios-device`, `--aax`, `--vst2`, `--lv2`), packaging paths, the
+  AAX validator and scaffold templates.
 - **GUI backends:** `truce-iced`, `truce-vizia`, `truce-slint` and
   `truce-gpu-examples`, plus the examples built on them (`gain-iced`,
   `gain-vizia`, `gain-slint`, `gui-zoo-iced`, `gui-zoo-slint`,
   `midi-inspector`).
 - iOS CI, simulator tooling and iOS screenshot baselines.
-- Leftover metadata and codecs for those formats: `PluginInfo`'s
-  fourcc, AU type/manufacturer, AAX category, per-format display names
-  and legacy IDs; the LV2 TTL emitter; `.aupreset` and LV2 preset
-  import/export in `cargo moose preset`. Their `moose.toml` keys
-  (`au_manufacturer`, `fourcc`, `au_type`, `au_subtype`, `aax_category`,
-  `vst2_name`, `au_name`, `au3_name`, `aax_name`, `lv2_name`,
-  `legacy_state`) are ignored if present.
+- Leftover metadata and codecs for those formats: `PluginInfo`'s AAX
+  category and VST2 / AAX / LV2 display names and IDs; the LV2 TTL
+  emitter; LV2 preset import/export in `cargo moose preset`. Their
+  `moose.toml` keys (`aax_category`, `vst2_name`, `aax_name`,
+  `lv2_name`) are ignored if present.
+
+### Kept
+
+- **AU v2 and AU v3 on macOS** are first-class: `moose-au`, the `au`
+  feature, `cargo moose build/install/package/validate --au2/--au3`
+  (auval, `.component` and appex bundles, signing, notarization, `.pkg`
+  components), `reset-au`, `log-stream-au`, `.aupreset` import/export
+  and the AU `moose.toml` keys (`au_manufacturer`, `fourcc`, `au_type`,
+  `au_subtype`, `au3_subtype`, `au_tag`, `au_name`, `au3_name`,
+  `legacy_state.au_keys`). Scaffolded plugins enable `au` by default.
+  The AU state key stays `truce_state`, so truce sessions reopen.
 
 ### Fixes carried on top of truce 6.3.0
 

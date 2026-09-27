@@ -1,4 +1,4 @@
-//! Helpers shared across format wrappers (CLAP, VST3, standalone).
+//! Helpers shared across format wrappers (CLAP, VST3, AU, standalone).
 //!
 //! Each wrapper still owns its format-specific descriptor types and
 //! callback tables; those don't unify cleanly. What unifies is the
@@ -27,7 +27,7 @@ use crate::export::PluginExport;
 
 pub use plugin_cell::{PluginCell, PluginGuard};
 
-/// The ownership cell the real-time format wrappers (CLAP, VST3) put
+/// The ownership cell the real-time format wrappers (CLAP, VST3, AU) put
 /// around their plugin instance. The audio thread owns the
 /// plugin while the host is processing (`process`, the queued state
 /// apply); the host thread owns it while processing is stopped (`init`,
@@ -306,8 +306,8 @@ pub fn default_io_channels<P: PluginExport>() -> Option<(u32, u32)> {
 
 /// Find the `bus_layouts()` index whose total input/output channel counts
 /// match `(inputs, outputs)`. Wrappers that negotiate a layout from a
-/// host-proposed arrangement (VST3 `setBusArrangements`, the standalone
-/// device match) use
+/// host-proposed arrangement (VST3 `setBusArrangements`, AU channel-config
+/// selection, the standalone device match) use
 /// this to map a request onto a supported layout. `None` when nothing
 /// matches; the caller then rejects the arrangement or falls back to the
 /// first layout.

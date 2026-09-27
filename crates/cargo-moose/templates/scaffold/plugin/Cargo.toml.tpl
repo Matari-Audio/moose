@@ -16,13 +16,15 @@ name = "{crate_name}-standalone"
 path = "src/main.rs"
 required-features = ["standalone"]
 {{ endif }}
-# Scaffolded default: {default_label}.
+# Scaffolded default: {default_label}. AU builds only on macOS; on
+# other hosts `cargo moose` skips it with a one-line note.
 # Each format feature gates the matching wrapper crate as an optional
 # dep.
 [features]
 default = {default_features | unescaped}
 clap = ["dep:moose-clap", "dep:clap-sys"]
 vst3 = ["dep:moose-vst3"]
+au = ["dep:moose-au"]
 {{ if has_standalone -}}
 standalone = ["dep:moose-standalone"]
 {{ endif -}}
@@ -41,6 +43,7 @@ moose-gui-types = \{ {dep_args | unescaped} }
 moose-gui = \{ {dep_args | unescaped} }
 moose-clap = \{ {dep_args | unescaped}, optional = true }
 moose-vst3 = \{ {dep_args | unescaped}, optional = true }
+moose-au = \{ {dep_args | unescaped}, optional = true }
 {{ if has_standalone -}}
 moose-standalone = \{ {dep_args | unescaped}, features = ["gui"], optional = true }
 {{ endif -}}

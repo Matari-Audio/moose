@@ -18,23 +18,29 @@ use crate::run_sudo;
 // by the `clang -bundle` link step, so `release_lib` is unused there.
 #[cfg(not(target_os = "macos"))]
 use crate::release_lib;
-// Plist scratch (CLAP / VST3) only happens on macOS - gate the
+// Plist scratch (VST3 / AU) only happens on macOS - gate the
 // import so Windows / Linux builds don't see it as unused.
 #[cfg(target_os = "macos")]
-use crate::codesign_bundle;
-#[cfg(target_os = "macos")]
 use crate::tmp_manifests;
-// `OsStr` (run_sudo args) and `fs` (pre-install remove_dir) are only
-// touched from macOS-gated branches below.
+#[cfg(target_os = "macos")]
+use crate::{codesign_bundle, dirs};
+// `OsStr` (run_sudo args) and `fs` (AU cache wipe, pre-install
+// remove_dir) are only touched from macOS-gated branches below.
 #[cfg(target_os = "macos")]
 use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
 use std::fs;
 use std::path::Path;
 
+// AU is macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) mod au_v3;
 pub(crate) mod presets;
 
 use presets::FactoryPresets;
+
+#[cfg(target_os = "macos")]
+use au_v3::build_and_install_au_v3;
 
 /// Guarantee the param-manifest sidecar exists for every plugin that
 /// ships presets, so install-time preset name resolution can't fail on a
@@ -87,6 +93,8 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
 
     let mut clap = false;
     let mut vst3 = false;
+    let mut au2 = false;
+    let mut au3 = false;
     let mut no_build = false;
     let mut shell_mode = false;
     let mut debug = false;
@@ -101,6 +109,8 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
         match args[i].as_str() {
             "--clap" => clap = true,
             "--vst3" => vst3 = true,
+            "--au2" => au2 = true,
+            "--au3" => au3 = true,
             "--no-build" => no_build = true,
             "--shell" => shell_mode = true,
             "--debug" => debug = true,
@@ -156,12 +166,17 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
     // shell dlopens at runtime) defaults to release for better DSP
     // perf, with `--debug` flipping it to debug for fast iteration.
 
-    if !clap && !vst3 {
+    if !clap && !vst3 && !au2 && !au3 {
         // No format flags specified - enable all formats that the project supports.
         // Check which features are defined in the first plugin's Cargo.toml.
         let available = detect_default_features();
         clap = available.contains("clap");
         vst3 = available.contains("vst3");
+        // AU is macOS-only at runtime, but flip the flags on every platform
+        // so the build/install paths can emit per-plugin skip lines for
+        // Linux / Windows users with `"au"` in their `[features].default`.
+        au2 = available.contains("au");
+        au3 = available.contains("au");
     }
 
     // Shell-mode preflight: bail early if the user's Cargo.toml is
@@ -170,6 +185,19 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
     // declared" downstream.
     if shell_mode {
         crate::verify_shell_profile_declared()?;
+    }
+
+    // AU v3 + shell is unreliable: the appex's sandbox blocks
+    // `dlopen` of arbitrary `target/` paths. Until the entitlement
+    // workaround lands, warn and let the build proceed; the user
+    // might still want the bundle for non-hot-reload smoke testing.
+    if shell_mode && au3 && cfg!(target_os = "macos") {
+        eprintln!(
+            "note: AU v3 + --shell is unreliable. The appex sandbox blocks dlopen of \
+             target/<profile>/lib<crate>.dylib, so hot-reload won't fire. Use --au2 \
+             for hot-reload iteration; run `cargo moose install --au3` (no --shell) \
+             for AU v3 smoke tests."
+        );
     }
 
     // Filter plugins if -p specified
@@ -214,14 +242,18 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
     // --- Build ---
     //
     // One cargo invocation per (plugin, format) pair so the
-    // name-override env vars can be applied per-plugin. The
-    // format-suffix copy lives inside `build_format_dylibs`; the
+    // name-override env vars can be applied per-plugin. The platform
+    // gate (AU is macOS-only) and the format-suffix copy live inside
+    // `build_format_dylibs`; the
     // shared target cache absorbs the cost of one cargo invocation
     // per format.
     if !no_build {
         use super::build_dylibs::{BuildFormat, build_format_dylibs, build_logic_dylibs};
-        let format_selection: &[(bool, BuildFormat)] =
-            &[(clap, BuildFormat::Clap), (vst3, BuildFormat::Vst3)];
+        let format_selection: &[(bool, BuildFormat)] = &[
+            (clap, BuildFormat::Clap),
+            (vst3, BuildFormat::Vst3),
+            (au2, BuildFormat::Au2),
+        ];
         for &(selected, format) in format_selection {
             if selected {
                 build_format_dylibs(format, &plugins, &extra_features, &root, dt, None)?;
@@ -238,13 +270,23 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
     // --- Install ---
     //
     // Per-format scope is resolved through `effective_scope`, which
-    // applies the per-(format, OS) default (when no CLI flag is set),
-    // emitting a one-line note (printed at most once per message via
-    // `note_once`).
+    // applies the per-(format, OS) default (when no CLI flag is set)
+    // and silently upgrades AU v3 to system scope, emitting a one-line
+    // note (printed at most once per message via `note_once`).
+    // Only these formats re-envelope the loop's factory presets. AU v3
+    // loads its own (after building its framework, so its sidecar exists),
+    // so an au3-only install must not read the param-manifest sidecar
+    // here, which for `--au3` after a clean hasn't been built yet.
+    let needs_loop_presets = clap || vst3 || au2;
+
     for p in &plugins {
         // Parsed once per plugin; each format re-envelopes the same
         // canonical state blobs into its native preset files.
-        let factory_presets = presets::load_factory_presets(&root, p, &config)?;
+        let factory_presets = if needs_loop_presets {
+            presets::load_factory_presets(&root, p, &config)?
+        } else {
+            None
+        };
         let fp = factory_presets.as_ref();
         if clap {
             let s = scope_for(Format::Clap, cli_scope);
@@ -254,12 +296,48 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
             let s = scope_for(Format::Vst3, cli_scope);
             install_vst3(&root, p, &config, s, fp)?;
         }
+        if au2 {
+            #[cfg(target_os = "macos")]
+            {
+                let s = scope_for(Format::Au2, cli_scope);
+                install_au(&root, p, &config, s, fp)?;
+            }
+            // Non-macOS skip line was already pushed in the build phase.
+        }
+    }
+
+    if au3 {
+        #[cfg(target_os = "macos")]
+        {
+            // AU v3 is always system-scope on macOS - emit the note
+            // once before delegating to the (system-only) installer.
+            let _ = scope_for(Format::Au3, cli_scope);
+            build_and_install_au_v3(&root, &config, &plugins, no_build)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        crate::log_skip(
+            "AU v3: not supported on this platform. Audio Unit is macOS-only.".to_string(),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if au2 && let Some(home) = dirs::home_dir() {
+        let cache = home.join("Library/Caches/AudioUnitCache");
+        let _ = fs::remove_dir_all(&cache);
+        crate::vprintln!("Cleared AU cache.");
     }
 
     let installed = crate::take_outputs();
     if !installed.is_empty() {
         eprintln!("\nInstalled:");
         for line in installed {
+            eprintln!("  {line}");
+        }
+    }
+    let skipped = crate::take_skipped();
+    if !skipped.is_empty() {
+        eprintln!("\nSkipped:");
+        for line in skipped {
             eprintln!("  {line}");
         }
     }
@@ -270,7 +348,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
 fn print_help() {
     eprintln!(
         "\
-Usage: cargo moose install [--clap] [--vst3]
+Usage: cargo moose install [--clap] [--vst3] [--au2] [--au3]
                            [--user|--system] [--shell] [--debug] [--no-build] [-p <crate>]
                            [--target-cpu <value>]
 
@@ -279,7 +357,7 @@ to release. Defaults to whichever formats are in the plugin's Cargo.toml
 default features (typically clap + vst3).
 
 Per-format scope is per-user by default; pass --system for the shared
-system directories. VST3 on
+system directories. AU v3 is always system-scope. VST3 on
 Windows defaults to system scope (the directory every commercial host
 scans); pass --user for the per-user `%LOCALAPPDATA%\\Programs\\Common\\VST3`
 location.
@@ -292,6 +370,8 @@ builds use NEON unconditionally and get no extra flag. Override with
 Options:
   --clap           CLAP only
   --vst3           VST3 only
+  --au2            AU v2 only (.component, macOS only)
+  --au3            AU v3 only (.appex, macOS only)
   --user           Install per-user (default; exception: VST3 on Windows
                    defaults to system - pass --user to override).
   --system         Install system-wide (sudo / admin required).
@@ -320,8 +400,8 @@ Options:
 
 /// Resolve the per-format effective scope and print the policy note
 /// (once per `cargo moose` invocation) when the user-visible result
-/// differs from a plain `--user`: a per-(format, OS) default
-/// (Windows VST3).
+/// differs from a plain `--user`: a hard upgrade (AU v3) or a
+/// per-(format, OS) default (Windows VST3).
 fn scope_for(format: Format, requested: Option<InstallScope>) -> InstallScope {
     let (effective, note) = effective_scope(format, requested);
     if let Some(msg) = note {
@@ -544,5 +624,130 @@ fn install_vst3(
         presets::emit_vst3_presets(fp, p, config, scope)?;
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_au(
+    root: &Path,
+    p: &PluginDef,
+    config: &Config,
+    scope: InstallScope,
+    factory_presets: Option<&FactoryPresets>,
+) -> Res {
+    // Profile-aware like every other format - hardcoding `release/`
+    // here used to make `--debug` silently re-install a stale release
+    // build.
+    let dylib = crate::util::release_lib(root, &format!("{}_au", p.dylib_stem()));
+    if !dylib.exists() {
+        return Err(format!("Missing: {}", dylib.display()).into());
+    }
+    let bundle = scope
+        .au_v2_dir()
+        .join(format!("{}.component", p.file_stem()));
+    let bundle_str = bundle.to_str().unwrap().to_string();
+    let contents = bundle.join("Contents");
+    let macos_dir = contents.join("MacOS");
+    let exec_name = p.file_stem();
+
+    if scope.needs_sudo() {
+        let _ = run_sudo("rm", &[OsStr::new("-rf"), bundle.as_os_str()]);
+        run_sudo("mkdir", &[OsStr::new("-p"), macos_dir.as_os_str()])?;
+        let dst_dylib = macos_dir.join(&exec_name);
+        run_sudo("cp", &[dylib.as_os_str(), dst_dylib.as_os_str()])?;
+    } else {
+        let _ = fs::remove_dir_all(&bundle);
+        fs_ctx::create_dir_all(&macos_dir)?;
+        fs_ctx::copy(&dylib, macos_dir.join(&exec_name))?;
+    }
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>{exec_name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>{vendor_id}.{bundle_id}.component</string>
+    <key>CFBundleName</key>
+    <string>{display_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>AudioComponents</key>
+    <array>
+        <dict>
+            <key>type</key>
+            <string>{au_type}</string>
+            <key>subtype</key>
+            <string>{au_subtype}</string>
+            <key>manufacturer</key>
+            <string>{au_mfr}</string>
+            <key>name</key>
+            <string>{vendor}: {display_name}</string>
+            <key>description</key>
+            <string>{display_name}</string>
+            <key>version</key>
+            <integer>65536</integer>
+            <key>factoryFunction</key>
+            <string>MooseAUFactory</string>
+            <key>sandboxSafe</key>
+            <true/>
+            <key>tags</key>
+            <array>
+                <string>{au_tag}</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>"#,
+        display_name = p.name,
+        bundle_id = p.bundle_id,
+        vendor_id = config.vendor.id,
+        vendor = config.vendor.name,
+        au_type = p.resolved_au_type(),
+        au_subtype = p.resolved_fourcc(),
+        au_mfr = config.vendor.au_manufacturer,
+        au_tag = p.au_tag,
+    );
+    let plist_tmp = tmp_manifests()
+        .join(format!("{}_au.plist", p.bundle_id))
+        .to_string_lossy()
+        .to_string();
+    fs_ctx::write(&plist_tmp, &plist)?;
+    let info_plist = contents.join("Info.plist");
+    if scope.needs_sudo() {
+        run_sudo("cp", &[OsStr::new(&plist_tmp), info_plist.as_os_str()])?;
+    } else {
+        fs_ctx::copy(&plist_tmp, &info_plist)?;
+    }
+
+    // The shim's kAudioUnitProperty_FactoryPresets handler enumerates
+    // these at runtime. Part of the sealed bundle - must precede
+    // codesign.
+    if let Some(fp) = factory_presets {
+        presets::emit_trucepreset_tree(
+            fp,
+            &contents.join("Resources/Presets"),
+            scope.needs_sudo(),
+            &format!("{}-au-bundle", p.bundle_id),
+        )?;
+    }
+
+    codesign_bundle(
+        &bundle_str,
+        &crate::application_identity(),
+        scope.needs_sudo(),
+    )?;
+    crate::log_output(format!("AU:   {}", bundle.display()));
+
+    // `.aupreset` files live outside the component bundle (the
+    // `Library/Audio/Presets` walk hosts do), so they don't interact
+    // with the codesign seal above.
+    if let Some(fp) = factory_presets {
+        presets::emit_au_presets(fp, p, config, scope)?;
+    }
     Ok(())
 }

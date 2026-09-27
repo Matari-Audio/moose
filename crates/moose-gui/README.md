@@ -13,7 +13,7 @@ opt into GPU rendering (wgpu) with the `gpu` feature.
 Windowing is handled through baseview. In CPU mode the tiny-skia pixmap
 is uploaded to a wgpu surface each frame for compositing; in GPU mode
 `GpuEditor` renders the widgets directly through wgpu. All supported
-formats (CLAP, VST3, standalone) use the same path.
+formats (CLAP, VST3, AU, standalone) use the same path.
 
 `moose-gui` orchestrates the two `RenderBackend` implementations into
 editor types. The renderers themselves live in sibling crates, so a

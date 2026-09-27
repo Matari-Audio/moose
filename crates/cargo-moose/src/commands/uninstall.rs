@@ -1,8 +1,10 @@
 //! `cargo moose uninstall` - remove plugin bundles for the current project,
 //! or with `--stale` evict vendor-matching bundles no longer in `moose.toml`.
 
-use crate::install_scope::{InstallScope, set_cli_install_scope};
-use crate::{PluginDef, Res, confirm_prompt, load_config};
+#[cfg(target_os = "macos")]
+use crate::Config;
+use crate::install_scope::{InstallScope, note_once, set_cli_install_scope};
+use crate::{PluginDef, Res, confirm_prompt, dirs, load_config};
 // `run_sudo` is macOS-only (Linux is always per-user, Windows uses
 // per-process UAC elevation rather than per-command sudo).
 #[cfg(target_os = "macos")]
@@ -12,11 +14,64 @@ use moose_utils::shell_sidecar::sidecar_path;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 struct RemoveTarget {
     format: &'static str,
     path: PathBuf,
     needs_sudo: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn unregister_au3(config: &Config, plugin: &PluginDef, app_path: &Path) {
+    // Match the vendor-rooted ids install registers (see `reset_au`);
+    // a `com.` prefix would miss any vendor id not starting with it.
+    let vid = config.vendor.id.as_str();
+    for pattern in [
+        format!("{vid}.{}.v3.ext", plugin.bundle_id),
+        format!("{vid}.{}.au", plugin.bundle_id),
+    ] {
+        let _ = Command::new("pluginkit")
+            .args(["-e", "ignore", "-i", &pattern])
+            .output();
+        let _ = Command::new("pluginkit")
+            .args(["-r", "-i", &pattern])
+            .output();
+    }
+    // `lsregister -u ""` interprets the empty string as the current
+    // directory and unregisters whatever app-bundle the CWD happens to
+    // be - alarming if the user invoked `cargo moose uninstall` from inside
+    // some other `.app`. Skip the call instead.
+    if let Some(app_path_str) = app_path.to_str() {
+        let _ = Command::new(
+            "/System/Library/Frameworks/CoreServices.framework/\
+             Frameworks/LaunchServices.framework/Support/lsregister",
+        )
+        .args(["-u", app_path_str])
+        .output();
+    }
+}
+
+fn clear_au_caches() {
+    // No HOME (or USERPROFILE on Windows) → skip the per-user cache
+    // sweep silently. The system-wide `killall AudioComponentRegistrar`
+    // below still runs; AU caches in $HOME just don't exist for a user
+    // whose env we can't resolve.
+    if let Some(home) = dirs::home_dir() {
+        for dir in [
+            home.join("Library/Caches/AudioUnitCache"),
+            home.join(
+                "Library/Containers/com.apple.garageband10/Data/Library/Caches/AudioUnitCache",
+            ),
+            home.join("Library/Containers/com.apple.logicpro10/Data/Library/Caches/AudioUnitCache"),
+            home.join("Library/Caches/com.apple.logic10/AudioUnitCache"),
+        ] {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+    let _ = Command::new("killall")
+        .args(["-9", "AudioComponentRegistrar"])
+        .output();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -25,6 +80,8 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
 
     let mut clap = false;
     let mut vst3 = false;
+    let mut au2 = false;
+    let mut au3 = false;
     let mut standalone = false;
     let mut dry_run = false;
     let mut yes = false;
@@ -38,6 +95,8 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
         match args[i].as_str() {
             "--clap" => clap = true,
             "--vst3" => vst3 = true,
+            "--au2" => au2 = true,
+            "--au3" => au3 = true,
             "--standalone" => standalone = true,
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
@@ -74,16 +133,29 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
         Some(InstallScope::System) => vec![InstallScope::System],
         None => vec![InstallScope::User, InstallScope::System],
     };
+    // AU v3 is always system-scope - surface the same one-line note as
+    // `install` when `--user` was explicitly requested for it.
+    if matches!(cli_scope, Some(InstallScope::User)) && au3 && cfg!(target_os = "macos") {
+        note_once("AU v3 is system-only; ignoring --user");
+    }
+
     // Captured before the default-fill below so the post-loop sidecar
     // cleanup can tell "user passed no format flag → uninstall
     // everything for these plugins" apart from "user picked specific
     // formats → leave shell sidecars alone for the others".
-    let all_formats_default = !clap && !vst3 && !standalone;
+    let all_formats_default = !clap && !vst3 && !au2 && !au3 && !standalone;
 
     // Default: all formats if none specified.
+    // `au3 = true` lands in a flag that's read only inside macOS-gated
+    // blocks; the assignment-never-read warning on Linux/Windows is
+    // intentional - keeping the flag uniform across platforms is more
+    // readable than a per-platform `if`.
+    #[allow(unused_assignments)]
     if all_formats_default {
         clap = true;
         vst3 = true;
+        au2 = true;
+        au3 = true;
         standalone = true;
     }
 
@@ -128,6 +200,8 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        let scan_system = scopes_to_scan.contains(&InstallScope::System);
         if clap {
             for s in &scopes_to_scan {
                 scan(
@@ -152,6 +226,68 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
                     s.needs_sudo(),
                     &mut targets,
                 );
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if au2 {
+            for s in &scopes_to_scan {
+                scan(
+                    &s.au_v2_dir(),
+                    "component",
+                    "AU v2",
+                    vendor,
+                    &known_names,
+                    s.needs_sudo(),
+                    &mut targets,
+                );
+            }
+        }
+        // AU v3 lives in `/Applications/...` only on macOS, so the
+        // `--au3` removal scan is macOS-only. The flag is still parsed
+        // on every platform so cross-platform CI scripts don't break;
+        // it just no-ops on Linux / Windows.
+        //
+        // `--user` skips this scan: AU v3 has no user-scope install
+        // path (the install-side note already explained that to the
+        // user), so there's nothing for `--user` to clean up.
+        #[cfg(target_os = "macos")]
+        if au3 && scan_system {
+            // Scan /Applications for vendor-matching v3 apps not in project.
+            // Recognize moose AU v3 containers by bundle-name convention:
+            // legacy "<name> v3.app" or the new default "<name> (AUv3).app".
+            // A custom `au3_name` override may produce neither pattern - those
+            // orphans can only be detected when the current config still
+            // produces a recognizable name, so we compare against the current
+            // bundle names as well.
+            let known_au3_bundles: Vec<String> = config
+                .plugin
+                .iter()
+                .map(|p| format!("{}.app", p.au3_app_name()))
+                .collect();
+            if let Ok(entries) = fs::read_dir("/Applications") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if !name_str.contains(vendor) || !name_str.ends_with(".app") {
+                        continue;
+                    }
+                    let looks_like_au3 =
+                        name_str.ends_with(" v3.app") || name_str.ends_with("(AUv3).app");
+                    if !looks_like_au3 {
+                        continue;
+                    }
+                    if known_au3_bundles
+                        .iter()
+                        .any(|k| k.as_str() == name_str.as_ref())
+                    {
+                        continue;
+                    }
+                    targets.push(RemoveTarget {
+                        format: "AU v3",
+                        path: entry.path(),
+                        needs_sudo: true,
+                    });
+                }
             }
         }
         // `--stale --standalone` cleans up legacy `<Name>.standalone.app`
@@ -209,7 +345,9 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
                     .file_stem()
                     .map(|f| f.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
-                fname == filter_lower
+                // Strip AU v3 suffixes: legacy " v3" and the new " (auv3)".
+                let display = fname.trim_end_matches(" v3").trim_end_matches(" (auv3)");
+                display == filter_lower
             });
         }
     } else {
@@ -263,6 +401,8 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
             crate_names_for_sidecar_cleanup.extend(plugins.iter().map(|p| p.crate_name.clone()));
         }
 
+        #[cfg(target_os = "macos")]
+        let scan_system = scopes_to_scan.contains(&InstallScope::System);
         let push_if_exists =
             |format: &'static str, path: PathBuf, needs_sudo: bool, targets: &mut Vec<_>| {
                 if path.exists() && !targets.iter().any(|t: &RemoveTarget| t.path == path) {
@@ -285,6 +425,18 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
                     let path = s.vst3_dir().join(format!("{}.vst3", p.file_stem()));
                     push_if_exists("VST3", path, s.needs_sudo(), &mut targets);
                 }
+            }
+            #[cfg(target_os = "macos")]
+            if au2 {
+                for s in &scopes_to_scan {
+                    let path = s.au_v2_dir().join(format!("{}.component", p.file_stem()));
+                    push_if_exists("AU v2", path, s.needs_sudo(), &mut targets);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if au3 && scan_system {
+                let path = PathBuf::from(format!("/Applications/{}.app", p.au3_app_name()));
+                push_if_exists("AU v3", path, true, &mut targets);
             }
             if standalone {
                 #[cfg(target_os = "macos")]
@@ -347,9 +499,37 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
     }
 
     // Remove bundles
+    let mut removed_au = false;
     let mut errors = 0u32;
 
     for t in &targets {
+        // AU v3 special handling: unregister before deleting (macOS-only).
+        #[cfg(target_os = "macos")]
+        if t.format == "AU v3" {
+            // Try to find a matching plugin def for precise unregistration
+            let matched_plugin = config
+                .plugin
+                .iter()
+                .find(|p| t.path == Path::new(&format!("/Applications/{}.app", p.au3_app_name())));
+            if let Some(p) = matched_plugin {
+                unregister_au3(&config, p, &t.path);
+            } else if let Some(path_str) = t.path.to_str() {
+                // Stale AU v3 - unregister by path only (lsregister).
+                // Skip the call when the path can't be UTF-8'd: `lsregister
+                // -u ""` would unregister whatever app the CWD happens to be.
+                let _ = Command::new(
+                    "/System/Library/Frameworks/CoreServices.framework/\
+                     Frameworks/LaunchServices.framework/Support/lsregister",
+                )
+                .args(["-u", path_str])
+                .output();
+            }
+            removed_au = true;
+        }
+        if t.format == "AU v2" {
+            removed_au = true;
+        }
+
         // `needs_sudo` only drives the macOS path: on Linux every
         // scope is per-user, and on Windows the cargo-moose process
         // is either elevated (direct fs ops succeed) or it isn't
@@ -385,6 +565,12 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
         }
     }
 
+    // Clear AU caches if any AU bundles were removed
+    if removed_au {
+        clear_au_caches();
+        eprintln!("\nCleared AU caches.");
+    }
+
     // Clean up `~/.moose/shell/<crate>.path` sidecars for plugins
     // whose entire format set is being uninstalled. Skipped on
     // partial uninstalls (`--clap`, `-p` etc. without all formats)
@@ -414,15 +600,19 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
 fn print_help() {
     eprintln!(
         "\
-Usage: cargo moose uninstall [--clap] [--vst3] [--standalone] [--user|--system] [-p <crate>] [-n <name>]
+Usage: cargo moose uninstall [--clap] [--vst3] [--au2] [--au3]
+                             [--standalone] [--user|--system] [-p <crate>] [-n <name>]
                              [--stale] [--dry-run] [--yes]
 
 Uninstall plugin bundles for this project. Default: all formats,
-all plugins, both user + system scopes. Asks for confirmation.
+all plugins, both user + system scopes. Asks for confirmation. AU v3 is
+always system-scope - `--user` skips it.
 
 Options:
   --clap           CLAP only
   --vst3           VST3 only
+  --au2            AU v2 only (.component, macOS only)
+  --au3            AU v3 only (.app, macOS only)
   --standalone     Standalone host app only (.app, macOS only)
   --user           Only uninstall from per-user directories.
   --system         Only uninstall from system directories.

@@ -90,9 +90,10 @@ pub(crate) fn cmd_run(args: &[String]) -> Res {
     if !no_build {
         eprintln!("Building {} standalone...", plugin.name);
         // `--no-default-features`: the standalone is self-contained
-        // and needs no format wrapper. Linking clap / vst3 into the
-        // preview binary only bloats it and runs their load-time
-        // registration constructors in a host that never uses them.
+        // and needs no format wrapper. Linking clap / vst3 / au into the preview binary only bloats it and runs their
+        // load-time registration constructors (e.g. the AU shim's,
+        // which logs a MIDI-port clamp warning) in a host that never
+        // uses them.
         //
         // `moose-standalone/playback` is enabled directly (not via a
         // plugin-level feature) because that routing differs across

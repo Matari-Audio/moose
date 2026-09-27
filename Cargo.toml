@@ -6,6 +6,7 @@ members = [
     "crates/moose-params",
     "crates/moose-clap",
     "crates/moose-vst3",
+    "crates/moose-au",
     "crates/moose-standalone",
     "crates/moose-driver",
     "crates/moose-gui",
@@ -26,6 +27,7 @@ members = [
     "crates/moose-gpu",
     "crates/moose-egui",
     "crates/moose-mui",
+    "crates/moose-shim-types",
     "crates/moose-simd",
     "crates/moose-font",
     "crates/moose-utils",
@@ -110,6 +112,7 @@ moose-core = { version = "7.0.0", path = "crates/moose-core" }
 moose-params = { version = "7.0.0", path = "crates/moose-params" }
 moose-clap = { version = "7.0.0", path = "crates/moose-clap" }
 moose-vst3 = { version = "7.0.0", path = "crates/moose-vst3" }
+moose-au = { version = "7.0.0", path = "crates/moose-au" }
 moose-standalone = { version = "7.0.0", path = "crates/moose-standalone" }
 moose-driver = { version = "7.0.0", path = "crates/moose-driver" }
 # `default-features = false` at the workspace so members pick a
@@ -132,6 +135,7 @@ moose-mui = { version = "7.0.0", path = "crates/moose-mui" }
 moose-simd = { version = "7.0.0", path = "crates/moose-simd" }
 moose-font = { version = "7.0.0", path = "crates/moose-font" }
 moose-build = { version = "7.0.0", path = "crates/moose-build" }
+moose-shim-types = { version = "7.0.0", path = "crates/moose-shim-types" }
 moose-utils = { version = "7.0.0", path = "crates/moose-utils" }
 
 # Common third-party deps consumed by multiple workspace crates.

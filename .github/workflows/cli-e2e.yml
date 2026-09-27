@@ -3,10 +3,13 @@ name: CLI end-to-end
 # One job per OS: build cargo-moose once, then drive every user-facing
 # pipeline through it against real validators.
 #   1. doctor, then install -> validate -> uninstall moose-example-gain
-#      (macOS: --system scope + MH_BUNDLE check; Linux/Windows: --user)
+#      (macOS: --system scope + MH_BUNDLE check + AU v2 via auval;
+#      Linux/Windows: --user)
+#   1b. macOS: AU v2 install + auval for every example plugin
 #   2. package moose-example-synth (clap,vst3,standalone) + preset checks
 #   3. for every scaffold shape: new -> fmt -> clippy pedantic -> install
-#      -> validate -> package -> uninstall (pure/stateful: Linux only, they
+#      -> validate (auval too on macOS) -> package -> uninstall
+#      (pure/stateful: Linux only, they
 #      only change the generated lib.rs)
 #   4. rt-paranoid allocation check on the scaffolded effect
 #
@@ -145,6 +148,7 @@ jobs:
           command -v clap-validator
           if [ "$RUNNER_OS" = macOS ]; then
             test -x /Applications/pluginval.app/Contents/MacOS/pluginval
+            command -v auval
           else
             command -v pluginval
           fi
@@ -162,15 +166,22 @@ jobs:
         run: |
           set -e
           if [ "$RUNNER_OS" = macOS ]; then
-            sudo "$CARGO_MOOSE" install --system --clap --vst3 -p moose-example-gain
+            sudo "$CARGO_MOOSE" install --system --clap --vst3 --au2 -p moose-example-gain
             # The sudo build left root-owned files in target/ and ~/.cargo;
             # hand them back so the later (non-root) builds can write.
             sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
-            for fmt in "CLAP/Moose Gain.clap" "VST3/Moose Gain.vst3"; do
+            # CLAP / VST3 binaries must be MH_BUNDLE; the AU v2 .component
+            # stays MH_DYLIB (its loader is happy with it).
+            for fmt in "CLAP/Moose Gain.clap" "VST3/Moose Gain.vst3" "Components/Moose Gain.component"; do
               otool -hv "/Library/Audio/Plug-Ins/$fmt/Contents/MacOS/Moose Gain" | tee /tmp/hdr.txt
-              grep -q "BUNDLE" /tmp/hdr.txt || { echo "::error::$fmt expected MH_BUNDLE"; exit 1; }
+              want=BUNDLE; [ "$fmt" = "Components/Moose Gain.component" ] && want=DYLIB
+              grep -q "$want" /tmp/hdr.txt || { echo "::error::$fmt expected MH_$want"; exit 1; }
             done
             $CARGO_MOOSE status
+            # A fresh runner's AudioComponentRegistrar hasn't scanned the
+            # component yet; restart it so auval can find it.
+            $CARGO_MOOSE reset-au --yes
+            sleep 5
           else
             $CARGO_MOOSE install --user --clap --vst3 -p moose-example-gain
           fi
@@ -184,7 +195,8 @@ jobs:
         run: |
           set -e -o pipefail
           run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
-          $run "$CARGO_MOOSE" validate --clap --pluginval -p moose-example-gain 2>&1 | tee validate.log
+          au=""; [ "$RUNNER_OS" = macOS ] && au=--auval
+          $run "$CARGO_MOOSE" validate --clap --pluginval $au -p moose-example-gain 2>&1 | tee validate.log
           if grep -E "SKIP|not found" validate.log >/dev/null; then
             echo "::error::validate skipped a step - failing"; exit 1
           fi
@@ -197,6 +209,7 @@ jobs:
             sudo "$CARGO_MOOSE" uninstall --system --yes -p moose-example-gain
             sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
             root=/Library/Audio/Plug-Ins; clap=CLAP; vst3=VST3
+            [ ! -e "$root/Components/Moose Gain.component" ] || { echo "::error::uninstall left the AU component behind"; exit 1; }
           elif [ "$RUNNER_OS" = Linux ]; then
             "$CARGO_MOOSE" uninstall --user --yes -p moose-example-gain
             root=$HOME; clap=.clap; vst3=.vst3
@@ -217,8 +230,9 @@ jobs:
         if: matrix.part != 'scaffolds'
         run: |
           set -e
-          extra=""; [ "$RUNNER_OS" = macOS ] && extra=--no-notarize
-          $CARGO_MOOSE package --formats clap,vst3,standalone $extra -p moose-example-synth
+          formats=clap,vst3,standalone; extra=""
+          [ "$RUNNER_OS" = macOS ] && { formats=clap,vst3,au2,standalone; extra=--no-notarize; }
+          $CARGO_MOOSE package --formats $formats $extra -p moose-example-synth
           ls -la target/dist/
           case "$RUNNER_OS" in
             macOS)   ls target/dist/moose-example-synth-*-macos.pkg ;;
@@ -239,9 +253,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ── macOS AU: auval slot ─────────────────────────────────────────
-      # The AU restore (stage2/au) adds its auval job here, macOS only,
-      # after the example plugins and before the scaffold shapes.
+      # ── every example: AU v2 install + auval (macOS) ─────────────────
+      # auval only scans the system Components dir reliably, so install
+      # --system. Build as the runner user first so the sudo install
+      # (--no-build) leaves no root-owned build output. `validate --auval`
+      # fails the step on any auval failure.
+      - name: auval every example plugin
+        if: runner.os == 'macOS'
+        run: |
+          set -e -o pipefail
+          "$CARGO_MOOSE" build --au2
+          sudo "$CARGO_MOOSE" install --system --au2 --no-build
+          sudo chown -R "$(id -u):$(id -g)" target "$HOME/.cargo"
+          "$CARGO_MOOSE" reset-au --yes
+          sleep 5
+          "$CARGO_MOOSE" validate --auval 2>&1 | tee auval.log
+          if grep -E "SKIP|not found" auval.log >/dev/null; then
+            echo "::error::auval skipped a plugin - failing"; exit 1
+          fi
+          echo "auval PASS count: $(grep -c ' PASS$' auval.log)"
+          sudo "$CARGO_MOOSE" uninstall --system --au2 --yes
 
       # ── scaffold shapes ───────────────────────────────────────────────
       # Catches templates that build but trip a downstream packager
@@ -273,12 +304,26 @@ jobs:
             echo "::endgroup::"
             echo "::group::$shape: install + validate + package + uninstall"
             "$CARGO_MOOSE" install --user --clap --vst3
-            $run "$CARGO_MOOSE" validate --clap --pluginval 2>&1 | tee validate.log
+            au=""
+            if [ "$RUNNER_OS" = macOS ]; then
+              # AU v2 goes system-wide (see the example auval step).
+              "$CARGO_MOOSE" build --au2
+              # sudo resets the env; keep the shared target dir so
+              # --no-build finds the dylib `build` just wrote there.
+              sudo CARGO_TARGET_DIR="$CARGO_TARGET_DIR" "$CARGO_MOOSE" install --system --au2 --no-build
+              sudo chown -R "$(id -u):$(id -g)" "$CARGO_TARGET_DIR" "$HOME/.cargo" .
+              "$CARGO_MOOSE" reset-au --yes
+              sleep 5
+              au=--auval
+            fi
+            $run "$CARGO_MOOSE" validate --clap --pluginval $au 2>&1 | tee validate.log
             if grep -E "SKIP|not found" validate.log >/dev/null; then
               echo "::error::$shape: validate skipped a step"; exit 1
             fi
-            "$CARGO_MOOSE" package --formats clap,vst3 $nz
+            pf=clap,vst3; [ "$RUNNER_OS" = macOS ] && pf=clap,vst3,au2
+            "$CARGO_MOOSE" package --formats $pf $nz
             "$CARGO_MOOSE" uninstall --user --yes
+            [ "$RUNNER_OS" = macOS ] && sudo "$CARGO_MOOSE" uninstall --system --au2 --yes
             echo "::endgroup::"
             cd "$GITHUB_WORKSPACE"
           done

@@ -296,8 +296,8 @@ pub fn assert_audio_alloc<R>(f: impl FnOnce() -> R) -> R {
 ///
 /// # Panics
 ///
-/// Panics if any string field is empty or the preset extension is
-/// empty / dotted.
+/// Panics if any string field is empty, the preset extension is
+/// empty / dotted, or any AU `FourCC` code is all zeros.
 pub fn assert_valid_info<P: PluginExport>() {
     let info = P::info();
     assert!(!info.name.is_empty(), "Plugin name is empty");
@@ -309,6 +309,70 @@ pub fn assert_valid_info<P: PluginExport>() {
         !info.preset_extension.is_empty() && !info.preset_extension.contains('.'),
         "preset extension must be non-empty and dot-free"
     );
+    assert!(info.au_type != [0; 4], "AU type is zero");
+    assert!(info.fourcc != [0; 4], "FourCC is zero");
+    assert!(info.au_manufacturer != [0; 4], "AU manufacturer is zero");
+}
+
+// ---------------------------------------------------------------------------
+// AU metadata tests
+// ---------------------------------------------------------------------------
+
+/// Assert AU type codes are valid 4-char ASCII.
+///
+/// Catches the `FourCharCode` endianness bug (big-endian on ARM64).
+///
+/// # Panics
+///
+/// Panics if any byte of `au_type`, `fourcc`, or `au_manufacturer`
+/// isn't a printable ASCII glyph.
+pub fn assert_au_type_codes_ascii<P: PluginExport>() {
+    let info = P::info();
+    for (label, code) in [
+        ("au_type", info.au_type),
+        ("fourcc", info.fourcc),
+        ("au_manufacturer", info.au_manufacturer),
+    ] {
+        for (i, &byte) in code.iter().enumerate() {
+            assert!(
+                byte.is_ascii_graphic(),
+                "{label}[{i}] is not printable ASCII: 0x{byte:02x} (full: {:?})",
+                std::str::from_utf8(&code).unwrap_or("??")
+            );
+        }
+    }
+}
+
+/// Assert AU `FourCharCode` round-trips through big-endian u32.
+///
+/// This is the encoding used by `AudioComponentDescription` on macOS.
+///
+/// # Panics
+///
+/// Panics if the big-endian pack/unpack of any `FourCharCode`
+/// doesn't reproduce the original byte sequence.
+pub fn assert_fourcc_roundtrip<P: PluginExport>() {
+    let info = P::info();
+    for (label, code) in [
+        ("au_type", info.au_type),
+        ("fourcc", info.fourcc),
+        ("au_manufacturer", info.au_manufacturer),
+    ] {
+        let packed = (u32::from(code[0]) << 24)
+            | (u32::from(code[1]) << 16)
+            | (u32::from(code[2]) << 8)
+            | u32::from(code[3]);
+        // Bit-extraction: each byte is a deliberate truncation of the
+        // packed `u32` into one of its four bytes.
+        #[allow(clippy::cast_possible_truncation)]
+        let unpacked = [
+            (packed >> 24) as u8,
+            (packed >> 16) as u8,
+            (packed >> 8) as u8,
+            packed as u8,
+        ];
+        assert_eq!(code, unpacked, "{label} FourCharCode round-trip failed");
+    }
 }
 
 /// Assert bus config is correct for an effect (has inputs and outputs).

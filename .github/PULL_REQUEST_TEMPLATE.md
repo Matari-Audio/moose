@@ -23,7 +23,7 @@ each is bridged or documented + logged as a skip. -->
 
 | Format | Carried / bridged / skipped (why) |
 |--------|-----------------------------------|
-| CLAP / VST3 / standalone | |
+| CLAP / VST3 / AU v2 / AU v3 / standalone | |
 
 ## Example
 
@@ -42,7 +42,7 @@ changes is a valid entry when true.
 Host-dependent changes (window embedding, resize, focus, DPI,
 editor lifecycle, MIDI routing, state/preset recall, transport)
 must cover the Tier 1 hosts for the affected OSes:
-macOS: Ableton Live, Cubase, Bitwig, REAPER
+macOS: Ableton Live, Logic Pro, Cubase, Bitwig, REAPER
 Windows: Ableton Live, Cubase, Bitwig, REAPER
 Linux: Bitwig, REAPER -->
 

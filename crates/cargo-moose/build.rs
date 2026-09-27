@@ -1,10 +1,12 @@
 //! Invalidate the crate's incremental cache whenever any embedded
 //! template file changes.
 //!
-//! The scaffolder pulls the files under `templates/` into the binary
-//! via `include_str!`. Cargo's default rebuild tracking only watches
-//! Rust sources, so a pure template edit doesn't re-trigger
-//! `include_str!` and `cargo moose new` would ship stale bytes.
+//! `src/templates.rs` pulls every file under `templates/` into the
+//! binary via `include_str!`. Cargo's default rebuild tracking only
+//! watches Rust sources, so a pure template edit (a `.swift` / `.h` /
+//! `.cpp` / `.plist` touch) doesn't re-trigger `include_str!` - the
+//! `cargo-moose install --au3` path then ships stale bytes to
+//! xcodebuild and any recent template fix silently falls on the floor.
 //!
 //! Watching the template directories (recursive) fixes that. We also
 //! watch this build script itself so editing the watch list triggers

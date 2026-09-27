@@ -803,6 +803,24 @@ pub(crate) fn lipo_into(inputs: &[PathBuf], output: &Path) -> crate::Res {
     Ok(())
 }
 
+/// Run a cargo release build for a specific Apple arch. Adds
+/// `--target <triple>` to the caller's args so output lands under
+/// `target/{triple}/release/` without colliding with other arches.
+#[cfg(target_os = "macos")]
+pub(crate) fn cargo_build_for_arch(
+    env_vars: &[(&str, &str)],
+    base_args: &[&str],
+    arch: MacArch,
+    dt: &str,
+) -> crate::Res {
+    let mut args: Vec<String> = vec!["--target".into(), arch.triple().into()];
+    for a in base_args {
+        args.push((*a).into());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
+    cargo_build(env_vars, &arg_refs, dt)
+}
+
 /// Build for every Apple arch in `archs` in a single cargo invocation
 /// by passing multiple `--target <triple>` flags. Cargo 1.64+ accepts
 /// this and parallelizes codegen across targets internally - shared

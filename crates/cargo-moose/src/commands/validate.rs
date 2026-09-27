@@ -1,4 +1,4 @@
-//! `cargo moose validate` - drive pluginval (VST3) and
+//! `cargo moose validate` - drive auval (AU v2/v3), pluginval (VST3), and
 //! clap-validator (CLAP) against the project's installed bundles, with
 //! shadow-install collision detection.
 
@@ -17,7 +17,7 @@ use std::path::Path;
 /// injects `DYLD_FALLBACK_LIBRARY_PATH` (macOS) / `LD_LIBRARY_PATH`
 /// (Linux) pointing at target/debug deps; inherited by a child that
 /// `dlopen`s the bundle, they break its dylib resolution (pluginval
-/// scanned zero types; clap-validator loads the same way). The wider `DYLD_*` family is scrubbed for the same
+/// scanned zero types; clap-validator and auval load the same way). The wider `DYLD_*` family is scrubbed for the same
 /// reason - any of them can redirect the bundle's resolution.
 fn validator_command(program: impl AsRef<OsStr>) -> Command {
     let mut cmd = Command::new(program);
@@ -34,6 +34,8 @@ fn validator_command(program: impl AsRef<OsStr>) -> Command {
     }
     cmd
 }
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Print a one-line warning when the same plugin is installed under
@@ -62,16 +64,144 @@ fn warn_on_scope_collision(format: Format, user_path: &Path, system_path: &Path)
     }
 }
 
+/// Read a single leaf value from a plist via `plutil -extract … raw`.
+/// Returns `None` if the key path doesn't exist or the value isn't a scalar.
+#[cfg(target_os = "macos")]
+fn plist_extract(plist: &Path, key_path: &str) -> Option<String> {
+    let out = Command::new("plutil")
+        .args(["-extract", key_path, "raw", "-o", "-", plist.to_str()?])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Find every AU bundle on disk that declares the given component code.
+/// Walks the standard AU install directories and reads each candidate's
+/// Info.plist. Used by `cmd_validate` to surface stale-install collisions
+/// (the underlying cause of cryptic auval errors like
+/// `FATAL ERROR: Initialize: result: -10875` when an old `Moose Gain.app`
+/// shadows the current `Moose Gain v3.app`).
+#[cfg(target_os = "macos")]
+fn find_au_collisions(au_type: &str, subtype: &str, manufacturer: &str) -> Vec<PathBuf> {
+    let mut hits = Vec::new();
+    let home = dirs::home_dir().unwrap_or_default();
+
+    // AU v3: Application bundles ship the appex inside Contents/PlugIns.
+    // Walk both /Applications and ~/Applications (per-user install).
+    for apps_dir in [PathBuf::from("/Applications"), home.join("Applications")] {
+        let Ok(apps) = fs::read_dir(&apps_dir) else {
+            continue;
+        };
+        for app in apps.flatten() {
+            let plugins_dir = app.path().join("Contents/PlugIns");
+            let Ok(appexes) = fs::read_dir(&plugins_dir) else {
+                continue;
+            };
+            for appex in appexes.flatten() {
+                let plist = appex.path().join("Contents/Info.plist");
+                if matches_au_v3_descriptor(&plist, au_type, subtype, manufacturer) {
+                    hits.push(appex.path());
+                }
+            }
+        }
+    }
+
+    // AU v2: .component bundles in the standard system & user paths.
+    for dir in [
+        PathBuf::from("/Library/Audio/Plug-Ins/Components"),
+        home.join("Library/Audio/Plug-Ins/Components"),
+    ] {
+        let Ok(comps) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for comp in comps.flatten() {
+            let plist = comp.path().join("Contents/Info.plist");
+            if matches_au_v2_descriptor(&plist, au_type, subtype, manufacturer) {
+                hits.push(comp.path());
+            }
+        }
+    }
+
+    hits
+}
+
+#[cfg(target_os = "macos")]
+fn matches_au_v3_descriptor(
+    plist: &Path,
+    au_type: &str,
+    subtype: &str,
+    manufacturer: &str,
+) -> bool {
+    if !plist.is_file() {
+        return false;
+    }
+    let prefix = "NSExtension.NSExtensionAttributes.AudioComponents.0";
+    plist_extract(plist, &format!("{prefix}.subtype")).as_deref() == Some(subtype)
+        && plist_extract(plist, &format!("{prefix}.type")).as_deref() == Some(au_type)
+        && plist_extract(plist, &format!("{prefix}.manufacturer")).as_deref() == Some(manufacturer)
+}
+
+#[cfg(target_os = "macos")]
+fn matches_au_v2_descriptor(
+    plist: &Path,
+    au_type: &str,
+    subtype: &str,
+    manufacturer: &str,
+) -> bool {
+    if !plist.is_file() {
+        return false;
+    }
+    plist_extract(plist, "AudioComponents.0.subtype").as_deref() == Some(subtype)
+        && plist_extract(plist, "AudioComponents.0.type").as_deref() == Some(au_type)
+        && plist_extract(plist, "AudioComponents.0.manufacturer").as_deref() == Some(manufacturer)
+}
+
+/// Print a warning if more than one bundle declares the AU component
+/// `(au_type, subtype, manufacturer)`. macOS picks one at load time; the other
+/// gets shadowed and produces opaque auval failures.
+#[cfg(target_os = "macos")]
+fn warn_on_au_collision(au_type: &str, subtype: &str, manufacturer: &str, expected: &Path) {
+    let hits = find_au_collisions(au_type, subtype, manufacturer);
+    if hits.len() <= 1 {
+        return;
+    }
+    eprintln!(
+        "    {} collision: {} other bundle(s) also claim {}/{}/{}",
+        tag_warn(),
+        hits.len() - 1,
+        au_type,
+        subtype,
+        manufacturer,
+    );
+    for h in &hits {
+        let marker = if h.starts_with(expected) || expected.starts_with(h) {
+            "← expected"
+        } else {
+            "← stale, remove this"
+        };
+        eprintln!("        • {} {}", h.display(), marker);
+    }
+    eprintln!("        macOS will pick one at load time; the rest are shadowed.");
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn cmd_validate(args: &[String]) -> Res {
     let config = load_config()?;
 
+    let mut run_auval = false;
+    let mut run_auval_v3 = false;
     let mut run_pluginval = false;
     let mut run_clap = false;
     // Track explicit per-format flags so a missing validator counts as a
     // failure for CI (`--clap`, `--pluginval`, …) but stays a warning for
     // a casual `cargo moose validate` run on a host that's missing some
     // tools. `--all` keeps the casual semantics.
+    let mut auval_explicit = false;
+    let mut auval_v3_explicit = false;
     let mut pluginval_explicit = false;
     let mut clap_explicit = false;
     let mut plugin_filter: Option<String> = None;
@@ -84,6 +214,14 @@ pub(crate) fn cmd_validate(args: &[String]) -> Res {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--auval" => {
+                run_auval = true;
+                auval_explicit = true;
+            }
+            "--auval3" => {
+                run_auval_v3 = true;
+                auval_v3_explicit = true;
+            }
             "--pluginval" => {
                 run_pluginval = true;
                 pluginval_explicit = true;
@@ -93,6 +231,8 @@ pub(crate) fn cmd_validate(args: &[String]) -> Res {
                 clap_explicit = true;
             }
             "--all" => {
+                run_auval = true;
+                run_auval_v3 = true;
                 run_pluginval = true;
                 run_clap = true;
             }
@@ -110,7 +250,9 @@ pub(crate) fn cmd_validate(args: &[String]) -> Res {
         }
         i += 1;
     }
-    if !run_pluginval && !run_clap {
+    if !run_auval && !run_auval_v3 && !run_pluginval && !run_clap {
+        run_auval = true;
+        run_auval_v3 = true;
         run_pluginval = true;
         run_clap = true;
     }
@@ -118,6 +260,129 @@ pub(crate) fn cmd_validate(args: &[String]) -> Res {
     let plugins: Vec<&PluginDef> = super::pick_plugins(&config, plugin_filter.as_deref())?;
 
     let mut failures = 0;
+
+    // auval (macOS only, AU v2)
+    if run_auval {
+        eprintln!("auval (AU v2)\n");
+        if Command::new("auval").arg("-h").output().is_ok() {
+            for p in &plugins {
+                #[cfg(target_os = "macos")]
+                {
+                    let user_path = InstallScope::User
+                        .au_v2_dir()
+                        .join(format!("{}.component", p.file_stem()));
+                    let system_path = InstallScope::System
+                        .au_v2_dir()
+                        .join(format!("{}.component", p.file_stem()));
+                    warn_on_scope_collision(Format::Au2, &user_path, &system_path);
+                }
+                eprint!(
+                    "  {} ({} {} {}) ... ",
+                    p.name,
+                    p.resolved_au_type(),
+                    p.resolved_fourcc(),
+                    config.vendor.au_manufacturer
+                );
+                let output = validator_command("auval")
+                    .args([
+                        "-v",
+                        p.resolved_au_type(),
+                        p.resolved_fourcc(),
+                        &config.vendor.au_manufacturer,
+                    ])
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stdout.contains("VALIDATION SUCCEEDED") {
+                    eprintln!("PASS");
+                } else {
+                    eprintln!("FAIL");
+                    if !stdout.is_empty() {
+                        eprintln!("{stdout}");
+                    }
+                    if !stderr.is_empty() {
+                        eprintln!("{stderr}");
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let expected = PathBuf::from(format!(
+                            "/Library/Audio/Plug-Ins/Components/{}.component",
+                            p.file_stem()
+                        ));
+                        warn_on_au_collision(
+                            p.resolved_au_type(),
+                            p.resolved_fourcc(),
+                            &config.vendor.au_manufacturer,
+                            &expected,
+                        );
+                    }
+                    failures += 1;
+                }
+            }
+        } else {
+            eprintln!("  auval not found (macOS only)");
+            if auval_explicit {
+                failures += 1;
+            }
+        }
+    }
+
+    // auval (AU v3 appex)
+    if run_auval_v3 {
+        eprintln!("\nauval (AU v3)\n");
+        if Command::new("auval").arg("-h").output().is_ok() {
+            for p in &plugins {
+                let sub = p.au3_sub();
+                eprint!(
+                    "  {} ({} {} {}) ... ",
+                    p.name,
+                    p.resolved_au_type(),
+                    sub,
+                    config.vendor.au_manufacturer
+                );
+                let output = validator_command("auval")
+                    .args([
+                        "-v",
+                        p.resolved_au_type(),
+                        sub,
+                        &config.vendor.au_manufacturer,
+                    ])
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stdout.contains("VALIDATION SUCCEEDED") {
+                    eprintln!("PASS");
+                } else {
+                    eprintln!("FAIL");
+                    if !stdout.is_empty() {
+                        eprintln!("{stdout}");
+                    }
+                    if !stderr.is_empty() {
+                        eprintln!("{stderr}");
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let expected = PathBuf::from(format!(
+                            "/Applications/{}.app/Contents/PlugIns/AUExt.appex",
+                            p.au3_app_name()
+                        ));
+                        warn_on_au_collision(
+                            p.resolved_au_type(),
+                            sub,
+                            &config.vendor.au_manufacturer,
+                            &expected,
+                        );
+                    }
+                    failures += 1;
+                }
+            }
+        } else {
+            eprintln!("  auval not found (macOS only)");
+            if auval_v3_explicit {
+                failures += 1;
+            }
+        }
+    }
 
     // pluginval (VST3)
     if run_pluginval {
@@ -296,13 +561,15 @@ pub(crate) fn cmd_validate(args: &[String]) -> Res {
 fn print_help() {
     eprintln!(
         "\
-Usage: cargo moose validate [--pluginval] [--clap] [--all]
+Usage: cargo moose validate [--auval] [--auval3] [--pluginval] [--clap] [--all]
                             [--skip-gui-tests] [-p <crate>]
 
 Run validation tools on installed plugins. With no flag, runs every
 available validator.
 
 Options:
+  --auval          AU v2 validation via auval (macOS).
+  --auval3         AU v3 validation via auval (macOS).
   --pluginval      VST3 validation via pluginval.
   --clap           CLAP validation via clap-validator.
   --all            Run every available validator (default).

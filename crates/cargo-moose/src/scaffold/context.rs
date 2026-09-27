@@ -43,7 +43,8 @@ pub(crate) struct PluginScaffoldingContext {
     /// Plain semver version (e.g. `0.48.7`). Used by the registry
     /// dep form when `use_registry` is true.
     pub version: String,
-    /// Toggles the dep style emitted by the per-plugin Cargo.toml. Mirrors the same flag on
+    /// Toggles the dep style emitted by the per-plugin Cargo.toml's
+    /// commented LV2/AU/AAX hints. Mirrors the same flag on
     /// `WorkspaceContext` so workspace + plugin templates stay in
     /// sync.
     pub use_registry: bool,
@@ -156,6 +157,7 @@ impl WorkspaceContext {
 pub(crate) struct MooseTomlContext {
     pub vendor_name: String,
     pub vendor_id: String,
+    pub vendor_fourcc: String,
     pub plugins: Vec<MooseTomlPlugin>,
     /// Suite-installer block emitted only for multi-plugin workspace
     /// scaffolds. `None` collapses the `{{ if suite }}` template guard
@@ -170,6 +172,8 @@ pub(crate) struct MooseTomlPlugin {
     pub bundle_id: String,
     pub crate_name: String,
     pub category: &'static str,
+    pub fourcc: String,
+    pub au_tag: &'static str,
     pub vst3_subcategory: &'static str,
 }
 
@@ -184,6 +188,7 @@ impl MooseTomlContext {
         vendor: &VendorInfo,
         plugins: &[PluginSpec],
         workspace_name: &str,
+        fourcc_map: &std::collections::HashMap<String, String>,
         is_workspace: bool,
     ) -> Self {
         let entries = plugins
@@ -200,6 +205,8 @@ impl MooseTomlContext {
                     bundle_id: p.name.clone(),
                     crate_name,
                     category: p.kind.category(),
+                    fourcc: fourcc_map[&p.name].clone(),
+                    au_tag: p.kind.au_tag(),
                     vst3_subcategory: p.kind.vst3_subcategory(),
                 }
             })
@@ -215,6 +222,7 @@ impl MooseTomlContext {
         Self {
             vendor_name: vendor.name.clone(),
             vendor_id: vendor.id.clone(),
+            vendor_fourcc: super::fourcc::to_fourcc(&vendor.name),
             plugins: entries,
             suite,
         }
@@ -228,17 +236,17 @@ impl MooseTomlContext {
 
 fn default_label(features: FeatureSet) -> &'static str {
     if features.standalone {
-        "CLAP + VST3 + standalone"
+        "CLAP + VST3 + AU + standalone"
     } else {
-        "CLAP + VST3"
+        "CLAP + VST3 + AU"
     }
 }
 
 fn default_features(features: FeatureSet) -> &'static str {
     if features.standalone {
-        r#"["clap", "vst3", "standalone"]"#
+        r#"["clap", "vst3", "au", "standalone"]"#
     } else {
-        r#"["clap", "vst3"]"#
+        r#"["clap", "vst3", "au"]"#
     }
 }
 

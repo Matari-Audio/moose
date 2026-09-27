@@ -158,6 +158,8 @@ pub(crate) fn extract_suite_selection(
 pub(crate) enum PkgFormat {
     Clap,
     Vst3,
+    Au2,
+    Au3,
     /// Standalone host application built from the plugin's
     /// `[features].standalone`. Installs to `/Applications/` on macOS,
     /// `%PROGRAMFILES%\<Vendor>\<Plugin>\` on Windows, `/usr/bin/` (or
@@ -172,6 +174,8 @@ impl std::str::FromStr for PkgFormat {
         match s {
             "clap" => Ok(PkgFormat::Clap),
             "vst3" => Ok(PkgFormat::Vst3),
+            "au2" => Ok(PkgFormat::Au2),
+            "au3" => Ok(PkgFormat::Au3),
             "standalone" => Ok(PkgFormat::Standalone),
             other => Err(format!("unknown format: {other}").into()),
         }
@@ -196,7 +200,7 @@ struct PkgFormatMeta {
     choice_description: &'static str,
 }
 
-const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 3] = [
+const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 5] = [
     (
         PkgFormat::Clap,
         PkgFormatMeta {
@@ -206,7 +210,7 @@ const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 3] = [
             install_location: "/Library/Audio/Plug-Ins/CLAP/",
             // macOS CLAP is a loadable bundle (`Contents/MacOS/<name>`
             // + `Info.plist`) - pkgbuild gets the same component-plist
-            // treatment as VST3 so the installer pins it to the
+            // treatment as VST3 / AU so the installer pins it to the
             // declared install_location and upgrades by bundle ID.
             is_native_bundle: true,
             choice_description: "For Reaper, Bitwig",
@@ -221,6 +225,28 @@ const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 3] = [
             install_location: "/Library/Audio/Plug-Ins/VST3/",
             is_native_bundle: true,
             choice_description: "For Ableton, FL Studio, Reaper, Cubase",
+        },
+    ),
+    (
+        PkgFormat::Au2,
+        PkgFormatMeta {
+            label: "AU2",
+            pkg_id_suffix: "au2",
+            extension: "component",
+            install_location: "/Library/Audio/Plug-Ins/Components/",
+            is_native_bundle: true,
+            choice_description: "For Logic Pro, GarageBand, Ableton",
+        },
+    ),
+    (
+        PkgFormat::Au3,
+        PkgFormatMeta {
+            label: "AU3",
+            pkg_id_suffix: "au3",
+            extension: "app",
+            install_location: "/Applications/",
+            is_native_bundle: true,
+            choice_description: "Audio Unit v3 (appex)",
         },
     ),
     (
@@ -285,10 +311,15 @@ impl PkgFormat {
     /// Bundle directory name for a given plugin.
     pub(crate) fn bundle_name(&self, plugin: &PluginDef) -> String {
         match self {
+            PkgFormat::Au3 => format!("{}.app", plugin.au3_app_name()),
             // Plain `<Plugin>.app` so Spotlight / Launch Services index
             // it as a regular application. The historical
             // `<Plugin>.standalone.app` extension confused some indexing
             // paths and the bundle would not appear in Spotlight search.
+            // AU v3 resolves to the same `<Plugin>.app` (its app *is* the
+            // standalone host with the appex), so `resolve_formats` drops
+            // the separate Standalone format whenever AU v3 is present -
+            // they never coexist at this path.
             PkgFormat::Standalone => format!("{}.app", plugin.file_stem()),
             _ => format!("{}.{}", plugin.file_stem(), self.extension()),
         }
@@ -299,14 +330,15 @@ impl PkgFormat {
     }
 
     /// True for formats whose install destination can't be redirected
-    /// into the user's home - a standalone `.app` belongs in
-    /// `/Applications/` to show up in Launchpad. When the user picks
-    /// "Install for me only" but selects one of these, the installer escalates
+    /// into the user's home - AU v3 needs `/Applications/` for `LaunchServices` to register
+    /// the appex, and a standalone `.app` belongs in `/Applications/`
+    /// to show up in Launchpad. When the user picks "Install for me
+    /// only" but selects one of these, the installer escalates
     /// (`auth="Root"` on the corresponding `<pkg-ref>`) so the
     /// component still lands in the right place rather than failing
     /// with a permission-denied shove.
     pub(crate) fn is_system_only_on_macos(&self) -> bool {
-        matches!(self, PkgFormat::Standalone)
+        matches!(self, PkgFormat::Au3 | PkgFormat::Standalone)
     }
 }
 
@@ -380,7 +412,7 @@ Selection (composable):
 
 Format selection:
   --formats <list>     Comma-separated subset
-                       (clap,vst3,standalone).
+                       (clap,vst3,au2,au3,standalone).
                        Default: every format in the plugin's
                        `[features].default`.
   --features <list>    Extra Cargo features for the plugin crate,
@@ -394,7 +426,8 @@ Format selection:
 Install scope (where the resulting installer puts files at the end user's machine):
   --ask                End user picks at install time. Default.
   --user               User-scope. CLAP/VST3 land in user paths with no
-                       admin prompt.
+                       admin prompt. AU v3 stays system-scope; the user
+                       sees one admin prompt.
   --system             Hard-lock to system paths.
   Override the default project-wide via `[packaging] preferred_scope` in moose.toml.
 

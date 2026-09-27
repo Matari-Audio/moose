@@ -11,7 +11,7 @@ use crate::install_scope::PkgScope;
 use crate::preset_codec::xml_escape;
 use crate::{Config, PluginDef, Res};
 #[cfg(target_os = "macos")]
-use crate::{MacosPackagingConfig, codesign_bundle};
+use crate::{MacosPackagingConfig, codesign_bundle, copy_dir_recursive};
 #[cfg(target_os = "macos")]
 use std::fmt::Write;
 use std::fs;
@@ -321,6 +321,138 @@ fn vst3_inner_extension(triple: &str) -> &'static str {
     }
 }
 
+/// Stage an AU v2 bundle (`.component` directory) into the staging
+/// directory. Audio Unit is macOS-only.
+#[cfg(target_os = "macos")]
+pub(crate) fn stage_au2(root: &Path, p: &PluginDef, config: &Config, staging: &Path) -> Res {
+    let dylib =
+        moose_build::target_dir(root).join(format!("release/lib{}_au.dylib", p.dylib_stem()));
+    if !dylib.exists() {
+        return Err(format!("Missing: {}", dylib.display()).into());
+    }
+    let bundle = staging.join(format!("{}.component", p.file_stem()));
+    let macos_dir = bundle.join("Contents/MacOS");
+    fs::create_dir_all(&macos_dir)?;
+    let exec_name = p.file_stem();
+    fs::copy(&dylib, macos_dir.join(&exec_name))?;
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>{exec_name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>{vendor_id}.{bundle_id}.component</string>
+    <key>CFBundleName</key>
+    <string>{display_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>AudioComponents</key>
+    <array>
+        <dict>
+            <key>type</key>
+            <string>{au_type}</string>
+            <key>subtype</key>
+            <string>{au_subtype}</string>
+            <key>manufacturer</key>
+            <string>{au_mfr}</string>
+            <key>name</key>
+            <string>{vendor}: {display_name}</string>
+            <key>description</key>
+            <string>{display_name}</string>
+            <key>version</key>
+            <integer>65536</integer>
+            <key>factoryFunction</key>
+            <string>MooseAUFactory</string>
+            <key>sandboxSafe</key>
+            <true/>
+            <key>tags</key>
+            <array>
+                <string>{au_tag}</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>"#,
+        display_name = xml_escape(&p.name),
+        bundle_id = p.bundle_id,
+        vendor_id = xml_escape(&config.vendor.id),
+        vendor = xml_escape(&config.vendor.name),
+        au_type = xml_escape(p.resolved_au_type()),
+        au_subtype = xml_escape(p.resolved_fourcc()),
+        au_mfr = xml_escape(&config.vendor.au_manufacturer),
+        au_tag = xml_escape(&p.au_tag),
+        exec_name = xml_escape(&exec_name),
+    );
+    fs::write(bundle.join("Contents/Info.plist"), &plist)?;
+    // The shim's kAudioUnitProperty_FactoryPresets handler enumerates
+    // these from the sealed bundle - emit before codesign.
+    if let Some(fp) = presets::load_factory_presets(root, p, config)? {
+        presets::emit_trucepreset_tree(
+            &fp,
+            &bundle.join("Contents/Resources/Presets"),
+            false,
+            &format!("{}-au-bundle", p.bundle_id),
+        )?;
+    }
+    codesign_bundle(
+        bundle.to_str().unwrap(),
+        &crate::application_identity(),
+        false,
+    )?;
+    Ok(())
+}
+
+/// Stage an AU v3 `.app` bundle into the staging directory for pkgbuild.
+///
+/// Reads from `target/bundles/{Plugin}.app/` - the fully-signed output
+/// of `emit_au_v3_bundle` - and copies it into the staging tree.
+/// The bundle is already signed + has its embedded framework, so this
+/// is a pure copy.
+#[cfg(target_os = "macos")]
+pub(crate) fn stage_au3(root: &Path, p: &PluginDef, _config: &Config, staging: &Path) -> Res {
+    let app_name = format!("{}.app", p.au3_app_name());
+    let built_app = moose_build::target_dir(root)
+        .join("bundles")
+        .join(&app_name);
+    if !built_app.exists() {
+        return Err(format!(
+            "AU v3 bundle missing at {}. Run `cargo moose build --au3 -p {}` first.",
+            built_app.display(),
+            p.bundle_id,
+        )
+        .into());
+    }
+
+    let dst = staging.join(&app_name);
+    // May be root-owned from a previous install-based run. Best-effort
+    // `rm -rf` covers that case; surface a pointed error if it still
+    // fails so the user knows exactly which command to run by hand.
+    if dst.exists() && fs::remove_dir_all(&dst).is_err() {
+        let status = Command::new("rm")
+            .args(["-rf", dst.to_str().unwrap()])
+            .status();
+        if dst.exists() {
+            return Err(format!(
+                "could not remove stale staging dir {} \
+                 (rm exit: {status:?}). \
+                 This is usually root-owned leftovers from an earlier \
+                 `cargo moose install`. Run:\n    \
+                 sudo rm -rf {}",
+                dst.display(),
+                dst.display(),
+            )
+            .into());
+        }
+    }
+    copy_dir_recursive(&built_app, &dst)?;
+    Ok(())
+}
+
 /// Stage the standalone host as a `.app` bundle inside the packaging
 /// staging tree. Reads the per-arch standalone binaries built by
 /// `build_and_lipo_standalone`, lipo-merges (or copies, single-arch)
@@ -496,6 +628,7 @@ pub(crate) fn generate_distribution_xml(
     version: &str,
     resources: Option<&MacosPackagingConfig>,
     scope: PkgScope,
+    au3_is_standalone_host: bool,
 ) -> String {
     let mut choices_outline = String::new();
     let mut choices = String::new();
@@ -505,7 +638,15 @@ pub(crate) fn generate_distribution_xml(
         let id = fmt.pkg_id_suffix();
         let pkg_id = format!("{vendor_id}.{bundle_id}.{id}");
         let label = fmt.label();
-        let (title, desc): (&str, &str) = (label, fmt.choice_description());
+        // AU v3's app *is* the standalone host when the plugin ships a
+        // standalone bin (we drop the separate Standalone format then), so
+        // surface that the one app does both. `label` stays the format
+        // label for the component filename; only the choice text changes.
+        let (title, desc): (&str, &str) = if *fmt == PkgFormat::Au3 && au3_is_standalone_host {
+            ("AU3 + Standalone", "Audio Unit v3 (appex) + standalone app")
+        } else {
+            (label, fmt.choice_description())
+        };
         let component_file = format!("{plugin_name}-{label}.pkg");
 
         // Every format ships checked by default.
@@ -518,11 +659,11 @@ pub(crate) fn generate_distribution_xml(
         // `root:wheel` even when "Install for me only" relocated the
         // destination to the user's home, and fails with EACCES.
         //
-        // - `--user` (explicit): user-viable formats (CLAP, VST3)
-        //   override to `auth="None"` so the relocated
+        // - `--user` (explicit): user-viable formats (CLAP, VST3,
+        //   AU v2) override to `auth="None"` so the relocated
         //   `~/Library/Audio/Plug-Ins/...` install runs as the
-        //   current user with no chown. System-only formats
-        //   (standalone) keep `auth="Root"` so they escalate
+        //   current user with no chown. System-only formats (AU v3,
+        //   standalone) keep `auth="Root"` so they escalate
         //   for `/Library/...` / `/Applications/`.
         // - `--ask` (default): leave user-viable formats at the
         //   component default - the user might pick "System" at
@@ -619,7 +760,12 @@ pub(crate) fn generate_distribution_xml(
 /// that removes any existing bundle at the destination before shove
 /// runs - without this, a stale leftover (especially one owned by
 /// root from a prior admin install) blocks the new payload with
-/// `Permission denied` during the relink step.
+/// `Permission denied` during the relink step. AU v2 additionally
+/// gets a `postinstall` that clears the AU cache so Logic / Garage-
+/// Band re-scan and pick up the new bundle; AU v3 gets one that
+/// registers its app-extension with `pluginkit` (see
+/// [`AU3_REGISTER_POSTINSTALL`]) - without it the component lists in
+/// hosts but won't open.
 ///
 /// The preinstall reads `$2` (the resolved install destination -
 /// already accounts for `enable_currentUserHome` relocation) and
@@ -630,11 +776,83 @@ pub(crate) fn generate_distribution_xml(
 /// leftovers and fails loudly with an actionable message otherwise
 /// (so the developer doing `cargo moose package --user` after a
 /// `--system` round sees what to clean up).
+/// AU v3 postinstall: schedule a deferred, one-shot registration of the
+/// app-extensions with `pluginkit`.
+///
+/// Registering inline from the postinstall does not work: pkg scripts run
+/// as root in the installer sandbox, but the installer re-touches every app
+/// bundle as its final step (after all postinstalls), which makes `pkd`
+/// drop any registration made earlier in the run. A `LaunchAgent` would run
+/// late enough but trips the macOS "Background Items Added" notification,
+/// which has no place in a plugin installer. A backgrounded child of the
+/// postinstall (`nohup ... &`) doesn't survive - the installer kills the
+/// sandbox process tree on teardown.
+///
+/// So hand the one-shot to the user's `launchd` via `launchctl submit` (a
+/// transient job - no plist in a monitored folder, so no notification;
+/// launchd-owned, so it outlives the installer). The job waits until the
+/// app bundles stop changing (finalization done), then registers every AU
+/// v3 appex in `/Applications` and refreshes the AU cache. Each AU v3
+/// component re-submits, replacing any prior submission, so the last one
+/// runs after the whole install settles; the postinstall returns at once so
+/// the install never blocks. No console user (CI / SSH / login window) ->
+/// skip.
+#[cfg(target_os = "macos")]
+const AU3_REGISTER_POSTINSTALL: &str = r#"#!/bin/bash
+set -u
+uid=$(stat -f %u /dev/console 2>/dev/null || true)
+user=$(stat -f %Su /dev/console 2>/dev/null || true)
+if [ -z "${uid:-}" ] || [ "$user" = "root" ]; then
+    exit 0
+fi
+DIR="/Library/Application Support/Moose"
+SCRIPT="$DIR/au3-register.sh"
+mkdir -p "$DIR"
+cat > "$SCRIPT" <<'EOF'
+#!/bin/bash
+# Deferred AU v3 registration: launchd runs this once in the user's GUI
+# session. Registration made during the install is wiped by the installer's
+# final bundle touch, so wait until the bundles stop changing, then register
+# every AU v3 appex and refresh the AU cache.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+prev=""
+stable=0
+for i in $(seq 1 60); do
+    cur=$(ls -dlT /Applications/*.app 2>/dev/null | md5)
+    if [ "$cur" = "$prev" ]; then
+        stable=$((stable + 1))
+    else
+        stable=0
+    fi
+    if [ "$stable" -ge 3 ]; then
+        break
+    fi
+    prev="$cur"
+    sleep 2
+done
+for ax in /Applications/*.app/Contents/PlugIns/AUExt.appex; do
+    if [ -d "$ax" ]; then
+        pluginkit -a "$ax" >/dev/null 2>&1
+    fi
+done
+killall -9 AudioComponentRegistrar 2>/dev/null || true
+launchctl remove com.moose.au3-register 2>/dev/null || true
+exit 0
+EOF
+chmod 755 "$SCRIPT"
+# Submit to the user's launchd. `remove` first so a re-submit replaces the
+# prior one; the last component's job is the one that runs to completion.
+launchctl asuser "$uid" sudo -u "$user" launchctl remove com.moose.au3-register 2>/dev/null || true
+launchctl asuser "$uid" sudo -u "$user" launchctl submit -l com.moose.au3-register -- /bin/bash "$SCRIPT"
+exit 0
+"#;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn write_format_scripts(
     staging: &Path,
     fmt: &PkgFormat,
     bundle_name: &str,
+    appex_id: Option<&str>,
 ) -> std::result::Result<PathBuf, crate::CargoMooseError> {
     let scripts_dir = staging.join(format!("{}_scripts", fmt.pkg_id_suffix()));
     let _ = fs::remove_dir_all(&scripts_dir);
@@ -670,6 +888,35 @@ pub(crate) fn write_format_scripts(
     Command::new("chmod")
         .args(["+x", preinstall.to_str().unwrap()])
         .status()?;
+
+    if *fmt == PkgFormat::Au2 {
+        let postinstall = scripts_dir.join("postinstall");
+        fs::write(
+            &postinstall,
+            "#!/bin/bash\n\
+             killall -9 AudioComponentRegistrar 2>/dev/null || true\n\
+             rm -rf ~/Library/Caches/AudioUnitCache/ 2>/dev/null || true\n\
+             rm -f ~/Library/Preferences/com.apple.audio.InfoHelper.plist 2>/dev/null || true\n\
+             exit 0\n",
+        )?;
+        Command::new("chmod")
+            .args(["+x", postinstall.to_str().unwrap()])
+            .status()?;
+    }
+
+    // AU v3 is an app-extension: dropping the `.app` into `/Applications`
+    // isn't enough, the appex has to be registered with `pluginkit` or
+    // hosts get a component that lists but won't open. The postinstall
+    // schedules a deferred one-shot that does this in the user's GUI
+    // session, since registering inline from the root sandbox doesn't
+    // survive the installer's final bundle touch.
+    if *fmt == PkgFormat::Au3 && appex_id.is_some() {
+        let postinstall = scripts_dir.join("postinstall");
+        fs::write(&postinstall, AU3_REGISTER_POSTINSTALL)?;
+        Command::new("chmod")
+            .args(["+x", postinstall.to_str().unwrap()])
+            .status()?;
+    }
 
     Ok(scripts_dir)
 }

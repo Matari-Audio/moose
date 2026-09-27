@@ -27,7 +27,7 @@ cargo moose install --clap         # single format only
 cargo moose build                  # bundle into target/bundles/ without installing
 cargo moose package                # build a signed .pkg / .exe in target/dist/
 cargo moose uninstall              # remove installed plugins (mirrors install scope flags)
-cargo moose validate               # run pluginval (VST3) + clap-validator
+cargo moose validate               # run auval (AU) + pluginval (VST3) + clap-validator
 cargo moose doctor                 # check toolchain, SDKs, signing certs, install paths
 cargo moose run                    # build and launch standalone
 cargo moose screenshot             # render every plugin's GUI to target/screenshots/
@@ -36,7 +36,8 @@ cargo moose status                 # show installed plugin versions
 
 ## Supported formats
 
-CLAP, VST3, and standalone on macOS, Windows, and Linux.
+CLAP, VST3, and standalone on macOS, Windows, and Linux, plus Audio
+Unit v2 (`.component`) and v3 (`.appex`) on macOS.
 
 ## Library API
 

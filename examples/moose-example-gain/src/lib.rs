@@ -119,7 +119,7 @@ mod tests {
     /// count covers frees as well as allocations, then restore the setting.
     /// Gated like its only callers, the per-format wrapper-glue tests
     /// below.
-    #[cfg(any(feature = "clap", feature = "vst3"))]
+    #[cfg(any(feature = "clap", feature = "vst3", feature = "au"))]
     fn wrapper_glue_violations(smoke: impl FnOnce() -> u32) -> u32 {
         let prev = moose::rt::check_dealloc();
         moose::rt::set_check_dealloc(true);
@@ -168,6 +168,18 @@ mod tests {
             wrapper_glue_violations(moose_vst3::rt_paranoid_smoke::<Plugin>),
             0,
             "the VST3 wrapper's per-block glue must not allocate or free on the audio thread"
+        );
+    }
+
+    /// The AU wrapper's per-block glue is allocation-free on the audio
+    /// thread. Drives the real render callback under the checker.
+    #[cfg(feature = "au")]
+    #[test]
+    fn au_wrapper_glue_is_allocation_free() {
+        assert_eq!(
+            wrapper_glue_violations(moose_au::rt_paranoid_smoke::<Plugin>),
+            0,
+            "the AU wrapper's per-block glue must not allocate or free on the audio thread"
         );
     }
 
@@ -232,6 +244,16 @@ mod tests {
         // A wrong-plugin envelope must fail without a hook.
         let renamed = serialize_state(hash ^ 1, &[0], &[-6.0], &[], &[]);
         moose_test::assert_state_migration_rejected::<Plugin>(PluginFormat::Clap, None, &renamed);
+    }
+
+    #[test]
+    fn au_type_codes_ascii() {
+        moose_test::assert_au_type_codes_ascii::<Plugin>();
+    }
+
+    #[test]
+    fn fourcc_roundtrip() {
+        moose_test::assert_fourcc_roundtrip::<Plugin>();
     }
 
     #[test]

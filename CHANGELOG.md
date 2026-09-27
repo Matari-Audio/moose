@@ -8,7 +8,8 @@ First release as MOOSE, a hard fork of truce 6.3.0. See the README's
 "Differences from truce" for the full list and migration steps.
 
 - Renamed every crate `truce*` → `moose*`, the CLI to `cargo moose`, and the config file to `moose.toml`. `truce.toml` and `TRUCE_*` environment variables are still read, with a deprecation warning.
-- Removed AU v2/v3, AAX, VST2, LV2 and iOS support, and the iced, vizia and Slint GUI backends with their examples. Remaining formats: CLAP, VST3, standalone.
+- Removed AAX, VST2, LV2 and iOS support, and the iced, vizia and Slint GUI backends with their examples. Remaining formats: CLAP, VST3, AU v2, AU v3 (macOS) and standalone.
+- AU stays a first-class format on macOS: the `moose-au` wrapper (v2 `.component` and the v3 appex built through `xcodebuild`), the `au` feature and `moose::plugin!` export, `cargo moose build/install/package/validate --au2/--au3` (auval, bundle layout, signing and notarization, `.pkg` components), `reset-au`, `log-stream-au` and the scaffold templates (`au` is a default feature there). The AU state key stays `truce_state`, so truce sessions reopen. The AU editor follows the same scale policy as CLAP and VST3: sizes are logical AppKit points and the editor tracks the parent view's backing scale; nothing multiplies a host scale on top.
 - CLAP rescans parameter values after state and preset loads; CLAP replays the host GUI scale into newly created editors.
 - VST3 interface IDs for `IUnitInfo`, `IEditControllerHostEditing` and `IProcessContextRequirements` are corrected.
 - New `moose-mui` crate (facade feature `mui`, `moose::mui`): `MuiEditor` and the parameter `Bridge` for [MUI](https://github.com/Matari-Audio/MUI) editors, ported from MUI's `mui-truce`. Example: `moose-example-gain-mui`.
@@ -37,14 +38,14 @@ First release as MOOSE, a hard fork of truce 6.3.0. See the README's
 - **Host text parsing is on by default (K13).** `Params::parse_value` returns a value for every derived parameter instead of `None`. Keep a `parse_fn` where the formatter-based parse is wrong for your notation.
 - **State restore can refuse (K11).** With `validate_persist`, a rejected blob fails the whole load (`RestoreError::Invalid` from `restore_plugin`; CLAP/VST3 report the load as failed).
 - **VST3 `setState` on an empty stream fails (K01)** instead of loading defaults.
-- **`PluginInfo`** lost `fourcc`, `au_type`, `au_manufacturer`, `aax_id`, `aax_category`, `vst2_name`, `au_name`, `au3_name`, `aax_name`, `lv2_name`, the `legacy_*` ids and `PluginInfo::fourcc()`, and gained `preset_extension: &'static str`. Struct literals must drop the old fields and set the new one (`moose_utils::preset::PRESET_FILE_EXT` for the default).
-- **`moose.toml`**: `au_manufacturer`, `fourcc`, `au_type`, `au_subtype`, `aax_category`, `vst2_name`, `au_name`, `au3_name`, `aax_name`, `lv2_name` and `[plugin.legacy_state]` are ignored; delete them at leisure.
-- **`moose-build`**: the `lv2` module, `presets::read_param_symbols` / `render_param_symbols`, `LegacyStateConfig` and the removed `PluginDef` / `VendorConfig` fields are gone. New: `preset_extension(&PluginDef)`, `param_index_dir(target, crate)`.
+- **`PluginInfo`** lost `aax_id`, `aax_category`, `vst2_name`, `aax_name`, `lv2_name` and the non-AU `legacy_*` ids, and gained `preset_extension: &'static str`. The AU fields (`fourcc`, `au_type`, `au_manufacturer`, `au_name`, `au3_name`, `legacy_au_keys`, `PluginInfo::fourcc()`) stay. Struct literals must drop the removed fields and set the new one (`moose_utils::preset::PRESET_FILE_EXT` for the default).
+- **`moose.toml`**: `aax_category`, `vst2_name`, `aax_name` and `lv2_name` are ignored; delete them at leisure. The AU keys (`[vendor] au_manufacturer`, `fourcc` or `au_subtype`, `au_type`, `au3_subtype`, `au_tag`, `au_name`, `au3_name`, `[plugin.legacy_state] au_keys`) stay, and every `[[plugin]]` needs a `fourcc` (or `au_subtype`).
+- **`moose-build`**: the `lv2` module, `presets::read_param_symbols` / `render_param_symbols` and the removed non-AU `PluginDef` fields are gone. New: `preset_extension(&PluginDef)`, `param_index_dir(target, crate)`.
 - **Param index sidecars** moved from `target/lv2-meta/<crate>/` to `target/param-index/<crate>/`; tests that read them should call `moose_build::param_index_dir`. The hidden macro `__moose_lv2_emit_root!` is now `__moose_param_index_root!`.
 - **`moose-utils`**: `presets::enumerate_scope` takes the container extension as a new last argument; the iOS app-group preset root is gone.
-- **`moose-core`**: `wrapper::max_io_channels`, `wrapper::first_bus_layout` and `wrapper::log_midi_ports_clamped` (AU/AAX/VST2 helpers) are removed.
-- **`moose-test`**: `assert_au_type_codes_ascii` and `assert_fourcc_roundtrip` are removed; `assert_valid_info` checks `preset_extension` instead.
-- **`cargo moose preset`** no longer reads or writes `.aupreset` or LV2 `.ttl`; `export` packs hold the native container and `.vstpreset`.
+- **`moose-core`**: `wrapper::max_io_channels`, `wrapper::first_bus_layout` and `wrapper::log_midi_ports_clamped` (AAX/VST2 helpers) are removed.
+- **`moose-test`**: `assert_valid_info` also checks `preset_extension`; `assert_au_type_codes_ascii` and `assert_fourcc_roundtrip` stay.
+- **`cargo moose preset`** no longer reads or writes LV2 `.ttl`; `export` packs hold the native container, `.vstpreset` and `.aupreset`.
 
 ### Inherited from the truce 7.0.0 fork line
 

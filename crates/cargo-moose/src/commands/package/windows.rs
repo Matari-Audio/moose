@@ -362,7 +362,7 @@ fn resolve_formats(
     config: &Config,
     format_str: Option<&str>,
 ) -> std::result::Result<Vec<PkgFormat>, crate::CargoMooseError> {
-    let formats = if let Some(s) = format_str {
+    let raw = if let Some(s) = format_str {
         PkgFormat::parse_list(s)?
     } else if !config.packaging.formats.is_empty() {
         PkgFormat::parse_list(&config.packaging.formats.join(","))?
@@ -381,8 +381,16 @@ fn resolve_formats(
         fmts
     };
 
+    // AU v2 / v3 are macOS-only. Drop silently: cross-platform moose.toml
+    // files shouldn't error on the Windows runner just because they list
+    // au2/au3 for macOS.
+    let formats: Vec<PkgFormat> = raw
+        .into_iter()
+        .filter(|f| !matches!(f, PkgFormat::Au2 | PkgFormat::Au3))
+        .collect();
+
     if formats.is_empty() {
-        return Err("no Windows-eligible formats selected".into());
+        return Err("no Windows-eligible formats selected (AU is macOS-only)".into());
     }
     Ok(formats)
 }
@@ -564,6 +572,9 @@ fn stage_plugin(
             }
             PkgFormat::Vst3 => {
                 signable.push(stage_vst3(root, p, staging, arch)?);
+            }
+            PkgFormat::Au2 | PkgFormat::Au3 => {
+                return Err("AU is macOS-only; should have been filtered".into());
             }
             PkgFormat::Standalone => {
                 signable.push(stage_standalone(root, p, staging, arch)?);
@@ -1701,6 +1712,7 @@ fn component_install_size(
                 .max()
                 .unwrap_or(0)
         }
+        PkgFormat::Au2 | PkgFormat::Au3 => 0,
     }
 }
 
@@ -1724,6 +1736,7 @@ fn files_all_check_gated(fmt: &PkgFormat, universal: bool) -> bool {
         PkgFormat::Vst3 => universal,
         // Standalone is single-file like CLAP - universal mode arch-gates.
         PkgFormat::Standalone => universal,
+        PkgFormat::Au2 | PkgFormat::Au3 => false,
     }
 }
 
@@ -1751,6 +1764,7 @@ fn iss_component_spec(fmt: &PkgFormat) -> (&'static str, &'static str, &'static 
         PkgFormat::Clap => ("clap", "CLAP", "full"),
         PkgFormat::Vst3 => ("vst3", "VST3", "full"),
         PkgFormat::Standalone => ("standalone", "Standalone app", "full"),
+        PkgFormat::Au2 | PkgFormat::Au3 => unreachable!("AU is filtered out on Windows"),
     }
 }
 
@@ -1858,6 +1872,7 @@ fn iss_files_block(
                 /* is_dir = */ false,
             )
         }
+        PkgFormat::Au2 | PkgFormat::Au3 => unreachable!(),
     }
 }
 
