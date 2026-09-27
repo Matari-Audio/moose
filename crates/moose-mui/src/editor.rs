@@ -81,14 +81,14 @@ fn points(s: Size) -> (u32, u32) {
 }
 
 /// The one field of [`MuiEditor`] that is not auto-`Send`.
-struct Handle(baseview::WindowHandle);
+struct Handle(window::baseview::Window);
 
-// SAFETY: `baseview::WindowHandle` wraps a native window pointer and is not
-// auto-`Send`. moose calls `open`, `set_size` and `close` from one GUI
-// thread, never concurrently, so the handle never leaves the thread that
-// made it; `Send` is only what `Box<dyn Editor>` asks for. moose-gui's own
-// `GpuEditor` makes the same argument.
-#[expect(unsafe_code, reason = "vouches Send for the baseview handle alone")]
+// SAFETY: `baseview::Window` wraps a native window pointer and is not
+// auto-`Send`. moose calls `open`, `set_size`, `window_scale` and `close`
+// from one GUI thread, never concurrently, so the window never leaves the
+// thread that made it; `Send` is only what `Box<dyn Editor>` asks for.
+// moose-gui's own `GpuEditor` makes the same argument.
+#[expect(unsafe_code, reason = "vouches Send for the baseview window alone")]
 unsafe impl Send for Handle {}
 
 impl<P: Params> MuiEditor<P> {
@@ -122,7 +122,7 @@ impl<P: Params> MuiEditor<P> {
     }
 
     fn close_window(&mut self) {
-        if let Some(Handle(mut window)) = self.window.take() {
+        if let Some(Handle(window)) = self.window.take() {
             window.close();
         }
     }
@@ -151,14 +151,15 @@ impl<P: Params> Editor for MuiEditor<P> {
             .attach(context.with_params(Arc::clone(&self.params)));
         // A request made while closed was for the last window.
         self.requests = Arc::default();
-        self.window = Some(Handle(window::open(
+        self.window = window::open(
             &ParentWindow(parent),
             "MUI",
             self.size,
             self.scale.policy(),
             Arc::clone(&self.shared),
             Arc::clone(&self.requests),
-        )));
+        )
+        .map(Handle);
     }
 
     fn close(&mut self) {
@@ -190,8 +191,9 @@ impl<P: Params> Editor for MuiEditor<P> {
         self.requests.scale(factor);
     }
 
-    fn set_uses_system_scale(&mut self, yes: bool) {
-        self.scale.set_uses_system(yes);
+    fn window_scale(&self) -> Option<f64> {
+        let open = self.window.as_ref().filter(|w| w.0.is_open())?;
+        (!cfg!(target_os = "macos")).then(|| open.0.size().scale_factor)
     }
 
     fn state_changed(&mut self) {

@@ -18,16 +18,12 @@ moose-core = { workspace = true }
 moose-params = { workspace = true }
 mui = { git = "https://github.com/Matari-Audio/MUI", features = ["gpu-effects"] }
 mui-baseview = { git = "https://github.com/Matari-Audio/MUI" }
-# The same baseview mui-baseview opens its window with: `WindowHandle` and
-# `WindowScalePolicy` cross that API. Not the workspace `baseview` (the
-# moose fork); see the crate README.
-baseview = { package = "baseview-truce", version = "0.1.1-truce.13" }
-# baseview's parent handle is raw-window-handle 0.5.
-raw-window-handle = "0.5"
+# baseview's parent handle is raw-window-handle 0.6.
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 moose = { workspace = true }
-keyboard-types = { version = "0.7", default-features = false }
+keyboard-types = { version = "0.8", default-features = false }
 
 [lints]
 workspace = true

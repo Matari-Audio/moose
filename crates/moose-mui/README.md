@@ -36,9 +36,8 @@ works when the cdylib unwinds.
 ## Dependencies
 
 The MUI crates are git dependencies, so this crate is `publish = false`.
-`mui-baseview` currently opens its window with crates.io `baseview-truce`
-and uses `truce-gui-utils` (a leaf crate: raw-window-handle, objc,
-windows-sys) for frame skipping and macOS re-anchoring. No `truce-core` or
-`truce-params` types reach the graph. A plugin that links both `moose-gui`
-and `moose-mui` carries two baseview copies (the moose fork and crates.io)
-until `mui-baseview` can take moose's.
+`mui-baseview` opens its window with moose-baseview, a git dependency on
+this repository. Inside the moose workspace the root `Cargo.toml` patches that
+git source to `crates/moose-baseview`, so one baseview is linked. A plugin
+outside the workspace that takes both moose and MUI from git resolves the same
+`https://github.com/Matari-Audio/moose` source for both, so it unifies too.

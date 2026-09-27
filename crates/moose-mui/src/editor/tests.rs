@@ -3,8 +3,8 @@
 //! come out.
 use super::*;
 use crate::window::Handler;
-use baseview::{Event, MouseEvent};
-use keyboard_types::{Key as HostKey, KeyState, KeyboardEvent, Modifiers};
+use crate::window::baseview::{self, Event, MouseEvent};
+use keyboard_types::{Key as HostKey, KeyState, KeyboardEvent, Modifiers, NamedKey};
 use moose::prelude::*;
 use moose_core::editor::ClosureBridge;
 use mui::prelude::{Point, knob, toggle};
@@ -188,7 +188,7 @@ fn a_key_step_is_one_bracket_and_the_late_pair_is_not_a_second_one() {
     for state in [KeyState::Down, KeyState::Up] {
         h.on_event_inner(&Event::Keyboard(KeyboardEvent {
             state,
-            key: HostKey::ArrowUp,
+            key: HostKey::Named(NamedKey::ArrowUp),
             modifiers: Modifiers::default(),
             ..KeyboardEvent::default()
         }));
@@ -448,4 +448,14 @@ fn a_reopened_editor_keeps_the_host_scale() {
     editor(&params).set_scale_factor(1.5);
     let reopened = editor(&params);
     assert_eq!(reopened.scale.get(), Some(1.5));
+}
+
+/// The host scale pins the window, never times the OS scale; macOS follows
+/// its own backing scale.
+#[test]
+fn the_host_scale_is_the_window_scale_off_macos() {
+    let mut scale = crate::HostScale::default();
+    scale.set(1.25);
+    let expected = (!cfg!(target_os = "macos")).then_some(1.25);
+    assert_eq!(scale.policy(), expected);
 }

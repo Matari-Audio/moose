@@ -7,49 +7,41 @@
 //! `LicenseRef-TruceLicense-1.0`.
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use baseview::WindowScalePolicy;
 use moose_core::editor::RawWindowHandle;
-use raw_window_handle::{HasRawWindowHandle, RawWindowHandle as Rwh};
+use raw_window_handle as rwh;
 
-/// Moose's parent handle as baseview's raw-window-handle 0.5: what
+/// Moose's parent handle as raw-window-handle 0.6: what
 /// [`mui_baseview::open`] takes.
 pub struct ParentWindow(pub RawWindowHandle);
 
-// SAFETY: the handle is the host's live parent window, which the host keeps
-// alive for as long as the editor is open; this only re-types it.
-#[expect(unsafe_code, reason = "HasRawWindowHandle is an unsafe trait")]
-unsafe impl HasRawWindowHandle for ParentWindow {
-    fn raw_window_handle(&self) -> Rwh {
-        match self.0 {
-            RawWindowHandle::AppKit(ptr) => {
-                let mut handle = raw_window_handle::AppKitWindowHandle::empty();
-                handle.ns_view = ptr;
-                Rwh::AppKit(handle)
-            }
-            RawWindowHandle::UiKit(ptr) => {
-                let mut handle = raw_window_handle::UiKitWindowHandle::empty();
-                handle.ui_view = ptr;
-                Rwh::UiKit(handle)
-            }
+impl rwh::HasWindowHandle for ParentWindow {
+    fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        let null = || rwh::HandleError::Unavailable;
+        let raw = match self.0 {
+            RawWindowHandle::AppKit(ptr) => rwh::RawWindowHandle::AppKit(
+                rwh::AppKitWindowHandle::new(std::ptr::NonNull::new(ptr).ok_or_else(null)?),
+            ),
+            RawWindowHandle::UiKit(ptr) => rwh::RawWindowHandle::UiKit(
+                rwh::UiKitWindowHandle::new(std::ptr::NonNull::new(ptr).ok_or_else(null)?),
+            ),
             RawWindowHandle::Win32(ptr) => {
-                let mut handle = raw_window_handle::Win32WindowHandle::empty();
-                handle.hwnd = ptr;
-                Rwh::Win32(handle)
+                rwh::RawWindowHandle::Win32(rwh::Win32WindowHandle::new(
+                    std::num::NonZeroIsize::new(ptr as isize).ok_or_else(null)?,
+                ))
             }
-            RawWindowHandle::X11(window_id) => {
-                let mut handle = raw_window_handle::XlibWindowHandle::empty();
-                // rwh 0.5's field is c_ulong: u32 on Windows, where an XID
-                // never reaches.
-                #[cfg_attr(
-                    windows,
-                    expect(clippy::cast_possible_truncation, reason = "c_ulong is u32")
-                )]
-                {
-                    handle.window = window_id as _;
-                }
-                Rwh::Xlib(handle)
+            RawWindowHandle::X11(id) => {
+                let id = u32::try_from(id)
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .ok_or_else(null)?;
+                rwh::RawWindowHandle::Xcb(rwh::XcbWindowHandle::new(id))
             }
-        }
+        };
+        // SAFETY: the host keeps the parent alive while the editor is open;
+        // this only re-types its handle.
+        #[expect(unsafe_code, reason = "borrow_raw vouches for the host's handle")]
+        let handle = unsafe { rwh::WindowHandle::borrow_raw(raw) };
+        Ok(handle)
     }
 }
 
@@ -62,13 +54,12 @@ unsafe impl HasRawWindowHandle for ParentWindow {
 // ponytail: one scale per process; per-instance if a host ever mixes scales.
 static HOST_SCALE: AtomicU64 = AtomicU64::new(0);
 
-/// What moose's editor tells it about scale, as the policy an embedded
-/// window opens with. Feed it `Editor::set_scale_factor` and
-/// `set_uses_system_scale`; it remembers the last host scale across editors.
+/// What moose's editor tells it about scale, as the scale an embedded
+/// window opens with. Feed it `Editor::set_scale_factor`; it remembers the
+/// last host scale across editors.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostScale {
     host: Option<f64>,
-    system: bool,
 }
 
 impl HostScale {
@@ -79,10 +70,6 @@ impl HostScale {
             HOST_SCALE.store(factor.to_bits(), Ordering::Relaxed);
         }
     }
-    /// The host asks the editor to follow the system scale.
-    pub fn set_uses_system(&mut self, yes: bool) {
-        self.system = yes;
-    }
     /// This editor's host scale, else the last one any editor was given.
     pub fn get(&self) -> Option<f64> {
         self.host.or(match HOST_SCALE.load(Ordering::Relaxed) {
@@ -90,32 +77,15 @@ impl HostScale {
             bits => Some(f64::from_bits(bits)),
         })
     }
-    /// Linux: an embedded editor follows the host's scale, not the
-    /// desktop's, which a non-DPI-aware host does not share. Elsewhere the
-    /// OS reports a reliable per-window scale.
+    /// The scale to pin the window to: the host's when it gave one, else
+    /// `None` for the OS scale, never the two multiplied. `None` on macOS,
+    /// whose `AppKit` coordinates are logical and backing scale is the OS's.
     #[must_use]
-    pub fn policy(&self) -> WindowScalePolicy {
-        let host = self.get();
-        match editor_window_scale(self.system, host.is_some(), host.unwrap_or(1.0)) {
-            Some(s) => WindowScalePolicy::ScaleFactor(s),
-            None => WindowScalePolicy::SystemScaleFactor,
+    pub fn policy(&self) -> Option<f64> {
+        if cfg!(target_os = "macos") {
+            None
+        } else {
+            self.get()
         }
-    }
-}
-
-/// `Some(scale)` to open with `ScaleFactor(scale)`, `None` for the system
-/// scale. Linux only: an embedded editor follows the host's content scale
-/// (default 1), not `Xft.dpi`, which a non-DPI-aware host does not share.
-fn editor_window_scale(
-    uses_system_scale: bool,
-    host_scale_set: bool,
-    host_scale: f64,
-) -> Option<f64> {
-    if !cfg!(target_os = "linux") || uses_system_scale {
-        None
-    } else if host_scale_set && host_scale.is_finite() && host_scale > 0.0 {
-        Some(host_scale)
-    } else {
-        Some(1.0)
     }
 }
