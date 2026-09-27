@@ -97,14 +97,15 @@ moose::plugin! { logic: Gain, params: GainParams }
 | Standalone | Yes   | Yes     | Yes   |
 
 GUI: the built-in widget set (`moose-gui`, CPU or GPU rendering), egui
-(`moose-egui`), or a raw window handle.
+(`moose-egui`), [MUI](https://github.com/Matari-Audio/MUI) (`moose-mui`,
+the facade's `mui` feature), or a raw window handle.
 
 Workspace crates: `moose`, `moose-core`, `moose-params`,
 `moose-derive`, `moose-utils`, `moose-simd`,
 `moose-build`, `moose-plugin`, `moose-clap`, `moose-vst3`,
 `moose-standalone`, `moose-loader`, `moose-test`, `moose-driver`,
 `moose-gui`, `moose-gui-types`, `moose-gui-utils`, `moose-gpu`,
-`moose-egui`, `moose-font`, `moose-cpu` and the `cargo-moose` CLI.
+`moose-egui`, `moose-mui`, `moose-font`, `moose-cpu` and the `cargo-moose` CLI.
 
 ## Differences from truce
 

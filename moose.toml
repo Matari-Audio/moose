@@ -174,6 +174,16 @@ windows_icon = "static/moose-minimal.ico"
 macos_icon = "static/moose-minimal.icns"
 
 [[plugin]]
+name = "Moose Gain MUI"
+bundle_id = "gain-mui"
+crate = "moose-example-gain-mui"
+category = "effect"
+fourcc = "TGmu"
+vst3_subcategory = "Tools"
+windows_icon = "static/moose-minimal.ico"
+macos_icon = "static/moose-minimal.icns"
+
+[[plugin]]
 name = "Moose Gain Egui Aspect"
 bundle_id = "gain-egui-aspect"
 crate = "moose-example-gain-egui-aspect"

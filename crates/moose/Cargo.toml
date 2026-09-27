@@ -28,6 +28,8 @@ moose-derive = { workspace = true }
 default = ["clap"]
 clap = ["dep:moose-clap"]
 vst3 = ["dep:moose-vst3"]
+# MUI editors (`moose::mui`): `MuiEditor` and the parameter `Bridge`.
+mui = ["dep:moose-mui"]
 shell = ["moose-loader/shell"]
 hot-debug = ["moose-loader/hot-debug"]
 # Paranoid real-time allocation checking (dev/test). Enables the check in
@@ -40,6 +42,10 @@ workspace = true
 optional = true
 
 [dependencies.moose-vst3]
+workspace = true
+optional = true
+
+[dependencies.moose-mui]
 workspace = true
 optional = true
 

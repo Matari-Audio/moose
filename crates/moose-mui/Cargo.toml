@@ -1,0 +1,33 @@
+[package]
+name = "moose-mui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# MUI needs 1.98.
+rust-version = "1.98"
+repository.workspace = true
+homepage.workspace = true
+description = "MUI editors for moose plugins: MuiEditor and the parameter Bridge"
+keywords = ["audio", "plugin", "gui", "mui"]
+categories = ["multimedia::audio", "gui"]
+# Git dependencies (MUI is not on crates.io) keep this off the registry.
+publish = false
+
+[dependencies]
+moose-core = { workspace = true }
+moose-params = { workspace = true }
+mui = { git = "https://github.com/Matari-Audio/MUI", rev = "48dde277444db4c4b9fa1099ecd52f997a18402a", features = ["gpu-effects"] }
+mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "48dde277444db4c4b9fa1099ecd52f997a18402a" }
+# The same baseview mui-baseview opens its window with: `WindowHandle` and
+# `WindowScalePolicy` cross that API. Not the workspace `baseview` (the
+# moose fork); see the crate README.
+baseview = { package = "baseview-truce", version = "0.1.1-truce.13" }
+# baseview's parent handle is raw-window-handle 0.5.
+raw-window-handle = "0.5"
+
+[dev-dependencies]
+moose = { workspace = true }
+keyboard-types = { version = "0.7", default-features = false }
+
+[lints]
+workspace = true

@@ -19,6 +19,11 @@ pub use moose_clap as clap_wrapper;
 #[cfg(feature = "vst3")]
 pub use moose_vst3 as vst3_wrapper;
 
+/// MUI editors: `moose::mui::MuiEditor`, the parameter `Bridge`, and the
+/// toolkit itself as `moose::mui::mui`.
+#[cfg(feature = "mui")]
+pub use moose_mui as mui;
+
 mod plugin_macro;
 
 /// Re-exports used by the plugin! macro internals.
