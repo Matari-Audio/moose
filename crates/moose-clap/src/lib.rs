@@ -3441,7 +3441,7 @@ unsafe fn refresh_parameter_list<P: PluginExport>(data: &ClapPluginData<P>) -> b
     let mut indices = data
         .exposed_param_indices
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if *indices == next {
         return false;
     }
@@ -3479,7 +3479,7 @@ unsafe extern "C" fn params_count<P: PluginExport>(plugin: *const clap_plugin) -
         len_u32(
             data.exposed_param_indices
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
         )
     }
@@ -3497,7 +3497,7 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
         let index = data
             .exposed_param_indices
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(param_index as usize)
             .copied();
         let Some(index) = index else { return false };
@@ -3810,7 +3810,7 @@ unsafe extern "C" fn remote_controls_count<P: PluginExport>(plugin: *const clap_
         let indices = data
             .exposed_param_indices
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         len_u32(remote_control_pages(indices.iter().map(|&i| &data.param_infos[i])).len())
     }
 }
@@ -3825,7 +3825,7 @@ unsafe extern "C" fn remote_controls_get<P: PluginExport>(
         let indices = data
             .exposed_param_indices
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pages = remote_control_pages(indices.iter().map(|&i| &data.param_infos[i]));
         let page_index = page_index as usize;
         if page_index >= pages.len() {
