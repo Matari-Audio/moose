@@ -1502,8 +1502,8 @@ mod routing_tests {
                 clap_features: &[],
                 accepts_midi_in: false,
                 emits_midi: false,
-                midi_input_dialect: Default::default(),
-                midi_output_dialect: Default::default(),
+                midi_input_dialect: moose_core::info::MidiDialect::default(),
+                midi_output_dialect: moose_core::info::MidiDialect::default(),
                 midi_input_ports: Default::default(),
                 midi_output_ports: Default::default(),
                 bundle_id: "routing-test",
@@ -1520,7 +1520,7 @@ mod routing_tests {
                 au_name: None,
                 au3_name: None,
                 mute_preview_output: false,
-                automation: Default::default(),
+                automation: moose_core::info::AutomationConfig::default(),
                 legacy_au_keys: &[],
             }
         }
@@ -1575,9 +1575,15 @@ mod routing_tests {
             .duration(Duration::from_millis(10))
             .input(InputSource::Constant(0.5))
             .run();
-        let expected = if KIND == 3 { 0.25 } else { 0.5 };
+        let expected: f32 = if KIND == 3 { 0.25 } else { 0.5 };
         assert!(!result.output[0].is_empty());
-        assert!(result.output.iter().flatten().all(|&x| x == expected));
+        assert!(
+            result
+                .output
+                .iter()
+                .flatten()
+                .all(|&x| x.to_bits() == expected.to_bits())
+        );
     }
     #[test]
     fn audio_inputs_follow_buses_for_effect_analyzer_tool_and_instrument() {
