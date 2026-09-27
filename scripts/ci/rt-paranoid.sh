@@ -53,3 +53,4 @@ for pkg in "${pkgs[@]}"; do
 done
 
 exit "$fail"
+# warm-cache timing probe (throwaway PR, do not merge)
