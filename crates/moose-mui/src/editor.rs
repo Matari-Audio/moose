@@ -166,6 +166,11 @@ impl<P: Params> MuiEditor<P> {
 
     fn close_window(&mut self) {
         if let Some(Handle(window)) = self.window.take() {
+            #[cfg(target_os = "linux")]
+            {
+                window.close_bounded(std::time::Duration::from_millis(250));
+            }
+            #[cfg(not(target_os = "linux"))]
             window.close();
         }
     }

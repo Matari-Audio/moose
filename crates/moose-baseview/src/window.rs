@@ -4,6 +4,8 @@ use crate::host::Host;
 use crate::platform;
 use crate::*;
 use std::marker::PhantomData;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 /// A handle to a Window created by baseview.
 ///
@@ -164,6 +166,18 @@ impl Window {
     #[inline]
     pub fn close(self) {
         drop(self)
+    }
+
+    /// Closes an X11 editor without waiting forever for a stalled render thread.
+    ///
+    /// After `timeout`, the window thread is detached only if its plug-in image
+    /// can be pinned and no host callbacks were registered. The handler may
+    /// finish its current callback; X11 enters no more after observing the
+    /// revocation. Call this only after revoking the handler's host
+    /// state; ordinary [`close`](Self::close) remains synchronous.
+    #[cfg(target_os = "linux")]
+    pub fn close_bounded(self, timeout: Duration) {
+        self.inner.set_close_timeout(timeout);
     }
 
     /// Returns `true` if the window is still open, and returns `false`

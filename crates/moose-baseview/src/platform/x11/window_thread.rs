@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub(crate) struct WindowThreadShared {
     stopped: AtomicBool,
@@ -23,6 +24,7 @@ pub(crate) struct WindowThreadShared {
     size: AtomicU32,
     final_error: Mutex<Option<String>>,
     stopped_requested_from_host: AtomicBool,
+    callbacks_revoked: AtomicBool,
     sizing_strategy: OnceLock<SizingStrategy>,
 }
 
@@ -34,6 +36,7 @@ impl WindowThreadShared {
             size: 0.into(),
             scaling_factor: 0.into(),
             stopped_requested_from_host: false.into(),
+            callbacks_revoked: false.into(),
             sizing_strategy: OnceLock::new(),
         }
     }
@@ -73,6 +76,10 @@ impl WindowThreadShared {
     pub fn is_stop_host_requested(&self) -> bool {
         self.stopped_requested_from_host.load(Ordering::Relaxed)
     }
+
+    pub fn callbacks_revoked(&self) -> bool {
+        self.callbacks_revoked.load(Ordering::Acquire)
+    }
 }
 
 struct ThreadStopWatcher(Arc<WindowThreadShared>);
@@ -108,10 +115,13 @@ pub struct WindowThreadHandle {
     response_receiver: mpsc::Receiver<WindowThreadResponseMessage>,
     callback_receiver: Option<mpsc::Receiver<HostCallback>>,
     host_callbacks: Option<RefCell<Box<dyn HostCallbacks>>>,
+    can_detach: bool,
+    close_timeout: Cell<Option<Duration>>,
 }
 
 impl WindowThreadHandle {
     pub fn create_window(init: WindowInitializer) -> Result<Self> {
+        let can_detach = init.host.callbacks.is_none() && init.host.main_thread.is_none();
         let (tx, rx) = result_channel();
         let shared = Arc::new(WindowThreadShared::new());
         let (request_sender, request_receiver) = calloop::channel::sync_channel(1);
@@ -155,6 +165,8 @@ impl WindowThreadHandle {
             response_receiver,
             host_callbacks: init.host.callbacks.map(|c| c.into_inner().into()),
             callback_receiver: main_thread_receiver,
+            can_detach,
+            close_timeout: Cell::new(None),
         })
     }
 
@@ -175,6 +187,10 @@ impl WindowThreadHandle {
 
     pub fn set_keyboard_capture(&self, _capture: bool) {
         // No-op: ignored key events already propagate to the host on this platform.
+    }
+
+    pub fn set_close_timeout(&self, timeout: Duration) {
+        self.close_timeout.set(Some(timeout));
     }
 
     pub fn set_scale_factor_override(&self, scale_factor: Option<f64>) -> Result<()> {
@@ -272,9 +288,64 @@ impl Drop for WindowThreadHandle {
         self.loop_signal.stop();
         self.loop_signal.wakeup();
 
-        if let Err(e) = self.run_until_closed() {
-            warn!("Error while closing window: {}", e)
+        if let Some(timeout) = self.close_timeout.get() {
+            let Some(thread) = self.event_loop_handle.take() else { return };
+            join_bounded(thread, timeout, || {
+                if !self.can_detach || !crate::pin_current_image_for_detached_work() {
+                    return false;
+                }
+                self.shared.callbacks_revoked.store(true, Ordering::Release);
+                true
+            });
+        } else if let Err(e) = self.run_until_closed() {
+            warn!("Error while closing window: {}", e);
         }
+    }
+}
+
+// Return false only after the image has been pinned and the thread detached.
+fn join_bounded(thread: JoinHandle<()>, timeout: Duration, pin: impl FnOnce() -> bool) -> bool {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        let _ = thread.join();
+        return true;
+    };
+    while !thread.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if !thread.is_finished() && pin() {
+        return false;
+    }
+    let _ = thread.join();
+    true
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_thread_detaches_only_after_pin() {
+        let (release, waiting) = mpsc::channel();
+        let thread = thread::spawn(move || assert!(waiting.recv().is_ok()));
+        let revoked = AtomicBool::new(false);
+        assert!(!join_bounded(thread, Duration::ZERO, || {
+            revoked.store(true, Ordering::Release);
+            true
+        }));
+        assert!(revoked.load(Ordering::Acquire));
+        assert!(release.send(()).is_ok());
+    }
+
+    #[test]
+    fn failed_pin_keeps_synchronous_close() {
+        let (release, waiting) = mpsc::channel();
+        let thread = thread::spawn(move || assert!(waiting.recv().is_ok()));
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            assert!(release.send(()).is_ok());
+        });
+        assert!(join_bounded(thread, Duration::ZERO, || false));
+        assert!(releaser.join().is_ok());
     }
 }
 
