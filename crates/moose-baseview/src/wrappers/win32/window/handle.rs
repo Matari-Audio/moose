@@ -1,10 +1,10 @@
-﻿use crate::dpi::{PhysicalPosition, PhysicalSize};
+use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::wrappers::win32::dpi::{Dpi, DpiAwarenessGuard};
 use crate::wrappers::win32::style::WindowStyle;
 use crate::wrappers::win32::user32::ExtendedUser32;
 use crate::wrappers::win32::{DpiAwarenessContext, ExtendedShCore, Rect};
 use std::ffi::c_void;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::ptr::{null_mut, NonNull};
 use windows::Win32::System::Ole::IDropTarget;
 use windows_core::{Error, Interface, InterfaceRef, Result, HRESULT};
@@ -18,9 +18,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetWindowLongPtrW, GetWindowLongW, SetParent, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX,
+    DestroyWindow, GetWindowLongPtrW, GetWindowLongW, SetParent, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX,
 };
 
 /// A simple wrapper around a HWND.
@@ -208,16 +208,6 @@ impl HWnd {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
         };
-
-        if result == 0 {
-            return Err(Error::from_thread());
-        }
-
-        Ok(())
-    }
-
-    pub fn set_timer(&self, timer_id: NonZeroUsize, elapse: u32) -> Result<()> {
-        let result = unsafe { SetTimer(self.as_raw(), timer_id.get(), elapse, None) };
 
         if result == 0 {
             return Err(Error::from_thread());

@@ -42,7 +42,7 @@ tracing = { version = "0.1", optional = true }
 
 [target.'cfg(target_os="linux")'.dependencies]
 libc = "0.2"
-x11rb = { version = "0.13.2", features = ["cursor", "resource_manager", "allow-unsafe-code", "dl-libxcb"], default-features = false }
+x11rb = { version = "0.13.2", features = ["cursor", "randr", "resource_manager", "allow-unsafe-code", "dl-libxcb"], default-features = false }
 xkbcommon-dl = { version = "0.4.2", features = ["x11"] }
 x11-dl = { version = "2.21.0" }
 calloop = "0.14.4"
@@ -58,6 +58,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-sys = { version = "0.61.2", features = [
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_Rpc",
     "Win32_System_LibraryLoader",
@@ -78,7 +79,8 @@ objc2 = "0.6.4"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString", "CFUUID", "block2", "objc2"] }
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSEnumerator", "block2", "NSOperation"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSEnumerator", "block2", "NSOperation", "NSRunLoop"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CADisplayLink"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSCursor",
@@ -89,10 +91,12 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSPasteboard",
     "NSResponder",
     "NSRunningApplication",
+    "NSScreen",
     "NSTrackingArea",
     "NSView",
     "NSWindow",
-    "objc2-core-foundation"
+    "objc2-core-foundation",
+    "objc2-quartz-core"
 ] }
 
 [lints.clippy]

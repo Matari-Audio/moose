@@ -4,6 +4,7 @@ use super::keyboard::{make_modifiers, KeyboardState};
 use super::window::WindowSharedState;
 use crate::dpi::{LogicalPosition, LogicalSize, Size};
 use crate::host::Host;
+use crate::platform::frame_rate::frame_interval;
 use crate::platform::macos::cursor::CursorManager;
 use crate::platform::*;
 use crate::tracing::warn;
@@ -18,12 +19,16 @@ use crate::{
 use objc2::__framework_prelude::Retained;
 use objc2::rc::Weak;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2::{msg_send, AllocAnyThread, ClassType, MainThreadMarker};
+use objc2::{msg_send, sel, AllocAnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{
-    NSApplication, NSDragOperation, NSDraggingInfo, NSEvent, NSFilenamesPboardType, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindow,
+    NSApplication, NSDragOperation, NSDraggingInfo, NSEvent, NSFilenamesPboardType, NSScreen,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
 };
-use objc2_foundation::{NSArray, NSNotification, NSPoint, NSPointInRect, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSArray, NSNotification, NSPoint, NSPointInRect, NSRect, NSRunLoop, NSRunLoopCommonModes,
+    NSSize, NSString,
+};
+use objc2_quartz_core::CADisplayLink;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -65,6 +70,8 @@ pub(crate) struct BaseviewView {
     pub(crate) mtm: MainThreadMarker,
     window_handler: WindowHandlerContainer,
 
+    /// Drives `on_frame`: the view's display link on macOS 14+, else a timer at the screen's rate.
+    display_link: Cell<Option<Retained<CADisplayLink>>>,
     frame_timer: Cell<Option<TimerHandle>>,
     notification_center_observer: Cell<Option<NotificationCenterObserver>>,
 
@@ -99,6 +106,7 @@ impl BaseviewView {
             state: Rc::clone(&state),
 
             keyboard_state: KeyboardState::new(),
+            display_link: None.into(),
             frame_timer: None.into(),
             window_handler: WindowHandlerContainer::new(),
             notification_center_observer: None.into(),
@@ -139,14 +147,7 @@ impl BaseviewView {
             let ns_filenames_pboard_type = unsafe { NSFilenamesPboardType };
             view.view.registerForDraggedTypes(&NSArray::from_slice(&[ns_filenames_pboard_type]));
 
-            let timer_view = Weak::new(view.view);
-            view.frame_timer.set(TimerHandle::new(0.015, move || {
-                if let Some(view) = timer_view.load() {
-                    if let Some(view) = view.inner_ref() {
-                        Self::trigger_frame(view);
-                    }
-                }
-            }));
+            Self::start_frame_driver(view);
 
             let notifier_view = Weak::new(view.view);
             let observer = NotificationCenterObserver::register_window_key_change(move |n| {
@@ -188,6 +189,10 @@ impl BaseviewView {
         this.state.closed.set(true);
         this.view.removeFromSuperview();
         this.notification_center_observer.take();
+        // The display link retains the view: invalidate it to break the cycle.
+        if let Some(link) = this.display_link.take() {
+            link.invalidate();
+        }
         this.frame_timer.take();
         this.window_handler.destroy();
 
@@ -246,6 +251,36 @@ impl BaseviewView {
     /// Trigger the event immediately and return the event status.
     fn trigger_event(this: ViewRef<Self>, event: Event) -> EventStatus {
         this.window_handler.use_handler(|h| h.on_event(event)).unwrap_or(EventStatus::Ignored)
+    }
+
+    /// MOOSE: fire `on_frame` once per display refresh. An `NSView` display link (macOS 14+)
+    /// follows the view across screens and runs on the main run loop, so frames never pile up.
+    /// Older macOS gets a run loop timer at the main screen's maximum rate.
+    fn start_frame_driver(this: ViewRef<Self>) {
+        let view: &NSView = this.view;
+        if view.respondsToSelector(sel!(displayLinkWithTarget:selector:)) {
+            // SAFETY: the view class implements `mooseDisplayLinkFired:` taking the link.
+            let link =
+                unsafe { view.displayLinkWithTarget_selector(view, sel!(mooseDisplayLinkFired:)) };
+            // SAFETY: the main run loop, on the main thread. Common modes keep frames coming
+            // during live resize and menu tracking.
+            unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
+            this.display_link.set(Some(link));
+            return;
+        }
+
+        let hz = NSScreen::mainScreen(this.mtm)
+            .filter(|screen| screen.respondsToSelector(sel!(maximumFramesPerSecond)))
+            .map(|screen| screen.maximumFramesPerSecond() as f64);
+        let interval = frame_interval(hz).as_secs_f64();
+        let timer_view = Weak::new(this.view);
+        this.frame_timer.set(TimerHandle::new(interval, move || {
+            if let Some(view) = timer_view.load() {
+                if let Some(view) = view.inner_ref() {
+                    Self::trigger_frame(view);
+                }
+            }
+        }));
     }
 
     fn trigger_frame(this: ViewRef<Self>) {
@@ -689,6 +724,10 @@ impl ViewImpl for BaseviewView {
                 }
             }
         }
+    }
+
+    fn display_link_fired(this: ViewRef<Self>) {
+        Self::trigger_frame(this);
     }
 }
 

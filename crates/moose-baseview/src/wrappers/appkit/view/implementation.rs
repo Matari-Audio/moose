@@ -146,6 +146,11 @@ pub unsafe fn create_view_class<V: ViewImpl>() -> &'static AnyClass {
         class.add_method(sel!(flagsChanged:), flags_changed::<V> as extern "C-unwind" fn(_, _, _));
 
         class.add_method(sel!(cursorUpdate:), cursor_update::<V> as extern "C-unwind" fn(_, _, _));
+
+        class.add_method(
+            sel!(mooseDisplayLinkFired:),
+            display_link_fired::<V> as extern "C-unwind" fn(_, _, _),
+        );
     }
 
     class.add_ivar::<*mut c_void>(BASEVIEW_STATE_IVAR);
@@ -164,6 +169,11 @@ pub extern "C-unwind" fn dealloc<V: ViewImpl>(this: &mut AnyObject, _sel: Sel) {
     // SAFETY: This is safe as long as nobody holds a reference to this class.
     // On the Baseview side, this is enforced by the safety contract in `create_view_class`
     unsafe { objc_disposeClassPair(class as *const _ as *mut _) }
+}
+
+extern "C-unwind" fn display_link_fired<V: ViewImpl>(this: &View<V>, _: Sel, _link: &AnyObject) {
+    let Some(inner) = this.inner_ref() else { return };
+    V::display_link_fired(inner);
 }
 
 extern "C-unwind" fn property_yes(_this: &NSView, _sel: Sel) -> Bool {
