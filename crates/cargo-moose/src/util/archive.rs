@@ -312,18 +312,41 @@ mod tests {
             out.push(b'\n');
         }
     }
+    fn object(dir: &Path, name: &str) -> Vec<u8> {
+        let source = dir.join(format!("{name}.c"));
+        let output = dir.join(format!("{name}.o"));
+        std::fs::write(&source, format!("int {name}(void) {{ return 1; }}")).unwrap();
+        let status = Command::new("cc")
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read(output).unwrap()
+    }
     #[test]
     fn dedupe_preserves_distinct_same_name_objects_and_long_names() {
         let dir = std::env::temp_dir().join(format!("moose-archive-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("input.a");
         let mut bytes = b"!<arch>\n".to_vec();
-        member(&mut bytes, "same.o/", b"first");
-        member(&mut bytes, "same.o/", b"second");
-        member(&mut bytes, "same.o/", b"first");
-        member(&mut bytes, "#1/8", b"long.o\0\0bsd");
+        // Native objects exercise Darwin ranlib as well as the archive parser.
+        let first = object(&dir, "first");
+        let second = object(&dir, "second");
+        let bsd = object(&dir, "bsd");
+        let gnu = object(&dir, "gnu");
+        member(&mut bytes, "same.o/", &first);
+        member(&mut bytes, "same.o/", &second);
+        member(&mut bytes, "same.o/", &first);
+        member(
+            &mut bytes,
+            "#1/8",
+            &[b"long.o\0\0".as_slice(), &bsd].concat(),
+        );
         member(&mut bytes, "//", b"gnu-long-name.o/\n");
-        member(&mut bytes, "/0", b"gnu");
+        member(&mut bytes, "/0", &gnu);
         std::fs::write(&input, bytes).unwrap();
         let deduped = dedupe_archive_members(&input).unwrap();
         let mut payloads: Vec<_> = archive_members(deduped.path())
@@ -333,15 +356,9 @@ mod tests {
             .map(|m| m.bytes)
             .collect();
         payloads.sort();
-        assert_eq!(
-            payloads,
-            [
-                b"bsd".to_vec(),
-                b"first".to_vec(),
-                b"gnu".to_vec(),
-                b"second".to_vec()
-            ]
-        );
+        let mut expected = vec![first, second, bsd, gnu];
+        expected.sort();
+        assert_eq!(payloads, expected);
         let path = deduped.path().to_owned();
         drop(deduped);
         assert!(!path.exists());
