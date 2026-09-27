@@ -676,8 +676,8 @@ fn query_refresh_hz(window: &WindowInner) -> Option<f64> {
     let root = window.connection.conn.default_screen().root;
     let origin = conn.translate_coordinates(window.raw_id(), root, 0, 0).ok()?.reply().ok()?;
     let size = window.get_size();
-    let x = i32::from(origin.dst_x).saturating_add(i32::from(size.width / 2));
-    let y = i32::from(origin.dst_y).saturating_add(i32::from(size.height / 2));
+    let x = i32::from(origin.dst_x).saturating_add(i32::from(size.width >> 1));
+    let y = i32::from(origin.dst_y).saturating_add(i32::from(size.height >> 1));
 
     let resources = conn.randr_get_screen_resources_current(root).ok()?.reply().ok()?;
     let crtcs: Vec<_> = resources

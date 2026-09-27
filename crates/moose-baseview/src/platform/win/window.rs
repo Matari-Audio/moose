@@ -5,9 +5,9 @@ use windows_sys::Win32::{
 };
 
 use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
+use crate::platform::frame_rate::frame_interval;
 use crate::{warn, EventStatus, HandlerError, WindowHandler};
 use std::cell::{Cell, OnceCell};
-use crate::platform::frame_rate::frame_interval;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -59,8 +59,8 @@ impl FramePacer {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let hwnd = hwnd as usize;
-        let thread = std::thread::Builder::new().name("baseview-frame-pacer".into()).spawn(
-            move || {
+        let thread =
+            std::thread::Builder::new().name("baseview-frame-pacer".into()).spawn(move || {
                 let hwnd = hwnd as HWND;
                 let fallback = frame_interval(None);
                 let mut last_frame = Instant::now();
@@ -85,8 +85,7 @@ impl FramePacer {
                         pending.store(false, Ordering::Release);
                     }
                 }
-            },
-        )?;
+            })?;
         Ok(Self { stop, thread: Some(thread) })
     }
 }

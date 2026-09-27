@@ -1515,6 +1515,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-quartz-core",
  "percent-encoding",
  "raw-window-handle",
  "tracing",
@@ -2518,6 +2519,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation",
  "objc2-open-gl",
+ "objc2-quartz-core",
 ]
 
 [[package]]
