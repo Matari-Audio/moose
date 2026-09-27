@@ -1,11 +1,13 @@
 name: rt-paranoid (audio-thread allocation check)
 
+# Called from ci.yml, which picks the OSes from the changed paths.
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['**.md', 'docs/**']
-  pull_request:
-    paths-ignore: ['**.md', 'docs/**']
+  workflow_call:
+    inputs:
+      oses:
+        description: JSON list of runner labels (Linux/Windows) to run on
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -17,10 +19,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Builds the DSP-distinct example plugins with the `rt-paranoid` feature
 # and runs their `assert_no_audio_alloc` tests, so any allocation the audio
@@ -37,7 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         # macOS runs inside ci.yml's macOS test job (one fewer macOS slot).
-        os: [ubuntu-24.04, windows-latest]
+        os: ${{ fromJSON(inputs.oses) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

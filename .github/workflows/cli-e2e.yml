@@ -14,12 +14,14 @@ name: CLI end-to-end
 # checkout's target/), so the moose-* crates and third-party deps compile
 # once per job and rust-cache keeps them warm across runs.
 
+# Called from ci.yml, which picks the OSes from the changed paths.
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['**.md', 'docs/**']
-  pull_request:
-    paths-ignore: ['**.md', 'docs/**']
+  workflow_call:
+    inputs:
+      oses:
+        description: JSON list of runner labels to run on
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -31,10 +33,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PLUGINVAL_VERSION: v1.0.4
   CLAP_VALIDATOR_REV: 2f71690639a742ce805574ce42e31250e3147aa9
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   e2e:
@@ -48,18 +46,17 @@ jobs:
         # queue slots are the scarce resource.
         #   plugins   = doctor + gain install/validate/uninstall + synth package
         #   scaffolds = scaffold round-trips + scaffolded rt-paranoid
-        include:
-          - os: ubuntu-24.04
-            part: all
-            shapes: effect instrument workspace-mixed pure stateful
-          - os: macos-14
-            part: all
-            shapes: effect instrument workspace-mixed
-          - os: windows-latest
-            part: plugins
-          - os: windows-latest
-            part: scaffolds
-            shapes: effect instrument workspace-mixed
+        #
+        # Scaffold shapes: effect instrument workspace-mixed everywhere, plus
+        # pure stateful on Linux (see the scaffold step).
+        os: ${{ fromJSON(inputs.oses) }}
+        part: [all, plugins, scaffolds]
+        exclude:
+          - {os: ubuntu-24.04, part: plugins}
+          - {os: ubuntu-24.04, part: scaffolds}
+          - {os: macos-14, part: plugins}
+          - {os: macos-14, part: scaffolds}
+          - {os: windows-latest, part: all}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -258,7 +255,7 @@ jobs:
           run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
           nz=""; [ "$RUNNER_OS" = macOS ] && nz=--no-notarize
           mkdir -p "$RUNNER_TEMP/scaffold"
-          for shape in ${{ matrix.shapes }}; do
+          for shape in effect instrument workspace-mixed ${{ runner.os == 'Linux' && 'pure stateful' || '' }}; do
             case $shape in
               effect)          set -- acme-fx ;;
               instrument)      set -- acme-synth --instrument ;;
