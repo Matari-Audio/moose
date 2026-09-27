@@ -51,6 +51,15 @@ jobs:
           wait
           df -h /
 
+      # Windows: target/ on a ReFS Dev Drive (see cli-e2e.yml).
+      - name: Dev Drive for target/
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@v4
+        with:
+          drive-size: 40GB
+          drive-type: Dynamic
+          mount-path: ${{ github.workspace }}/target
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -112,6 +121,13 @@ jobs:
       # gain shape on the same runner (~22x locally).
       - name: perf regression (gain vs gain-simd)
         run: cargo test --release -p moose-simd --test gain_perf_regression -- --ignored --nocapture
+
+      # macOS runs the rt-paranoid example check here instead of in its own
+      # job (ci-rt-paranoid.yml covers Linux/Windows): macOS queue slots are
+      # the scarce resource, and this job already has the deps compiled.
+      - name: rt-paranoid (macOS)
+        if: runner.os == 'macOS'
+        run: ./scripts/ci/rt-paranoid.sh
 
       - name: upload failing screenshots
         if: failure()

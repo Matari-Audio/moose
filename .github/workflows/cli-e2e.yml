@@ -38,16 +38,27 @@ concurrency:
 
 jobs:
   e2e:
-    name: cli e2e (${{ matrix.os }})
+    name: cli e2e (${{ matrix.os }}${{ matrix.part != 'all' && format(', {0}', matrix.part) || '' }})
     strategy:
       fail-fast: false
       matrix:
+        # `part` splits the Windows job in two: its release builds (x64 +
+        # arm64 per config) made one job the 26 min critical path, and
+        # Windows runner slots are plentiful. macOS stays one job: macOS
+        # queue slots are the scarce resource.
+        #   plugins   = doctor + gain install/validate/uninstall + synth package
+        #   scaffolds = scaffold round-trips + scaffolded rt-paranoid
         include:
           - os: ubuntu-24.04
+            part: all
             shapes: effect instrument workspace-mixed pure stateful
           - os: macos-14
+            part: all
             shapes: effect instrument workspace-mixed
           - os: windows-latest
+            part: plugins
+          - os: windows-latest
+            part: scaffolds
             shapes: effect instrument workspace-mixed
     runs-on: ${{ matrix.os }}
     defaults:
@@ -56,13 +67,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Windows: put target/ on a ReFS Dev Drive (VHD mounted over the
+      # target dir, so every path and the rust-cache config stay the same).
+      # Dev Drives skip the filter-driver/Defender overhead that makes
+      # cargo's many small-file writes slow on the default NTFS volume.
+      - name: Dev Drive for target/
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@v4
+        with:
+          drive-size: 40GB
+          drive-type: Dynamic
+          mount-path: ${{ github.workspace }}/target
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cli-e2e
+          key: cli-e2e-${{ matrix.part }}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -141,6 +164,7 @@ jobs:
           fi
 
       - name: cargo moose doctor
+        if: matrix.part != 'scaffolds'
         run: $CARGO_MOOSE doctor
 
       # ── moose-example-gain: install -> validate -> uninstall ──────────
@@ -148,6 +172,7 @@ jobs:
       # /Library/Audio/Plug-Ins system scope; the scaffolds below cover
       # --user there.
       - name: install moose-example-gain
+        if: matrix.part != 'scaffolds'
         run: |
           set -e
           if [ "$RUNNER_OS" = macOS ]; then
@@ -169,6 +194,7 @@ jobs:
           esac
 
       - name: validate moose-example-gain
+        if: matrix.part != 'scaffolds'
         run: |
           set -e -o pipefail
           run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
@@ -178,6 +204,7 @@ jobs:
           fi
 
       - name: uninstall moose-example-gain
+        if: matrix.part != 'scaffolds'
         run: |
           set -e
           if [ "$RUNNER_OS" = macOS ]; then
@@ -201,6 +228,7 @@ jobs:
       # Setup .exe. verify-package-presets.sh asserts the presets ship and,
       # on Linux/Windows, that the VST3 merge never wipes a user preset.
       - name: package moose-example-synth
+        if: matrix.part != 'scaffolds'
         run: |
           set -e
           extra=""; [ "$RUNNER_OS" = macOS ] && extra=--no-notarize
@@ -214,6 +242,7 @@ jobs:
           bash scripts/ci/verify-package-presets.sh "$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
 
       - name: upload synth package
+        if: matrix.part != 'scaffolds'
         uses: actions/upload-artifact@v4
         with:
           name: moose-example-synth-${{ runner.os }}
@@ -224,12 +253,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # ── macOS AU: auval slot ─────────────────────────────────────────
+      # The AU restore (stage2/au) adds its auval job here, macOS only,
+      # after the example plugins and before the scaffold shapes.
+
       # ── scaffold shapes ───────────────────────────────────────────────
       # Catches templates that build but trip a downstream packager
       # (workspace bundle-id derivation, instrument vs effect routing), and
       # holds generated code to the workspace bar (fmt + pedantic clippy).
       # Deps are rewritten to this checkout by rewrite-scaffold-deps.py.
-      - name: scaffold round-trips (${{ matrix.shapes }})
+      - name: scaffold round-trips
+        if: matrix.part != 'plugins'
         run: |
           set -euo pipefail
           run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
@@ -267,6 +301,7 @@ jobs:
       # thread, and its shipped rt-paranoid wiring must work. The scaffold
       # ships no tests by design; add a test dep + the alloc check.
       - name: rt-paranoid on the scaffolded effect
+        if: matrix.part != 'plugins'
         working-directory: ${{ runner.temp }}/scaffold/acme-fx
         run: |
           set -e
