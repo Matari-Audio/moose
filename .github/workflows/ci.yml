@@ -2,14 +2,19 @@ name: CI
 
 # Core workspace gate: fmt (Linux), clippy, every test (unit, integration,
 # doc, screenshot, scaffold_e2e) and the SIMD perf guard, on all three OSes.
-# Install / validate / package round-trips live in cli-e2e.yml.
+# Also calls the install / validate / package round-trips (cli-e2e.yml) and
+# the example rt-paranoid check (ci-rt-paranoid.yml).
+#
+# On a PR, `changes` picks the OSes from the changed paths
+# (scripts/ci/changed-oses.sh): a macOS-only change runs only the macOS
+# jobs, a docs-only change runs none. Pushes to main run every OS. `ci-ok`
+# always runs and fails if any selected job failed.
 
 on:
   push:
     branches: [main]
     paths-ignore: ['**.md', 'docs/**']
   pull_request:
-    paths-ignore: ['**.md', 'docs/**']
 
 permissions:
   contents: read
@@ -28,18 +33,46 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      # JSON lists of runner labels, e.g. ["macos-14"]
+      oses: ${{ steps.pick.outputs.oses }}
+      rt_oses: ${{ steps.pick.outputs.rt_oses }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # HEAD is the PR merge commit: HEAD^1 is the base it merges into.
+            git diff --name-only --no-renames HEAD^1 HEAD > changed.txt
+            picked=$(scripts/ci/changed-oses.sh < changed.txt)
+          else
+            picked="macos windows linux"
+          fi
+          echo "OSes: ${picked:-none (docs only)}"
+          oses=(); rt=()
+          for o in $picked; do
+            case $o in
+              linux) oses+=(ubuntu-24.04); rt+=(ubuntu-24.04) ;;
+              macos) oses+=(macos-14) ;;
+              windows) oses+=(windows-latest); rt+=(windows-latest) ;;
+            esac
+          done
+          json() { printf '%s\n' "$@" | jq -Rnc '[inputs | select(. != "")]'; }
+          echo "oses=$(json "${oses[@]}")" >> "$GITHUB_OUTPUT"
+          echo "rt_oses=$(json "${rt[@]}")" >> "$GITHUB_OUTPUT"
+
   test:
     name: test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.oses != '[]'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14, windows-latest]
-        include:
-          # Windows runs cargo-moose's tests (scaffold_e2e: ~6 min of
-          # scaffolded cargo builds) in the parallel `cargo-moose tests (windows-latest)`
-          # job below; Linux/macOS keep them here.
-          - os: windows-latest
-            exclude: --exclude cargo-moose
+        os: ${{ fromJSON(needs.changes.outputs.oses) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -111,7 +144,10 @@ jobs:
       # crate opts into `moose-gui/gpu` again, test it with its own `-p`
       # invocation and `--exclude` it here.
       - name: test
-        run: cargo test --workspace ${{ matrix.exclude }}
+        # Windows runs cargo-moose's tests (scaffold_e2e: ~6 min of
+        # scaffolded cargo builds) in the parallel `cargo-moose tests
+        # (windows-latest)` job below; Linux/macOS keep them here.
+        run: cargo test --workspace ${{ runner.os == 'Windows' && '--exclude cargo-moose' || '' }}
       - name: benches (test mode)
         run: cargo test -p moose-simd --benches
 
@@ -140,6 +176,8 @@ jobs:
     # cargo-moose's own tests on Windows, split out of `test (windows)` to
     # run in parallel: scaffold_e2e scaffolds and builds real projects.
     name: cargo-moose tests (windows-latest)
+    needs: changes
+    if: contains(needs.changes.outputs.oses, 'windows')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -156,6 +194,8 @@ jobs:
     # Newest macOS on purpose: the baseview hitTest: crash was an AppKit
     # isa-swizzling regression that only surfaced on a new OS.
     name: gui hitTest (windowed, newest macOS)
+    needs: changes
+    if: contains(needs.changes.outputs.oses, 'macos')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -167,3 +207,30 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: windowed hitTest smoke
         run: ./scripts/gui-window-test.sh
+
+  cli-e2e:
+    name: cli
+    needs: changes
+    if: needs.changes.outputs.oses != '[]'
+    uses: ./.github/workflows/cli-e2e.yml
+    with:
+      oses: ${{ needs.changes.outputs.oses }}
+
+  rt-paranoid:
+    name: rt-paranoid
+    needs: changes
+    if: needs.changes.outputs.rt_oses != '[]'
+    uses: ./.github/workflows/ci-rt-paranoid.yml
+    with:
+      oses: ${{ needs.changes.outputs.rt_oses }}
+
+  # The one check to watch: green when every selected job passed (skipped
+  # jobs are fine), red if any failed or was cancelled.
+  ci-ok:
+    needs: [changes, test, cargo-moose-windows, gui-window, cli-e2e, rt-paranoid]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo '${{ toJSON(needs.*.result) }}'
+          ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
