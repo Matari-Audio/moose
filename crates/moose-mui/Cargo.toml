@@ -16,8 +16,8 @@ publish = false
 [dependencies]
 moose-core = { workspace = true }
 moose-params = { workspace = true }
-mui = { git = "https://github.com/Matari-Audio/MUI", rev = "48dde277444db4c4b9fa1099ecd52f997a18402a", features = ["gpu-effects"] }
-mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "48dde277444db4c4b9fa1099ecd52f997a18402a" }
+mui = { git = "https://github.com/Matari-Audio/MUI", features = ["gpu-effects"] }
+mui-baseview = { git = "https://github.com/Matari-Audio/MUI" }
 # The same baseview mui-baseview opens its window with: `WindowHandle` and
 # `WindowScalePolicy` cross that API. Not the workspace `baseview` (the
 # moose fork); see the crate README.
