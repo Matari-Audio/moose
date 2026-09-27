@@ -29,7 +29,6 @@ use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routi
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::events::{EVENT_LIST_PREALLOC, Event, EventBody, EventList, OutputEventStatus};
 use moose_core::export::PluginExport;
-use moose_core::info::PluginCategory;
 use moose_params::{ParamInfo, Params};
 
 use crate::cli::Options;
@@ -643,7 +642,8 @@ pub fn start_audio<P: PluginExport>(opts: &Options) -> Result<AudioHandles<P>, B
     let sample_format = default_config.sample_format();
     let sample_rate = f64::from(config.sample_rate);
     let channels = config.channels as usize;
-    let is_effect = P::info().category == PluginCategory::Effect;
+    // Keep the public field name for compatibility; this means audio-input capable.
+    let is_effect = num_in > 0;
 
     // Capacity 256: covers a generous MIDI burst within a single
     // audio callback period. ArrayQueue is lock-free MPMC - the MIDI

@@ -28,7 +28,6 @@ use moose_core::bus::BusLayout;
 use moose_core::cast::frame_count_f64;
 use moose_core::config::ProcessMode;
 use moose_core::export::PluginExport;
-use moose_core::info::PluginCategory;
 use moose_driver::{InputSource, PluginDriver};
 
 use crate::cli::Options;
@@ -61,12 +60,6 @@ where
         .as_deref()
         .ok_or("offline render requires --output-file")?;
 
-    if P::info().category != PluginCategory::Effect {
-        return Err("offline render only supports effect plugins; \
-             instruments need a MIDI input source which this path does not expose"
-            .into());
-    }
-
     let (file_sr, file_channels) = peek_wav_spec(input_path)?;
     let sample_rate = opts
         .sample_rate
@@ -83,7 +76,7 @@ where
     // offset and the output width.
     let layouts = P::bus_layouts();
     let (channels, sidechain_width) = resolve_render_layout(&layouts, file_channels)
-        .ok_or("effect plugin declares no bus layout; cannot offline-render")?;
+        .ok_or("plugin declares no bus layout; cannot offline-render")?;
     if channels == 0 {
         return Err("plugin's main input bus has no channels; cannot offline-render".into());
     }

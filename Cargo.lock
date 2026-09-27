@@ -2038,6 +2038,7 @@ name = "moose-driver"
 version = "7.0.0"
 dependencies = [
  "hound",
+ "moose",
  "moose-core",
  "moose-params",
 ]

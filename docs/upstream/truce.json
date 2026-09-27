@@ -1,0 +1,1368 @@
+{
+  "head": "25791270cf7ca1309cb6bdc6fa75a6fe94617d1c",
+  "items": {
+    "1": {
+      "html_url": "https://github.com/truce-audio/truce/issues/1",
+      "state": "closed",
+      "title": "Doesn't compile on Windows 11",
+      "updated_at": "2026-04-23T01:35:24Z"
+    },
+    "10": {
+      "html_url": "https://github.com/truce-audio/truce/pull/10",
+      "state": "closed",
+      "title": "Release v0.16.3",
+      "updated_at": "2026-05-05T00:21:29Z"
+    },
+    "100": {
+      "html_url": "https://github.com/truce-audio/truce/pull/100",
+      "state": "closed",
+      "title": "Staging dev/v0.49.18",
+      "updated_at": "2026-07-07T09:23:19Z"
+    },
+    "101": {
+      "html_url": "https://github.com/truce-audio/truce/pull/101",
+      "state": "closed",
+      "title": "Staging dev/v0.49.19",
+      "updated_at": "2026-07-07T09:23:20Z"
+    },
+    "102": {
+      "html_url": "https://github.com/truce-audio/truce/pull/102",
+      "state": "closed",
+      "title": "Staging dev/v0.49.20",
+      "updated_at": "2026-07-07T09:23:21Z"
+    },
+    "103": {
+      "html_url": "https://github.com/truce-audio/truce/pull/103",
+      "state": "closed",
+      "title": "Staging dev/v0.49.21",
+      "updated_at": "2026-07-07T09:23:22Z"
+    },
+    "104": {
+      "html_url": "https://github.com/truce-audio/truce/pull/104",
+      "state": "closed",
+      "title": "Staging dev/v0.49.22",
+      "updated_at": "2026-07-07T09:23:24Z"
+    },
+    "105": {
+      "html_url": "https://github.com/truce-audio/truce/pull/105",
+      "state": "closed",
+      "title": "Staging dev/v0.49.23",
+      "updated_at": "2026-07-07T09:23:25Z"
+    },
+    "106": {
+      "html_url": "https://github.com/truce-audio/truce/pull/106",
+      "state": "closed",
+      "title": "Staging dev/v0.50.0",
+      "updated_at": "2026-07-07T09:23:27Z"
+    },
+    "107": {
+      "html_url": "https://github.com/truce-audio/truce/pull/107",
+      "state": "closed",
+      "title": "Staging dev/v0.51.0",
+      "updated_at": "2026-07-07T09:23:28Z"
+    },
+    "108": {
+      "html_url": "https://github.com/truce-audio/truce/pull/108",
+      "state": "closed",
+      "title": "0.52.0: Initial param-dependent chunking",
+      "updated_at": "2026-07-07T09:23:29Z"
+    },
+    "109": {
+      "html_url": "https://github.com/truce-audio/truce/pull/109",
+      "state": "closed",
+      "title": "Staging dev/v0.53.0",
+      "updated_at": "2026-07-07T09:23:30Z"
+    },
+    "11": {
+      "html_url": "https://github.com/truce-audio/truce/pull/11",
+      "state": "closed",
+      "title": "Release v0.16.4",
+      "updated_at": "2026-05-05T00:21:30Z"
+    },
+    "110": {
+      "html_url": "https://github.com/truce-audio/truce/pull/110",
+      "state": "closed",
+      "title": "Staging dev/v0.54.0",
+      "updated_at": "2026-07-07T09:23:35Z"
+    },
+    "111": {
+      "html_url": "https://github.com/truce-audio/truce/pull/111",
+      "state": "closed",
+      "title": "Staging dev/v0.55.0",
+      "updated_at": "2026-07-07T09:23:36Z"
+    },
+    "112": {
+      "html_url": "https://github.com/truce-audio/truce/pull/112",
+      "state": "closed",
+      "title": "Staging dev/v0.56.0",
+      "updated_at": "2026-07-07T09:23:37Z"
+    },
+    "113": {
+      "html_url": "https://github.com/truce-audio/truce/pull/113",
+      "state": "closed",
+      "title": "Staging dev/v0.57.0",
+      "updated_at": "2026-07-07T09:23:38Z"
+    },
+    "114": {
+      "html_url": "https://github.com/truce-audio/truce/pull/114",
+      "state": "closed",
+      "title": "Staging dev/v0.57.1",
+      "updated_at": "2026-07-07T09:23:39Z"
+    },
+    "115": {
+      "html_url": "https://github.com/truce-audio/truce/pull/115",
+      "state": "closed",
+      "title": "Staging dev/v0.57.2",
+      "updated_at": "2026-07-07T09:23:40Z"
+    },
+    "116": {
+      "html_url": "https://github.com/truce-audio/truce/pull/116",
+      "state": "closed",
+      "title": "Staging 0.58.0: Presets support",
+      "updated_at": "2026-07-07T09:23:41Z"
+    },
+    "117": {
+      "html_url": "https://github.com/truce-audio/truce/pull/117",
+      "state": "closed",
+      "title": "Staging v1.0.0",
+      "updated_at": "2026-06-13T09:53:33Z"
+    },
+    "118": {
+      "html_url": "https://github.com/truce-audio/truce/pull/118",
+      "state": "closed",
+      "title": "Release v0.58.1",
+      "updated_at": "2026-07-07T09:23:42Z"
+    },
+    "119": {
+      "html_url": "https://github.com/truce-audio/truce/pull/119",
+      "state": "closed",
+      "title": "Staging dev/v0.58.2",
+      "updated_at": "2026-07-07T09:23:43Z"
+    },
+    "12": {
+      "html_url": "https://github.com/truce-audio/truce/pull/12",
+      "state": "closed",
+      "title": "Release v0.16.5",
+      "updated_at": "2026-05-05T00:21:32Z"
+    },
+    "120": {
+      "html_url": "https://github.com/truce-audio/truce/pull/120",
+      "state": "closed",
+      "title": "Staging dev/v0.58.3",
+      "updated_at": "2026-07-07T09:23:43Z"
+    },
+    "121": {
+      "html_url": "https://github.com/truce-audio/truce/pull/121",
+      "state": "closed",
+      "title": "update: rebase latest truce",
+      "updated_at": "2026-06-15T19:23:44Z"
+    },
+    "122": {
+      "html_url": "https://github.com/truce-audio/truce/pull/122",
+      "state": "closed",
+      "title": "truce-clap: keep aspect ratio on any resize edge",
+      "updated_at": "2026-06-19T04:35:10Z"
+    },
+    "123": {
+      "html_url": "https://github.com/truce-audio/truce/issues/123",
+      "state": "closed",
+      "title": "MIDI Output?",
+      "updated_at": "2026-06-22T12:24:51Z"
+    },
+    "124": {
+      "html_url": "https://github.com/truce-audio/truce/issues/124",
+      "state": "closed",
+      "title": "`cargo-truce` doesn't use workspace's target dir but assumes plugin/target path, even when the plugin crate is a member of a larger Cargo workspace",
+      "updated_at": "2026-06-22T11:56:19Z"
+    },
+    "125": {
+      "html_url": "https://github.com/truce-audio/truce/pull/125",
+      "state": "closed",
+      "title": "Staging dev/v0.58.4",
+      "updated_at": "2026-07-07T09:23:46Z"
+    },
+    "126": {
+      "html_url": "https://github.com/truce-audio/truce/pull/126",
+      "state": "closed",
+      "title": "fix(gui): skip on_frame while macos host window is occluded or detached",
+      "updated_at": "2026-06-18T14:38:43Z"
+    },
+    "127": {
+      "html_url": "https://github.com/truce-audio/truce/issues/127",
+      "state": "closed",
+      "title": "CLAP: Single axis resize for ratio-locked editors",
+      "updated_at": "2026-06-23T11:35:59Z"
+    },
+    "128": {
+      "html_url": "https://github.com/truce-audio/truce/pull/128",
+      "state": "closed",
+      "title": "fix(packaging): azure endpoint env variable",
+      "updated_at": "2026-06-18T10:45:40Z"
+    },
+    "129": {
+      "html_url": "https://github.com/truce-audio/truce/pull/129",
+      "state": "closed",
+      "title": "Fix truce-iced selector omitting enum options",
+      "updated_at": "2026-06-19T12:56:51Z"
+    },
+    "13": {
+      "html_url": "https://github.com/truce-audio/truce/pull/13",
+      "state": "closed",
+      "title": "Release v0.17.0",
+      "updated_at": "2026-05-05T00:21:33Z"
+    },
+    "130": {
+      "html_url": "https://github.com/truce-audio/truce/pull/130",
+      "state": "closed",
+      "title": "Staging dev/v0.59.0",
+      "updated_at": "2026-07-07T09:23:46Z"
+    },
+    "131": {
+      "html_url": "https://github.com/truce-audio/truce/issues/131",
+      "state": "closed",
+      "title": "VST2 MIDI output broken on 64-bit: `VstEvents` pointer array uses wrong offset",
+      "updated_at": "2026-06-22T11:56:02Z"
+    },
+    "133": {
+      "html_url": "https://github.com/truce-audio/truce/pull/133",
+      "state": "closed",
+      "title": "Staging dev/v0.60.0",
+      "updated_at": "2026-07-07T09:23:47Z"
+    },
+    "135": {
+      "html_url": "https://github.com/truce-audio/truce/issues/135",
+      "state": "closed",
+      "title": "#[derive(Params)] triggers \"expected Expr\" rust-analyzer error on edition 2024 (RA 1.96)",
+      "updated_at": "2026-06-20T06:45:46Z"
+    },
+    "136": {
+      "html_url": "https://github.com/truce-audio/truce/pull/136",
+      "state": "closed",
+      "title": "Staging dev/v0.60.1",
+      "updated_at": "2026-07-07T09:23:48Z"
+    },
+    "137": {
+      "html_url": "https://github.com/truce-audio/truce/pull/137",
+      "state": "closed",
+      "title": "Fix nested params initialization in `Params` derive",
+      "updated_at": "2026-06-22T14:33:50Z"
+    },
+    "138": {
+      "html_url": "https://github.com/truce-audio/truce/pull/138",
+      "state": "closed",
+      "title": "feat: add cosmo-specific patches (IMidiMapping, CLAP_MIDI dialect, di\u2026",
+      "updated_at": "2026-06-20T18:29:50Z"
+    },
+    "139": {
+      "html_url": "https://github.com/truce-audio/truce/pull/139",
+      "state": "closed",
+      "title": "Staging dev/v0.60.2",
+      "updated_at": "2026-07-07T09:23:51Z"
+    },
+    "14": {
+      "html_url": "https://github.com/truce-audio/truce/pull/14",
+      "state": "closed",
+      "title": "Release v0.17.1",
+      "updated_at": "2026-04-28T22:08:09Z"
+    },
+    "140": {
+      "html_url": "https://github.com/truce-audio/truce/pull/140",
+      "state": "closed",
+      "title": "Staging dev/v0.61.0",
+      "updated_at": "2026-07-07T09:23:51Z"
+    },
+    "141": {
+      "html_url": "https://github.com/truce-audio/truce/issues/141",
+      "state": "closed",
+      "title": "Keyboard Input and Subscriptions",
+      "updated_at": "2026-06-24T23:00:39Z"
+    },
+    "142": {
+      "html_url": "https://github.com/truce-audio/truce/pull/142",
+      "state": "closed",
+      "title": "Staging dev/v0.62.0",
+      "updated_at": "2026-07-07T09:23:53Z"
+    },
+    "143": {
+      "html_url": "https://github.com/truce-audio/truce/pull/143",
+      "state": "closed",
+      "title": "Staging dev/v0.63.0",
+      "updated_at": "2026-07-07T09:23:53Z"
+    },
+    "144": {
+      "html_url": "https://github.com/truce-audio/truce/pull/144",
+      "state": "closed",
+      "title": "Cosmo/truce v0.60.1 20260620",
+      "updated_at": "2026-06-23T14:29:15Z"
+    },
+    "145": {
+      "html_url": "https://github.com/truce-audio/truce/pull/145",
+      "state": "closed",
+      "title": "fix(vst3): accept channel MIDI input events",
+      "updated_at": "2026-06-25T22:05:54Z"
+    },
+    "146": {
+      "html_url": "https://github.com/truce-audio/truce/pull/146",
+      "state": "closed",
+      "title": "Staging dev/v0.63.1",
+      "updated_at": "2026-07-07T09:23:54Z"
+    },
+    "147": {
+      "html_url": "https://github.com/truce-audio/truce/pull/147",
+      "state": "closed",
+      "title": "fix(vst2): notify host about plugin-emitted parameter changes",
+      "updated_at": "2026-06-24T12:45:16Z"
+    },
+    "148": {
+      "html_url": "https://github.com/truce-audio/truce/issues/148",
+      "state": "closed",
+      "title": "cargo-truce shell profile preflight ignores Cargo workspace root",
+      "updated_at": "2026-06-24T11:53:28Z"
+    },
+    "149": {
+      "html_url": "https://github.com/truce-audio/truce/pull/149",
+      "state": "closed",
+      "title": "Staging dev/v0.63.2",
+      "updated_at": "2026-07-07T09:23:56Z"
+    },
+    "15": {
+      "html_url": "https://github.com/truce-audio/truce/pull/15",
+      "state": "closed",
+      "title": "Release v0.17.2",
+      "updated_at": "2026-05-05T00:21:36Z"
+    },
+    "150": {
+      "html_url": "https://github.com/truce-audio/truce/pull/150",
+      "state": "closed",
+      "title": "Staging dev/v0.64.0",
+      "updated_at": "2026-07-11T20:00:30Z"
+    },
+    "151": {
+      "html_url": "https://github.com/truce-audio/truce/pull/151",
+      "state": "closed",
+      "title": "Staging dev/v0.64.1",
+      "updated_at": "2026-07-11T20:00:29Z"
+    },
+    "152": {
+      "html_url": "https://github.com/truce-audio/truce/pull/152",
+      "state": "closed",
+      "title": "Staging dev/v0.65.0",
+      "updated_at": "2026-07-11T20:00:28Z"
+    },
+    "153": {
+      "html_url": "https://github.com/truce-audio/truce/pull/153",
+      "state": "closed",
+      "title": "Staging dev/v1.0.0",
+      "updated_at": "2026-07-11T20:00:25Z"
+    },
+    "154": {
+      "html_url": "https://github.com/truce-audio/truce/pull/154",
+      "state": "closed",
+      "title": "Staging dev/v1.0.1",
+      "updated_at": "2026-07-11T20:00:20Z"
+    },
+    "156": {
+      "html_url": "https://github.com/truce-audio/truce/issues/156",
+      "state": "open",
+      "title": "Add discrete UI scale presets",
+      "updated_at": "2026-07-14T09:33:15Z"
+    },
+    "157": {
+      "html_url": "https://github.com/truce-audio/truce/issues/157",
+      "state": "closed",
+      "title": "VST3 TransportInfo.position_samples remains 0 while position_beats advances",
+      "updated_at": "2026-06-30T21:06:09Z"
+    },
+    "158": {
+      "html_url": "https://github.com/truce-audio/truce/pull/158",
+      "state": "closed",
+      "title": "Staging dev/v1.0.2",
+      "updated_at": "2026-07-11T20:00:19Z"
+    },
+    "159": {
+      "html_url": "https://github.com/truce-audio/truce/issues/159",
+      "state": "closed",
+      "title": "Vizia scale factor",
+      "updated_at": "2026-06-30T21:08:15Z"
+    },
+    "16": {
+      "html_url": "https://github.com/truce-audio/truce/pull/16",
+      "state": "closed",
+      "title": "Release v0.18.0",
+      "updated_at": "2026-05-05T00:21:39Z"
+    },
+    "160": {
+      "html_url": "https://github.com/truce-audio/truce/issues/160",
+      "state": "closed",
+      "title": "Support passing extra Cargo features to cargo truce build/install/package",
+      "updated_at": "2026-07-01T06:54:40Z"
+    },
+    "161": {
+      "html_url": "https://github.com/truce-audio/truce/pull/161",
+      "state": "closed",
+      "title": "Update issue templates",
+      "updated_at": "2026-07-07T09:24:08Z"
+    },
+    "162": {
+      "html_url": "https://github.com/truce-audio/truce/issues/162",
+      "state": "closed",
+      "title": "clap-validator state-reproducibility-flush fails \u2014 flush() not applying param values",
+      "updated_at": "2026-06-30T22:00:42Z"
+    },
+    "163": {
+      "html_url": "https://github.com/truce-audio/truce/issues/163",
+      "state": "closed",
+      "title": "[Bug]: Linux HiDPI editor resize issues",
+      "updated_at": "2026-07-14T12:07:39Z"
+    },
+    "164": {
+      "html_url": "https://github.com/truce-audio/truce/pull/164",
+      "state": "closed",
+      "title": "Staging dev/v1.0.3",
+      "updated_at": "2026-07-11T20:00:18Z"
+    },
+    "165": {
+      "html_url": "https://github.com/truce-audio/truce/pull/165",
+      "state": "closed",
+      "title": "Staging dev/v1.0.4",
+      "updated_at": "2026-07-11T20:00:17Z"
+    },
+    "166": {
+      "html_url": "https://github.com/truce-audio/truce/pull/166",
+      "state": "closed",
+      "title": "Staging dev/v1.1.0",
+      "updated_at": "2026-07-03T08:39:19Z"
+    },
+    "168": {
+      "html_url": "https://github.com/truce-audio/truce/issues/168",
+      "state": "closed",
+      "title": "[Bug]: Mouse Event Delivery \u2014 General Issue in Truce-Iced",
+      "updated_at": "2026-07-03T09:50:55Z"
+    },
+    "17": {
+      "html_url": "https://github.com/truce-audio/truce/pull/17",
+      "state": "closed",
+      "title": "Release v0.18.1",
+      "updated_at": "2026-05-05T00:21:45Z"
+    },
+    "171": {
+      "html_url": "https://github.com/truce-audio/truce/pull/171",
+      "state": "closed",
+      "title": "Staging dev/v2.0.0",
+      "updated_at": "2026-07-11T20:00:15Z"
+    },
+    "172": {
+      "html_url": "https://github.com/truce-audio/truce/pull/172",
+      "state": "closed",
+      "title": "Staging dev/v1.0.5",
+      "updated_at": "2026-07-11T20:00:16Z"
+    },
+    "173": {
+      "html_url": "https://github.com/truce-audio/truce/pull/173",
+      "state": "closed",
+      "title": "fix(truce-clap): forward non-envelope state bytes to Plugin::load_state for legacy migration",
+      "updated_at": "2026-07-04T12:37:24Z"
+    },
+    "174": {
+      "html_url": "https://github.com/truce-audio/truce/pull/174",
+      "state": "closed",
+      "title": "fix(truce-clap): handle CLAP_EVENT_NOTE_CHOKE, guard empty bus_layouts()",
+      "updated_at": "2026-07-05T10:04:12Z"
+    },
+    "175": {
+      "html_url": "https://github.com/truce-audio/truce/issues/175",
+      "state": "closed",
+      "title": "[Bug]: get_meter/save_state form a &data.plugin alias across the audio thread's &mut P (data race) in CLAP/VST3/AU/AAX/VST2 GUI bridges",
+      "updated_at": "2026-07-05T11:50:12Z"
+    },
+    "176": {
+      "html_url": "https://github.com/truce-audio/truce/pull/176",
+      "state": "closed",
+      "title": "fix(truce-clap): fall back to Plugin::load_state() for non-envelope state bytes",
+      "updated_at": "2026-07-04T12:38:07Z"
+    },
+    "177": {
+      "html_url": "https://github.com/truce-audio/truce/pull/177",
+      "state": "closed",
+      "title": "fix(truce-params): Percent params in 0-1 range instead of 0-100",
+      "updated_at": "2026-07-04T15:14:39Z"
+    },
+    "178": {
+      "html_url": "https://github.com/truce-audio/truce/pull/178",
+      "state": "closed",
+      "title": "feat(truce-clap): implement clap.remote-controls extension",
+      "updated_at": "2026-07-11T20:00:15Z"
+    },
+    "179": {
+      "html_url": "https://github.com/truce-audio/truce/pull/179",
+      "state": "closed",
+      "title": "Staging dev/v2.0.1",
+      "updated_at": "2026-07-11T20:00:13Z"
+    },
+    "18": {
+      "html_url": "https://github.com/truce-audio/truce/pull/18",
+      "state": "closed",
+      "title": "Release v0.18.2",
+      "updated_at": "2026-05-05T00:21:46Z"
+    },
+    "180": {
+      "html_url": "https://github.com/truce-audio/truce/pull/180",
+      "state": "closed",
+      "title": "truce-vizia: patch around vizia_core's modify_timer infinite-loop bug",
+      "updated_at": "2026-07-05T12:31:18Z"
+    },
+    "181": {
+      "html_url": "https://github.com/truce-audio/truce/pull/181",
+      "state": "closed",
+      "title": "Staging dev/v2.0.2",
+      "updated_at": "2026-07-11T20:00:11Z"
+    },
+    "182": {
+      "html_url": "https://github.com/truce-audio/truce/pull/182",
+      "state": "closed",
+      "title": "Staging dev/v3.0.0",
+      "updated_at": "2026-07-11T20:00:12Z"
+    },
+    "183": {
+      "html_url": "https://github.com/truce-audio/truce/pull/183",
+      "state": "closed",
+      "title": "Staging dev/v3.0.1",
+      "updated_at": "2026-07-11T20:00:09Z"
+    },
+    "184": {
+      "html_url": "https://github.com/truce-audio/truce/pull/184",
+      "state": "closed",
+      "title": "Staging dev/v3.1.0",
+      "updated_at": "2026-07-11T20:00:07Z"
+    },
+    "185": {
+      "html_url": "https://github.com/truce-audio/truce/pull/185",
+      "state": "closed",
+      "title": "Staging dev/v3.1.1",
+      "updated_at": "2026-07-11T20:00:06Z"
+    },
+    "186": {
+      "html_url": "https://github.com/truce-audio/truce/pull/186",
+      "state": "closed",
+      "title": "Staging dev/v3.1.2",
+      "updated_at": "2026-07-11T20:00:05Z"
+    },
+    "187": {
+      "html_url": "https://github.com/truce-audio/truce/pull/187",
+      "state": "closed",
+      "title": "Staging dev/v3.1.3",
+      "updated_at": "2026-07-11T20:00:05Z"
+    },
+    "188": {
+      "html_url": "https://github.com/truce-audio/truce/pull/188",
+      "state": "closed",
+      "title": "fix(truce-gui): fall back to GL when no DX12 adapter exists on Windows",
+      "updated_at": "2026-07-08T02:19:24Z"
+    },
+    "189": {
+      "html_url": "https://github.com/truce-audio/truce/pull/189",
+      "state": "closed",
+      "title": "Staging dev/v3.1.4",
+      "updated_at": "2026-07-11T20:00:04Z"
+    },
+    "19": {
+      "html_url": "https://github.com/truce-audio/truce/pull/19",
+      "state": "closed",
+      "title": "Manual bump to v0.18.2",
+      "updated_at": "2026-05-05T00:21:47Z"
+    },
+    "190": {
+      "html_url": "https://github.com/truce-audio/truce/pull/190",
+      "state": "closed",
+      "title": "Staging dev/v4.0.0",
+      "updated_at": "2026-07-11T20:00:03Z"
+    },
+    "191": {
+      "html_url": "https://github.com/truce-audio/truce/pull/191",
+      "state": "closed",
+      "title": "Staging dev/v4.0.0-receiverless",
+      "updated_at": "2026-07-09T23:19:58Z"
+    },
+    "192": {
+      "html_url": "https://github.com/truce-audio/truce/pull/192",
+      "state": "closed",
+      "title": "Staging dev/v5.0.0",
+      "updated_at": "2026-07-09T17:55:17Z"
+    },
+    "193": {
+      "html_url": "https://github.com/truce-audio/truce/pull/193",
+      "state": "closed",
+      "title": "Staging dev/v4.1.0",
+      "updated_at": "2026-07-11T20:00:02Z"
+    },
+    "194": {
+      "html_url": "https://github.com/truce-audio/truce/pull/194",
+      "state": "closed",
+      "title": "Staging v5.0.1",
+      "updated_at": "2026-07-11T19:59:47Z"
+    },
+    "195": {
+      "html_url": "https://github.com/truce-audio/truce/pull/195",
+      "state": "closed",
+      "title": "Staging v6.0.0",
+      "updated_at": "2026-07-10T09:24:26Z"
+    },
+    "196": {
+      "html_url": "https://github.com/truce-audio/truce/pull/196",
+      "state": "closed",
+      "title": "Staging v6.1.0",
+      "updated_at": "2026-07-11T03:45:39Z"
+    },
+    "197": {
+      "html_url": "https://github.com/truce-audio/truce/pull/197",
+      "state": "closed",
+      "title": "Staging v6.1.1",
+      "updated_at": "2026-07-11T11:49:15Z"
+    },
+    "198": {
+      "html_url": "https://github.com/truce-audio/truce/pull/198",
+      "state": "closed",
+      "title": "Staging dev/v6.1.2",
+      "updated_at": "2026-07-12T08:31:15Z"
+    },
+    "199": {
+      "html_url": "https://github.com/truce-audio/truce/issues/199",
+      "state": "closed",
+      "title": "[Feature]: implement clap.remote-controls extension",
+      "updated_at": "2026-07-16T08:53:13Z"
+    },
+    "2": {
+      "html_url": "https://github.com/truce-audio/truce/issues/2",
+      "state": "closed",
+      "title": "`cargo truce build` commands examples discrepancy",
+      "updated_at": "2026-04-24T14:19:25Z"
+    },
+    "20": {
+      "html_url": "https://github.com/truce-audio/truce/pull/20",
+      "state": "closed",
+      "title": "Release v0.18.3",
+      "updated_at": "2026-05-05T00:21:48Z"
+    },
+    "200": {
+      "html_url": "https://github.com/truce-audio/truce/issues/200",
+      "state": "closed",
+      "title": "[Bug]: Truce-driver published to crates.io?",
+      "updated_at": "2026-07-13T10:46:25Z"
+    },
+    "201": {
+      "html_url": "https://github.com/truce-audio/truce/issues/201",
+      "state": "closed",
+      "title": "[Bug]: Standalone app crashes on Ubuntu - HiDPI dual-monitor setup",
+      "updated_at": "2026-07-13T15:05:09Z"
+    },
+    "202": {
+      "html_url": "https://github.com/truce-audio/truce/pull/202",
+      "state": "closed",
+      "title": "Staging dev/v6.1.4",
+      "updated_at": "2026-07-13T14:44:24Z"
+    },
+    "203": {
+      "html_url": "https://github.com/truce-audio/truce/pull/203",
+      "state": "closed",
+      "title": "fix(truce-vizia): poll host param changes into value_signal",
+      "updated_at": "2026-07-14T01:18:39Z"
+    },
+    "204": {
+      "html_url": "https://github.com/truce-audio/truce/pull/204",
+      "state": "closed",
+      "title": "Staging v6.1.5",
+      "updated_at": "2026-07-14T02:39:40Z"
+    },
+    "205": {
+      "html_url": "https://github.com/truce-audio/truce/issues/205",
+      "state": "closed",
+      "title": "[Bug]: truce-vizia -  value_signal-bound widgets don't repaint on host parameter automation",
+      "updated_at": "2026-07-16T22:44:10Z"
+    },
+    "206": {
+      "html_url": "https://github.com/truce-audio/truce/pull/206",
+      "state": "closed",
+      "title": "Staging dev/v6.1.6",
+      "updated_at": "2026-07-14T11:02:08Z"
+    },
+    "207": {
+      "html_url": "https://github.com/truce-audio/truce/issues/207",
+      "state": "closed",
+      "title": "[Feature]: Cross-compile support",
+      "updated_at": "2026-07-16T04:51:21Z"
+    },
+    "209": {
+      "html_url": "https://github.com/truce-audio/truce/pull/209",
+      "state": "closed",
+      "title": "Staging dev/v6.1.7",
+      "updated_at": "2026-07-14T20:56:56Z"
+    },
+    "21": {
+      "html_url": "https://github.com/truce-audio/truce/pull/21",
+      "state": "closed",
+      "title": "Stage/v0.18.4",
+      "updated_at": "2026-05-05T00:21:50Z"
+    },
+    "210": {
+      "html_url": "https://github.com/truce-audio/truce/pull/210",
+      "state": "closed",
+      "title": "Upgrade/v6.1.7 local patches",
+      "updated_at": "2026-07-15T17:02:41Z"
+    },
+    "211": {
+      "html_url": "https://github.com/truce-audio/truce/pull/211",
+      "state": "closed",
+      "title": "Staging v6.1.8",
+      "updated_at": "2026-07-16T04:30:21Z"
+    },
+    "212": {
+      "html_url": "https://github.com/truce-audio/truce/pull/212",
+      "state": "closed",
+      "title": "Staging dev/v6.1.9",
+      "updated_at": "2026-07-16T07:36:52Z"
+    },
+    "213": {
+      "html_url": "https://github.com/truce-audio/truce/issues/213",
+      "state": "closed",
+      "title": "[Feature]: truce-slint: slow first paint on editor open (2\u20134s blank) \u2014 device reuse / warm start?",
+      "updated_at": "2026-07-16T16:43:19Z"
+    },
+    "214": {
+      "html_url": "https://github.com/truce-audio/truce/pull/214",
+      "state": "closed",
+      "title": "Staging dev/v6.1.10",
+      "updated_at": "2026-07-17T06:55:16Z"
+    },
+    "215": {
+      "html_url": "https://github.com/truce-audio/truce/pull/215",
+      "state": "closed",
+      "title": "Staging v6.1.11",
+      "updated_at": "2026-07-17T20:28:37Z"
+    },
+    "216": {
+      "html_url": "https://github.com/truce-audio/truce/pull/216",
+      "state": "closed",
+      "title": "chore(truce-slint): bump slint from 1.15.1 to 1.17.0",
+      "updated_at": "2026-07-17T18:52:42Z"
+    },
+    "217": {
+      "html_url": "https://github.com/truce-audio/truce/pull/217",
+      "state": "closed",
+      "title": "chore(truce-slint): bump slint from 1.15.1 to 1.17.0",
+      "updated_at": "2026-07-18T11:27:22Z"
+    },
+    "218": {
+      "html_url": "https://github.com/truce-audio/truce/pull/218",
+      "state": "closed",
+      "title": "Staging v6.2.0",
+      "updated_at": "2026-07-17T20:59:58Z"
+    },
+    "219": {
+      "html_url": "https://github.com/truce-audio/truce/pull/219",
+      "state": "closed",
+      "title": "Staging v6.2.1",
+      "updated_at": "2026-07-17T23:14:53Z"
+    },
+    "22": {
+      "html_url": "https://github.com/truce-audio/truce/pull/22",
+      "state": "closed",
+      "title": "Dev/v0.18.5",
+      "updated_at": "2026-05-16T23:01:57Z"
+    },
+    "220": {
+      "html_url": "https://github.com/truce-audio/truce/pull/220",
+      "state": "closed",
+      "title": "Staging v6.3.0",
+      "updated_at": "2026-07-18T15:33:27Z"
+    },
+    "221": {
+      "html_url": "https://github.com/truce-audio/truce/pull/221",
+      "state": "open",
+      "title": "truce-egui: migrate to egui 0.35",
+      "updated_at": "2026-07-19T22:51:25Z"
+    },
+    "222": {
+      "html_url": "https://github.com/truce-audio/truce/pull/222",
+      "state": "open",
+      "title": "add halfband-cascade oversampling crate",
+      "updated_at": "2026-07-24T14:59:59Z"
+    },
+    "223": {
+      "html_url": "https://github.com/truce-audio/truce/issues/223",
+      "state": "closed",
+      "title": "[Bug]: truce-driver allocates no audio inputs for Analyzer/Tool plugins (empty AudioBuffer::input offline)",
+      "updated_at": "2026-08-08T16:28:19Z"
+    },
+    "224": {
+      "html_url": "https://github.com/truce-audio/truce/pull/224",
+      "state": "open",
+      "title": "Fix macOS bundle archive dedupe and Steinberg IID",
+      "updated_at": "2026-07-29T13:39:36Z"
+    },
+    "226": {
+      "html_url": "https://github.com/truce-audio/truce/issues/226",
+      "state": "open",
+      "title": "[Feature]: File Browser",
+      "updated_at": "2026-08-14T22:31:41Z"
+    },
+    "227": {
+      "html_url": "https://github.com/truce-audio/truce/issues/227",
+      "state": "open",
+      "title": "[Feature]: not forcing dx12 on windows",
+      "updated_at": "2026-08-30T01:52:20Z"
+    },
+    "228": {
+      "html_url": "https://github.com/truce-audio/truce/pull/228",
+      "state": "open",
+      "title": "Upgrade slint to 1.17.1",
+      "updated_at": "2026-09-02T21:15:23Z"
+    },
+    "229": {
+      "html_url": "https://github.com/truce-audio/truce/issues/229",
+      "state": "open",
+      "title": "[Feature]: nested array params",
+      "updated_at": "2026-09-06T23:39:38Z"
+    },
+    "23": {
+      "html_url": "https://github.com/truce-audio/truce/pull/23",
+      "state": "closed",
+      "title": "Dev/v0.19.0",
+      "updated_at": "2026-05-16T23:01:58Z"
+    },
+    "230": {
+      "html_url": "https://github.com/truce-audio/truce/issues/230",
+      "state": "open",
+      "title": "[Feature]: support constants in params",
+      "updated_at": "2026-09-06T23:42:26Z"
+    },
+    "231": {
+      "html_url": "https://github.com/truce-audio/truce/pull/231",
+      "state": "open",
+      "title": "sample-loader: add truce-sample-loader crate",
+      "updated_at": "2026-09-11T00:11:07Z"
+    },
+    "232": {
+      "html_url": "https://github.com/truce-audio/truce/issues/232",
+      "state": "open",
+      "title": "[Bug]: State recall does not restore parameters \u2014 clap-validator state-reproducibility fails on the stock scaffold",
+      "updated_at": "2026-09-11T21:17:08Z"
+    },
+    "233": {
+      "html_url": "https://github.com/truce-audio/truce/issues/233",
+      "state": "open",
+      "title": "[Bug]: Editor::idle() is never called by any format wrapper",
+      "updated_at": "2026-09-11T21:17:15Z"
+    },
+    "234": {
+      "html_url": "https://github.com/truce-audio/truce/issues/234",
+      "state": "open",
+      "title": "[Bug]: Editor::open() runs before the parent NSView is in an NSWindow, breaking webview editors",
+      "updated_at": "2026-09-11T21:17:29Z"
+    },
+    "235": {
+      "html_url": "https://github.com/truce-audio/truce/pull/235",
+      "state": "open",
+      "title": "clap: request a parameter rescan after state and preset load",
+      "updated_at": "2026-09-23T15:53:17Z"
+    },
+    "236": {
+      "html_url": "https://github.com/truce-audio/truce/pull/236",
+      "state": "open",
+      "title": "vst3: correct the IUnitInfo and IEditControllerHostEditing interface IDs",
+      "updated_at": "2026-09-23T16:01:06Z"
+    },
+    "24": {
+      "html_url": "https://github.com/truce-audio/truce/pull/24",
+      "state": "closed",
+      "title": "Staging dev/v0.19.2",
+      "updated_at": "2026-05-16T23:02:00Z"
+    },
+    "25": {
+      "html_url": "https://github.com/truce-audio/truce/pull/25",
+      "state": "closed",
+      "title": "Staging dev/v0.19.3",
+      "updated_at": "2026-05-16T23:02:00Z"
+    },
+    "26": {
+      "html_url": "https://github.com/truce-audio/truce/pull/26",
+      "state": "closed",
+      "title": "Staging dev/v0.20.0",
+      "updated_at": "2026-05-16T23:02:02Z"
+    },
+    "27": {
+      "html_url": "https://github.com/truce-audio/truce/pull/27",
+      "state": "closed",
+      "title": "Staging PR for v0.20.1",
+      "updated_at": "2026-05-16T23:02:03Z"
+    },
+    "28": {
+      "html_url": "https://github.com/truce-audio/truce/pull/28",
+      "state": "closed",
+      "title": "Staging dev/v0.21.0",
+      "updated_at": "2026-05-16T23:02:04Z"
+    },
+    "29": {
+      "html_url": "https://github.com/truce-audio/truce/pull/29",
+      "state": "closed",
+      "title": "Staging dev/v0.21.1",
+      "updated_at": "2026-05-16T23:02:05Z"
+    },
+    "3": {
+      "html_url": "https://github.com/truce-audio/truce/pull/3",
+      "state": "closed",
+      "title": "Release v0.15.0",
+      "updated_at": "2026-04-28T06:24:01Z"
+    },
+    "30": {
+      "html_url": "https://github.com/truce-audio/truce/pull/30",
+      "state": "closed",
+      "title": "Staging dev/v0.22.0",
+      "updated_at": "2026-05-16T23:02:07Z"
+    },
+    "31": {
+      "html_url": "https://github.com/truce-audio/truce/pull/31",
+      "state": "closed",
+      "title": "Dev/v0.22.1",
+      "updated_at": "2026-05-16T23:02:08Z"
+    },
+    "32": {
+      "html_url": "https://github.com/truce-audio/truce/pull/32",
+      "state": "closed",
+      "title": "Dev/v0.22.2",
+      "updated_at": "2026-05-03T14:39:19Z"
+    },
+    "33": {
+      "html_url": "https://github.com/truce-audio/truce/pull/33",
+      "state": "closed",
+      "title": "Staging dev/v0.32.0",
+      "updated_at": "2026-05-16T23:02:11Z"
+    },
+    "34": {
+      "html_url": "https://github.com/truce-audio/truce/pull/34",
+      "state": "closed",
+      "title": "Staging dev/v0.32.1",
+      "updated_at": "2026-05-16T23:02:13Z"
+    },
+    "35": {
+      "html_url": "https://github.com/truce-audio/truce/pull/35",
+      "state": "closed",
+      "title": "Staging dev/v0.33.0",
+      "updated_at": "2026-05-16T23:02:15Z"
+    },
+    "36": {
+      "html_url": "https://github.com/truce-audio/truce/pull/36",
+      "state": "closed",
+      "title": "Staging dev/v0.34.0",
+      "updated_at": "2026-05-16T23:02:16Z"
+    },
+    "37": {
+      "html_url": "https://github.com/truce-audio/truce/pull/37",
+      "state": "closed",
+      "title": "Staging dev/v0.34.1",
+      "updated_at": "2026-05-16T23:02:22Z"
+    },
+    "38": {
+      "html_url": "https://github.com/truce-audio/truce/pull/38",
+      "state": "closed",
+      "title": "Staging dev/v0.35.0",
+      "updated_at": "2026-05-16T23:02:38Z"
+    },
+    "39": {
+      "html_url": "https://github.com/truce-audio/truce/pull/39",
+      "state": "closed",
+      "title": "Staging dev/v0.35.1",
+      "updated_at": "2026-05-16T23:02:41Z"
+    },
+    "4": {
+      "html_url": "https://github.com/truce-audio/truce/pull/4",
+      "state": "closed",
+      "title": "Release v0.15.1",
+      "updated_at": "2026-04-28T06:23:37Z"
+    },
+    "40": {
+      "html_url": "https://github.com/truce-audio/truce/pull/40",
+      "state": "closed",
+      "title": "Staging dev/v0.36.0",
+      "updated_at": "2026-05-16T23:02:40Z"
+    },
+    "41": {
+      "html_url": "https://github.com/truce-audio/truce/pull/41",
+      "state": "closed",
+      "title": "Staging dev/v0.36.1",
+      "updated_at": "2026-05-16T23:02:43Z"
+    },
+    "42": {
+      "html_url": "https://github.com/truce-audio/truce/pull/42",
+      "state": "closed",
+      "title": "Staging dev/v0.36.2",
+      "updated_at": "2026-05-16T23:02:44Z"
+    },
+    "43": {
+      "html_url": "https://github.com/truce-audio/truce/pull/43",
+      "state": "closed",
+      "title": "Staging dev/v0.37.0",
+      "updated_at": "2026-05-24T08:24:19Z"
+    },
+    "44": {
+      "html_url": "https://github.com/truce-audio/truce/pull/44",
+      "state": "closed",
+      "title": "Staging dev/v0.37.1",
+      "updated_at": "2026-05-16T23:02:24Z"
+    },
+    "45": {
+      "html_url": "https://github.com/truce-audio/truce/pull/45",
+      "state": "closed",
+      "title": "Staging dev/v0.38.0",
+      "updated_at": "2026-05-24T08:24:20Z"
+    },
+    "46": {
+      "html_url": "https://github.com/truce-audio/truce/pull/46",
+      "state": "closed",
+      "title": "Staging dev/v0.38.1",
+      "updated_at": "2026-05-16T23:02:27Z"
+    },
+    "47": {
+      "html_url": "https://github.com/truce-audio/truce/pull/47",
+      "state": "closed",
+      "title": "Staging dev/v0.39.0",
+      "updated_at": "2026-05-24T08:24:21Z"
+    },
+    "48": {
+      "html_url": "https://github.com/truce-audio/truce/pull/48",
+      "state": "closed",
+      "title": "Staging: dev/v0.39.1",
+      "updated_at": "2026-05-24T08:24:22Z"
+    },
+    "49": {
+      "html_url": "https://github.com/truce-audio/truce/pull/49",
+      "state": "closed",
+      "title": "Staging dev/v0.39.2",
+      "updated_at": "2026-05-24T08:24:23Z"
+    },
+    "5": {
+      "html_url": "https://github.com/truce-audio/truce/pull/5",
+      "state": "closed",
+      "title": "Release v0.15.2",
+      "updated_at": "2026-04-28T06:23:34Z"
+    },
+    "50": {
+      "html_url": "https://github.com/truce-audio/truce/pull/50",
+      "state": "closed",
+      "title": "Staging dev/v0.39.3",
+      "updated_at": "2026-05-24T08:24:24Z"
+    },
+    "51": {
+      "html_url": "https://github.com/truce-audio/truce/issues/51",
+      "state": "closed",
+      "title": "cargo truce install --clap produces flat Mach-O binary instead of macOS bundle",
+      "updated_at": "2026-05-14T11:12:14Z"
+    },
+    "52": {
+      "html_url": "https://github.com/truce-audio/truce/pull/52",
+      "state": "closed",
+      "title": "Staging dev/v0.40.0",
+      "updated_at": "2026-05-24T08:24:26Z"
+    },
+    "53": {
+      "html_url": "https://github.com/truce-audio/truce/pull/53",
+      "state": "closed",
+      "title": "Staging dev/v0.40.1",
+      "updated_at": "2026-05-24T08:24:26Z"
+    },
+    "54": {
+      "html_url": "https://github.com/truce-audio/truce/pull/54",
+      "state": "closed",
+      "title": "Staging dev/v0.40.2",
+      "updated_at": "2026-05-24T08:24:27Z"
+    },
+    "55": {
+      "html_url": "https://github.com/truce-audio/truce/pull/55",
+      "state": "closed",
+      "title": "Staging dev/v0.40.3",
+      "updated_at": "2026-05-16T23:02:30Z"
+    },
+    "56": {
+      "html_url": "https://github.com/truce-audio/truce/pull/56",
+      "state": "closed",
+      "title": "Staging dev/v0.41.0",
+      "updated_at": "2026-05-24T08:24:29Z"
+    },
+    "57": {
+      "html_url": "https://github.com/truce-audio/truce/pull/57",
+      "state": "closed",
+      "title": "Staging dev/v0.42.0",
+      "updated_at": "2026-05-24T08:24:30Z"
+    },
+    "58": {
+      "html_url": "https://github.com/truce-audio/truce/pull/58",
+      "state": "closed",
+      "title": "Staging dev/v0.42.1",
+      "updated_at": "2026-05-24T08:24:31Z"
+    },
+    "59": {
+      "html_url": "https://github.com/truce-audio/truce/pull/59",
+      "state": "closed",
+      "title": "Staging 0.43.0: Initial Sysex + UMP support",
+      "updated_at": "2026-05-24T08:24:36Z"
+    },
+    "6": {
+      "html_url": "https://github.com/truce-audio/truce/pull/6",
+      "state": "closed",
+      "title": "Release v0.15.3",
+      "updated_at": "2026-04-28T05:17:14Z"
+    },
+    "60": {
+      "html_url": "https://github.com/truce-audio/truce/pull/60",
+      "state": "closed",
+      "title": "Staging dev/v0.43.1",
+      "updated_at": "2026-05-24T08:24:41Z"
+    },
+    "61": {
+      "html_url": "https://github.com/truce-audio/truce/pull/61",
+      "state": "closed",
+      "title": "Staging dev/v0.44.0",
+      "updated_at": "2026-05-24T08:24:44Z"
+    },
+    "62": {
+      "html_url": "https://github.com/truce-audio/truce/pull/62",
+      "state": "closed",
+      "title": "Staging dev/v0.45.0",
+      "updated_at": "2026-05-24T08:24:45Z"
+    },
+    "63": {
+      "html_url": "https://github.com/truce-audio/truce/pull/63",
+      "state": "closed",
+      "title": "Staging dev/v0.45.1",
+      "updated_at": "2026-05-24T08:24:47Z"
+    },
+    "64": {
+      "html_url": "https://github.com/truce-audio/truce/pull/64",
+      "state": "closed",
+      "title": "Staging dev/v0.45.2",
+      "updated_at": "2026-05-24T08:24:48Z"
+    },
+    "65": {
+      "html_url": "https://github.com/truce-audio/truce/pull/65",
+      "state": "closed",
+      "title": "Staging dev/v0.45.3",
+      "updated_at": "2026-05-24T08:24:50Z"
+    },
+    "66": {
+      "html_url": "https://github.com/truce-audio/truce/pull/66",
+      "state": "closed",
+      "title": "Staging dev/0.45.4",
+      "updated_at": "2026-05-24T08:24:51Z"
+    },
+    "67": {
+      "html_url": "https://github.com/truce-audio/truce/pull/67",
+      "state": "closed",
+      "title": "Staging dev/v0.46.0",
+      "updated_at": "2026-05-25T15:15:46Z"
+    },
+    "68": {
+      "html_url": "https://github.com/truce-audio/truce/pull/68",
+      "state": "closed",
+      "title": "Staging dev/v0.47.0",
+      "updated_at": "2026-05-25T15:15:48Z"
+    },
+    "69": {
+      "html_url": "https://github.com/truce-audio/truce/pull/69",
+      "state": "closed",
+      "title": "Staging dev/v0.48.0",
+      "updated_at": "2026-05-25T15:15:49Z"
+    },
+    "7": {
+      "html_url": "https://github.com/truce-audio/truce/pull/7",
+      "state": "closed",
+      "title": "Release v0.16.0",
+      "updated_at": "2026-04-28T06:24:44Z"
+    },
+    "70": {
+      "html_url": "https://github.com/truce-audio/truce/pull/70",
+      "state": "closed",
+      "title": "Staging dev/v0.48.1",
+      "updated_at": "2026-05-25T15:15:50Z"
+    },
+    "71": {
+      "html_url": "https://github.com/truce-audio/truce/pull/71",
+      "state": "closed",
+      "title": "Staging dev/v0.48.2",
+      "updated_at": "2026-05-31T08:36:21Z"
+    },
+    "72": {
+      "html_url": "https://github.com/truce-audio/truce/pull/72",
+      "state": "closed",
+      "title": "Staging dev/v0.48.3",
+      "updated_at": "2026-05-31T08:36:23Z"
+    },
+    "73": {
+      "html_url": "https://github.com/truce-audio/truce/pull/73",
+      "state": "closed",
+      "title": "Staging dev/v0.48.4",
+      "updated_at": "2026-05-31T08:36:24Z"
+    },
+    "74": {
+      "html_url": "https://github.com/truce-audio/truce/pull/74",
+      "state": "closed",
+      "title": "Staging dev/v0.48.5",
+      "updated_at": "2026-05-25T15:15:59Z"
+    },
+    "75": {
+      "html_url": "https://github.com/truce-audio/truce/pull/75",
+      "state": "closed",
+      "title": "Staging dev/v0.48.6",
+      "updated_at": "2026-05-31T08:36:25Z"
+    },
+    "76": {
+      "html_url": "https://github.com/truce-audio/truce/pull/76",
+      "state": "closed",
+      "title": "Staging dev/v0.48.7",
+      "updated_at": "2026-05-31T08:36:26Z"
+    },
+    "77": {
+      "html_url": "https://github.com/truce-audio/truce/pull/77",
+      "state": "closed",
+      "title": "Staging dev/v0.48.8",
+      "updated_at": "2026-05-31T08:36:27Z"
+    },
+    "78": {
+      "html_url": "https://github.com/truce-audio/truce/pull/78",
+      "state": "closed",
+      "title": "Staging dev/v0.48.9",
+      "updated_at": "2026-05-31T08:36:29Z"
+    },
+    "79": {
+      "html_url": "https://github.com/truce-audio/truce/pull/79",
+      "state": "closed",
+      "title": "Staging dev/v0.48.10",
+      "updated_at": "2026-05-31T08:36:31Z"
+    },
+    "8": {
+      "html_url": "https://github.com/truce-audio/truce/pull/8",
+      "state": "closed",
+      "title": "Release v0.16.1",
+      "updated_at": "2026-04-28T06:41:36Z"
+    },
+    "80": {
+      "html_url": "https://github.com/truce-audio/truce/pull/80",
+      "state": "closed",
+      "title": "Staging dev/v0.48.11",
+      "updated_at": "2026-05-31T08:36:33Z"
+    },
+    "81": {
+      "html_url": "https://github.com/truce-audio/truce/pull/81",
+      "state": "closed",
+      "title": "Staging dev/v0.49.0",
+      "updated_at": "2026-06-29T09:21:49Z"
+    },
+    "82": {
+      "html_url": "https://github.com/truce-audio/truce/pull/82",
+      "state": "closed",
+      "title": "Staging dev/v0.49.1",
+      "updated_at": "2026-06-29T09:21:49Z"
+    },
+    "83": {
+      "html_url": "https://github.com/truce-audio/truce/pull/83",
+      "state": "closed",
+      "title": "Staging dev/v0.49.2",
+      "updated_at": "2026-06-29T09:21:53Z"
+    },
+    "84": {
+      "html_url": "https://github.com/truce-audio/truce/pull/84",
+      "state": "closed",
+      "title": "Staging dev/v0.49.3",
+      "updated_at": "2026-06-29T09:21:52Z"
+    },
+    "85": {
+      "html_url": "https://github.com/truce-audio/truce/pull/85",
+      "state": "closed",
+      "title": "Staging dev/v0.49.4",
+      "updated_at": "2026-06-29T09:21:54Z"
+    },
+    "86": {
+      "html_url": "https://github.com/truce-audio/truce/pull/86",
+      "state": "closed",
+      "title": "Staging dev/v0.49.6",
+      "updated_at": "2026-06-29T09:21:56Z"
+    },
+    "87": {
+      "html_url": "https://github.com/truce-audio/truce/pull/87",
+      "state": "closed",
+      "title": "Staging dev/v0.49.7",
+      "updated_at": "2026-06-29T09:21:57Z"
+    },
+    "88": {
+      "html_url": "https://github.com/truce-audio/truce/pull/88",
+      "state": "closed",
+      "title": "Staging dev/v0.49.8",
+      "updated_at": "2026-06-29T09:21:58Z"
+    },
+    "89": {
+      "html_url": "https://github.com/truce-audio/truce/pull/89",
+      "state": "closed",
+      "title": "Staging dev/v0.49.9",
+      "updated_at": "2026-06-29T09:21:59Z"
+    },
+    "9": {
+      "html_url": "https://github.com/truce-audio/truce/pull/9",
+      "state": "closed",
+      "title": "Release v0.16.2",
+      "updated_at": "2026-04-28T07:17:20Z"
+    },
+    "90": {
+      "html_url": "https://github.com/truce-audio/truce/pull/90",
+      "state": "closed",
+      "title": "Staging dev/v0.49.10",
+      "updated_at": "2026-06-29T09:22:01Z"
+    },
+    "91": {
+      "html_url": "https://github.com/truce-audio/truce/pull/91",
+      "state": "closed",
+      "title": "Staging dev/v0.49.11",
+      "updated_at": "2026-06-29T09:22:03Z"
+    },
+    "92": {
+      "html_url": "https://github.com/truce-audio/truce/issues/92",
+      "state": "closed",
+      "title": "`truce-slint` can panic on scaled displays after a resize event",
+      "updated_at": "2026-05-28T16:56:24Z"
+    },
+    "93": {
+      "html_url": "https://github.com/truce-audio/truce/pull/93",
+      "state": "closed",
+      "title": "Staging dev/v0.49.12",
+      "updated_at": "2026-06-29T09:22:04Z"
+    },
+    "94": {
+      "html_url": "https://github.com/truce-audio/truce/pull/94",
+      "state": "closed",
+      "title": "Staging dev/v0.49.13",
+      "updated_at": "2026-06-29T09:22:20Z"
+    },
+    "95": {
+      "html_url": "https://github.com/truce-audio/truce/pull/95",
+      "state": "closed",
+      "title": "Staging dev/v0.49.14",
+      "updated_at": "2026-06-29T09:22:24Z"
+    },
+    "96": {
+      "html_url": "https://github.com/truce-audio/truce/pull/96",
+      "state": "closed",
+      "title": "Staging dev/v0.49.15",
+      "updated_at": "2026-06-29T09:22:25Z"
+    },
+    "97": {
+      "html_url": "https://github.com/truce-audio/truce/pull/97",
+      "state": "closed",
+      "title": "Staging dev/v0.49.16",
+      "updated_at": "2026-07-07T09:23:16Z"
+    },
+    "99": {
+      "html_url": "https://github.com/truce-audio/truce/pull/99",
+      "state": "closed",
+      "title": "Staging dev/v0.49.17",
+      "updated_at": "2026-07-07T09:23:18Z"
+    }
+  },
+  "repository": "truce-audio/truce"
+}

@@ -111,7 +111,9 @@ Workspace crates: `moose`, `moose-core`, `moose-params`,
 
 ## Differences from truce
 
-MOOSE is a hard fork. It does not track truce releases.
+MOOSE is a hard fork that selectively tracks Truce fixes, issues and PRs.
+A daily [upstream review workflow](docs/upstream/README.md) reports changes
+since the last reviewed snapshot; releases and GUI backends are not merged wholesale.
 
 ### Removed
 
