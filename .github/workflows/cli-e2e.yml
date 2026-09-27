@@ -308,7 +308,9 @@ jobs:
             if [ "$RUNNER_OS" = macOS ]; then
               # AU v2 goes system-wide (see the example auval step).
               "$CARGO_MOOSE" build --au2
-              sudo "$CARGO_MOOSE" install --system --au2 --no-build
+              # sudo resets the env; keep the shared target dir so
+              # --no-build finds the dylib `build` just wrote there.
+              sudo CARGO_TARGET_DIR="$CARGO_TARGET_DIR" "$CARGO_MOOSE" install --system --au2 --no-build
               sudo chown -R "$(id -u):$(id -g)" "$CARGO_TARGET_DIR" "$HOME/.cargo" .
               "$CARGO_MOOSE" reset-au --yes
               sleep 5
