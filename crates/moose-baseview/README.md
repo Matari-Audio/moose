@@ -32,6 +32,9 @@ API:
   (KURV K23): Windows only; with capture off, keys stay in the host's pump.
 - `pin_current_image_for_detached_work()` (KURV K24/K27): pins the plugin
   binary so a detached render thread can never outlive its code.
+- `Window::close_bounded(timeout)` on Linux: opt-in X11 close for an editor
+  whose host state was already revoked. Detaches a stalled window thread only
+  after pinning its image; normal `close` still waits for the thread.
 
 Behaviour:
 
@@ -52,8 +55,7 @@ Behaviour:
 
 Not ported (upstream already covers it, or not needed): KURV's HWND parking on
 close (upstream destroys synchronously), the 4 ms Windows frame timer
-(upstream keeps 15 ms), the bounded X11 close join (upstream joins), X11
-parent tracking and XDND (already upstream).
+(upstream uses display refresh), X11 parent tracking and XDND (already upstream).
 
 `rustfmt.toml` carries upstream's formatting settings so the workspace
 `cargo fmt --check` leaves these sources in upstream style.
