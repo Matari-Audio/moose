@@ -86,8 +86,8 @@ must be verified against, in the Tier 1 hosts above, before merge:
 
 | Tier | Formats |
 |------|---------|
-| Tier 1 | CLAP, VST3 |
-| Tier 2 | standalone |
+| Tier 1 | CLAP, VST3, AU v3 |
+| Tier 2 | AU v2, standalone |
 
 ## Code quality
 

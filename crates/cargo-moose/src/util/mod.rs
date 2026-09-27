@@ -26,7 +26,8 @@ pub(crate) use build::cargo_rustc_bin;
 pub(crate) use build::rustup_has_target;
 #[cfg(target_os = "macos")]
 pub(crate) use build::{
-    MacArch, cargo_build_multi_arch, cargo_build_multi_arch_with_profile, lipo_into,
+    MacArch, cargo_build_for_arch, cargo_build_multi_arch, cargo_build_multi_arch_with_profile,
+    lipo_into,
 };
 pub(crate) use build::{apply_extra_features, cargo_build, cargo_build_debug, sccache_wrapper};
 #[cfg(target_os = "macos")]
@@ -34,7 +35,9 @@ pub(crate) use bundle_link::{
     CLAP_EXPORTS, VST3_EXPORTS, link_macos_bundle, missing_staticlib_error,
 };
 #[cfg(target_os = "macos")]
-pub(crate) use codesign::{codesign_bundle, verify_signed_for_notarization};
+pub(crate) use codesign::{
+    codesign_bundle, is_production_identity, verify_signed_for_notarization,
+};
 pub(crate) use locate::find_on_path;
 #[cfg(target_os = "windows")]
 pub(crate) use locate::{locate_msvc_cl, locate_vcvarsall, vs_install_paths, which_exe};
@@ -68,6 +71,27 @@ pub(crate) mod fs_ctx {
     ) -> Result<(), CargoMooseError> {
         let path = path.as_ref();
         fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()).into())
+    }
+
+    /// Write only if the target file is missing or its bytes differ. On a
+    /// no-op, the file's mtime stays put - important for tools like cmake
+    /// that rebuild based on mtime comparisons. Only AU v3 staging
+    /// (macOS) needs the mtime-preserving variant today.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn write_if_changed(
+        path: impl AsRef<Path>,
+        contents: impl AsRef<[u8]>,
+    ) -> Result<bool, CargoMooseError> {
+        let path = path.as_ref();
+        let new = contents.as_ref();
+        if let Ok(existing) = fs::read(path)
+            && existing == new
+        {
+            return Ok(false);
+        }
+        fs::write(path, new)
+            .map_err(|e| -> CargoMooseError { format!("write {}: {e}", path.display()).into() })?;
+        Ok(true)
     }
 }
 
@@ -282,7 +306,7 @@ pub(crate) fn keep_default_features() -> bool {
 /// through `--features` would cross-contaminate other formats' builds
 /// (a `--clap` build also lighting up VST3), so they are rejected with a
 /// pointer to the format flag.
-const RESERVED_FORMAT_FEATURES: &[&str] = &["clap", "vst3", "standalone", "shell"];
+const RESERVED_FORMAT_FEATURES: &[&str] = &["clap", "vst3", "au", "standalone", "shell"];
 
 /// Split a `--features` value (`"a, b c"`) into individual feature
 /// names, rejecting the format features moose drives via its own flags.
@@ -296,7 +320,7 @@ pub(crate) fn parse_extra_features(value: &str) -> Result<Vec<String>, CargoMoos
         if RESERVED_FORMAT_FEATURES.contains(&f) {
             return Err(format!(
                 "`{f}` is a format feature moose enables itself; select it with the \
-                 matching format flag (--clap / --vst3), not --features."
+                 matching format flag (--clap / --vst3 / --au2 / ...), not --features."
             )
             .into());
         }
@@ -823,6 +847,31 @@ pub(crate) fn take_outputs() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Per-process collector of soft-skipped install reasons (e.g. AU v3
+/// with ad-hoc signing). Same pattern as
+/// `INSTALLED` but printed under a `Skipped:` header at the end of
+/// `cmd_install` so the user sees what didn't make it.
+static SKIPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Append a soft-skip reason. One line per (format, plugin) target -
+/// callers should embed the plugin name in the message so the user
+/// can match each skip to the corresponding `Installed:` row.
+pub(crate) fn log_skip(line: String) {
+    if is_verbose() {
+        eprintln!("{line}");
+    }
+    if let Ok(mut v) = SKIPPED.lock() {
+        v.push(line);
+    }
+}
+
+pub(crate) fn take_skipped() -> Vec<String> {
+    SKIPPED
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
 /// Run `codesign` with the given args. Prints a one-line success or
 /// failure summary per call (`    [ OK ] signed Moose Gain.vst3` /
 /// `    [FAIL] failed to sign ...`), using the same colored ASCII tags
@@ -891,10 +940,28 @@ pub(crate) fn run_codesign(args: &[&OsStr], use_sudo: bool) -> crate::Res {
     }
 }
 
+/// Fire-and-forget cleanup helper. Intended for `killall -9 pkd` /
+/// `killall -9 AudioComponentRegistrar` where non-zero exit
+/// ("No matching processes were found") is expected noise on clean
+/// systems and shouldn't clutter the install log. No sudo: both
+/// daemons run in the user's launchd session, so the user can kill
+/// their own processes. Only used by macOS-side AU v3 install +
+/// `reset-au`.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_silent(cmd: &str, args: &[&OsStr]) {
+    use std::process::Stdio;
+    let _ = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Return the project-local temp directory (`<target>/tmp/`), creating it if needed.
 ///
 /// Every consumer (the macOS / Windows-only `tmp_manifests`,
-/// `tmp_scripts`, `tmp_verify`) is platform-gated, so the function is
+/// `tmp_scripts`, `tmp_verify`, `tmp_au_v3`, plus the macOS-only
+/// `reset_au`) is platform-gated, so the function is
 /// dead on Linux - gate it to keep the Linux build warning-free.
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 pub(crate) fn tmp_dir() -> PathBuf {
@@ -904,7 +971,7 @@ pub(crate) fn tmp_dir() -> PathBuf {
 }
 
 // Per-purpose subdirs under `tmp/`. Keeping `tmp/` from becoming a flat
-// junk drawer of `entitlements.plist`, `*.bat`,
+// junk drawer of `au-v3/`, `entitlements.plist`, `*.bat`,
 // `<id>_vst3.plist`, `verify-pkg-*/` … each shape
 // gets its own subdir below. Helpers always create the dir lazily.
 
@@ -937,10 +1004,19 @@ pub(crate) fn tmp_verify() -> PathBuf {
     dir
 }
 
+/// `tmp/au-v3/<bundle_id>/` - per-plugin AU v3 framework + appex build root.
+#[cfg(target_os = "macos")]
+pub(crate) fn tmp_au_v3(bundle_id: &str) -> PathBuf {
+    let dir = tmp_dir().join("au-v3").join(bundle_id);
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
 /// Recursive copy that preserves symlinks (critical for macOS .framework
 /// bundles) and creates the destination tree.
 ///
-/// Only `commands::package::macos` calls it.
+/// Only macOS callers (`commands::package::{macos, stage}`, AU v3
+/// install).
 #[cfg(target_os = "macos")]
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> crate::Res {
     fs::create_dir_all(dst)?;
@@ -964,6 +1040,18 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> crate::Res {
         }
     }
     Ok(())
+}
+
+/// Extract the team ID from a signing identity string like
+/// `"Developer ID Application: Name (TEAMID)"`.
+#[cfg(target_os = "macos")]
+pub(crate) fn extract_team_id(sign_id: &str) -> String {
+    if let Some(start) = sign_id.rfind('(')
+        && let Some(end) = sign_id.rfind(')')
+    {
+        return sign_id[start + 1..end].to_string();
+    }
+    String::new()
 }
 
 /// Interactive `[y/N]` prompt that returns `true` only on an explicit yes.

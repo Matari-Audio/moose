@@ -88,8 +88,8 @@ pub struct MidiWiring {
 /// `midi_input` / `midi_output` / `midi_input_ports` /
 /// `midi_output_ports` moose.toml keys. Shared by `moose-derive`
 /// (bakes the result onto `PluginInfo`, which every Rust wrapper
-/// reads) and `cargo-moose`, so every format-facing declaration
-/// agrees.
+/// reads) and `cargo-moose` (AU component type), so every
+/// format-facing declaration agrees.
 ///
 /// Defaults: instruments and note effects accept MIDI input; only
 /// note effects emit MIDI; one port per enabled direction. A port
@@ -251,14 +251,19 @@ pub struct VendorConfig {
     pub id: String,
     #[serde(default)]
     pub url: String,
+    /// AU manufacturer code: exactly four ASCII characters, at least
+    /// one uppercase (Apple reserves all-lowercase codes).
+    pub au_manufacturer: String,
 }
 
 /// Shared TOML schema for a `[[plugin]]` entry.
 ///
 /// Lives in `moose-build` so both the `#[derive(Params)]` /
 /// `plugin_info!()` proc macros and `cargo-moose`'s install-time
-/// logic read the same definition. Unknown keys (such as the AU / AAX /
-/// LV2 keys of a pre-7.0 `moose.toml` / `truce.toml`) are ignored.
+/// logic read the same definition. Install-time tooling extends this
+/// with extra fields like `au3_subtype` / `au_tag` via
+/// `#[serde(flatten)]`. Unknown keys (such as the AAX / VST2 / LV2 keys
+/// of a `truce.toml`) are ignored.
 #[derive(Deserialize, Debug)]
 pub struct PluginDef {
     pub name: String,
@@ -290,7 +295,17 @@ pub struct PluginDef {
     /// An empty list keeps the category-derived defaults.
     #[serde(default)]
     pub clap_features: Vec<String>,
+    /// AU component subtype (four ASCII characters). `au_subtype` is
+    /// accepted as an alias source.
+    #[serde(default)]
+    pub fourcc: Option<String>,
     pub category: String,
+    /// AU component type override. Absent -> derived from `category`
+    /// (`aumu` / `aumi` / `aumf` / `aufx`).
+    #[serde(default)]
+    pub au_type: Option<String>,
+    #[serde(default)]
+    pub au_subtype: Option<String>,
     /// VST3 "Plugin Type Categories" secondary token. The wrapper
     /// emits this after the primary token (`Fx|<sub>`,
     /// `Instrument|<sub>`) so hosts like Cubase can route the
@@ -312,8 +327,12 @@ pub struct PluginDef {
     pub vst3_name: Option<String>,
     #[serde(default)]
     pub clap_name: Option<String>,
-    /// Silence the audio output in *preview* hosts (moose-standalone).
-    /// `process()` keeps running on the
+    #[serde(default)]
+    pub au_name: Option<String>,
+    #[serde(default)]
+    pub au3_name: Option<String>,
+    /// Silence the audio output in *preview* hosts (moose-standalone,
+    /// the AU v3 container app). `process()` keeps running on the
     /// usual cadence so plug-ins whose editor visualises an input
     /// signal (analyzers, tuners, spectrum displays) still update -
     /// but the signal never reaches the speakers, so a mic-fed analyzer
@@ -367,6 +386,13 @@ pub struct PluginDef {
     /// directory next to the plugin crate if one exists.
     #[serde(default)]
     pub presets: Option<PresetsConfig>,
+    /// Optional `[plugin.legacy_state]` table - where AU should look
+    /// for a pre-moose build's state when moose's own `ClassInfo` entry
+    /// is absent, feeding the plugin's `migrate_state` hook. Stream
+    /// formats (CLAP / VST3) need no declaration: the wrapper already
+    /// holds the foreign bytes.
+    #[serde(default)]
+    pub legacy_state: Option<LegacyStateConfig>,
 }
 
 #[derive(Deserialize)]
@@ -440,6 +466,19 @@ pub fn load_vst3_class_ids(path: &Path) -> Result<Vec<(String, [u8; 16])>, Strin
                 .map(|class_id| (plugin.crate_name, class_id))
         })
         .collect())
+}
+
+/// `[plugin.legacy_state]` - foreign-state probe declarations for AU's
+/// keyed `ClassInfo` container. A legacy build stored its state under
+/// *its* own key, which moose never reads; only the developer knows it,
+/// so it's declared here and embedded into `PluginInfo` at proc-macro
+/// expansion time.
+#[derive(Deserialize, Debug, Default)]
+pub struct LegacyStateConfig {
+    /// AU `ClassInfo` dictionary keys to probe when moose's data key
+    /// is absent (e.g. `"jucePluginState"` for a JUCE-era AU).
+    #[serde(default)]
+    pub au_keys: Vec<String>,
 }
 
 /// `[plugin.presets]` - factory-preset emission settings.

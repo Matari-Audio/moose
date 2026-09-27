@@ -18,9 +18,10 @@ path = "src/main.rs"
 required-features = ["standalone"]
 
 [features]
-default = ["clap", "vst3"]
+default = ["clap", "vst3", "au"]
 clap = ["dep:moose-clap", "dep:clap-sys"]
 vst3 = ["dep:moose-vst3"]
+au = ["dep:moose-au"]
 standalone = ["dep:moose-standalone"]
 shell = ["moose/shell"]
 rt-paranoid = ["moose/rt-paranoid"]
@@ -39,6 +40,7 @@ num-traits = "0.2"
 wide = "0.7"
 moose-clap = { workspace = true, optional = true }
 moose-vst3 = { workspace = true, optional = true }
+moose-au = { workspace = true, optional = true }
 clap-sys = { version = "0.5", optional = true }
 moose-standalone = { workspace = true, features = ["gui"], optional = true }
 moose-gui-types = { workspace = true }

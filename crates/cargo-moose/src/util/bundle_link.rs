@@ -6,8 +6,9 @@
 //! formats (VST3, CLAP) and instead link a Rust `staticlib`
 //! through `clang -bundle` to produce a real `MH_BUNDLE`.
 //!
-//! Linux / Windows continue to use the cdylib path: ELF / PE don't
-//! carry the bundle vs dylib distinction.
+//! AU v2 / Linux / Windows continue to use the cdylib path: AU's
+//! component loader is happy with `MH_DYLIB`, and ELF / PE don't carry
+//! the bundle vs dylib distinction.
 
 #![cfg(target_os = "macos")]
 
@@ -210,7 +211,7 @@ fn clang_bundle_single(
     // `-dead_strip` removes everything not reachable from the
     // `-exported_symbol` roots. Without this the bundle ships every
     // monomorphization and dep the staticlib brought in - roughly
-    // double the size of the equivalent cdylib, whose
+    // double the size of the equivalent cdylib (AU2), whose
     // rustc-driven link gets `-dead_strip` for free on apple-darwin.
     cmd.arg("-Wl,-dead_strip");
     cmd.arg(staticlib);

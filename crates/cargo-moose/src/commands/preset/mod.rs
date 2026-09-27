@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::commands::install::presets::{authored_presets_dir, resolved_name};
-use crate::preset_codec::{PresetFormat, decode, vstpreset_bytes};
+use crate::preset_codec::{PresetFormat, aupreset_xml, decode, fourcc_int, vstpreset_bytes};
 use crate::util::fs_ctx;
 use crate::{Config, PluginDef, Res, load_config, project_root};
 
@@ -77,7 +77,7 @@ USAGE:
   cargo moose preset pull    [--category <c>] [--new] [--watch] [-p <crate>]
 
 FORMATS (by extension): .preset (authored TOML), .trucepreset (or the
-  plugin's [presets] extension), .vstpreset
+  plugin's [presets] extension), .vstpreset, .aupreset
 
 `pull` scans the OS preset locations hosts save into (Library/Audio/
 Presets, VST3 Presets, the moose user root) for presets
@@ -371,6 +371,12 @@ fn encode_native(
     Ok(match format {
         PresetFormat::MoosePreset => moose_utils::preset::write_preset_file(&meta, &blob),
         PresetFormat::Vst3 => vstpreset_bytes(&ctx.config.vst3_cid(ctx.p), &blob),
+        PresetFormat::Au => {
+            let au_type = fourcc_int(ctx.p.resolved_au_type())?;
+            let subtype = fourcc_int(ctx.p.resolved_fourcc())?;
+            let manufacturer = fourcc_int(&ctx.config.vendor.au_manufacturer)?;
+            aupreset_xml(au_type, subtype, manufacturer, &meta.name, &blob).into_bytes()
+        }
         PresetFormat::AuthoredToml => {
             render_preset_toml(&meta, params, extra, &ctx.annotations()).into_bytes()
         }
@@ -525,7 +531,7 @@ fn cmd_import(args: &[String]) -> Res {
 }
 
 /// Unzip a pack's native-container tree into the user pack directory.
-/// Other per-format trees in the pack (`.vstpreset`)
+/// Other per-format trees in the pack (`.vstpreset` / `.aupreset`)
 /// are host-side conveniences; they're counted and left to the user
 /// to place, keeping `import` from writing into host directories
 /// unasked.
@@ -625,10 +631,21 @@ fn cmd_export(args: &[String]) -> Res {
         zip.start_file(format!("vstpreset/{dir}{display}.vstpreset"), options)
             .map_err(zip_err)?;
         zip.write_all(&vstpreset_bytes(&ctx.config.vst3_cid(ctx.p), &blob))?;
+
+        zip.start_file(format!("aupreset/{dir}{display}.aupreset"), options)
+            .map_err(zip_err)?;
+        let au = aupreset_xml(
+            fourcc_int(ctx.p.resolved_au_type())?,
+            fourcc_int(ctx.p.resolved_fourcc())?,
+            fourcc_int(&ctx.config.vendor.au_manufacturer)?,
+            &preset.meta.name,
+            &blob,
+        );
+        zip.write_all(au.as_bytes())?;
     }
     zip.finish().map_err(zip_err)?;
     eprintln!(
-        "{} preset(s) x 2 formats -> {}",
+        "{} preset(s) x 3 formats -> {}",
         presets.len(),
         out_path.display()
     );
@@ -738,11 +755,12 @@ fn host_preset_files(ctx: &PluginCtx<'_>) -> Vec<PathBuf> {
     let vendor = safe_filename(&ctx.config.vendor.name);
 
     // Plugin-scoped host locations, per display name the host
-    // groups under.
-    let names = [safe_filename(resolved_name(
-        ctx.p.vst3_name.as_deref(),
-        &ctx.p.name,
-    ))];
+    // groups under (VST3 + AU share the macOS tree).
+    let mut names: Vec<String> = vec![
+        safe_filename(resolved_name(ctx.p.vst3_name.as_deref(), &ctx.p.name)),
+        safe_filename(resolved_name(ctx.p.au_name.as_deref(), &ctx.p.name)),
+    ];
+    names.dedup();
     let ext = ctx.native_ext();
 
     #[cfg(target_os = "macos")]

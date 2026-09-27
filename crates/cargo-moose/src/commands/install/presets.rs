@@ -11,6 +11,9 @@
 //!   provider declares this directory to the host.
 //! - VST3: `.vstpreset` files under `Contents/Resources/Presets/`,
 //!   the location hosts scan for in-bundle factory presets.
+//! - AU v2: `.aupreset` plists under the OS preset location
+//!   (`[~]/Library/Audio/Presets/<Vendor>/<Plugin>/`), which Logic
+//!   and `GarageBand` walk.
 //!
 //! The state-envelope hash is derived from the same
 //! `moose_build::plugin_id` string `moose::plugin_info!()` bakes into
@@ -27,7 +30,10 @@ use crate::{run_sudo, tmp_manifests};
 #[cfg(target_os = "macos")]
 use std::ffi::OsStr;
 
+// The `.aupreset` emitters only run from the macOS-gated AU install.
 use crate::preset_codec::vstpreset_bytes;
+#[cfg(target_os = "macos")]
+use crate::preset_codec::{aupreset_xml, fourcc_int};
 use moose_utils::preset::{PresetMeta, write_preset_file};
 use moose_utils::{safe_filename, state};
 
@@ -51,7 +57,7 @@ impl EmittablePreset {
     }
 
     /// Like [`Self::rel_path`] but named after the display name - for
-    /// the host-facing format (`.vstpreset`) whose
+    /// the host-facing formats (`.vstpreset`, `.aupreset`) whose
     /// hosts label presets by file name. Library validation rejects
     /// duplicate (category, name) pairs, so the path is unique.
     fn display_rel_path(&self, ext: &str) -> PathBuf {
@@ -225,8 +231,10 @@ fn write_tree(
 
 /// Emit a tree of native preset containers (`.trucepreset`, or the
 /// plugin's `[presets] extension`) under `dest_root`: the CLAP factory
-/// location (the wrapper's discovery provider declares it to the host)
-/// and the standalone's factory directory.
+/// location (the wrapper's discovery provider declares it to the host),
+/// the AU component's `Contents/Resources/Presets/` (the shim's
+/// factory-presets property enumerates it) and the standalone's
+/// factory directory.
 pub(crate) fn emit_trucepreset_tree(
     fp: &FactoryPresets,
     dest_root: &Path,
@@ -300,7 +308,8 @@ fn standalone_factory_root(exec_path: &Path) -> PathBuf {
 /// Emit `.vstpreset` files into the OS preset location hosts scan.
 /// The VST3 spec defines no in-bundle preset location; the scanned
 /// roots are the per-OS directories [`vst3_presets_root`] resolves.
-/// On macOS that tree is shared with host-saved user presets, so emission overwrites its own files and never wipes
+/// On macOS that tree is shared with `.aupreset` files and host-saved
+/// user presets, so emission overwrites its own files and never wipes
 /// the directory. Hosts match presets to the plugin via the class ID
 /// in the file header; the vendor / plugin directory names follow the
 /// reported factory vendor and display name for the spec-defined walk.
@@ -413,4 +422,59 @@ pub(crate) fn resolved_name<'a>(name_override: Option<&'a str>, name: &'a str) -
         Some(n) if !n.is_empty() => n,
         _ => name,
     }
+}
+
+/// Emit `.aupreset` plists into the AU preset location
+/// (`[~]/Library/Audio/Presets/<Vendor>/<Plugin>/`), which Logic and
+/// `GarageBand` walk on AU instantiation. macOS-only, like the AU
+/// install itself.
+#[cfg(target_os = "macos")]
+pub(crate) fn emit_au_presets(
+    fp: &FactoryPresets,
+    p: &PluginDef,
+    config: &Config,
+    scope: InstallScope,
+) -> Res {
+    let presets_root = match scope {
+        InstallScope::User => {
+            let Some(home) = crate::dirs::home_dir() else {
+                return Err("cannot resolve home directory for AU presets".into());
+            };
+            home.join("Library/Audio/Presets")
+        }
+        InstallScope::System => PathBuf::from("/Library/Audio/Presets"),
+    };
+    let dest_root = presets_root
+        .join(safe_filename(&config.vendor.name))
+        .join(safe_filename(resolved_name(p.au_name.as_deref(), &p.name)));
+
+    let au_type = fourcc_int(p.resolved_au_type())?;
+    let subtype = fourcc_int(p.resolved_fourcc())?;
+    let manufacturer = fourcc_int(&config.vendor.au_manufacturer)?;
+
+    let files: Vec<_> = fp
+        .presets
+        .iter()
+        .map(|pr| {
+            (
+                pr.display_rel_path("aupreset"),
+                aupreset_xml(au_type, subtype, manufacturer, &pr.meta.name, &pr.blob).into_bytes(),
+            )
+        })
+        .collect();
+    // Hosts save user presets into the same directory tree - never
+    // wipe it, only overwrite our own files.
+    write_tree(
+        &files,
+        &dest_root,
+        false,
+        scope.needs_sudo(),
+        &format!("{}-au", p.bundle_id),
+    )?;
+    crate::log_output(format!(
+        "      {} factory presets -> {}",
+        files.len(),
+        dest_root.display()
+    ));
+    Ok(())
 }

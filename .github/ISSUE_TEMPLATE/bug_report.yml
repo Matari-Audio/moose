@@ -54,6 +54,8 @@ body:
       options:
         - label: CLAP
         - label: VST3
+        - label: AU v2
+        - label: AU v3
         - label: Standalone
         - label: Not format-specific / N/A
   - type: checkboxes
@@ -104,7 +106,7 @@ body:
     attributes:
       label: Logs / output
       description: >
-        Relevant `cargo moose` output, validator (pluginval / clap-validator)
+        Relevant `cargo moose` output, validator (auval / pluginval / clap-validator)
         output, panic backtraces, or host logs. Paste as text rather than a screenshot
         so it stays searchable.
       render: shell

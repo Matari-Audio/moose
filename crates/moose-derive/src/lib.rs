@@ -105,10 +105,29 @@ fn resolve_midi(
     Ok((wiring, midi2_in, midi2_out))
 }
 
+/// Validate 4-ASCII-byte fourccs for `plugin_info!`. `Some(message)` on
+/// the first bad code. `info::fourcc` asserts this at runtime (during the
+/// host scan), so an invalid code otherwise compiles clean and the plugin
+/// never loads in any DAW.
+fn fourcc_error(codes: &[(&str, &str)]) -> Option<String> {
+    for (label, code) in codes {
+        if code.len() != 4 || !code.is_ascii() {
+            return Some(format!(
+                "`{label}` must be exactly 4 ASCII characters (an AU fourcc); \
+                 got {code:?} ({} bytes)",
+                code.len(),
+            ));
+        }
+    }
+    None
+}
+
+// `au_name` / `au3_name` mirror the user-facing moose.toml keys;
+// renaming would break the 1:1 with the TOML schema.
 // Linear metadata assembly: one `let` per moose.toml field feeding a
 // single `PluginInfo` literal - splitting it would just thread the same
 // locals through helpers without aiding clarity.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
 #[proc_macro]
 pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let (config, pkg_name, moose_toml_path) = match try_resolve_plugin() {
@@ -172,7 +191,40 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     };
     let midi_input_dialect = dialect_tokens(midi2_in);
     let midi_output_dialect = dialect_tokens(midi2_out);
+    // NoteEffect plugins map to `aumi` (Apple's MIDI Processor type).
+    // Pairs with empty `bus_layouts` at the plugin level: aumi
+    // plugins must not expose audio I/O. Logic routes `aumi` to the
+    // MIDI FX slot, which is where arpeggiators / transposers /
+    // note-shapers belong. A mismatch with the AU-type computed at
+    // install / package time causes auval to report "Class Data
+    // fields ... do not match component description".
+    // An audio effect that accepts MIDI input is an `aumf` MusicEffect,
+    // not a plain `aufx`: AU routes MIDI to a plugin by its component
+    // type, so an `aufx` would never be handed the events.
+    let au_type = plugin
+        .au_type
+        .as_deref()
+        .unwrap_or(match plugin.category.as_str() {
+            "instrument" => "aumu",
+            "midi" | "note_effect" => "aumi",
+            _ if accepts_midi_in => "aumf",
+            _ => "aufx",
+        });
+
     let plugin_id = moose_build::plugin_id(&config.vendor.id, &plugin.bundle_id);
+
+    let Some(resolved_fourcc) = plugin.fourcc.as_ref().or(plugin.au_subtype.as_ref()) else {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "moose.toml: [[plugin]] entry `{}` requires `fourcc` or `au_subtype`",
+                plugin.crate_name
+            ),
+        )
+        .to_compile_error()
+        .into();
+    };
+    let au_manufacturer = &config.vendor.au_manufacturer;
 
     let vst3_subcategory = if let Some(sub) = &plugin.vst3_subcategory {
         quote! { Some(#sub) }
@@ -195,6 +247,8 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let clap_support_url = opt_str(&plugin.clap_support_url);
     let vst3_name = opt_str(&plugin.vst3_name);
     let clap_name = opt_str(&plugin.clap_name);
+    let au_name = opt_str(&plugin.au_name);
+    let au3_name = opt_str(&plugin.au3_name);
     let clap_features = &plugin.clap_features;
     let clap_features = quote! { &[#(#clap_features),*] };
     let preset_extension = moose_build::preset_extension(plugin);
@@ -211,12 +265,28 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
     let mute_preview_output = plugin.mute_preview_output;
     let min_subblock_samples = config.automation.min_subblock_samples;
 
+    // `[plugin.legacy_state]` AU probe keys, baked as a static slice.
+    let legacy_au_keys = plugin.legacy_state.as_ref().map_or(&[][..], |l| &l.au_keys[..]);
+    let legacy_au_keys = quote! { &[#(#legacy_au_keys),*] };
+
     // `include_bytes!` registers `moose.toml` as a build-time dependency
     // through the compiler's normal dep-info tracking. Without it, edits
     // to moose.toml don't trigger a rebuild - proc macros on stable Rust
     // have no other way to declare external file dependencies.
     // Path is canonicalized in `try_resolve_plugin` so the literal is
     // stable across invocations.
+    // `info::fourcc` asserts a 4-byte code at runtime - which fires when
+    // the host first scans the plugin, so a 3-char or non-ASCII code
+    // compiles clean and just never loads in any DAW. These are string
+    // literals here, so validate at expansion time.
+    if let Some(msg) = fourcc_error(&[
+        ("fourcc / au_subtype", resolved_fourcc.as_str()),
+        ("au_type", au_type),
+        ("vendor au_manufacturer", au_manufacturer.as_str()),
+    ]) {
+        return quote! { compile_error!(#msg); }.into();
+    }
+
     let moose_toml_lit = moose_toml_path.to_string_lossy().into_owned();
     let expanded = quote! {
         {
@@ -240,15 +310,21 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
                 bundle_id: #bundle_id,
                 vst3_id: #plugin_id,
                 clap_id: #plugin_id,
+                fourcc: ::moose::core::info::fourcc(#resolved_fourcc.as_bytes()),
+                au_type: ::moose::core::info::fourcc(#au_type.as_bytes()),
+                au_manufacturer: ::moose::core::info::fourcc(#au_manufacturer.as_bytes()),
                 vst3_subcategory: #vst3_subcategory,
                 preset_user_dir: #preset_user_dir,
                 preset_extension: #preset_extension,
                 vst3_name: #vst3_name,
                 clap_name: #clap_name,
+                au_name: #au_name,
+                au3_name: #au3_name,
                 mute_preview_output: #mute_preview_output,
                 automation: ::moose::core::info::AutomationConfig {
                     min_subblock_samples: #min_subblock_samples,
                 },
+                legacy_au_keys: #legacy_au_keys,
             }
         }
     };

@@ -24,7 +24,7 @@
 /// | Features                    | Result                                      |
 /// |-----------------------------|---------------------------------------------|
 /// | none                        | `cargo check` / test-only logic dylib       |
-/// | one or more of `clap`, `vst3` | multi-format cdylib that exports every enabled format from one binary |
+/// | one or more of `clap`, `vst3`, `au` | multi-format cdylib that exports every enabled format from one binary |
 /// | `shell` only                | shell-mode loader (logic dylib loaded at runtime) |
 /// | `shell` + format(s)         | shell-mode cdylib that re-exports the loaded logic to the enabled formats |
 ///
@@ -251,6 +251,9 @@ macro_rules! __plugin_impl {
 
             #[cfg(feature = "vst3")]
             ::moose_vst3::export_vst3!(__HotShellWrapper);
+
+            #[cfg(feature = "au")]
+            ::moose_au::export_au!(__HotShellWrapper);
         }
     };
 }

@@ -3,11 +3,15 @@
 //!
 //! Both commands run an identical sequence for every selected format:
 //!
-//! 1. One `cargo build -p a -p b -p c …` per format batch with the
-//!    format's feature set. No per-plugin env vars: per-format display
-//!    names travel with `PluginInfo` (baked by `moose::plugin_info!`).
-//! 2. Copy the produced `lib<stem>.<dylib-ext>` to a format-suffixed
-//!    path (`<stem>_clap`, `<stem>_vst3`) so the next format build
+//! 1. Skip on unsupported platforms (AU is macOS-only) with a single
+//!    `log_skip` line.
+//! 2. One `cargo build -p a -p b -p c …` per format batch with the
+//!    format's feature set. Per-format display names travel with
+//!    `PluginInfo` (baked by `moose::plugin_info!`). AU v2 is the
+//!    exception: one build per plugin with `MOOSE_AU_PLUGIN_ID` set, so
+//!    each dylib's Cocoa view class gets a unique name.
+//! 3. Copy the produced `lib<stem>.<dylib-ext>` to a format-suffixed
+//!    path (`<stem>_clap`, `<stem>_vst3`, `<stem>_au`) so the next format build
 //!    doesn't overwrite the previous one (every plugin's cdylib lands
 //!    at the same canonical cargo path).
 
@@ -23,6 +27,7 @@ use std::path::Path;
 pub(crate) enum BuildFormat {
     Clap,
     Vst3,
+    Au2,
 }
 
 impl BuildFormat {
@@ -31,6 +36,7 @@ impl BuildFormat {
         match self {
             BuildFormat::Clap => "clap",
             BuildFormat::Vst3 => "vst3",
+            BuildFormat::Au2 => "au",
         }
     }
 
@@ -39,6 +45,7 @@ impl BuildFormat {
         match self {
             BuildFormat::Clap => "CLAP",
             BuildFormat::Vst3 => "VST3",
+            BuildFormat::Au2 => "AU v2",
         }
     }
 
@@ -49,13 +56,18 @@ impl BuildFormat {
         match self {
             BuildFormat::Clap => "_clap",
             BuildFormat::Vst3 => "_vst3",
+            BuildFormat::Au2 => "_au",
         }
     }
 }
 
 /// Build cdylibs for one format across `plugins`. Centralizes the
-/// per-format banner, cargo build, and copy-to-suffix step that
-/// `cargo moose build` and `cargo moose install` share.
+/// per-format banner, env-var assembly, cargo build, and copy-to-suffix
+/// step that `cargo moose build` and `cargo moose install` share.
+///
+/// Platform gate: `Au2` is macOS only. Other platforms emit
+/// `crate::log_skip` and return `Ok(())` so callers don't need cfg
+/// blocks at the call site.
 ///
 /// `extra_features` are appended to the format's own feature (used by
 /// shell-mode builds to add `"shell"`); empty otherwise.
@@ -72,6 +84,14 @@ pub(crate) fn build_format_dylibs(
     deployment_target: &str,
     target: Option<&str>,
 ) -> Res {
+    // Platform gate first: emit a single skip line and exit cleanly, so
+    // the caller's "if format_selected { build }" needs no cfg arms.
+    #[cfg(not(target_os = "macos"))]
+    if format == BuildFormat::Au2 {
+        crate::log_skip("AU v2: not supported on this platform. Audio Unit is macOS-only.".to_string());
+        return Ok(());
+    }
+
     // Build banner. Shell-mode label gets the extra-feature list
     // parenthesised (e.g. "Building CLAP (shell)...").
     if extra_features.is_empty() {
@@ -94,22 +114,50 @@ pub(crate) fn build_format_dylibs(
         feats.join(",")
     };
 
-    let env_pairs: &[(&str, &str)] = &[];
-    let mut cargo_args: Vec<String> = Vec::with_capacity(plugins.len() * 2 + 5);
-    for p in plugins {
-        cargo_args.push("-p".into());
-        cargo_args.push(p.crate_name.clone());
+    // AU v2 needs a per-plugin `MOOSE_AU_PLUGIN_ID` env so each
+    // dylib's cocoa-view class lands in `__objc_classlist` under a
+    // unique name. Hosts load every `.component` into one process;
+    // libobjc dedupes classes by name and `[NSBundle classNamed:]`
+    // returns nil on the loser's bundle - host then thinks the
+    // plugin has no GUI. Splitting AU2 into one cargo invocation per
+    // plugin is the cost of correctness here; moose-au's tiny C/ObjC
+    // shim recompiles per plugin but the leaf cdylib link cost
+    // dominates anyway.
+    let batched = format != BuildFormat::Au2;
+    if batched {
+        let env_pairs: &[(&str, &str)] = &[];
+        let mut cargo_args: Vec<String> = Vec::with_capacity(plugins.len() * 2 + 5);
+        for p in plugins {
+            cargo_args.push("-p".into());
+            cargo_args.push(p.crate_name.clone());
+        }
+        cargo_args.push("--no-default-features".into());
+        cargo_args.push("--features".into());
+        let names: Vec<&str> = plugins.iter().map(|p| p.crate_name.as_str()).collect();
+        cargo_args.push(features_with(&names));
+        if let Some(t) = target {
+            cargo_args.push("--target".into());
+            cargo_args.push(t.into());
+        }
+        let cargo_arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
+        cargo_build(env_pairs, &cargo_arg_refs, deployment_target)?;
+    } else {
+        for p in plugins {
+            let env_pairs: &[(&str, &str)] = &[("MOOSE_AU_PLUGIN_ID", p.bundle_id.as_str())];
+            let mut cargo_args: Vec<String> = Vec::with_capacity(7);
+            cargo_args.push("-p".into());
+            cargo_args.push(p.crate_name.clone());
+            cargo_args.push("--no-default-features".into());
+            cargo_args.push("--features".into());
+            cargo_args.push(features_with(&[p.crate_name.as_str()]));
+            if let Some(t) = target {
+                cargo_args.push("--target".into());
+                cargo_args.push(t.into());
+            }
+            let cargo_arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
+            cargo_build(env_pairs, &cargo_arg_refs, deployment_target)?;
+        }
     }
-    cargo_args.push("--no-default-features".into());
-    cargo_args.push("--features".into());
-    let names: Vec<&str> = plugins.iter().map(|p| p.crate_name.as_str()).collect();
-    cargo_args.push(features_with(&names));
-    if let Some(t) = target {
-        cargo_args.push("--target".into());
-        cargo_args.push(t.into());
-    }
-    let cargo_arg_refs: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
-    cargo_build(env_pairs, &cargo_arg_refs, deployment_target)?;
 
     // Post-build per-plugin staging: copy the produced `.dylib` to
     // its format-suffixed name. Cheap I/O, kept as a separate pass so
@@ -133,14 +181,20 @@ pub(crate) fn build_format_dylibs(
         // which CFBundle rejects on the JUCE-hosted VST3 path. Run
         // `clang -bundle` against the matching Rust `staticlib` to
         // produce a real MH_BUNDLE at the canonical bundle-bin path
-        // that stage / install steps read from.
+        // that stage / install steps read from. AU2 keeps the
+        // cdylib (their loaders are happy with MH_DYLIB).
         // Only for a macOS *target* - cross-compiling to Windows / Linux
         // keeps the cdylib, and `clang -bundle` can't relink a foreign-arch
         // static archive anyway.
         #[cfg(target_os = "macos")]
-        if crate::target_os_of(target.unwrap_or_else(|| moose_build::host_triple())) == "macos" {
+        if matches!(
+            format,
+            BuildFormat::Clap | BuildFormat::Vst3
+        ) && crate::target_os_of(target.unwrap_or_else(|| moose_build::host_triple())) == "macos"
+        {
             link_macos_bundle_for_plugin(root, p, format, target)?;
         }
+
     }
 
     Ok(())
@@ -296,6 +350,7 @@ fn link_macos_bundle_for_plugin(
     let exports = match format {
         BuildFormat::Clap => crate::CLAP_EXPORTS,
         BuildFormat::Vst3 => crate::VST3_EXPORTS,
+        BuildFormat::Au2 => unreachable!("caller gates on bundle formats"),
     };
 
     let out = crate::release_bundle_bin(root, &p.dylib_stem(), format.dylib_suffix());

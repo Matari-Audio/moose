@@ -362,7 +362,7 @@ fn resolve_formats(
     config: &Config,
     format_str: Option<&str>,
 ) -> std::result::Result<Vec<PkgFormat>, crate::CargoMooseError> {
-    let formats = if let Some(s) = format_str {
+    let raw = if let Some(s) = format_str {
         PkgFormat::parse_list(s)?
     } else if !config.packaging.formats.is_empty() {
         PkgFormat::parse_list(&config.packaging.formats.join(","))?
@@ -381,8 +381,16 @@ fn resolve_formats(
         fmts
     };
 
+    // AU v2 / v3 are macOS-only. Drop silently: cross-platform moose.toml
+    // files shouldn't error on the Windows runner just because they list
+    // au2/au3 for macOS.
+    let formats: Vec<PkgFormat> = raw
+        .into_iter()
+        .filter(|f| !matches!(f, PkgFormat::Au2 | PkgFormat::Au3))
+        .collect();
+
     if formats.is_empty() {
-        return Err("no Windows-eligible formats selected".into());
+        return Err("no Windows-eligible formats selected (AU is macOS-only)".into());
     }
     Ok(formats)
 }

@@ -562,11 +562,15 @@ fn stage_plugin_payload(
 
 /// Map a `PkgFormat` to its `cargo moose build` flag, or `None` for
 /// formats that aren't a build target (the standalone host binary
-/// is staged by `cargo moose run`, not `build`).
+/// is staged by `cargo moose run`, not `build`). `Au2`/`Au3` map to
+/// their build flags even though AU is a no-op on Linux; `cargo moose
+/// build` emits a single skip line and returns cleanly.
 fn build_flag_for_format(f: &PkgFormat) -> Option<&'static str> {
     match f {
         PkgFormat::Clap => Some("--clap"),
         PkgFormat::Vst3 => Some("--vst3"),
+        PkgFormat::Au2 => Some("--au2"),
+        PkgFormat::Au3 => Some("--au3"),
         PkgFormat::Standalone => None,
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "moose-shim-types"
+version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared C header types for the moose AU shim"
+
+[lints]
+workspace = true

@@ -42,7 +42,7 @@ body:
       description: Which part of moose does this touch?
       options:
         - cargo moose CLI (build / install / package / validate / ...)
-        - A plugin format (CLAP / VST3 / standalone)
+        - A plugin format (CLAP / VST3 / AU / standalone)
         - Parameters / state
         - GUI / editor backend
         - Presets

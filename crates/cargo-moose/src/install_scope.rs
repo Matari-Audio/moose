@@ -3,8 +3,9 @@
 //! Every plug-in install path flows through [`InstallScope`]; the
 //! developer picks scope via `--user` / `--system` on
 //! `cargo moose install`, with `--ask` added for `cargo moose
-//! package` ([`PkgScope`]). See [`effective_scope`] for the
-//! per-format default.
+//! package` ([`PkgScope`]). AU v3 silently falls back to system
+//! scope because `--user` isn't reliably supported for it. See
+//! [`effective_scope`] for the fallback policy.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -98,8 +99,12 @@ impl PkgScope {
 /// `requested` is the raw CLI choice: `Some` when the developer
 /// passed `--user` / `--system`, `None` when they passed neither.
 ///
-/// An explicit choice always wins. When `requested` is `None`, picks
-/// the per-(format, OS) default. Most combinations default to User to
+/// Two policies layered together:
+/// - **Hard upgrade** - AU v3 is system-only. An explicit `--user` is downgraded to System with
+///   a note (printed once per `cargo moose` invocation via
+///   [`note_once`]).
+/// - **Default selection** - when `requested` is `None`, picks the
+///   per-(format, OS) default. Most combinations default to User to
 ///   keep the dev loop password-free; the exception is VST3 on
 ///   Windows, which defaults to System because that's the directory
 ///   every commercial host scans by convention (the per-user
@@ -109,6 +114,24 @@ pub(crate) fn effective_scope(
     format: Format,
     requested: Option<InstallScope>,
 ) -> (InstallScope, Option<&'static str>) {
+    // Hard upgrades come first - they override both an explicit
+    // `--user` and the per-format default.
+    let hard_upgrade: Option<&'static str> = match format {
+        Format::Au3 => Some("AU v3 is system-only; ignoring --user"),
+        _ => None,
+    };
+    if let Some(msg) = hard_upgrade {
+        // Note only fires when the user *asked* for User and got
+        // overridden; staying silent when they passed --system or
+        // nothing keeps the install log uncluttered.
+        let note = if requested == Some(InstallScope::User) {
+            Some(msg)
+        } else {
+            None
+        };
+        return (InstallScope::System, note);
+    }
+
     if let Some(s) = requested {
         return (s, None);
     }
@@ -186,6 +209,12 @@ impl InstallScope {
         match self {
             Self::User => home().join("Library/Audio/Plug-Ins/VST3"),
             Self::System => PathBuf::from("/Library/Audio/Plug-Ins/VST3"),
+        }
+    }
+    pub(crate) fn au_v2_dir(self) -> PathBuf {
+        match self {
+            Self::User => home().join("Library/Audio/Plug-Ins/Components"),
+            Self::System => PathBuf::from("/Library/Audio/Plug-Ins/Components"),
         }
     }
     /// Directory the packager drops `<Plugin>.app` into for the

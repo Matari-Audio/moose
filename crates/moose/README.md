@@ -42,6 +42,7 @@ so `&mut AudioBuffer` resolves to the prelude's chosen precision
 |---------|-------------|
 | `clap` (default) | Enable CLAP format export |
 | `vst3` | Enable VST3 format export |
+| `au` | Enable Audio Unit (v2 `.component` / v3 `.appex`) export; macOS only |
 | `shell` | Build a dynamic shell that dlopens a hot-reloadable logic dylib (turns on `moose-loader/shell`) |
 | `hot-debug` | Verbose hot-reload diagnostics |
 

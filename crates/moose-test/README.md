@@ -41,7 +41,8 @@ type parameter (the driver is set up internally):
 - `assert_param_defaults_match`, `assert_param_normalized_clamped`,
   `assert_param_normalized_roundtrip`, `assert_param_count_matches`,
   `assert_no_duplicate_param_ids`
-- `assert_valid_info`
+- `assert_valid_info`, `assert_au_type_codes_ascii`,
+  `assert_fourcc_roundtrip`
 - `assert_bus_config_effect`, `assert_bus_config_instrument`
 
 ## Usage

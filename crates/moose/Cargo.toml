@@ -6,7 +6,7 @@ homepage.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Audio plugin framework - write once, build CLAP, VST3, and a standalone host binary"
+description = "Audio plugin framework - write once, build CLAP, VST3, AU v2, AU v3, and a standalone host binary"
 keywords = ["audio", "plugin", "vst", "clap", "midi"]
 categories = ["multimedia::audio"]
 
@@ -30,6 +30,7 @@ clap = ["dep:moose-clap"]
 vst3 = ["dep:moose-vst3"]
 # MUI editors (`moose::mui`): `MuiEditor` and the parameter `Bridge`.
 mui = ["dep:moose-mui"]
+au = ["dep:moose-au"]
 shell = ["moose-loader/shell"]
 hot-debug = ["moose-loader/hot-debug"]
 # Paranoid real-time allocation checking (dev/test). Enables the check in
@@ -46,6 +47,10 @@ workspace = true
 optional = true
 
 [dependencies.moose-mui]
+workspace = true
+optional = true
+
+[dependencies.moose-au]
 workspace = true
 optional = true
 

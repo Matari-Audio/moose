@@ -17,6 +17,7 @@ moose-gui = \{ version = "{version}" }
 moose-gui-types = \{ version = "{version}" }
 moose-clap = \{ version = "{version}" }
 moose-vst3 = \{ version = "{version}" }
+moose-au = \{ version = "{version}" }
 {{ if has_standalone -}}
 moose-standalone = \{ version = "{version}" }
 {{ endif -}}
@@ -26,6 +27,7 @@ moose-gui = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 moose-gui-types = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 moose-clap = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 moose-vst3 = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
+moose-au = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 {{ if has_standalone -}}
 moose-standalone = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 {{ endif -}}

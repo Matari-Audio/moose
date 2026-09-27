@@ -13,6 +13,7 @@ mod format;
 mod install_scope;
 pub(crate) mod preset_codec;
 pub mod scaffold;
+mod templates;
 mod util;
 
 pub use error::CargoMooseError;
@@ -32,11 +33,11 @@ pub(crate) use config::{
 pub(crate) use util::tmp_verify;
 pub(crate) use util::{
     apply_extra_features, cargo_build, cargo_build_debug, check_cmd, confirm_prompt,
-    detect_default_features, find_on_path, is_debug_profile, log_output,
+    detect_default_features, find_on_path, is_debug_profile, log_output, log_skip,
     namespaced_nonformat_defaults, parse_extra_features, project_root, read_standalone_bin_name,
     set_build_profile, set_debug_profile, set_extra_features, set_no_default_features,
-    set_target_cpu, tag_fail, tag_ok, tag_warn, take_outputs, verify_shell_profile_declared,
-    vprintln,
+    set_target_cpu, tag_fail, tag_ok, tag_warn, take_outputs, take_skipped,
+    verify_shell_profile_declared, vprintln,
 };
 // `run_sudo` shells out to `/usr/bin/sudo`, which only exists on macOS in
 // our supported targets. Windows admin elevation is per-process (UAC, not
@@ -49,6 +50,11 @@ pub(crate) use util::codesign_bundle;
 pub(crate) use util::release_lib;
 #[cfg(target_os = "macos")]
 pub(crate) use util::run_sudo;
+// `tmp_dir` is the raw escape hatch - used by `reset_au` (macOS only)
+// to walk every subdir under `tmp/`. Most callers pick the typed
+// helper that matches their purpose (`tmp_manifests`, `tmp_au_v3`, …).
+#[cfg(target_os = "macos")]
+pub(crate) use util::tmp_dir;
 // `tmp_manifests` is used on both macOS (codesign / AU / VST plist
 // scratch) and Windows (Azure signing metadata). Not used on Linux
 // since the tarball pipeline doesn't shell out to platform tools.
@@ -87,9 +93,10 @@ pub(crate) use util::rustup_has_target;
 pub(crate) use config::MacosPackagingConfig;
 #[cfg(target_os = "macos")]
 pub(crate) use util::{
-    CLAP_EXPORTS, MacArch, VST3_EXPORTS, cargo_build_multi_arch,
-    cargo_build_multi_arch_with_profile, copy_dir_recursive, link_macos_bundle, lipo_into,
-    missing_staticlib_error,
+    CLAP_EXPORTS, MacArch, VST3_EXPORTS, cargo_build_for_arch, cargo_build_multi_arch,
+    cargo_build_multi_arch_with_profile, copy_dir_recursive, extract_team_id,
+    is_production_identity, link_macos_bundle, lipo_into, missing_staticlib_error, run_codesign,
+    run_silent, tmp_au_v3,
 };
 
 // Windows-only: VS / MSVC discovery + Program Files path helpers,
@@ -135,9 +142,11 @@ pub fn run(args: &[String]) -> ExitCode {
         "run" => commands::run::cmd_run(&args[1..]),
         "screenshot" => commands::screenshot::cmd_screenshot(&args[1..]),
         "status" => commands::status::cmd_status(&args[1..]),
+        "reset-au" => commands::reset_au::cmd_reset_au(&args[1..]),
         "validate" => commands::validate::cmd_validate(&args[1..]),
         "preset" => commands::preset::cmd_preset(&args[1..]),
         "doctor" => commands::doctor::cmd_doctor(&args[1..]),
+        "log-stream-au" => commands::log_stream_au::cmd_log_stream_au(&args[1..]),
         other => Err(format!("unknown command: {other:?}").into()),
     };
 

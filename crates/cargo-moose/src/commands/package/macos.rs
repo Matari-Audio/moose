@@ -5,8 +5,8 @@
 
 use super::PkgFormat;
 use super::stage::{
-    ExtraComponent, build_preset_component, generate_distribution_xml, stage_clap,
-    stage_standalone, stage_vst3, write_format_scripts,
+    ExtraComponent, build_preset_component, generate_distribution_xml, stage_au2, stage_au3,
+    stage_clap, stage_standalone, stage_vst3, write_format_scripts,
 };
 use crate::commands::build_dylibs::BuildFormat;
 use crate::commands::install::presets;
@@ -16,7 +16,8 @@ use crate::{
     CLAP_EXPORTS, Config, MacArch, PluginDef, Res, VST3_EXPORTS, cargo_build_multi_arch,
     cargo_build_multi_arch_with_profile, copy_dir_recursive, deployment_target,
     detect_default_features, link_macos_bundle, lipo_into, load_config, project_root,
-    read_workspace_version, release_bundle_bin, release_lib_for_target, release_static_for_target,
+    read_workspace_version, release_bundle_bin, release_lib_for_target,
+    release_static_for_target,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,7 +115,7 @@ pub(crate) fn cmd_package_macos(args: &[String], selection: &super::SuiteSelecti
     if formats.is_empty() {
         return Err("no formats to package".into());
     }
-    // Standalone is system-only on macOS; a `--user`
+    // AU v3 / standalone are system-only on macOS; a `--user`
     // package that includes one still needs the localSystem domain to
     // install it, so widen the installer scope to System. The `.pkg`
     // filename keeps the requested scope's suffix (see `run_productbuild`)
@@ -184,7 +185,7 @@ pub(crate) fn cmd_package_macos(args: &[String], selection: &super::SuiteSelecti
         narrowed
     };
 
-    build_all_formats(&root, &plugins, &archs, dt, &formats)?;
+    build_all_formats(&root, &config, &plugins, &archs, dt, &formats)?;
 
     let dist_dir = moose_build::target_dir(&root).join("dist");
     fs::create_dir_all(&dist_dir)?;
@@ -279,6 +280,8 @@ fn stage_components_only(root: &Path, p: &PluginDef, o: &PackageOpts) -> Res {
                 None,
             ),
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
+            PkgFormat::Au2 => stage_au2(root, p, o.config, &staging),
+            PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
         match result {
@@ -292,7 +295,7 @@ fn stage_components_only(root: &Path, p: &PluginDef, o: &PackageOpts) -> Res {
 
     let components_dir = staging.join("components");
     // Wipe the components dir before rebuilding so a previous run's
-    // `--formats clap,vst3,...` output doesn't leak into the
+    // `--formats clap,vst3,au2,...` output doesn't leak into the
     // current `--formats clap` productbuild - productbuild reads
     // every `.pkg` it finds via `--package-path`, and a stale entry
     // typically fails to install (signature mismatch, entitlements
@@ -300,7 +303,9 @@ fn stage_components_only(root: &Path, p: &PluginDef, o: &PackageOpts) -> Res {
     let _ = fs::remove_dir_all(&components_dir);
     fs::create_dir_all(&components_dir)?;
     for fmt in &plugin_formats {
-        let scripts_dir = write_format_scripts(&staging, fmt, &fmt.bundle_name(p))?;
+        let appex_id = (*fmt == PkgFormat::Au3).then(|| au3_appex_id(o.config, p));
+        let scripts_dir =
+            write_format_scripts(&staging, fmt, &fmt.bundle_name(p), appex_id.as_deref())?;
         run_pkgbuild_for_format(p, fmt, &staging, &components_dir, &scripts_dir, o)?;
     }
     // VST3 presets ride as their own component; the suite distribution
@@ -488,6 +493,9 @@ fn generate_suite_distribution_xml(
         // this member's outline + pkg-refs so productbuild doesn't
         // reference a `.pkg` that was never built.
         let member_formats = formats_for_plugin(formats, plugin);
+        // AU v3's app is the standalone host when this member ships a
+        // standalone bin (the Standalone format is collapsed into it).
+        let au3_is_standalone_host = crate::read_standalone_bin_name(&plugin.crate_name).is_some();
         let outer_id = sanitize_id(&plugin.bundle_id);
         let _ = writeln!(outline, "        <line choice=\"{outer_id}\">");
         for fmt in &member_formats {
@@ -509,7 +517,11 @@ fn generate_suite_distribution_xml(
             let inner_id = format!("{outer_id}-{}", fmt.pkg_id_suffix());
             let pkg_id = format!("{vendor_id}.{}.{}", plugin.bundle_id, fmt.pkg_id_suffix());
             let component_file = format!("{}-{}.pkg", plugin.file_stem(), fmt.label());
-            let (label, desc): (&str, &str) = (fmt.label(), fmt.choice_description());
+            let (label, desc): (&str, &str) = if *fmt == PkgFormat::Au3 && au3_is_standalone_host {
+                ("AU3 + Standalone", "Audio Unit v3 (appex) + standalone app")
+            } else {
+                (fmt.label(), fmt.choice_description())
+            };
             // All formats checked by default - see matching note in
             // the per-plugin `generate_distribution_xml`.
             let enabled_attr = "";
@@ -679,19 +691,37 @@ fn resolve_formats(
         if available.contains("vst3") {
             fmts.push(PkgFormat::Vst3);
         }
+        if available.contains("au") {
+            fmts.push(PkgFormat::Au2);
+            fmts.push(PkgFormat::Au3);
+        }
         if available.contains("standalone") {
             fmts.push(PkgFormat::Standalone);
         }
         fmts
     };
 
-    Ok(fmts)
+    Ok(drop_standalone_if_au3(fmts))
+}
+
+/// AU v3's bundle *is* the standalone `{name}.app` - the host with the
+/// appex embedded, installed at the same path. When both are requested,
+/// drop the separate Standalone format: a lean standalone app at that
+/// path (no appex) clobbers the AU v3 one, and once `pkd` has scanned the
+/// appex-less app first it won't register the appex the AU v3 payload
+/// later adds. The AU v3 app is itself launchable as a standalone.
+fn drop_standalone_if_au3(mut fmts: Vec<PkgFormat>) -> Vec<PkgFormat> {
+    if fmts.contains(&PkgFormat::Au3) {
+        fmts.retain(|f| *f != PkgFormat::Standalone);
+    }
+    fmts
 }
 
 /// The package formats that actually apply to `p`. Standalone is dropped
 /// for plugins that declare no standalone `[[bin]]` (MIDI / utility
 /// examples): they can't run as a desktop app, so they get no Standalone
-/// component or installer choice.
+/// component or installer choice. AU v3 still ships for them - as a stub
+/// app - so it is never filtered here.
 fn formats_for_plugin(formats: &[PkgFormat], p: &PluginDef) -> Vec<PkgFormat> {
     let has_standalone = crate::read_standalone_bin_name(&p.crate_name).is_some();
     formats
@@ -707,6 +737,7 @@ fn formats_for_plugin(formats: &[PkgFormat], p: &PluginDef) -> Vec<PkgFormat> {
 /// don't need to know whether the build was universal.
 fn build_all_formats(
     root: &Path,
+    config: &Config,
     plugins: &[&PluginDef],
     archs: &[MacArch],
     dt: &str,
@@ -717,6 +748,27 @@ fn build_all_formats(
     }
     if formats.contains(&PkgFormat::Vst3) {
         build_and_lipo_format(root, plugins, archs, dt, BuildFormat::Vst3)?;
+    }
+    if formats.contains(&PkgFormat::Au2) {
+        build_and_lipo_format(root, plugins, archs, dt, BuildFormat::Au2)?;
+    }
+    if formats.contains(&PkgFormat::Au3) {
+        // Build per-arch Rust framework, lipo, xcodebuild, sign
+        // inside-out → `target/bundles/{Plugin Name}.app/`. `stage_au3`
+        // copies from there into the packaging staging tree.
+        //
+        // AU2 and AU3 share `--features au` byte-for-byte. When AU2 was
+        // built first in this same run, the universal `lib<stem>_au.dylib`
+        // is already on disk - let AU3 reuse it instead of re-running
+        // cargo + lipo for an identical artifact.
+        let reuse_au_artifacts = formats.contains(&PkgFormat::Au2);
+        crate::commands::install::au_v3::emit_au_v3_bundle(
+            root,
+            config,
+            plugins,
+            archs,
+            reuse_au_artifacts,
+        )?;
     }
     if formats.contains(&PkgFormat::Standalone) {
         // Standalone is a `[[bin]]`, not a cdylib - the per-arch
@@ -861,7 +913,7 @@ struct PackageOpts<'a> {
     /// so a build's output name stays stable regardless of widening.
     scope: PkgScope,
     /// The requested scope, widened to System when the package contains
-    /// a system-only format (standalone) that a `--user`
+    /// a system-only format (AU v3 / standalone) that a `--user`
     /// installer's domains couldn't reach. Drives the distribution.xml
     /// domains + per-component auth.
     effective_scope: PkgScope,
@@ -874,6 +926,15 @@ struct PackageOpts<'a> {
 /// (2 through 7) - splitting them into separate helpers would inflate
 /// the boilerplate without surfacing any reuse, since `cmd_package_macos`
 /// is the only caller.
+/// AU v3 app-extension bundle id, matching what the build's pbxproj
+/// stamps and `install_au_v3` registers - so the installer postinstall
+/// registers the same identifier.
+fn au3_appex_id(config: &Config, p: &PluginDef) -> String {
+    // Vendor-rooted, matching the appex `PRODUCT_BUNDLE_IDENTIFIER` the
+    // build's pbxproj stamps.
+    format!("{}.{}.v3.ext", config.vendor.id, p.bundle_id)
+}
+
 /// A preset file tree as `(relative path -> bytes)`.
 type PresetPayload = Vec<(PathBuf, Vec<u8>)>;
 
@@ -967,6 +1028,8 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
                 None,
             ),
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
+            PkgFormat::Au2 => stage_au2(root, p, o.config, &staging),
+            PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
         match result {
@@ -1002,7 +1065,9 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
     fs::create_dir_all(&components_dir)?;
 
     for fmt in &plugin_formats {
-        let scripts_dir = write_format_scripts(&staging, fmt, &fmt.bundle_name(p))?;
+        let appex_id = (*fmt == PkgFormat::Au3).then(|| au3_appex_id(o.config, p));
+        let scripts_dir =
+            write_format_scripts(&staging, fmt, &fmt.bundle_name(p), appex_id.as_deref())?;
         run_pkgbuild_for_format(p, fmt, &staging, &components_dir, &scripts_dir, o)?;
     }
     // Out-of-bundle VST3 presets ship as their own component.
@@ -1027,6 +1092,7 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
         o.version,
         Some(&o.config.macos.packaging),
         o.effective_scope,
+        crate::read_standalone_bin_name(&p.crate_name).is_some(),
     );
     let dist_xml_path = staging.join("distribution.xml");
     fs::write(&dist_xml_path, &dist_xml)?;
@@ -1093,7 +1159,7 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
 /// Step 6 of the per-plugin packaging pipeline: productbuild → signed
 /// `.pkg`. The dist suffix uses the developer-requested `scope`, not the
 /// widened `effective_scope` - a `--user` build that widened to System
-/// because it bundles the standalone app still gets the `-user` filename so the
+/// because it bundles AU v3 still gets the `-user` filename so the
 /// developer's CI scripts find it.
 fn run_productbuild(
     p: &PluginDef,
@@ -1168,7 +1234,7 @@ fn run_pkgbuild_for_format(
     // Stage every format through an isolated `_pkgroot_<fmt>/` so
     // pkgbuild sees exactly one payload per call. Historically we
     // used `--component <bundle>` for the "native bundle" formats
-    // (VST3, standalone) and `--root` only for the
+    // (VST3, AU v2, AU v3, standalone) and `--root` only for the
     // others, but `--component` auto-stamps `BundleIsRelocatable=true`
     // in the PackageInfo. That makes the installer "upgrade in place"
     // any prior copy of the bundle ID Launch Services knows about,
@@ -1236,7 +1302,7 @@ fn run_pkgbuild_for_format(
     ]);
 
     // Per-format scripts dir; always present now (preinstall sweeps
-    // stale leftovers).
+    // stale leftovers and AU v2's postinstall clears the AU cache).
     // `write_format_scripts` produced the dir; pkgbuild copies its
     // contents into the resulting `.pkg`'s `Scripts` payload.
     pkgbuild_args.push("--scripts".to_string());
@@ -1262,8 +1328,9 @@ fn run_pkgbuild_for_format(
 /// the canonical `target/release/lib{stem}_{feature}.dylib` location
 /// the stage helpers read from.
 ///
-/// Used for CLAP / VST3, which share the same "build per arch, then
-/// lipo" shape.
+/// Used for CLAP / VST3 / AU2, which all share the same
+/// "build per arch, then lipo" shape. AU3 has its own framework
+/// pipeline so it doesn't route through here.
 fn build_and_lipo_format(
     root: &Path,
     plugins: &[&PluginDef],
@@ -1275,19 +1342,45 @@ fn build_and_lipo_format(
     let label = format.label();
     let suffix = format.dylib_suffix();
 
-    let mut base: Vec<&str> = Vec::new();
-    for p in plugins {
-        base.push("-p");
-        base.push(&p.crate_name);
-    }
-    base.extend_from_slice(&["--no-default-features", "--features", feature]);
-
-    if archs.len() == 1 {
-        eprintln!("Building {label} ({})...", archs[0].triple());
+    // AU v2 needs a unique cocoa-view class name per dylib so hosts
+    // that look up classes via `[NSBundle classNamed:]` (REAPER) can
+    // find the right one - see `moose-au`'s `build.rs`. That means
+    // one cargo invocation per plugin with `MOOSE_AU_PLUGIN_ID` set,
+    // instead of one batched build for all plugins.
+    if format == BuildFormat::Au2 {
+        if archs.len() == 1 {
+            eprintln!("Building {label} ({})...", archs[0].triple());
+        } else {
+            eprintln!("Building {label} for {} archs...", archs.len());
+        }
+        for p in plugins {
+            let env = [("MOOSE_AU_PLUGIN_ID", p.bundle_id.as_str())];
+            let args: Vec<&str> = vec![
+                "-p",
+                &p.crate_name,
+                "--no-default-features",
+                "--features",
+                feature,
+            ];
+            for &arch in archs {
+                crate::cargo_build_for_arch(&env, &args, arch, dt)?;
+            }
+        }
     } else {
-        eprintln!("Building {label} for {} archs...", archs.len());
+        let mut base: Vec<&str> = Vec::new();
+        for p in plugins {
+            base.push("-p");
+            base.push(&p.crate_name);
+        }
+        base.extend_from_slice(&["--no-default-features", "--features", feature]);
+
+        if archs.len() == 1 {
+            eprintln!("Building {label} ({})...", archs[0].triple());
+        } else {
+            eprintln!("Building {label} for {} archs...", archs.len());
+        }
+        cargo_build_multi_arch(archs, &base, dt)?;
     }
-    cargo_build_multi_arch(archs, &base, dt)?;
 
     for &arch in archs {
         for p in plugins {
@@ -1318,16 +1411,18 @@ fn build_and_lipo_format(
         lipo_into(&inputs, &output)?;
     }
 
-    // VST3 / CLAP need an MH_BUNDLE binary (not the
+    // VST3 / CLAP also need an MH_BUNDLE binary (not the
     // MH_DYLIB that `rustc --crate-type cdylib` emits) so JUCE-hosted
     // VST3 + CFBundle loaders accept them. Link the per-arch Rust
     // `staticlib` (`lib<stem>.a`) through `clang -bundle` per arch,
     // then `lipo` the slices into a universal bundle-bin that the
-    // stage / install pipelines copy into `Contents/MacOS/`.
-    {
+    // stage / install pipelines copy into `Contents/MacOS/`. AU2 keeps
+    // the cdylib - its loader is happy with MH_DYLIB.
+    if matches!(format, BuildFormat::Clap | BuildFormat::Vst3) {
         let exports: &[&str] = match format {
             BuildFormat::Clap => CLAP_EXPORTS,
             BuildFormat::Vst3 => VST3_EXPORTS,
+            BuildFormat::Au2 => unreachable!(),
         };
         for p in plugins {
             let mut staticlibs: Vec<(MacArch, PathBuf)> = Vec::with_capacity(archs.len());
@@ -1599,5 +1694,27 @@ fn fetch_notarization_log(output: &str, keychain_profile: &str) {
                 eprintln!("{log}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_dropped_when_au3_present() {
+        let out =
+            drop_standalone_if_au3(vec![PkgFormat::Clap, PkgFormat::Standalone, PkgFormat::Au3]);
+        // The AU v3 app is the standalone host; the separate Standalone
+        // format is dropped so they don't fight over `{name}.app`.
+        assert_eq!(out, vec![PkgFormat::Clap, PkgFormat::Au3]);
+    }
+
+    #[test]
+    fn standalone_kept_without_au3() {
+        assert_eq!(
+            drop_standalone_if_au3(vec![PkgFormat::Clap, PkgFormat::Standalone]),
+            vec![PkgFormat::Clap, PkgFormat::Standalone]
+        );
     }
 }

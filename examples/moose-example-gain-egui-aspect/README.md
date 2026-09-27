@@ -6,4 +6,5 @@ the host keeps width and height proportional on every resize edge. The
 window size and min/max bounds all sit on 2:3 so the lock holds across
 the whole range.
 
-Honored by CLAP, VST3, and the standalone host.
+Honored by CLAP, VST3, AU v3, and the standalone host; AU v2 ignores
+aspect ratios.
