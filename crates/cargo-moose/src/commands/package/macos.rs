@@ -279,7 +279,7 @@ fn stage_components_only(root: &Path, p: &PluginDef, o: &PackageOpts) -> Res {
                 None,
             ),
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
-            PkgFormat::Au2 => stage_au2(root, p, o.config, &staging),
+            PkgFormat::Au2 => stage_au2(root, p, o.config, &staging, None),
             PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
@@ -1027,7 +1027,7 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
                 None,
             ),
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
-            PkgFormat::Au2 => stage_au2(root, p, o.config, &staging),
+            PkgFormat::Au2 => stage_au2(root, p, o.config, &staging, None),
             PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
