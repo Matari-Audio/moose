@@ -11,6 +11,7 @@ First release as MOOSE, a hard fork of truce 6.3.0. See the README's
 - Removed AU v2/v3, AAX, VST2, LV2 and iOS support, and the iced, vizia and Slint GUI backends with their examples. Remaining formats: CLAP, VST3, standalone.
 - CLAP rescans parameter values after state and preset loads; CLAP replays the host GUI scale into newly created editors.
 - VST3 interface IDs for `IUnitInfo`, `IEditControllerHostEditing` and `IProcessContextRequirements` are corrected.
+- New `moose-mui` crate (facade feature `mui`, `moose::mui`): `MuiEditor` and the parameter `Bridge` for [MUI](https://github.com/Matari-Audio/MUI) editors, ported from MUI's `mui-truce`. Example: `moose-example-gain-mui`.
 
 ### Fixes carried from vendored truce copies
 

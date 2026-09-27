@@ -25,6 +25,7 @@ members = [
     "crates/moose-cpu",
     "crates/moose-gpu",
     "crates/moose-egui",
+    "crates/moose-mui",
     "crates/moose-simd",
     "crates/moose-font",
     "crates/moose-utils",
@@ -45,6 +46,7 @@ members = [
     "examples/moose-example-arpeggio",
     "examples/moose-example-gain-egui",
     "examples/moose-example-gain-egui-aspect",
+    "examples/moose-example-gain-mui",
     "examples/moose-example-tremolo",
     "examples/moose-example-state",
     "examples/moose-example-fundsp-reverb-worker",
@@ -126,6 +128,7 @@ moose-derive = { version = "7.0.0", path = "crates/moose-derive" }
 moose-cpu = { version = "7.0.0", path = "crates/moose-cpu" }
 moose-gpu = { version = "7.0.0", path = "crates/moose-gpu" }
 moose-egui = { version = "7.0.0", path = "crates/moose-egui" }
+moose-mui = { version = "7.0.0", path = "crates/moose-mui" }
 moose-simd = { version = "7.0.0", path = "crates/moose-simd" }
 moose-font = { version = "7.0.0", path = "crates/moose-font" }
 moose-build = { version = "7.0.0", path = "crates/moose-build" }
