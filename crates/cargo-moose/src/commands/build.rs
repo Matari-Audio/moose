@@ -226,8 +226,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
                     // AU2 is macOS-only and only fires for host targets;
                     // cross-target macOS builds (e.g. x86_64 from arm64)
                     // are still macOS-host so the existing helper works.
-                    let _ = plan; // referenced via stage_dir below
-                    stage_au2(&root, p, &config, &plan.stage_dir)?;
+                    stage_au2(&root, p, &config, &plan.stage_dir, plan.target)?;
                     let filename = format!("{}.component", p.file_stem());
                     crate::log_output(format!(
                         "AU:   {}",
