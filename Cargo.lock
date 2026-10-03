@@ -1992,6 +1992,7 @@ dependencies = [
  "crossbeam-queue",
  "log",
  "moose-core",
+ "moose-derive",
  "moose-params",
  "objc",
 ]
@@ -2826,6 +2827,7 @@ dependencies = [
  "cc",
  "crossbeam-queue",
  "moose-core",
+ "moose-derive",
  "moose-params",
 ]
 

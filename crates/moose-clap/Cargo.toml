@@ -27,3 +27,6 @@ objc = "0.2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+moose-derive = { workspace = true }

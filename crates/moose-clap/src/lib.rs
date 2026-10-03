@@ -66,7 +66,8 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info, clap_plugin_params,
 };
 use clap_sys::ext::params::{
-    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, clap_host_params,
+    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
+    CLAP_PARAM_RESCAN_VALUES, clap_host_params,
 };
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
@@ -925,7 +926,7 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
                 flags |= CLAP_PARAM_RESCAN_VALUES;
             }
             if info_changed {
-                flags |= CLAP_PARAM_RESCAN_INFO;
+                flags |= CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT;
             }
             rescan(data.host, flags);
         }
@@ -6010,5 +6011,129 @@ mod bus_kind_tests {
         // Main bus disabled: the first enabled port is the sidechain.
         assert_eq!(audio_port_main_flag(0, BusKind::Sidechain), 0);
         assert_eq!(audio_port_main_flag(1, BusKind::Sidechain), 0);
+    }
+}
+
+// The derive's umbrella paths resolve locally for this shared test fixture.
+#[cfg(test)]
+extern crate self as moose;
+#[cfg(test)]
+use moose_core as core;
+#[cfg(test)]
+use moose_params as params;
+#[cfg(test)]
+#[path = "../../../test-support/host_value_fixture.rs"]
+mod host_value_fixture;
+
+#[cfg(test)]
+mod host_value_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    use moose_params::Params;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static RESCAN: AtomicU32 = AtomicU32::new(0);
+    unsafe extern "C" fn rescan(_: *const clap_host, flags: u32) {
+        RESCAN.fetch_or(flags, Ordering::Relaxed);
+    }
+    unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+        static PARAMS: clap_host_params = clap_host_params {
+            rescan: Some(rescan),
+            clear: None,
+            request_flush: None,
+        };
+        // SAFETY: host extensions are queried with a terminated CLAP identifier.
+        if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PARAMS {
+            (&raw const PARAMS).cast::<c_void>()
+        } else {
+            ptr::null()
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "unchanged storage values must compare exactly"
+    )]
+    fn ffi_text_hooks_and_rescan_preserve_declared_slot_range() {
+        // SAFETY: own the plugin, descriptor, host, and all callback buffers.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.get_extension = Some(extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(!plugin.is_null());
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let params = data_from_plugin::<TestPlugin>(plugin).params_arc.clone();
+            let mut info: clap_param_info = std::mem::zeroed();
+            assert!(params_get_info::<TestPlugin>(plugin, 1, &raw mut info));
+            assert_eq!((info.id, info.min_value, info.max_value), (1, 0., 1.));
+            let normalized = 49. / 96.;
+            params.set_plain(1, normalized);
+            let mut stored = 0.;
+            assert!(params_get_value::<TestPlugin>(plugin, 1, &raw mut stored));
+            assert_eq!(stored, normalized);
+            let mut buffer = [0_i8; 128];
+            assert!(params_value_to_text::<TestPlugin>(
+                plugin,
+                1,
+                stored,
+                buffer.as_mut_ptr(),
+                128
+            ));
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "+1 st");
+            let mut parsed = -999.;
+            assert!(params_text_to_value::<TestPlugin>(
+                plugin,
+                1,
+                c"+1 st".as_ptr(),
+                &raw mut parsed
+            ));
+            assert_eq!(parsed, normalized);
+            for invalid in [c"0.5", c"nan"] {
+                assert!(!params_text_to_value::<TestPlugin>(
+                    plugin,
+                    1,
+                    invalid.as_ptr(),
+                    &raw mut parsed
+                ));
+            }
+            assert!(params_text_to_value::<TestPlugin>(
+                plugin,
+                0,
+                c"-6 dB".as_ptr(),
+                &raw mut parsed
+            ));
+            assert_eq!(parsed, -6.);
+            RESCAN.store(0, Ordering::Relaxed);
+            params.rebound.store(true, Ordering::Relaxed);
+            params.generation.fetch_add(1, Ordering::Relaxed);
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(
+                RESCAN.load(Ordering::Relaxed),
+                CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT
+            );
+            assert!(params_value_to_text::<TestPlugin>(
+                plugin,
+                1,
+                stored,
+                buffer.as_mut_ptr(),
+                128
+            ));
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "51%");
+            assert!(params_text_to_value::<TestPlugin>(
+                plugin,
+                1,
+                c"25%".as_ptr(),
+                &raw mut parsed
+            ));
+            assert_eq!(parsed, 0.25);
+            assert_eq!(params.get_plain(1), Some(normalized));
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
     }
 }
