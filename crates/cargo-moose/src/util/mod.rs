@@ -1131,7 +1131,7 @@ mod tests {
             parse_extra_features("a, b c").unwrap(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
-        assert!(parse_extra_features("").unwrap().is_empty());
+        assert_eq!(parse_extra_features("").unwrap(), [] as [String; 0]);
         assert_eq!(
             parse_extra_features(" fancy-dsp ").unwrap(),
             vec!["fancy-dsp".to_string()]
@@ -1189,9 +1189,12 @@ mod tests {
         );
         // Only formats → nothing to re-add.
         let only_formats = feature_graph(&[("default", &["clap", "vst3", "standalone"])]);
-        assert!(nonformat_default_features(&only_formats).is_empty());
+        assert_eq!(nonformat_default_features(&only_formats), [] as [String; 0]);
         // No `default` key at all → empty.
-        assert!(nonformat_default_features(&BTreeMap::new()).is_empty());
+        assert_eq!(
+            nonformat_default_features(&BTreeMap::new()),
+            [] as [String; 0]
+        );
     }
 
     #[test]

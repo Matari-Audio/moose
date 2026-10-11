@@ -5725,7 +5725,7 @@ mod sounding_notes_tests {
         // Drained notes are cleared - a second wildcard finds nothing.
         hits.clear();
         s.drain_matching(0, Some(3), None, |ch, k| hits.push((ch, k)));
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
 
         // Channel wildcard, concrete key.
         s.set(0, 5, 60);
@@ -5752,7 +5752,7 @@ mod sounding_notes_tests {
         s.clear(0, 0, 60);
         let mut hits = Vec::new();
         s.drain_matching(0, None, None, |ch, k| hits.push((ch, k)));
-        assert!(hits.is_empty());
+        assert_eq!(hits, []);
     }
 
     #[test]
@@ -5827,7 +5827,7 @@ mod remote_controls_tests {
     #[test]
     fn ungrouped_params_produce_no_page() {
         let infos = vec![info(0, ""), info(1, "")];
-        assert!(remote_control_pages(&infos).is_empty());
+        assert_eq!(remote_control_pages(&infos), []);
     }
 
     #[test]
@@ -5984,7 +5984,7 @@ mod deferred_param_tests {
             })
             .collect();
         assert_eq!(seen, vec![(0, 7, 0.6), (0, 8, 0.1), (32, 7, 0.7)]);
-        assert!(deferred.is_empty());
+        assert_eq!(deferred, []);
     }
 
     #[test]
@@ -5993,7 +5993,7 @@ mod deferred_param_tests {
         let mut list = EventList::with_capacity(8);
         replay_deferred_params(&mut list, &mut deferred, true);
         assert_eq!(list.iter().count(), 0);
-        assert!(deferred.is_empty());
+        assert_eq!(deferred, []);
     }
 }
 

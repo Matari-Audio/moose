@@ -415,6 +415,7 @@ fn same_library_slot(meta: &PresetMeta, name: &str, category: &str) -> bool {
 /// with the same display name is regenerated in place (uuid and
 /// metadata preserved, state replaced) unless `always_new`;
 /// an exact state match is a no-op.
+#[allow(clippy::too_many_arguments)]
 fn import_into_library(
     ctx: &PluginCtx<'_>,
     name: &str,

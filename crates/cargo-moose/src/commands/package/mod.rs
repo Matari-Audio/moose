@@ -467,7 +467,7 @@ mod selection_tests {
         let (sel, rest) = extract_suite_selection(&[]).unwrap();
         assert!(sel.want_per_plugin());
         assert!(sel.want_suite("Studio", "studio"));
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [String; 0]);
     }
 
     #[test]
@@ -477,7 +477,7 @@ mod selection_tests {
         assert!(sel.want_suite("Studio", "studio"));
         assert!(sel.want_suite("Free", "free"));
         assert!(!sel.want_suite("MIDI Tools", "midi-tools"));
-        assert!(rest.is_empty());
+        assert_eq!(rest, [] as [String; 0]);
     }
 
     #[test]

@@ -178,7 +178,20 @@ impl<P: Params> MuiEditor<P> {
 
 impl<P: Params> Editor for MuiEditor<P> {
     fn size(&self) -> (u32, u32) {
-        self.size
+        // The open window, not the last `set_size`: on X11 the window follows
+        // its parent without the host calling `set_size`, and a stale answer
+        // here makes the host snap the editor back to the old size.
+        match self
+            .window
+            .as_ref()
+            .filter(|w| self.min.is_some() && w.0.is_open())
+        {
+            Some(open) => {
+                let l = open.0.size().logical;
+                points(Size::new(l.width, l.height))
+            }
+            None => self.size,
+        }
     }
 
     fn can_resize(&self) -> bool {

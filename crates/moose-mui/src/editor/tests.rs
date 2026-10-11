@@ -490,7 +490,7 @@ fn zoom_at(editor: &MuiEditor<Synth>, physical: (u32, u32), scale: f64) -> f64 {
 }
 
 #[test]
-#[expect(
+#[allow(
     clippy::float_cmp,
     reason = "the zooms are exact ratios of whole sizes"
 )]

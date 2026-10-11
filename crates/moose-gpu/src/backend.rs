@@ -2297,7 +2297,7 @@ mod tests {
         atlas.ensure_glyph(&font, 'C', 14.0);
 
         assert_eq!(atlas.glyphs.len(), 3);
-        assert!(!atlas.pending.is_empty());
+        assert_ne!(atlas.pending, []);
 
         // Same glyph at same size should not create a new entry
         atlas.ensure_glyph(&font, 'A', 14.0);
