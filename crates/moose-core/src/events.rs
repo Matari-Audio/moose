@@ -19,11 +19,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_EVENT_LIST_OWNER: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_event_list_owner() -> u64 {
-    NEXT_EVENT_LIST_OWNER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner| {
-            owner.checked_add(1)
-        })
-        .expect("EventList owner space exhausted")
+    let mut owner = NEXT_EVENT_LIST_OWNER.load(Ordering::Relaxed);
+    loop {
+        let next = owner
+            .checked_add(1)
+            .expect("EventList owner space exhausted");
+        match NEXT_EVENT_LIST_OWNER.compare_exchange_weak(
+            owner,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(prev) => return prev,
+            Err(cur) => owner = cur,
+        }
+    }
 }
 
 /// A timestamped event within a process block.
