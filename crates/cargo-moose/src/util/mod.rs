@@ -1191,7 +1191,10 @@ mod tests {
         let only_formats = feature_graph(&[("default", &["clap", "vst3", "standalone"])]);
         assert_eq!(nonformat_default_features(&only_formats), [] as [String; 0]);
         // No `default` key at all → empty.
-        assert_eq!(nonformat_default_features(&BTreeMap::new()), [] as [String; 0]);
+        assert_eq!(
+            nonformat_default_features(&BTreeMap::new()),
+            [] as [String; 0]
+        );
     }
 
     #[test]
