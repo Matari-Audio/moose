@@ -294,10 +294,20 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// [`Self::set_normalized`].
     fn set_plain(&self, id: u32, value: f64);
 
-    /// Format a plain value to display string.
+    /// Format a value in the parameter's declared plain/storage range.
+    /// `#[params(value_format = "method")]` first calls an instance method
+    /// `fn(&self, id: u32, value: f64) -> Option<String>`. Returning `None`
+    /// keeps the generated field/nested formatter. This can give a fixed
+    /// automation slot its current target's musical display without changing
+    /// its range, stored values or automation transport.
     fn format_value(&self, id: u32, value: f64) -> Option<String>;
 
-    /// Parse a display string to plain value.
+    /// Parse display text into the parameter's declared plain/storage range.
+    /// `#[params(value_parse = "method")]` first calls an instance method
+    /// `fn(&self, id: u32, text: &str) -> Result<Option<f64>, ()>`.
+    /// `Ok(Some(value))` handles the input (non-finite values are rejected),
+    /// `Ok(None)` uses generated field/nested parsing, and `Err(())` rejects
+    /// input without falling back to a potentially different numeric meaning.
     fn parse_value(&self, id: u32, text: &str) -> Option<f64>;
 
     /// Reset all smoothers to current values.

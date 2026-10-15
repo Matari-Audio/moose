@@ -882,6 +882,10 @@ struct ParamsStructAttrs {
     presentation: Option<syn::Ident>,
     /// Inherent `fn(&self) -> u64`.
     presentation_revision: Option<syn::Ident>,
+    /// Inherent `fn(&self, u32, f64) -> Option<String>`; None uses static formatting.
+    value_format: Option<syn::Ident>,
+    /// Inherent `fn(&self, u32, &str) -> Result<Option<f64>, ()>`.
+    value_parse: Option<syn::Ident>,
 }
 
 /// Read the struct-level `#[params(...)]` keys. `id_scheme` defaults
@@ -896,6 +900,8 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
         restore_state: None,
         presentation: None,
         presentation_revision: None,
+        value_format: None,
+        value_parse: None,
     };
     for attr in attrs {
         if !attr.path().is_ident("params") {
@@ -927,11 +933,13 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 "restore_state" => &mut parsed.restore_state,
                 "presentation" => &mut parsed.presentation,
                 "presentation_revision" => &mut parsed.presentation_revision,
+                "value_format" => &mut parsed.value_format,
+                "value_parse" => &mut parsed.value_parse,
                 _ => {
                     return Err(meta.error(
                         "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
-                         `validate_persist`, `restore_state`, `presentation`, or \
-                         `presentation_revision`)",
+                         `validate_persist`, `restore_state`, `presentation`, \
+                         `presentation_revision`, `value_format`, or `value_parse`)",
                     ));
                 }
             };
@@ -2839,6 +2847,21 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
     });
 
+    let value_format_override = struct_attrs.value_format.as_ref().map(|method| {
+        quote! {
+            if let Some(text) = self.#method(id, value) { return Some(text); }
+        }
+    });
+    let value_parse_override = struct_attrs.value_parse.as_ref().map(|method| {
+        quote! {
+            match self.#method(id, text) {
+                Ok(Some(value)) => return value.is_finite().then_some(value),
+                Ok(None) => {},
+                Err(()) => return None,
+            }
+        }
+    });
+
     // Nothing to carry: leave the empty-`Vec` trait default so a plugin
     // without persisted config adds no bytes to its saved state. A
     // `pre_save` / `post_load` / `validate_persist` hook still needs the
@@ -2972,6 +2995,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn format_value(&self, id: u32, value: f64) -> Option<String> {
+                #value_format_override
                 match id {
                     #(#format_value_arms)*
                     #format_fallthrough
@@ -2979,6 +3003,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn parse_value(&self, id: u32, text: &str) -> Option<f64> {
+                #value_parse_override
                 #parse_value_impl
             }
 
