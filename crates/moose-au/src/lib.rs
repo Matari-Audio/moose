@@ -1516,7 +1516,6 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
 
         let len = blob.len();
-        if len > P::max_host_state_bytes() { return; }
         let ptr = malloc(len).cast::<u8>();
         if ptr.is_null() {
             // malloc failed - `*out_data` is already null and

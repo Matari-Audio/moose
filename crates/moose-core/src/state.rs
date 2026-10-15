@@ -181,9 +181,6 @@ pub fn parse_or_migrate<P: PluginExport>(
     format: PluginFormat,
     source_key: Option<&str>,
 ) -> Option<DeserializedState> {
-    if data.len() > P::max_host_state_bytes() {
-        return None;
-    }
     finish_parse_or_migrate::<P>(
         parse_state(data, expected_plugin_id),
         data,

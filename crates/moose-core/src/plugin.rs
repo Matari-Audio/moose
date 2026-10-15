@@ -76,7 +76,8 @@ pub trait PluginRuntime: Send + 'static {
 
     /// Maximum serialized host state this plugin can produce. Defaults to the
     /// historical 32 MiB. Override only with a proven document bound; format
-    /// wrappers enforce it on both save and load, outside audio processing.
+    /// CLAP/VST3 wrappers enforce it on both save and load, outside audio
+    /// processing. Other formats keep their existing native container bounds.
     fn max_host_state_bytes() -> usize where Self: Sized { 32 * 1024 * 1024 }
 
     /// Static metadata about the plugin.

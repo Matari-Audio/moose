@@ -1832,7 +1832,7 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         // `slice::from_raw_parts(null, n)` for `n > 0` is UB. Treat
         // `(null, *)` and `(_, 0)` the same as "host gave us nothing".
-        if data.is_null() || len == 0 {
+        if data.is_null() || len == 0 || len as usize > P::max_host_state_bytes() {
             return 0;
         }
         let blob = slice::from_raw_parts(data, len as usize);
