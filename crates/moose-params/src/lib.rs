@@ -173,6 +173,11 @@ impl Default for ParameterPresentation {
     }
 }
 
+/// Host-thread commit of a fully read and validated persistence document.
+/// Preparation must not mutate plugin state. Large fields may be decoded into
+/// their final immutable representation instead of a serialized staging buffer.
+pub type PreparedPersist<P> = Box<dyn FnOnce(&P, &[(u32, f64)], &[u8]) + Send>;
+
 /// Trait implemented by #[derive(Params)] on a struct.
 /// Format wrappers use this to enumerate, read, and write parameters.
 ///
@@ -183,10 +188,6 @@ impl Default for ParameterPresentation {
 /// rather than expecting one on the trait - `#[derive(Params)]` emits
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
-/// Host-thread commit of a fully read and validated persistence document.
-/// Preparation must not mutate plugin state. Large fields may be decoded into
-/// their final immutable representation instead of a serialized staging buffer.
-pub type PreparedPersist<P> = Box<dyn FnOnce(&P, &[(u32, f64)], &[u8]) + Send>;
 
 pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Optional incremental persistence preparation. Return `None` without
