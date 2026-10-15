@@ -4026,6 +4026,10 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             // comment for why "newest wins" is right.
             let _ = data.pending_state.force_push(deserialized);
         } else {
+            // A stopped-transport params.flush may have queued a value for
+            // the next block. Recall supersedes it just as active recall
+            // supersedes deferred events in convert_input_events.
+            data.audio.enter().deferred_params.clear();
             // Inactive: no `process` will run, so the queue would never
             // drain and the plugin's custom state would stay stale until
             // the next activate. Apply the full state (params + extra)
@@ -6482,6 +6486,78 @@ mod floating_gui_tests {
                 "programmatic hide must not notify close"
             );
             gui_destroy::<TestPlugin>(plugin);
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+}
+
+#[cfg(test)]
+mod inactive_recall_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    struct Stream {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+    unsafe extern "C" fn write(stream: *const clap_ostream, bytes: *const c_void, len: u64) -> i64 {
+        // SAFETY: the test retains its stream storage and CLAP supplies len bytes.
+        unsafe {
+            let stream = &mut *(*stream).ctx.cast::<Stream>();
+            stream
+                .bytes
+                .extend_from_slice(std::slice::from_raw_parts(bytes.cast(), len as usize));
+            len as i64
+        }
+    }
+    unsafe extern "C" fn read(stream: *const clap_istream, bytes: *mut c_void, len: u64) -> i64 {
+        // SAFETY: the test retains its stream storage; CLAP supplies len writable bytes.
+        unsafe {
+            let stream = &mut *(*stream).ctx.cast::<Stream>();
+            let len = (len as usize).min(stream.bytes.len() - stream.offset);
+            ptr::copy_nonoverlapping(stream.bytes.as_ptr().add(stream.offset), bytes.cast(), len);
+            stream.offset += len;
+            len as i64
+        }
+    }
+    unsafe extern "C" fn no_extension(_: *const clap_host, _: *const c_char) -> *const c_void {
+        ptr::null()
+    }
+    #[test]
+    fn inactive_recall_discards_a_stopped_transport_flush() {
+        // SAFETY: own the plugin, host, descriptor and stream through destruction.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.get_extension = Some(no_extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let data = data_from_plugin::<TestPlugin>(plugin);
+            let original = data.params_arc.get_plain(0).unwrap();
+            let mut storage = Stream {
+                bytes: Vec::new(),
+                offset: 0,
+            };
+            let output = clap_ostream {
+                ctx: (&raw mut storage).cast(),
+                write: Some(write),
+            };
+            assert!(state_save::<TestPlugin>(plugin, &raw const output));
+            data.params_arc.set_plain(0, 6.);
+            defer_param_change(&mut data.audio.enter().deferred_params, 0, 6.);
+            let input = clap_istream {
+                ctx: (&raw mut storage).cast(),
+                read: Some(read),
+            };
+            assert!(state_load::<TestPlugin>(plugin, &raw const input));
+            assert_eq!(data.params_arc.get_plain(0), Some(original));
+            assert!(
+                data.audio.enter().deferred_params.is_empty(),
+                "stale flush would overwrite recall on the next block"
+            );
             clap_plugin_destroy::<TestPlugin>(plugin);
         }
     }
