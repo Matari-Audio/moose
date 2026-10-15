@@ -878,6 +878,7 @@ struct ParamsStructAttrs {
     /// Inherent `fn(&self, &[(u32, f64)], &[u8])` behind
     /// `Params::restore_state`.
     restore_state: Option<syn::Ident>,
+    prepare_persist_stream: Option<syn::Ident>,
     /// Inherent `fn(&self, u32) -> Option<ParameterPresentation>`.
     presentation: Option<syn::Ident>,
     /// Inherent `fn(&self) -> u64`.
@@ -898,6 +899,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
         pre_save: None,
         validate_persist: None,
         restore_state: None,
+        prepare_persist_stream: None,
         presentation: None,
         presentation_revision: None,
         value_format: None,
@@ -931,6 +933,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 "pre_save" => &mut parsed.pre_save,
                 "validate_persist" => &mut parsed.validate_persist,
                 "restore_state" => &mut parsed.restore_state,
+                "prepare_persist_stream" => &mut parsed.prepare_persist_stream,
                 "presentation" => &mut parsed.presentation,
                 "presentation_revision" => &mut parsed.presentation_revision,
                 "value_format" => &mut parsed.value_format,
@@ -2849,6 +2852,15 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
         }
     });
+    let prepare_stream_impl = struct_attrs.prepare_persist_stream.as_ref().map(|m| {
+        quote! {
+            fn prepare_persist_stream(read: &mut dyn ::std::io::Read, len: usize)
+                -> Option<::std::io::Result<(Vec<u8>, ::moose::params::PreparedPersist<Self>)>>
+            {
+                Self::#m(read, len)
+            }
+        }
+    });
     let presentation_impl = struct_attrs.presentation.as_ref().map(|m| {
         quote! {
             fn parameter_presentation(&self, id: u32)
@@ -2975,6 +2987,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #presentation_revision_impl
             #validate_impl
             #restore_impl
+            #prepare_stream_impl
 
             fn count(&self) -> usize {
                 #count_expr
