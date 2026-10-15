@@ -6445,7 +6445,13 @@ mod host_value_tests {
             let other = data_from_plugin::<TestPlugin>(b);
             let captured = Arc::new(Mutex::new(None));
             data.gui.enter().editor = Some(Box::new(CaptureEditor(captured.clone())));
+            assert!(gui_create::<TestPlugin>(
+                a,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                false
+            ));
             let mut window: clap_window = std::mem::zeroed();
+            window.api = CLAP_WINDOW_API_X11.as_ptr();
             window.specific.ptr = ptr::dangling_mut::<c_void>();
             assert!(gui_set_parent::<TestPlugin>(a, &raw const window));
             let context = captured.lock().unwrap().take().unwrap();
