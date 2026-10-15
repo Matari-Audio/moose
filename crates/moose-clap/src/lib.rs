@@ -292,6 +292,9 @@ struct ClapPluginData<P: PluginExport> {
     render_mode: AtomicU8,
     /// Flag: GUI changed params, need rescan on main thread.
     needs_rescan: Arc<AtomicBool>,
+    floating_mode: AtomicBool,
+    floating_visible: Arc<AtomicBool>,
+    floating_closed: Arc<AtomicBool>,
     /// Last `Params::parameter_presentation_revision` the host saw.
     presentation_revision: AtomicU64,
     /// Shared transport slot: audio thread writes each block, editor reads.
@@ -393,6 +396,9 @@ struct ClapGui {
     editor: Option<Box<dyn Editor>>,
     /// Whether the GUI has been created via the gui extension.
     gui_created: bool,
+    floating: bool,
+    visible: bool,
+    title: String,
 }
 
 impl<P: PluginExport> ClapPluginData<P> {
@@ -906,6 +912,19 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
+        if data.floating_closed.swap(false, Ordering::AcqRel) {
+            data.gui.enter().visible = false;
+            if !data.host.is_null()
+                && let Some(get) = (*data.host).get_extension
+            {
+                let host_gui = get(data.host, CLAP_EXT_GUI.as_ptr()).cast::<clap_host_gui>();
+                if !host_gui.is_null()
+                    && let Some(closed) = (*host_gui).closed
+                {
+                    closed(data.host, false);
+                }
+            }
+        }
         // Runtime presentation metadata is re-read on RESCAN_INFO. A change
         // to the exposed list requests a restart and is published inactive.
         let revision = data.params_arc.parameter_presentation_revision();
@@ -4007,6 +4026,10 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             // comment for why "newest wins" is right.
             let _ = data.pending_state.force_push(deserialized);
         } else {
+            // A stopped-transport params.flush may have queued a value for
+            // the next block. Recall supersedes it just as active recall
+            // supersedes deferred events in convert_input_events.
+            data.audio.enter().deferred_params.clear();
             // Inactive: no `process` will run, so the queue would never
             // drain and the plugin's custom state would stay stale until
             // the next activate. Apply the full state (params + extra)
@@ -4418,22 +4441,40 @@ fn make_note_ports_extension<P: PluginExport>() -> clap_plugin_note_ports {
 use clap_sys::ext::gui::CLAP_WINDOW_API_COCOA;
 #[cfg(target_os = "windows")]
 use clap_sys::ext::gui::CLAP_WINDOW_API_WIN32;
-#[cfg(target_os = "linux")]
-use clap_sys::ext::gui::CLAP_WINDOW_API_X11;
 use clap_sys::ext::gui::{
     CLAP_EXT_GUI, clap_gui_resize_hints, clap_host_gui, clap_plugin_gui, clap_window,
 };
+#[cfg(target_os = "linux")]
+use clap_sys::ext::gui::{CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_X11};
 
 unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
     _plugin: *const clap_plugin,
     api: *const c_char,
     is_floating: bool,
 ) -> bool {
-    unsafe {
+    if api.is_null() {
+        return false;
+    }
+    run_extern_callback_with::<P, bool>("CLAP", "gui_is_api_supported", false, || unsafe {
+        let api = CStr::from_ptr(api);
+        #[cfg(target_os = "linux")]
+        if api == CLAP_WINDOW_API_WAYLAND {
+            if !is_floating {
+                return false;
+            }
+            let data = data_from_plugin::<P>(_plugin);
+            let mut gui = data.gui.enter();
+            if gui.editor.is_none() {
+                gui.editor = (data.editor_builder)(data.params_arc.clone());
+            }
+            return gui
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.supports_floating_wayland());
+        }
         if is_floating {
             return false;
         }
-        let api = CStr::from_ptr(api);
         #[cfg(target_os = "macos")]
         if api == CLAP_WINDOW_API_COCOA {
             return true;
@@ -4447,7 +4488,7 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
             return true;
         }
         false
-    }
+    })
 }
 
 unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
@@ -4455,6 +4496,9 @@ unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
     api: *mut *const c_char,
     is_floating: *mut bool,
 ) -> bool {
+    if api.is_null() || is_floating.is_null() {
+        return false;
+    }
     unsafe {
         #[cfg(target_os = "macos")]
         {
@@ -4470,6 +4514,16 @@ unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
         }
         #[cfg(target_os = "linux")]
         {
+            // Prefer native floating Wayland only when a compositor is present
+            // and this particular editor supports it. Explicit X11 requests
+            // always remain embedded X11, even in a Wayland desktop session.
+            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && gui_is_api_supported::<P>(_plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
+            {
+                *api = CLAP_WINDOW_API_WAYLAND.as_ptr();
+                *is_floating = true;
+                return true;
+            }
             *api = CLAP_WINDOW_API_X11.as_ptr();
             *is_floating = false;
             return true;
@@ -4481,21 +4535,38 @@ unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
 
 unsafe extern "C" fn gui_create<P: PluginExport>(
     plugin: *const clap_plugin,
-    _api: *const c_char,
-    _is_floating: bool,
+    api: *const c_char,
+    is_floating: bool,
 ) -> bool {
     // The editor builder is author code; firewall its construction so a
     // panic can't unwind across the C ABI (false = "no editor created").
     run_extern_callback_with::<P, bool>("CLAP", "gui_create", false, || unsafe {
+        #[cfg(target_os = "linux")]
+        let api = if is_floating && (api.is_null() || *api == 0) {
+            CLAP_WINDOW_API_WAYLAND.as_ptr()
+        } else {
+            api
+        };
+        if !gui_is_api_supported::<P>(plugin, api, is_floating) {
+            return false;
+        }
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
         if gui.gui_created {
-            return true;
+            return gui.floating == is_floating;
         }
         // Built through the cached lock-free editor factory, so opening
         // the GUI never stalls the audio thread (and `--shell` rebuilds
         // from the reloaded dylib).
-        gui.editor = (data.editor_builder)(data.params_arc.clone());
+        if gui.editor.is_none() {
+            gui.editor = (data.editor_builder)(data.params_arc.clone());
+        }
+        gui.floating = is_floating;
+        data.floating_mode.store(is_floating, Ordering::Release);
+        if is_floating {
+            data.host_scale.store(0, Ordering::Relaxed);
+        }
+        gui.title = resolved_name(&data.info).into();
         // Each `create` builds a fresh editor, but the host's scale lives
         // on the instance and outlives `destroy`. A host that sets it only
         // once, or calls `set_scale` before `create`, would leave the new
@@ -4517,6 +4588,9 @@ unsafe extern "C" fn gui_destroy<P: PluginExport>(plugin: *const clap_plugin) {
         // cell (e.g. a stray `request_resize`).
         let editor = {
             let mut gui = data.gui.enter();
+            data.floating_visible.store(false, Ordering::Release);
+            data.floating_closed.store(false, Ordering::Release);
+            gui.visible = false;
             gui.gui_created = false;
             gui.editor.take()
         };
@@ -4546,6 +4620,9 @@ unsafe extern "C" fn gui_set_scale<P: PluginExport>(
             return false;
         }
         let data = data_from_plugin::<P>(plugin);
+        if data.gui.enter().floating {
+            return false;
+        }
         data.set_host_scale(scale);
         if let Some(ref mut editor) = data.gui.enter().editor {
             editor.set_scale_factor(scale);
@@ -4592,6 +4669,7 @@ unsafe extern "C" fn gui_get_size<P: PluginExport>(
             apply_physical_resize(editor.as_mut(), pw, ph, data.host_scale());
         }
         if let Some(ref editor) = gui.editor {
+            data.note_window_scale(editor.as_ref());
             let (w, h) = editor.size();
             // Like VST3, the CLAP spec describes gui size as pixels, but
             // macOS AppKit handles Retina backing automatically. On macOS
@@ -4653,8 +4731,14 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
     window: *const clap_window,
 ) -> bool {
     unsafe {
+        if window.is_null() || !gui_is_api_supported::<P>(plugin, (*window).api, false) {
+            return false;
+        }
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
+        if !gui.gui_created || gui.floating {
+            return false;
+        }
         let Some(editor) = gui.editor.as_mut() else {
             return false;
         };
@@ -4670,6 +4754,41 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
             return false;
         }
 
+        let context = editor_context::<P>(plugin);
+
+        #[cfg(target_os = "macos")]
+        let handle = RawWindowHandle::AppKit(parent_ptr);
+        #[cfg(target_os = "windows")]
+        let handle = RawWindowHandle::Win32(parent_ptr);
+        #[cfg(target_os = "linux")]
+        let handle = RawWindowHandle::X11(parent_ptr as u64);
+
+        editor.open(handle, context);
+        // baseview attaches its child NSView at the parent's
+        // `(0, 0)`. NSView's coordinate system is unflipped, so
+        // `(0, 0)` is the parent's bottom-left - which renders the
+        // editor anchored to the bottom-left of Reaper's plugin
+        // area when Reaper opens the window at a size larger than
+        // the editor's natural dimensions (the common case for
+        // backends whose `editor.set_size` doesn't actually apply,
+        // e.g. vizia: Reaper falls back to a default plugin-window
+        // size and our child sits in the corner of all that extra
+        // space). Re-anchor the child to the parent's top with a
+        // fully-fixed autoresize mask (`0`) - the parent grows the
+        // empty space below/right of the child rather than dragging
+        // the child along. We re-pin per-frame from the editor
+        // (`reanchor_to_superview_top` in `on_frame`) since
+        // baseview's `setFrameSize:` notifications during embed can
+        // override the origin we set here.
+        #[cfg(target_os = "macos")]
+        anchor_child_to_top(parent_ptr);
+        true
+    }
+}
+
+unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginContext {
+    unsafe {
+        let data = data_from_plugin::<P>(plugin);
         let params = Arc::clone(&data.params_arc);
         let meter_store = Arc::clone(&data.meter_store);
         let snapshot = Arc::clone(&data.snapshot);
@@ -4705,7 +4824,7 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
         let task_spawner_for_ctx = data.task_spawner.clone();
         let pending_state_for_set = data.pending_state.clone();
         let transport_slot = data.transport_slot.clone();
-        let context = PluginContext::from_closures(
+        PluginContext::from_closures(
             ClosureBridge {
                 begin_edit: Box::new(move |id| {
                     // Push can fail only if the audio thread hasn't
@@ -4753,7 +4872,11 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
                         // Read `host_scale` live (it's atomic) so a
                         // `gui_set_scale` after the editor opened is reflected
                         // instead of using a stale snapshot.
-                        let host_scale = data_from_plugin::<P>(plugin_ptr.as_ptr()).host_scale();
+                        let data = data_from_plugin::<P>(plugin_ptr.as_ptr());
+                        if data.floating_mode.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        let host_scale = data.host_scale();
                         request_host_resize(host_ptr.as_ptr(), host_scale, lw, lh)
                     }
                 }),
@@ -4798,35 +4921,7 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
             },
             params_for_ctx,
         )
-        .with_tasks(task_spawner_for_ctx);
-
-        #[cfg(target_os = "macos")]
-        let handle = RawWindowHandle::AppKit(parent_ptr);
-        #[cfg(target_os = "windows")]
-        let handle = RawWindowHandle::Win32(parent_ptr);
-        #[cfg(target_os = "linux")]
-        let handle = RawWindowHandle::X11(parent_ptr as u64);
-
-        editor.open(handle, context);
-        // baseview attaches its child NSView at the parent's
-        // `(0, 0)`. NSView's coordinate system is unflipped, so
-        // `(0, 0)` is the parent's bottom-left - which renders the
-        // editor anchored to the bottom-left of Reaper's plugin
-        // area when Reaper opens the window at a size larger than
-        // the editor's natural dimensions (the common case for
-        // backends whose `editor.set_size` doesn't actually apply,
-        // e.g. vizia: Reaper falls back to a default plugin-window
-        // size and our child sits in the corner of all that extra
-        // space). Re-anchor the child to the parent's top with a
-        // fully-fixed autoresize mask (`0`) - the parent grows the
-        // empty space below/right of the child rather than dragging
-        // the child along. We re-pin per-frame from the editor
-        // (`reanchor_to_superview_top` in `on_frame`) since
-        // baseview's `setFrameSize:` notifications during embed can
-        // override the origin we set here.
-        #[cfg(target_os = "macos")]
-        anchor_child_to_top(parent_ptr);
-        true
+        .with_tasks(task_spawner_for_ctx)
     }
 }
 
@@ -4902,12 +4997,62 @@ unsafe fn anchor_child_to_top(parent: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn gui_show<P: PluginExport>(_plugin: *const clap_plugin) -> bool {
-    true
+unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_plugin) -> bool {
+    run_extern_callback_with::<P, bool>("CLAP", "gui_show", false, || unsafe {
+        let data = data_from_plugin::<P>(plugin);
+        let mut gui = data.gui.enter();
+        if !gui.gui_created {
+            return false;
+        }
+        if !gui.floating || gui.visible {
+            return true;
+        }
+        let title = gui.title.clone();
+        let Some(editor) = gui.editor.as_mut() else {
+            return false;
+        };
+        let visible = data.floating_visible.clone();
+        let closed = data.floating_closed.clone();
+        let host = SendPtr::new(data.host);
+        visible.store(true, Ordering::Release);
+        let opened = editor.open_floating_wayland(
+            editor_context::<P>(plugin),
+            &title,
+            Arc::new(move || {
+                if visible.swap(false, Ordering::AcqRel) {
+                    closed.store(true, Ordering::Release);
+                    let host = host.as_ptr();
+                    if !host.is_null()
+                        && let Some(request) = (*host).request_callback
+                    {
+                        request(host);
+                    }
+                }
+            }),
+        );
+        data.floating_visible.store(opened, Ordering::Release);
+        data.note_window_scale(editor.as_ref());
+        gui.visible = opened;
+        opened
+    })
 }
 
-unsafe extern "C" fn gui_hide<P: PluginExport>(_plugin: *const clap_plugin) -> bool {
-    true
+unsafe extern "C" fn gui_hide<P: PluginExport>(plugin: *const clap_plugin) -> bool {
+    run_extern_callback_with::<P, bool>("CLAP", "gui_hide", false, || unsafe {
+        let data = data_from_plugin::<P>(plugin);
+        let mut gui = data.gui.enter();
+        if !gui.gui_created {
+            return false;
+        }
+        if gui.floating {
+            data.floating_visible.store(false, Ordering::Release);
+            if let Some(editor) = gui.editor.as_mut() {
+                editor.close();
+            }
+            gui.visible = false;
+        }
+        true
+    })
 }
 
 /// Reports horizontal/vertical/aspect-ratio constraints from the
@@ -4943,10 +5088,9 @@ unsafe extern "C" fn gui_get_resize_hints<P: PluginExport>(
     })
 }
 
-/// Stub: floating windows aren't supported (`is_api_supported` rejects
-/// `is_floating=true`); `set_transient` is meaningless when the GUI is
-/// always embedded. Present as `Some` for the same Bitwig probe-quirk
-/// described on `gui_get_resize_hints`.
+/// CLAP defines no exported Wayland parent token/connection. A host-owned
+/// wl_surface cannot be used on our independent display connection. Return false
+/// rather than treating a foreign proxy pointer as our own Wayland object.
 unsafe extern "C" fn gui_set_transient<P: PluginExport>(
     _plugin: *const clap_plugin,
     _window: *const clap_window,
@@ -4954,13 +5098,25 @@ unsafe extern "C" fn gui_set_transient<P: PluginExport>(
     false
 }
 
-/// Stub: the editor renders its own title bar; we don't need the host's
-/// hint. Present as `Some` for the same Bitwig probe-quirk described
-/// on `gui_get_resize_hints`.
+/// Retain a floating title before show and apply changes to an open toplevel.
 unsafe extern "C" fn gui_suggest_title<P: PluginExport>(
-    _plugin: *const clap_plugin,
-    _title: *const c_char,
+    plugin: *const clap_plugin,
+    title: *const c_char,
 ) {
+    if title.is_null() {
+        return;
+    }
+    run_extern_callback_with::<P, ()>("CLAP", "gui_suggest_title", (), || unsafe {
+        let data = data_from_plugin::<P>(plugin);
+        let mut gui = data.gui.enter();
+        gui.title = CStr::from_ptr(title).to_string_lossy().into_owned();
+        let title = gui.title.clone();
+        if gui.floating
+            && let Some(editor) = gui.editor.as_mut()
+        {
+            editor.set_floating_title(&title);
+        }
+    });
 }
 
 /// Ask the host to resize its window to a logical size via
@@ -5386,6 +5542,9 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             active: AtomicBool::new(false),
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
             needs_rescan: Arc::new(AtomicBool::new(false)),
+            floating_mode: AtomicBool::new(false),
+            floating_visible: Arc::new(AtomicBool::new(false)),
+            floating_closed: Arc::new(AtomicBool::new(false)),
             presentation_revision: AtomicU64::new(0),
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),
@@ -5410,6 +5569,9 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             gui: PluginCell::new(ClapGui {
                 editor: None,
                 gui_created: false,
+                floating: false,
+                visible: false,
+                title: String::new(),
             }),
         });
 
@@ -6283,7 +6445,13 @@ mod host_value_tests {
             let other = data_from_plugin::<TestPlugin>(b);
             let captured = Arc::new(Mutex::new(None));
             data.gui.enter().editor = Some(Box::new(CaptureEditor(captured.clone())));
+            assert!(gui_create::<TestPlugin>(
+                a,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                false
+            ));
             let mut window: clap_window = std::mem::zeroed();
+            window.api = CLAP_WINDOW_API_X11.as_ptr();
             window.specific.ptr = ptr::dangling_mut::<c_void>();
             assert!(gui_set_parent::<TestPlugin>(a, &raw const window));
             let context = captured.lock().unwrap().take().unwrap();
@@ -6329,6 +6497,209 @@ mod host_value_tests {
             drop(context);
             clap_plugin_destroy::<TestPlugin>(a);
             clap_plugin_destroy::<TestPlugin>(b);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod floating_gui_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    type Close = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+    struct Probe(Close);
+    impl Editor for Probe {
+        fn size(&self) -> (u32, u32) {
+            (320, 240)
+        }
+        fn open(&mut self, _: RawWindowHandle, _: PluginContext) {
+            panic!("must not embed Wayland");
+        }
+        fn close(&mut self) {
+            if let Some(closed) = self.0.lock().unwrap().take() {
+                closed();
+            }
+        }
+        fn supports_floating_wayland(&self) -> bool {
+            true
+        }
+        fn open_floating_wayland(
+            &mut self,
+            _: PluginContext,
+            _: &str,
+            closed: Arc<dyn Fn() + Send + Sync>,
+        ) -> bool {
+            *self.0.lock().unwrap() = Some(closed);
+            true
+        }
+    }
+    unsafe extern "C" fn request(host: *const clap_host) {
+        // SAFETY: test retains its two counters through plugin destruction.
+        unsafe {
+            (&*(*host).host_data.cast::<[AtomicU32; 2]>())[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    unsafe extern "C" fn closed(host: *const clap_host, destroyed: bool) {
+        assert!(!destroyed);
+        // SAFETY: test retains its two counters through plugin destruction.
+        unsafe {
+            (&*(*host).host_data.cast::<[AtomicU32; 2]>())[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    unsafe extern "C" fn extension(_: *const clap_host, name: *const c_char) -> *const c_void {
+        static GUI: clap_host_gui = clap_host_gui {
+            resize_hints_changed: None,
+            request_resize: None,
+            request_show: None,
+            request_hide: None,
+            closed: Some(closed),
+        };
+        // SAFETY: CLAP passes a valid extension name.
+        if unsafe { CStr::from_ptr(name) } == CLAP_EXT_GUI {
+            (&raw const GUI).cast()
+        } else {
+            ptr::null()
+        }
+    }
+    #[test]
+    fn wayland_negotiation_and_close_work_with_a_deferred_host() {
+        let counters = [AtomicU32::new(0), AtomicU32::new(0)];
+        // SAFETY: own host, descriptor, plugin and fake editor; callbacks retain
+        // no native resources and all borrowed test state outlives the instance.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.host_data = (&raw const counters).cast_mut().cast();
+            host.get_extension = Some(extension);
+            host.request_callback = Some(request);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let data = data_from_plugin::<TestPlugin>(plugin);
+            assert!(!gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                true
+            ));
+            let hook: Close = Arc::default();
+            data.gui.enter().editor = Some(Box::new(Probe(hook.clone())));
+            assert!(gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                true
+            ));
+            assert!(!gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                false
+            ));
+            assert!(gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                false
+            ));
+            assert!(!gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                true
+            ));
+            assert!(!gui_create::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                false
+            ));
+            assert!(gui_create::<TestPlugin>(plugin, ptr::null(), true));
+            assert!(!gui_set_scale::<TestPlugin>(plugin, 2.));
+            assert!(gui_show::<TestPlugin>(plugin));
+            let close = hook.lock().unwrap().take().unwrap();
+            close();
+            assert_eq!(counters[0].load(Ordering::Relaxed), 1);
+            assert_eq!(counters[1].load(Ordering::Relaxed), 0);
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(counters[1].load(Ordering::Relaxed), 1);
+            assert!(gui_show::<TestPlugin>(plugin));
+            assert!(gui_hide::<TestPlugin>(plugin));
+            assert_eq!(
+                counters[0].load(Ordering::Relaxed),
+                1,
+                "programmatic hide must not notify close"
+            );
+            gui_destroy::<TestPlugin>(plugin);
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+}
+
+#[cfg(test)]
+mod inactive_recall_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    struct Stream {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+    unsafe extern "C" fn write(stream: *const clap_ostream, bytes: *const c_void, len: u64) -> i64 {
+        // SAFETY: the test retains its stream storage and CLAP supplies len bytes.
+        unsafe {
+            let stream = &mut *(*stream).ctx.cast::<Stream>();
+            stream
+                .bytes
+                .extend_from_slice(std::slice::from_raw_parts(bytes.cast(), len as usize));
+            len as i64
+        }
+    }
+    unsafe extern "C" fn read(stream: *const clap_istream, bytes: *mut c_void, len: u64) -> i64 {
+        // SAFETY: the test retains its stream storage; CLAP supplies len writable bytes.
+        unsafe {
+            let stream = &mut *(*stream).ctx.cast::<Stream>();
+            let len = (len as usize).min(stream.bytes.len() - stream.offset);
+            ptr::copy_nonoverlapping(stream.bytes.as_ptr().add(stream.offset), bytes.cast(), len);
+            stream.offset += len;
+            len as i64
+        }
+    }
+    unsafe extern "C" fn no_extension(_: *const clap_host, _: *const c_char) -> *const c_void {
+        ptr::null()
+    }
+    #[test]
+    fn inactive_recall_discards_a_stopped_transport_flush() {
+        // SAFETY: own the plugin, host, descriptor and stream through destruction.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.get_extension = Some(no_extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let data = data_from_plugin::<TestPlugin>(plugin);
+            let original = data.params_arc.get_plain(0).unwrap();
+            let mut storage = Stream {
+                bytes: Vec::new(),
+                offset: 0,
+            };
+            let output = clap_ostream {
+                ctx: (&raw mut storage).cast(),
+                write: Some(write),
+            };
+            assert!(state_save::<TestPlugin>(plugin, &raw const output));
+            data.params_arc.set_plain(0, 6.);
+            defer_param_change(&mut data.audio.enter().deferred_params, 0, 6.);
+            let input = clap_istream {
+                ctx: (&raw mut storage).cast(),
+                read: Some(read),
+            };
+            assert!(state_load::<TestPlugin>(plugin, &raw const input));
+            assert_eq!(data.params_arc.get_plain(0), Some(original));
+            assert!(
+                data.audio.enter().deferred_params.is_empty(),
+                "stale flush would overwrite recall on the next block"
+            );
+            clap_plugin_destroy::<TestPlugin>(plugin);
         }
     }
 }
