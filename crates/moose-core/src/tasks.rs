@@ -49,7 +49,7 @@ use std::ffi::c_void;
 #[cfg(all(unix, not(miri)))]
 use std::ffi::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -107,10 +107,44 @@ static NOTIFY_EPOCH: AtomicUsize = AtomicUsize::new(0);
 /// and republishes it when the injector is still saturated.
 static RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 
+// Built/registered off-thread. Lanes and the pool share this owner, so waking
+// never dereferences the raw pool pointer during teardown.
+#[derive(Default)]
+struct WakeSignal {
+    notifier: OnceLock<Thread>,
+    workers: OnceLock<Box<[Thread]>>,
+    polling_lanes: AtomicUsize,
+}
+impl WakeSignal {
+    fn notify(&self) {
+        if let Some(notifier) = self.notifier.get() {
+            notifier.unpark();
+        } else if let Some(workers) = self.workers.get() {
+            for worker in workers {
+                worker.unpark();
+            }
+        }
+    }
+}
+static WAKE_SIGNAL: Mutex<Weak<WakeSignal>> = Mutex::new(Weak::new());
+fn wake_signal() -> Arc<WakeSignal> {
+    let mut weak = WAKE_SIGNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(signal) = weak.upgrade() {
+        return signal;
+    }
+    let signal = Arc::new(WakeSignal::default());
+    *weak = Arc::downgrade(&signal);
+    signal
+}
+
 /// Per-instance inbound queue plus the monomorphized handler. Shared
 /// (`Arc`) between the schedulers (audio thread / editor / init, via
 /// [`TaskSpawner`]) and the pool worker that drains it.
 struct Sink<T: Send + 'static> {
+    wake: Arc<WakeSignal>,
+    wake_on_schedule: bool,
     /// `try_spawn`: FIFO, every queued task runs.
     queue: ArrayQueue<T>,
     /// `spawn_coalescing`: a single slot. `force_push` keeps only the
@@ -253,6 +287,15 @@ impl<T: Send + 'static> Drain for Sink<T> {
     }
 }
 
+impl<T: Send + 'static> Drop for Sink<T> {
+    fn drop(&mut self) {
+        if !self.wake_on_schedule {
+            self.wake.polling_lanes.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.wake.notify();
+    }
+}
+
 fn register_lane(sink: &Arc<dyn Drain>) {
     REGISTERED_LANES
         .lock()
@@ -289,6 +332,7 @@ fn retry_registered(shared: &Shared) -> (usize, bool) {
 /// Worker-visible pool state: the injector of ready sinks. Held in an
 /// `Arc` so every worker closure can reach it.
 struct Shared {
+    wake: Arc<WakeSignal>,
     injector: ArrayQueue<Arc<dyn Drain>>,
     /// Non-realtime notifier's round-robin wake cursor.
     next_worker: AtomicUsize,
@@ -361,6 +405,7 @@ fn start_pool(pin_module: bool) -> bool {
     }
 
     let shared = Arc::new(Shared {
+        wake: wake_signal(),
         injector: ArrayQueue::new(INJECTOR_CAP),
         next_worker: AtomicUsize::new(0),
         execution_state: AtomicUsize::new(0),
@@ -408,6 +453,13 @@ fn start_pool(pin_module: bool) -> bool {
         .notifier_running
         .store(notifier_join.is_some(), Ordering::Release);
     let notifier = notifier_join.as_ref().map(|handle| handle.thread().clone());
+    let _ = shared.wake.workers.set(workers.clone().into_boxed_slice());
+    if let Some(thread) = &notifier {
+        let _ = shared.wake.notifier.set(thread.clone());
+    }
+    // Close registration-vs-first-park races while handles were being bound.
+    shared.wake.notify();
+
     let available = !workers.is_empty();
     let pool = Box::new(Pool {
         shared,
@@ -647,7 +699,11 @@ fn notifier_loop(shared: &Shared, workers: &[Thread]) {
     let mut observed = NOTIFY_EPOCH.load(Ordering::Acquire);
     let mut first_pass = true;
     loop {
-        thread::park_timeout(NOTIFIER_INTERVAL);
+        if shared.wake.polling_lanes.load(Ordering::Acquire) == 0 {
+            thread::park();
+        } else {
+            thread::park_timeout(NOTIFIER_INTERVAL);
+        }
         if shared.stopping.load(Ordering::Acquire) {
             return;
         }
@@ -693,6 +749,9 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
             deferred.pop_front().or_else(|| shared.injector.pop())
         };
         if let Some(sink) = next_sink {
+            if RETRY_PENDING.load(Ordering::Acquire) {
+                shared.wake.notify();
+            }
             prefer_injector = !prefer_injector;
             loop {
                 if shared.stopping.load(Ordering::Acquire) {
@@ -738,12 +797,14 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
         if retried != 0 || !shared.injector.is_empty() {
             continue;
         }
-        let timeout = if notifier_fallback && !shared.notifier_running.load(Ordering::Acquire) {
-            NOTIFIER_INTERVAL
+        if notifier_fallback
+            && !shared.notifier_running.load(Ordering::Acquire)
+            && shared.wake.polling_lanes.load(Ordering::Acquire) != 0
+        {
+            thread::park_timeout(NOTIFIER_INTERVAL);
         } else {
-            PARK_TIMEOUT
-        };
-        thread::park_timeout(timeout);
+            thread::park();
+        }
     }
 }
 
@@ -834,7 +895,31 @@ impl<T: Send + 'static> TaskSpawner<T> {
     }
 
     fn with_mode(run: impl Fn(T) -> Option<T> + Send + Sync + 'static, serialized: bool) -> Self {
+        Self::with_wake_mode(run, serialized, false)
+    }
+
+    /// Explicitly permit a scheduler wake syscall, retaining no allocation or
+    /// blocking locks on enqueue. When every live lane opts in, the notifier
+    /// parks indefinitely instead of polling an atomic epoch.
+    pub fn new_managed_waking(
+        run: impl Fn(T) -> Option<T> + Send + Sync + 'static,
+        serialized: bool,
+    ) -> Self {
+        Self::with_wake_mode(run, serialized, true)
+    }
+
+    fn with_wake_mode(
+        run: impl Fn(T) -> Option<T> + Send + Sync + 'static,
+        serialized: bool,
+        wake_on_schedule: bool,
+    ) -> Self {
+        let wake = wake_signal();
+        if !wake_on_schedule {
+            wake.polling_lanes.fetch_add(1, Ordering::AcqRel);
+        }
         let sink = Arc::new(Sink {
+            wake,
+            wake_on_schedule,
             queue: ArrayQueue::new(TASK_QUEUE_PREALLOC),
             coalesced: ArrayQueue::new(1),
             continuation: ArrayQueue::new(TASK_QUEUE_PREALLOC),
@@ -848,6 +933,7 @@ impl<T: Send + 'static> TaskSpawner<T> {
         });
         let erased = Arc::clone(&sink) as Arc<dyn Drain>;
         register_lane(&erased);
+        sink.wake.notify();
         Self { sink }
     }
 
@@ -901,6 +987,9 @@ impl<T: Send + 'static> TaskSpawner<T> {
                 RETRY_PENDING.store(true, Ordering::Release);
             }
             notify_scheduler();
+            if self.sink.wake_on_schedule {
+                self.sink.wake.notify();
+            }
         }
     }
 }
@@ -1345,6 +1434,48 @@ mod tests {
         // `sum` write before the read below, so the Relaxed sum is exact.
         latch.wait_for(10);
         assert_eq!(sum.load(Ordering::Relaxed), 55, "all ten tasks ran");
+    }
+
+    #[test]
+    fn explicitly_waking_lane_runs_after_idle_without_changing_default_policy() {
+        warm_pool();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waking = TaskSpawner::new_managed_waking(
+            move |value: u32| {
+                send.send(value).unwrap();
+                None
+            },
+            true,
+        );
+        assert!(waking.sink.wake_on_schedule);
+        for value in 0..16 {
+            waking.spawn_coalescing(value);
+            assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), value);
+        }
+        let ordinary = TaskSpawner::new(|_: u32| {});
+        assert!(!ordinary.sink.wake_on_schedule);
+    }
+
+    #[test]
+    #[ignore = "manual process-isolated idle wakeup audit"]
+    fn parked_pool_idle_audit() {
+        warm_pool();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waking = TaskSpawner::new_managed_waking(
+            move |value: u32| {
+                send.send(value).unwrap();
+                None
+            },
+            true,
+        );
+        for value in 0..4 {
+            waking.spawn_coalescing(value);
+            assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), value);
+        }
+        eprintln!("PARKED_POOL_READY {}", std::process::id());
+        thread::sleep(Duration::from_secs(3));
+        waking.spawn_coalescing(42);
+        assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), 42);
     }
 
     #[test]
