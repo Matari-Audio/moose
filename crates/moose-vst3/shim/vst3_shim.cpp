@@ -474,6 +474,8 @@ struct Vst3Callbacks {
      * plugin's migrate_state translated it), 0 when the load failed -
      * setState forwards that to the host as kResultFalse. */
     int32_t (*state_load)(void*, const uint8_t*, uint32_t);
+    int32_t (*state_load_stream)(void*, void*, int64_t (*)(void*, uint8_t*, uint32_t));
+    int32_t (*state_save_stream)(void*, void*, int64_t (*)(void*, const uint8_t*, uint32_t));
     void (*state_free)(uint8_t*, uint32_t);
     // Latency + tail
     uint32_t (*get_latency)(void*);
@@ -709,62 +711,38 @@ struct IBStreamVtbl {
     tresult (*tell)(void*, int64_t*);
 };
 
-// Largest state blob accepted from, or handed to, a host stream.
-static constexpr int32 kMaxHostStateBytes = 32 * 1024 * 1024;
-
 extern "C" {
 
-// Read one bounded state blob from a host IBStream. Returns a malloc'd
-// buffer (caller frees) and its length, or nullptr when the stream is
-// empty, errors before any data, reports a byte count outside the
-// request, or runs past kMaxHostStateBytes. A short final read is
-// valid. Exported so the Rust tests can drive it with a fake stream.
-uint8_t* moose_vst3_read_state_stream(void* stream, int32* outLen) {
-    *outLen = 0;
-    if (!stream) return nullptr;
+// Return an arbitrary short host read directly to the bounded Rust parser.
+int64_t moose_vst3_read_state_chunk(void* stream, uint8_t* dst, uint32_t requested) {
+    if (!stream || !dst || requested == 0 || requested > 8192) return -1;
     auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
-    uint8_t buf[4096];
-    uint8_t* data = nullptr;
-    int32 total = 0;
-    int32 capacity = 0;
-    for (;;) {
-        int32 bytesRead = 0;
-        tresult r = vtbl->read(stream, buf, (int32)sizeof(buf), &bytesRead);
-        if (bytesRead < 0 || bytesRead > (int32)sizeof(buf)) { free(data); return nullptr; }
-        if (bytesRead == 0) break;
-        if (total > kMaxHostStateBytes - bytesRead) { free(data); return nullptr; }
-        const int32 nextTotal = total + bytesRead;
-        if (nextTotal > capacity) {
-            // Geometric growth: one realloc per doubling, not per chunk.
-            int32 nextCapacity = capacity == 0 ? (int32)sizeof(buf) : capacity;
-            while (nextCapacity < nextTotal) {
-                nextCapacity = nextCapacity > kMaxHostStateBytes / 2
-                    ? kMaxHostStateBytes : nextCapacity * 2;
-            }
-            auto* grown = (uint8_t*)realloc(data, (size_t)nextCapacity);
-            if (!grown) { free(data); return nullptr; }
-            data = grown;
-            capacity = nextCapacity;
-        }
-        memcpy(data + total, buf, (size_t)bytesRead);
-        total = nextTotal;
-        if (r != kResultOk) break;
-    }
-    if (total == 0) { free(data); return nullptr; }
-    *outLen = total;
-    return data;
+    int32 count = 0;
+    const tresult result = vtbl->read(stream, dst, (int32)requested, &count);
+    if (count < 0 || (uint32_t)count > requested) return -1;
+    if (result != kResultOk && result != kResultFalse) return -1;
+    return count;
+}
+
+int64_t moose_vst3_write_state_chunk(void* stream, const uint8_t* src, uint32_t requested) {
+    if (!stream || !src || requested == 0 || requested > 8192) return -1;
+    auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
+    int32 count = 0;
+    const tresult result = vtbl->write(stream, (void*)src, (int32)requested, &count);
+    if (count <= 0 || (uint32_t)count > requested || result != kResultOk) return -1;
+    return count;
 }
 
 // Write a whole state blob to a host IBStream, looping over partial
 // writes. Returns 1 when every byte landed, 0 when the blob is empty or
-// oversized, or the stream reports no progress, a count outside the
+// beyond the signed IBStream range, or the stream reports no progress, a count outside the
 // request, or an error before the blob is complete.
 int32_t moose_vst3_write_state_stream(void* stream, const uint8_t* data, uint32_t len) {
-    if (!stream || !data || len == 0 || len > (uint32_t)kMaxHostStateBytes) return 0;
+    if (!stream || !data || len == 0 || len > (uint32_t)INT32_MAX) return 0;
     auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
     uint32_t offset = 0;
     while (offset < len) {
-        const int32 request = (int32)(len - offset);
+        const int32 request = (int32)((len - offset) > 65536 ? 65536 : (len - offset));
         int32 written = 0;
         tresult r = vtbl->write(stream, (void*)(data + offset), request, &written);
         if (written <= 0 || written > request) return 0;
@@ -1270,14 +1248,8 @@ public:
 
     tresult setState(void* stream) {
         if (!stream || !g_cb || !ctx) return kResultFalse;
-        int32 total = 0;
-        uint8_t* data = moose_vst3_read_state_stream(stream, &total);
-        tresult result = kResultFalse;
-        if (data) {
-            if (g_cb->state_load(ctx, data, (uint32_t)total))
-                result = kResultOk;
-            free(data);
-        }
+        const tresult result = g_cb->state_load_stream(ctx, stream, moose_vst3_read_state_chunk)
+            ? kResultOk : kResultFalse;
         stateLoaded = true;
         // If the editor was attached before state was loaded, open it now
         if (deferredParent) {
@@ -1289,13 +1261,8 @@ public:
 
     tresult getState(void* stream) {
         if (!stream || !g_cb || !ctx) return kResultFalse;
-        uint8_t* blob = nullptr;
-        uint32_t len = 0;
-        g_cb->state_save(ctx, &blob, &len);
-        if (!blob) return kResultFalse;
-        const int32_t ok = moose_vst3_write_state_stream(stream, blob, len);
-        g_cb->state_free(blob, len);
-        return ok ? kResultOk : kResultFalse;
+        return g_cb->state_save_stream(ctx, stream, moose_vst3_write_state_chunk)
+            ? kResultOk : kResultFalse;
     }
 
     // --- IAudioProcessor ---

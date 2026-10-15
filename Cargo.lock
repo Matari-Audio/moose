@@ -2293,6 +2293,7 @@ dependencies = [
  "cc",
  "crossbeam-queue",
  "moose-core",
+ "moose-derive",
  "moose-params",
  "moose-shim-types",
 ]

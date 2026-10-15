@@ -5,6 +5,8 @@
 //! `cargo-moose` can emit byte-identical blobs (factory preset files)
 //! without inheriting `moose-core`'s runtime dependency chain.
 
+pub use moose_utils::state_stream::write_state_stream;
+
 pub use moose_utils::state::{
     DeserializedState, StateParse, deserialize_state, hash_plugin_id, parse_state,
     resolve_vst3_cid, serialize_state, vst3_cid,
@@ -179,7 +181,21 @@ pub fn parse_or_migrate<P: PluginExport>(
     format: PluginFormat,
     source_key: Option<&str>,
 ) -> Option<DeserializedState> {
-    let state = match moose_utils::state::parse_state(data, expected_plugin_id) {
+    finish_parse_or_migrate::<P>(
+        parse_state(data, expected_plugin_id),
+        data,
+        format,
+        source_key,
+    )
+}
+
+fn finish_parse_or_migrate<P: PluginExport>(
+    parsed: StateParse,
+    data: &[u8],
+    format: PluginFormat,
+    source_key: Option<&str>,
+) -> Option<DeserializedState> {
+    let state = match parsed {
         StateParse::Ok(state) => Some(state),
         StateParse::NotAnEnvelope => P::migrate_state(&ForeignState::Raw {
             format,
@@ -217,6 +233,27 @@ pub fn parse_or_migrate<P: PluginExport>(
         return None;
     }
     Some(state)
+}
+
+/// Read canonical state incrementally into the final state lanes. Foreign
+/// blobs alone retain the bounded whole-blob migration fallback.
+pub fn read_or_migrate<P: PluginExport>(
+    read: impl FnMut(&mut [u8]) -> i64,
+    expected_plugin_id: u64,
+    format: PluginFormat,
+) -> Option<DeserializedState> {
+    use moose_utils::state_stream::{StreamState, read_state_stream};
+    match read_state_stream(read, P::max_host_state_bytes())? {
+        StreamState::Foreign(bytes) => {
+            parse_or_migrate::<P>(&bytes, expected_plugin_id, format, None)
+        }
+        StreamState::Envelope(StateParse::WrongPlugin { found, state })
+            if found == expected_plugin_id =>
+        {
+            finish_parse_or_migrate::<P>(StateParse::Ok(state), &[], format, None)
+        }
+        StreamState::Envelope(parsed) => finish_parse_or_migrate::<P>(parsed, &[], format, None),
+    }
 }
 
 /// Apply just the parameter values from a deserialized state - the
@@ -377,5 +414,72 @@ mod tests {
         assert_eq!(restored.persist, []);
         assert!(restored.extra.is_none());
         assert_eq!(restored.params, []);
+    }
+}
+
+/// Host-produced, single audio-consumer state handoff. The host retains an Arc
+/// until it observes that neither the ready slot nor audio owns it. Audio only
+/// decrements an Arc; it can never perform the final free of a recalled state.
+/// At most one consumed state and one queued state survive a producer call.
+/// Persist lanes have already been applied on the host and are released there.
+pub struct StateLoadQueue {
+    ready: crossbeam_queue::ArrayQueue<std::sync::Arc<DeserializedState>>,
+    owners: std::sync::Mutex<Vec<std::sync::Arc<DeserializedState>>>,
+}
+impl StateLoadQueue {
+    pub fn new(capacity: usize) -> Self {
+        assert_eq!(capacity, 1, "state loads coalesce in one slot");
+        Self {
+            ready: crossbeam_queue::ArrayQueue::new(1),
+            owners: std::sync::Mutex::new(Vec::with_capacity(3)),
+        }
+    }
+    /// Host thread only. All persist fields must already have been applied.
+    pub fn force_push(&self, mut state: DeserializedState) {
+        state.persist = Vec::new();
+        let state = std::sync::Arc::new(state);
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.push(std::sync::Arc::clone(&state));
+        drop(self.ready.force_push(state));
+        owners.retain(|state| std::sync::Arc::strong_count(state) > 1);
+        debug_assert!(owners.len() <= 2, "single audio consumer contract");
+    }
+    pub fn pop(&self) -> Option<std::sync::Arc<DeserializedState>> {
+        self.ready.pop()
+    }
+}
+
+#[cfg(test)]
+mod state_handoff_tests {
+    use super::*;
+    fn state(value: u8) -> DeserializedState {
+        DeserializedState {
+            params: vec![],
+            extra: Some(vec![value; 1024]),
+            persist: vec![value; 1024],
+        }
+    }
+    #[test]
+    fn audio_cannot_drop_the_last_owner_and_retention_is_bounded() {
+        let queue = StateLoadQueue::new(1);
+        queue.force_push(state(1));
+        let audio = queue.pop().unwrap();
+        assert!(audio.persist.is_empty());
+        let weak = std::sync::Arc::downgrade(&audio);
+        for _ in 0..100 {
+            queue.force_push(state(2));
+        }
+        assert_eq!(queue.owners.lock().unwrap().len(), 2);
+        drop(audio); // Audio never releases the last owner.
+        assert!(weak.upgrade().is_some());
+        queue.force_push(state(3)); // Host reclaims the retired owner.
+        assert!(weak.upgrade().is_none());
+        assert_eq!(queue.owners.lock().unwrap().len(), 1);
+        let audio = queue.pop().unwrap();
+        drop(audio);
+        assert_eq!(queue.owners.lock().unwrap().len(), 1);
     }
 }

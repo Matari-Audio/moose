@@ -53,7 +53,7 @@
 // v11: appended process-time audio-bus activation metadata.
 #define MOOSE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define MOOSE_AU_ABI_MAGIC 0x54417500u
-#define MOOSE_AU_ABI_VERSION 0x5441750Bu
+#define MOOSE_AU_ABI_VERSION 0x5441750Cu
 
 typedef struct {
     uint8_t component_type[4];
@@ -273,7 +273,7 @@ typedef struct {
     uint32_t (*param_format_value)(void *ctx, uint32_t id, double value,
                                     char *out, uint32_t out_len);
     void (*state_save)(void *ctx, uint8_t **out_data, uint32_t *out_len);
-    void (*state_load)(void *ctx, const uint8_t *data, uint32_t len);
+    int32_t (*state_load)(void *ctx, const uint8_t *data, uint32_t len);
     void (*state_free)(uint8_t *data, uint32_t len);
     /* Plugin → host MIDI output. The Rust side filters its event
      * queue to events that fit in 3-byte MIDI 1.0 packets so the

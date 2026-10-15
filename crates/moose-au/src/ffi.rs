@@ -110,8 +110,9 @@ pub struct AuParamDescriptor {
 /// UMP protocol. v8 appends final output-delivery status publication. v9
 /// appends wrapper-time preflight and transactional parameter feedback. v10
 /// appends explicit parameter-feedback carrier negotiation. v11 appends
-/// process-time audio-bus activation metadata.
-pub const MOOSE_AU_ABI_VERSION: u32 = 0x5441_750B;
+/// process-time audio-bus activation metadata. v12 makes state_load return
+/// acceptance so the AUv2 property setter can report malformed state.
+pub const MOOSE_AU_ABI_VERSION: u32 = 0x5441_750C;
 
 /// Callbacks from the `ObjC` shim into Rust.
 #[repr(C)]
@@ -181,7 +182,7 @@ pub struct AuCallbacks {
         unsafe extern "C" fn(ctx: *mut c_void, out_data: *mut *mut u8, out_len: *mut u32),
 
     /// Load state from a buffer.
-    pub state_load: unsafe extern "C" fn(ctx: *mut c_void, data: *const u8, len: u32),
+    pub state_load: unsafe extern "C" fn(ctx: *mut c_void, data: *const u8, len: u32) -> i32,
 
     /// Free a buffer returned by `state_save`.
     pub state_free: unsafe extern "C" fn(data: *mut u8, len: u32),

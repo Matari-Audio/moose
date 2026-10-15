@@ -175,7 +175,7 @@ type GuiChangeQueue = crossbeam_queue::ArrayQueue<GuiParamChange>;
 /// overflow we want most-recent-wins (`force_push`) so a rapid
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
-type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+type StateLoadQueue = state::StateLoadQueue;
 
 // ---------------------------------------------------------------------------
 // Internal wrapper struct held as plugin_data
@@ -3923,36 +3923,15 @@ unsafe extern "C" fn state_save<P: PluginExport>(
         // can't stall a block in flight.
         let extra = save_extra(&data.snapshot);
         let persist = data.params_arc.serialize_persist();
-        let blob = state::serialize_state(data.plugin_id_hash, &ids, &values, &extra, &persist);
-
-        // Write to the CLAP output stream
-        let Some(write_fn) = (*stream).write else {
-            return false;
-        };
-
-        let mut offset = 0usize;
-        while offset < blob.len() {
-            let written = write_fn(
-                stream,
-                blob[offset..].as_ptr().cast::<c_void>(),
-                (blob.len() - offset) as u64,
-            );
-            if written <= 0 {
-                return false;
-            }
-            // `written > 0` checked above; on 32-bit targets the cast
-            // narrows but blob.len() also fits in usize.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let n = written as usize;
-            offset += n;
-        }
-
-        true
+        let Some(write_fn) = (*stream).write else { return false; };
+        state::write_state_stream(data.plugin_id_hash, &ids, &values, &extra, &persist,
+            P::max_host_state_bytes(), |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64))
     })
 }
 
 /// Largest state blob a host stream may hand us. Anything bigger is a
 /// misbehaving stream (or an unrelated file), not a moose state.
+#[cfg(test)]
 const MAX_HOST_STATE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Drain a host `clap_istream` into one bounded blob. `read` fills the
@@ -3960,6 +3939,7 @@ const MAX_HOST_STATE_BYTES: usize = 32 * 1024 * 1024;
 /// negative count is a read error. A count larger than the buffer, or a
 /// stream past [`MAX_HOST_STATE_BYTES`], fails the load before any
 /// further allocation.
+#[cfg(test)]
 fn read_host_state(mut read: impl FnMut(&mut [u8]) -> i64) -> Option<Vec<u8>> {
     let mut blob = Vec::new();
     let mut buf = [0u8; 4096];
@@ -3989,25 +3969,9 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
-        let Some(blob) = read_host_state(|buf| {
+        let Some(deserialized) = state::read_or_migrate::<P>(|buf| {
             read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64)
-        }) else {
-            return false;
-        };
-
-        if blob.is_empty() {
-            return false;
-        }
-
-        // Not this plugin's envelope? Offer the bytes to the plugin's
-        // `migrate_state` hook (legacy sessions from a pre-moose
-        // build); `None` fails the load honestly.
-        let Some(deserialized) = state::parse_or_migrate::<P>(
-            &blob,
-            data.plugin_id_hash,
-            state::PluginFormat::Clap,
-            None,
-        ) else {
+        }, data.plugin_id_hash, state::PluginFormat::Clap) else {
             return false;
         };
 
@@ -6700,6 +6664,48 @@ mod inactive_recall_tests {
                 "stale flush would overwrite recall on the next block"
             );
             clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../test-support/large_state_fixture.rs"]
+mod large_state_fixture;
+#[cfg(test)]
+mod large_state_tests {
+    use super::*;
+    use super::large_state_fixture::{LargePlugin,payload};
+    type Large=LargePlugin<{64*1024*1024}>;
+    struct Stream { bytes:Vec<u8>, offset:usize }
+    unsafe extern "C" fn write(s:*const clap_ostream, bytes:*const c_void, size:u64)->i64 {
+        let s=unsafe{&mut *((*s).ctx.cast::<Stream>())};
+        let n=(size as usize).min(317);
+        s.bytes.extend_from_slice(unsafe{std::slice::from_raw_parts(bytes.cast::<u8>(),n)}); n as i64
+    }
+    unsafe extern "C" fn read(s:*const clap_istream, dst:*mut c_void, size:u64)->i64 {
+        let s=unsafe{&mut *((*s).ctx.cast::<Stream>())};
+        let n=(size as usize).min(311).min(s.bytes.len()-s.offset);
+        unsafe{std::ptr::copy_nonoverlapping(s.bytes.as_ptr().add(s.offset),dst.cast(),n)};
+        s.offset+=n; n as i64
+    }
+    #[test]
+    fn large_host_state_roundtrips_and_default_bound_rejects() {
+        unsafe {
+            let mut host:clap_host=std::mem::zeroed(); host.clap_version=clap_sys::version::CLAP_VERSION;
+            let descriptor=DescriptorHolder::new(&Large::info());
+            let plugin=create_plugin_instance::<Large>(&raw const descriptor.descriptor,&raw const host);
+            assert!(clap_plugin_init::<Large>(plugin));
+            let data=data_from_plugin::<Large>(plugin);
+            *data.params_arc.payload.lock().unwrap()=payload();
+            let mut s=Stream{bytes:Vec::new(),offset:0};
+            let out=clap_ostream{ctx:(&raw mut s).cast(),write:Some(write)};
+            assert!(state_save::<Large>(plugin,&out)); assert!(s.bytes.len()>32*1024*1024);
+            data.params_arc.payload.lock().unwrap().clear();
+            let input=clap_istream{ctx:(&raw mut s).cast(),read:Some(read)};
+            assert!(state_load::<Large>(plugin,&input));
+            assert_eq!(*data.params_arc.payload.lock().unwrap(),payload());
+            s.offset=0; s.bytes.pop(); assert!(!state_load::<Large>(plugin,&input));
+            clap_plugin_destroy::<Large>(plugin);
         }
     }
 }
