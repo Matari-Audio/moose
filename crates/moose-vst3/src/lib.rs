@@ -4411,3 +4411,75 @@ mod tests {
         ));
     }
 }
+
+// The derive's umbrella paths resolve locally for this shared test fixture.
+#[cfg(test)]
+extern crate self as moose;
+#[cfg(test)]
+use moose_core as core;
+#[cfg(test)]
+use moose_params as params;
+#[cfg(test)]
+#[path = "../../../test-support/host_value_fixture.rs"]
+mod host_value_fixture;
+
+#[cfg(test)]
+mod host_value_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    use moose_params::Params;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "unchanged storage values must compare exactly"
+    )]
+    fn ffi_text_hooks_preserve_static_plain_and_normalized_storage() {
+        // SAFETY: own the instance and bounded buffers for all callback calls.
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            assert!(!ctx.is_null());
+            let params = (&*ctx.cast::<Vst3Instance<TestPlugin>>())
+                .params_arc
+                .clone();
+            let normalized = 49. / 96.;
+            let plain = cb_param_denormalize::<TestPlugin>(ctx, 1, normalized);
+            assert_eq!(plain, normalized);
+            let mut buffer = [0_i8; 128];
+            assert!(cb_param_format::<TestPlugin>(ctx, 1, plain, buffer.as_mut_ptr(), 128) > 0);
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "+1 st");
+            let mut parsed = -999.;
+            assert_eq!(
+                cb_param_parse::<TestPlugin>(ctx, 1, c"+1 st".as_ptr(), &raw mut parsed),
+                1
+            );
+            assert_eq!(cb_param_normalize::<TestPlugin>(ctx, 1, parsed), normalized);
+            cb_param_set_value::<TestPlugin>(ctx, 1, parsed);
+            assert_eq!(params.get_plain(1), Some(normalized));
+            for invalid in [c"0.5", c"nan"] {
+                assert_eq!(
+                    cb_param_parse::<TestPlugin>(ctx, 1, invalid.as_ptr(), &raw mut parsed),
+                    0
+                );
+            }
+            assert_eq!(
+                cb_param_parse::<TestPlugin>(ctx, 0, c"-6 dB".as_ptr(), &raw mut parsed),
+                1
+            );
+            assert_eq!(parsed, -6.);
+            params.rebound.store(true, Ordering::Relaxed);
+            assert!(
+                cb_param_format::<TestPlugin>(ctx, 1, normalized, buffer.as_mut_ptr(), 128) > 0
+            );
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "51%");
+            assert_eq!(
+                cb_param_parse::<TestPlugin>(ctx, 1, c"25%".as_ptr(), &raw mut parsed),
+                1
+            );
+            assert_eq!(parsed, 0.25);
+            assert_eq!(params.get_plain(1), Some(normalized));
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+}

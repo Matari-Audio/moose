@@ -66,7 +66,8 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info, clap_plugin_params,
 };
 use clap_sys::ext::params::{
-    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, clap_host_params,
+    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
+    CLAP_PARAM_RESCAN_VALUES, clap_host_params,
 };
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
@@ -925,7 +926,7 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
                 flags |= CLAP_PARAM_RESCAN_VALUES;
             }
             if info_changed {
-                flags |= CLAP_PARAM_RESCAN_INFO;
+                flags |= CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT;
             }
             rescan(data.host, flags);
         }
@@ -2551,6 +2552,9 @@ unsafe fn flush_gui_changes<P: PluginExport>(
                         value: plain,
                     };
                     if plain.is_finite() && !try_push(out_events, &raw const event.header) {
+                        // Popped and refused: the host never hears this
+                        // value as an event, so ask it to re-read values.
+                        request_value_rescan(data);
                         return false;
                     }
                 }
@@ -4707,16 +4711,21 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
                     // Push can fail only if the audio thread hasn't
                     // drained for `GUI_QUEUE_CAPACITY` gestures.
                     // request_flush below pokes the host to call
-                    // back; needs_rescan in set_param ensures the
-                    // param tree picks up the latest plain values
-                    // even if a begin/end pair gets dropped.
+                    // back; a value the queue drops falls back to a
+                    // values rescan in set_param.
                     let _ = gui_changes.push(GuiParamChange::GestureBegin(id));
                     request_flush();
                 }),
                 set_param: Box::new(move |id, value| {
                     let plain = params_for_set.set_normalized_returning_plain(id, value);
-                    let _ = gui_changes2.push(GuiParamChange::Value(id, plain));
+                    let queued = gui_changes2.push(GuiParamChange::Value(id, plain)).is_ok();
                     request_flush2();
+                    // The queued PARAM_VALUE event is how the host hears
+                    // this edit. A values rescan per drag frame made hosts
+                    // (Bitwig) re-read every parameter on the main thread
+                    // mid-gesture, so it is only the fallback for a value
+                    // the full queue dropped.
+                    //
                     // Symmetry with the host-pointer null guards at
                     // `:297, :365, :1404`. CLAP guarantees a valid
                     // host on init, but a host that creates a plugin
@@ -4725,7 +4734,8 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
                     // null; the deref below would crash inside the
                     // GUI thread.
                     let host_ptr = host_for_callback.as_ptr();
-                    if !needs_rescan.swap(true, Ordering::Relaxed)
+                    if !queued
+                        && !needs_rescan.swap(true, Ordering::Relaxed)
                         && !host_ptr.is_null()
                         && let Some(req_cb) = (*host_ptr).request_callback
                     {
@@ -6010,5 +6020,180 @@ mod bus_kind_tests {
         // Main bus disabled: the first enabled port is the sidechain.
         assert_eq!(audio_port_main_flag(0, BusKind::Sidechain), 0);
         assert_eq!(audio_port_main_flag(1, BusKind::Sidechain), 0);
+    }
+}
+
+// The derive's umbrella paths resolve locally for this shared test fixture.
+#[cfg(test)]
+extern crate self as moose;
+#[cfg(test)]
+use moose_core as core;
+#[cfg(test)]
+use moose_params as params;
+#[cfg(test)]
+#[path = "../../../test-support/host_value_fixture.rs"]
+mod host_value_fixture;
+
+#[cfg(test)]
+mod host_value_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    use moose_params::Params;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static RESCAN: AtomicU32 = AtomicU32::new(0);
+    unsafe extern "C" fn rescan(_: *const clap_host, flags: u32) {
+        RESCAN.fetch_or(flags, Ordering::Relaxed);
+    }
+    unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+        static PARAMS: clap_host_params = clap_host_params {
+            rescan: Some(rescan),
+            clear: None,
+            request_flush: None,
+        };
+        // SAFETY: host extensions are queried with a terminated CLAP identifier.
+        if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PARAMS {
+            (&raw const PARAMS).cast::<c_void>()
+        } else {
+            ptr::null()
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "unchanged storage values must compare exactly"
+    )]
+    fn ffi_text_hooks_and_rescan_preserve_declared_slot_range() {
+        // SAFETY: own the plugin, descriptor, host, and all callback buffers.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.get_extension = Some(extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(!plugin.is_null());
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let params = data_from_plugin::<TestPlugin>(plugin).params_arc.clone();
+            let mut info: clap_param_info = std::mem::zeroed();
+            assert!(params_get_info::<TestPlugin>(plugin, 1, &raw mut info));
+            assert_eq!((info.id, info.min_value, info.max_value), (1, 0., 1.));
+            let normalized = 49. / 96.;
+            params.set_plain(1, normalized);
+            let mut stored = 0.;
+            assert!(params_get_value::<TestPlugin>(plugin, 1, &raw mut stored));
+            assert_eq!(stored, normalized);
+            let mut buffer = [0_i8; 128];
+            assert!(params_value_to_text::<TestPlugin>(
+                plugin,
+                1,
+                stored,
+                buffer.as_mut_ptr(),
+                128
+            ));
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "+1 st");
+            let mut parsed = -999.;
+            assert!(params_text_to_value::<TestPlugin>(
+                plugin,
+                1,
+                c"+1 st".as_ptr(),
+                &raw mut parsed
+            ));
+            assert_eq!(parsed, normalized);
+            for invalid in [c"0.5", c"nan"] {
+                assert!(!params_text_to_value::<TestPlugin>(
+                    plugin,
+                    1,
+                    invalid.as_ptr(),
+                    &raw mut parsed
+                ));
+            }
+            assert!(params_text_to_value::<TestPlugin>(
+                plugin,
+                0,
+                c"-6 dB".as_ptr(),
+                &raw mut parsed
+            ));
+            assert_eq!(parsed, -6.);
+            RESCAN.store(0, Ordering::Relaxed);
+            params.rebound.store(true, Ordering::Relaxed);
+            params.generation.fetch_add(1, Ordering::Relaxed);
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(
+                RESCAN.load(Ordering::Relaxed),
+                CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT
+            );
+            assert!(params_value_to_text::<TestPlugin>(
+                plugin,
+                1,
+                stored,
+                buffer.as_mut_ptr(),
+                128
+            ));
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "51%");
+            assert!(params_text_to_value::<TestPlugin>(
+                plugin,
+                1,
+                c"25%".as_ptr(),
+                &raw mut parsed
+            ));
+            assert_eq!(parsed, 0.25);
+            assert_eq!(params.get_plain(1), Some(normalized));
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+
+    static PUSHED: AtomicU32 = AtomicU32::new(0);
+    unsafe extern "C" fn accept(_: *const clap_output_events, _: *const clap_event_header) -> bool {
+        PUSHED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+    unsafe extern "C" fn refuse(_: *const clap_output_events, _: *const clap_event_header) -> bool {
+        false
+    }
+
+    /// GUI values reach the host as events. A values rescan is only the
+    /// fallback for a value the host refused, never a per-edit request.
+    #[test]
+    fn gui_values_flush_as_events_and_rescan_only_when_refused() {
+        // SAFETY: own the plugin, descriptor, host, and output-event shims.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.get_extension = Some(extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let data = data_from_plugin::<TestPlugin>(plugin);
+            for value in [0.25, 0.5] {
+                data.gui_changes
+                    .push(GuiParamChange::Value(1, value))
+                    .unwrap_or_else(|_| panic!("queue full"));
+            }
+            let out = clap_output_events {
+                ctx: ptr::null_mut(),
+                try_push: Some(accept),
+            };
+            PUSHED.store(0, Ordering::Relaxed);
+            assert!(flush_gui_changes::<TestPlugin>(data, &raw const out));
+            assert_eq!(PUSHED.load(Ordering::Relaxed), 2);
+            assert!(!data.needs_rescan.load(Ordering::Relaxed));
+            data.gui_changes
+                .push(GuiParamChange::Value(1, 0.75))
+                .unwrap_or_else(|_| panic!("queue full"));
+            let full = clap_output_events {
+                ctx: ptr::null_mut(),
+                try_push: Some(refuse),
+            };
+            assert!(!flush_gui_changes::<TestPlugin>(data, &raw const full));
+            assert!(data.needs_rescan.load(Ordering::Relaxed));
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
     }
 }
