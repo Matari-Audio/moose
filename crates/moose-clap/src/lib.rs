@@ -6358,6 +6358,141 @@ mod host_value_tests {
             clap_plugin_destroy::<TestPlugin>(plugin);
         }
     }
+
+    // Exercise the actual editor bridge as well as the queue-draining helper.
+    // A fake X11 parent is safe because this editor never calls a window API.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gui_set_param_keeps_rescans_fallback_only_and_epochs_instance_local() {
+        use moose_core::editor::{Editor, PluginContext, RawWindowHandle};
+        use std::sync::Mutex;
+
+        struct CaptureEditor(Arc<Mutex<Option<PluginContext>>>);
+        impl Editor for CaptureEditor {
+            fn size(&self) -> (u32, u32) {
+                (100, 100)
+            }
+            fn open(&mut self, _: RawWindowHandle, context: PluginContext) {
+                *self.0.lock().unwrap() = Some(context);
+            }
+            fn close(&mut self) {}
+        }
+        #[derive(Default)]
+        struct Calls {
+            callbacks: AtomicU32,
+            rescans: AtomicU32,
+            flushes: AtomicU32,
+        }
+        unsafe fn calls<'a>(host: *const clap_host) -> &'a Calls {
+            // SAFETY: each shim receives the live host owned below.
+            unsafe { &*((*host).host_data.cast::<Calls>()) }
+        }
+        unsafe extern "C" fn callback(host: *const clap_host) {
+            unsafe { calls(host) }
+                .callbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn flush(host: *const clap_host) {
+            unsafe { calls(host) }
+                .flushes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn rescan(host: *const clap_host, flags: u32) {
+            assert_eq!(flags, CLAP_PARAM_RESCAN_VALUES);
+            unsafe { calls(host) }
+                .rescans
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+            static PARAMS: clap_host_params = clap_host_params {
+                rescan: Some(rescan),
+                clear: None,
+                request_flush: Some(flush),
+            };
+            if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PARAMS {
+                (&raw const PARAMS).cast()
+            } else {
+                ptr::null()
+            }
+        }
+        unsafe extern "C" fn accept(
+            _: *const clap_output_events,
+            _: *const clap_event_header,
+        ) -> bool {
+            true
+        }
+
+        // SAFETY: all host/plugin/window/event pointers remain live until destruction.
+        unsafe {
+            let calls = Calls::default();
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.host_data = (&raw const calls).cast_mut().cast();
+            host.get_extension = Some(extension);
+            host.request_callback = Some(callback);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let a = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            let b = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(a));
+            assert!(clap_plugin_init::<TestPlugin>(b));
+            let data = data_from_plugin::<TestPlugin>(a);
+            let other = data_from_plugin::<TestPlugin>(b);
+            let captured = Arc::new(Mutex::new(None));
+            data.gui.enter().editor = Some(Box::new(CaptureEditor(captured.clone())));
+            let mut window: clap_window = std::mem::zeroed();
+            window.specific.ptr = ptr::dangling_mut::<c_void>();
+            assert!(gui_set_parent::<TestPlugin>(a, &raw const window));
+            let context = captured.lock().unwrap().take().unwrap();
+            let out = clap_output_events {
+                ctx: ptr::null_mut(),
+                try_push: Some(accept),
+            };
+            let epoch = data.params_arc.parameter_edit_epoch();
+            let foreign_epoch = other.params_arc.parameter_edit_epoch();
+            for i in 0..128 {
+                context.set_param(1_u32, if i % 2 == 0 { 0.25 } else { 0.75 });
+                assert!(flush_gui_changes::<TestPlugin>(data, &raw const out));
+            }
+            assert_eq!(data.params_arc.parameter_edit_epoch(), epoch + 128);
+            assert_eq!(other.params_arc.parameter_edit_epoch(), foreign_epoch);
+            assert_eq!(calls.flushes.load(Ordering::Relaxed), 128);
+            assert_eq!(calls.callbacks.load(Ordering::Relaxed), 0);
+            clap_plugin_on_main_thread::<TestPlugin>(a);
+            assert_eq!(calls.rescans.load(Ordering::Relaxed), 0);
+
+            context.set_param(1_u32, 0.5);
+            let full = clap_output_events {
+                ctx: ptr::null_mut(),
+                try_push: Some(refuse),
+            };
+            assert!(!flush_gui_changes::<TestPlugin>(data, &raw const full));
+            assert_eq!(calls.callbacks.load(Ordering::Relaxed), 1);
+            clap_plugin_on_main_thread::<TestPlugin>(a);
+            assert_eq!(calls.rescans.load(Ordering::Relaxed), 1);
+
+            for _ in 0..GUI_QUEUE_CAPACITY + 2 {
+                context.set_param(1_u32, 0.25);
+            }
+            assert_eq!(
+                calls.callbacks.load(Ordering::Relaxed),
+                2,
+                "overflow callbacks coalesce"
+            );
+            assert!(flush_gui_changes::<TestPlugin>(data, &raw const out));
+            clap_plugin_on_main_thread::<TestPlugin>(a);
+            assert_eq!(calls.rescans.load(Ordering::Relaxed), 2);
+            assert_eq!(other.params_arc.parameter_edit_epoch(), foreign_epoch);
+            drop(context);
+            clap_plugin_destroy::<TestPlugin>(a);
+            clap_plugin_destroy::<TestPlugin>(b);
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
