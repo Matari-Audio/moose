@@ -4448,7 +4448,7 @@ use clap_sys::ext::gui::{
 use clap_sys::ext::gui::{CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_X11};
 
 unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
-    plugin: *const clap_plugin,
+    _plugin: *const clap_plugin,
     api: *const c_char,
     is_floating: bool,
 ) -> bool {
@@ -4462,7 +4462,7 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
             if !is_floating {
                 return false;
             }
-            let data = data_from_plugin::<P>(plugin);
+            let data = data_from_plugin::<P>(_plugin);
             let mut gui = data.gui.enter();
             if gui.editor.is_none() {
                 gui.editor = (data.editor_builder)(data.params_arc.clone());
@@ -4492,7 +4492,7 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
 }
 
 unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
-    plugin: *const clap_plugin,
+    _plugin: *const clap_plugin,
     api: *mut *const c_char,
     is_floating: *mut bool,
 ) -> bool {
@@ -4518,7 +4518,7 @@ unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
             // and this particular editor supports it. Explicit X11 requests
             // always remain embedded X11, even in a Wayland desktop session.
             if std::env::var_os("WAYLAND_DISPLAY").is_some()
-                && gui_is_api_supported::<P>(plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
+                && gui_is_api_supported::<P>(_plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
             {
                 *api = CLAP_WINDOW_API_WAYLAND.as_ptr();
                 *is_floating = true;

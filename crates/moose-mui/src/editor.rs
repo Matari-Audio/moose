@@ -23,6 +23,7 @@ pub(crate) struct Session<P: Params> {
     /// The size `build` was designed at, fitted to the window; `None` is
     /// [`MuiEditor::fixed_zoom`].
     design: Option<Size>,
+    #[cfg(target_os = "linux")]
     native_requests: std::sync::Weak<Requests>,
 }
 
@@ -139,6 +140,7 @@ impl<P: Params> MuiEditor<P> {
             build: Box::new(build),
             changed: None,
             design: Some(size),
+            #[cfg(target_os = "linux")]
             native_requests: std::sync::Weak::new(),
         };
         Self {
