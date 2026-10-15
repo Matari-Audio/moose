@@ -4478,10 +4478,12 @@ unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
         }
         #[cfg(target_os = "linux")]
         {
-            // Prefer native floating Wayland only when a compositor is present
-            // and this particular editor supports it. Explicit X11 requests
-            // always remain embedded X11, even in a Wayland desktop session.
-            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            // Embedded X11 whenever an X server (incl. XWayland) is reachable:
+            // embedding hosts such as Bitwig follow this preference and never
+            // show a floating window. Floating Wayland stays available to
+            // hosts that request it, and is preferred only without X11.
+            if std::env::var_os("DISPLAY").is_none()
+                && std::env::var_os("WAYLAND_DISPLAY").is_some()
                 && gui_is_api_supported::<P>(_plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
             {
                 *api = CLAP_WINDOW_API_WAYLAND.as_ptr();
