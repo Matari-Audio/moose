@@ -4585,6 +4585,7 @@ unsafe extern "C" fn gui_destroy<P: PluginExport>(plugin: *const clap_plugin) {
         let editor = {
             let mut gui = data.gui.enter();
             data.floating_visible.store(false, Ordering::Release);
+            data.floating_closed.store(false, Ordering::Release);
             gui.visible = false;
             gui.gui_created = false;
             gui.editor.take()
@@ -6350,6 +6351,137 @@ mod host_value_tests {
             };
             assert!(!flush_gui_changes::<TestPlugin>(data, &raw const full));
             assert!(data.needs_rescan.load(Ordering::Relaxed));
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod floating_gui_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    type Close = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+    struct Probe(Close);
+    impl Editor for Probe {
+        fn size(&self) -> (u32, u32) {
+            (320, 240)
+        }
+        fn open(&mut self, _: RawWindowHandle, _: PluginContext) {
+            panic!("must not embed Wayland");
+        }
+        fn close(&mut self) {
+            if let Some(closed) = self.0.lock().unwrap().take() {
+                closed();
+            }
+        }
+        fn supports_floating_wayland(&self) -> bool {
+            true
+        }
+        fn open_floating_wayland(
+            &mut self,
+            _: PluginContext,
+            _: &str,
+            closed: Arc<dyn Fn() + Send + Sync>,
+        ) -> bool {
+            *self.0.lock().unwrap() = Some(closed);
+            true
+        }
+    }
+    unsafe extern "C" fn request(host: *const clap_host) {
+        // SAFETY: test retains its two counters through plugin destruction.
+        unsafe {
+            (&*(*host).host_data.cast::<[AtomicU32; 2]>())[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    unsafe extern "C" fn closed(host: *const clap_host, destroyed: bool) {
+        assert!(!destroyed);
+        // SAFETY: test retains its two counters through plugin destruction.
+        unsafe {
+            (&*(*host).host_data.cast::<[AtomicU32; 2]>())[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    unsafe extern "C" fn extension(_: *const clap_host, name: *const c_char) -> *const c_void {
+        static GUI: clap_host_gui = clap_host_gui {
+            resize_hints_changed: None,
+            request_resize: None,
+            request_show: None,
+            request_hide: None,
+            closed: Some(closed),
+        };
+        // SAFETY: CLAP passes a valid extension name.
+        if unsafe { CStr::from_ptr(name) } == CLAP_EXT_GUI {
+            (&raw const GUI).cast()
+        } else {
+            ptr::null()
+        }
+    }
+    #[test]
+    fn wayland_negotiation_and_close_work_with_a_deferred_host() {
+        let counters = [AtomicU32::new(0), AtomicU32::new(0)];
+        // SAFETY: own host, descriptor, plugin and fake editor; callbacks retain
+        // no native resources and all borrowed test state outlives the instance.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.host_data = (&raw const counters).cast_mut().cast();
+            host.get_extension = Some(extension);
+            host.request_callback = Some(request);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let data = data_from_plugin::<TestPlugin>(plugin);
+            assert!(!gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                true
+            ));
+            let hook: Close = Arc::default();
+            data.gui.enter().editor = Some(Box::new(Probe(hook.clone())));
+            assert!(gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                true
+            ));
+            assert!(!gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                false
+            ));
+            assert!(gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                false
+            ));
+            assert!(!gui_is_api_supported::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                true
+            ));
+            assert!(!gui_create::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                false
+            ));
+            assert!(gui_create::<TestPlugin>(plugin, ptr::null(), true));
+            assert!(!gui_set_scale::<TestPlugin>(plugin, 2.));
+            assert!(gui_show::<TestPlugin>(plugin));
+            let close = hook.lock().unwrap().take().unwrap();
+            close();
+            assert_eq!(counters[0].load(Ordering::Relaxed), 1);
+            assert_eq!(counters[1].load(Ordering::Relaxed), 0);
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(counters[1].load(Ordering::Relaxed), 1);
+            assert!(gui_show::<TestPlugin>(plugin));
+            assert!(gui_hide::<TestPlugin>(plugin));
+            assert_eq!(
+                counters[0].load(Ordering::Relaxed),
+                1,
+                "programmatic hide must not notify close"
+            );
+            gui_destroy::<TestPlugin>(plugin);
             clap_plugin_destroy::<TestPlugin>(plugin);
         }
     }
