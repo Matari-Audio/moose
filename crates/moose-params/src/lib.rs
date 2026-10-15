@@ -173,6 +173,11 @@ impl Default for ParameterPresentation {
     }
 }
 
+/// Host-thread commit of a fully read and validated persistence document.
+/// Preparation must not mutate plugin state. Large fields may be decoded into
+/// their final immutable representation instead of a serialized staging buffer.
+pub type PreparedPersist<P> = Box<dyn FnOnce(&P, &[(u32, f64)], &[u8]) + Send>;
+
 /// Trait implemented by #[derive(Params)] on a struct.
 /// Format wrappers use this to enumerate, read, and write parameters.
 ///
@@ -183,7 +188,19 @@ impl Default for ParameterPresentation {
 /// rather than expecting one on the trait - `#[derive(Params)]` emits
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
+
 pub trait Params: __private::Sealed + Send + Sync + 'static {
+    /// Optional incremental persistence preparation. Return `None` without
+    /// reading to keep the ordinary buffered path. `Some(Err)` rejects before
+    /// any parameter changes; `Some(Ok)` must consume exactly `len` bytes and
+    /// return small validation bytes plus a host-thread commit. The wrapper
+    /// validates framing, EOF and `validate_persist` before invoking the commit.
+    fn prepare_persist_stream(
+        _read: &mut dyn std::io::Read, _len: usize,
+    ) -> Option<std::io::Result<(Vec<u8>, PreparedPersist<Self>)>> where Self: Sized {
+        None
+    }
+
     /// Runtime name / group / visibility / availability for `id`, read on the
     /// host main thread. `None` keeps the static [`ParamInfo`] label.
     /// Derive: `#[params(presentation = "method")]`.

@@ -256,6 +256,48 @@ pub fn read_or_migrate<P: PluginExport>(
     }
 }
 
+/// Prepare large persistence fields directly from a bounded host stream, then
+/// commit on the host thread only after framing, EOF and store validation pass.
+/// Formats with native borrowed containers may pass that container's existing
+/// bound; CLAP/VST3 pass the plugin's explicit stream policy.
+pub fn read_and_apply_params<P: PluginExport>(
+    read: impl FnMut(&mut [u8]) -> i64,
+    expected_plugin_id: u64,
+    format: PluginFormat,
+    source_key: Option<&str>,
+    params: &P::Params,
+    limit: usize,
+) -> Option<DeserializedState> {
+    use moose_utils::state_stream::{StreamState, read_state_stream_prepared};
+    let (stream, prepared) = read_state_stream_prepared(read, limit, |id, input, len| {
+        if id == expected_plugin_id {
+            <P::Params as Params>::prepare_persist_stream(input, len)
+        } else {
+            None
+        }
+    })?;
+    let state = match stream {
+        StreamState::Foreign(bytes) => {
+            parse_or_migrate::<P>(&bytes, expected_plugin_id, format, source_key)
+        }
+        StreamState::Envelope(StateParse::WrongPlugin { found, state })
+            if found == expected_plugin_id =>
+        {
+            finish_parse_or_migrate::<P>(StateParse::Ok(state), &[], format, source_key)
+        }
+        StreamState::Envelope(parsed) => {
+            finish_parse_or_migrate::<P>(parsed, &[], format, source_key)
+        }
+    }?;
+    if let Some(commit) = prepared {
+        commit(params, &state.params, &state.persist);
+        params.snap_smoothers();
+    } else {
+        apply_params(params, &state);
+    }
+    Some(state)
+}
+
 /// Apply just the parameter values from a deserialized state - the
 /// host-thread-safe subset of [`apply_state`]. Format wrappers call
 /// this from their state-load callback (host main thread) before

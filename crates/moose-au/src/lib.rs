@@ -1540,22 +1540,22 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         if data.is_null() || len == 0 {
             return 0;
         }
-        let blob = slice::from_raw_parts(data, len as usize);
+        let mut blob = slice::from_raw_parts(data, len as usize);
         // Not this plugin's envelope? Offer the bytes to the plugin's
         // `migrate_state` hook (legacy sessions from a pre-moose
         // build that stored foreign bytes under moose's key, or a
         // renamed plugin's envelope).
-        if let Some(deserialized) = state::parse_or_migrate::<P>(
-            blob,
+        if let Some(deserialized) = state::read_and_apply_params::<P>(
+            |dst| std::io::Read::read(&mut blob, dst).map_or(-1, |n| n as i64),
             inst.plugin_id_hash,
             state::PluginFormat::Au,
-            Some("truce_state"),
+            Some("truce_state"), &*inst.params_arc, len as usize,
         ) {
             // Apply params synchronously on the host thread (atomic-safe)
             // so host queries that read parameter values right after
             // `setFullState:` see the restored values without first
             // running a render block.
-            state::apply_params(&*inst.params_arc, &deserialized);
+
             // Hand the deserialized state to the audio thread for
             // application. `force_push` overwrites any older pending
             // blob - see the `pending_state` field comment for why

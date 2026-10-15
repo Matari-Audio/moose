@@ -15,6 +15,11 @@ struct Input<F> {
 }
 impl<F: FnMut(&mut [u8]) -> i64> Input<F> {
     fn read(&mut self, dst: &mut [u8]) -> Option<usize> {
+        if dst.is_empty() {
+            return Some(0);
+        }
+        let request = dst.len().min(8192);
+        let dst = &mut dst[..request];
         let n = usize::try_from((self.read)(dst)).ok()?;
         self.used = self.used.checked_add(n)?;
         (n <= dst.len() && self.used <= self.limit).then_some(n)
@@ -50,10 +55,26 @@ impl<F: FnMut(&mut [u8]) -> i64> Input<F> {
     }
 }
 
+impl<F: FnMut(&mut [u8]) -> i64> std::io::Read for Input<F> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        Input::read(self, dst).ok_or_else(|| std::io::Error::other("invalid host state read"))
+    }
+}
+
 /// Accept arbitrary short reads, reject impossible counts, errors, overflow,
 /// trailing bytes and oversized declared lanes before allocating them.
 /// All allocation and callbacks occur on the host's state thread.
 pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Option<StreamState> {
+    read_state_stream_prepared::<()>(read, limit, |_, _, _| None).map(|(state, _)| state)
+}
+
+/// A prepared field decoder sees only the declared persistence section. Its
+/// commit is returned only after the entire envelope, including EOF, is valid.
+pub fn read_state_stream_prepared<T>(
+    read: impl FnMut(&mut [u8]) -> i64,
+    limit: usize,
+    prepare: impl FnOnce(u64, &mut dyn std::io::Read, usize) -> Option<std::io::Result<(Vec<u8>, T)>>,
+) -> Option<(StreamState, Option<T>)> {
     let mut input = Input {
         read,
         used: 0,
@@ -77,11 +98,14 @@ pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Op
             }
             prefix.extend_from_slice(&buf[..n]);
         }
-        return Some(StreamState::Foreign(prefix));
+        return Some((StreamState::Foreign(prefix), None));
     }
     let version = u32::from_le_bytes(input.word()?);
     if version != 1 {
-        return Some(StreamState::Envelope(StateParse::UnknownVersion(version)));
+        return Some((
+            StreamState::Envelope(StateParse::UnknownVersion(version)),
+            None,
+        ));
     }
     let plugin_id = u64::from_le_bytes(input.word()?);
     let count = u32::from_le_bytes(input.word()?) as usize;
@@ -103,6 +127,7 @@ pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Op
         Some(input.bytes(extra_len)?)
     };
     let mut first = [0];
+    let mut prepared = None;
     let persist = if input.read(&mut first)? == 0 {
         Vec::new()
     } else {
@@ -110,7 +135,28 @@ pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Op
         word[0] = first[0];
         input.exact(&mut word[1..])?;
         let len = usize::try_from(u64::from_le_bytes(word)).ok()?;
-        let bytes = input.bytes(len)?;
+        if len > limit.checked_sub(input.used)? {
+            return None;
+        }
+        let mut section = std::io::Read::take(&mut input, len as u64);
+        let result = prepare(plugin_id, &mut section, len);
+        let bytes = match result {
+            Some(result) => {
+                let (bytes, commit) = result.ok()?;
+                if section.limit() != 0 {
+                    return None;
+                }
+                prepared = Some(commit);
+                bytes
+            }
+            None => {
+                if section.limit() != len as u64 {
+                    return None;
+                }
+                drop(section);
+                input.bytes(len)?
+            }
+        };
         if input.read(&mut first)? != 0 {
             return None;
         }
@@ -118,14 +164,17 @@ pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Op
     };
     // Reuse the format parser's routing for renamed plugin IDs without copying
     // either custom-state lane into another whole-envelope buffer.
-    Some(StreamState::Envelope(StateParse::WrongPlugin {
-        found: plugin_id,
-        state: DeserializedState {
-            params,
-            extra,
-            persist,
-        },
-    }))
+    Some((
+        StreamState::Envelope(StateParse::WrongPlugin {
+            found: plugin_id,
+            state: DeserializedState {
+                params,
+                extra,
+                persist,
+            },
+        }),
+        prepared,
+    ))
 }
 
 #[cfg(test)]
@@ -269,5 +318,92 @@ mod writer_tests {
         for reply in [-1, 0, 10000] {
             assert!(!write_state_stream(42, &[], &[], b"", b"", 1024, |_| reply));
         }
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    fn prepare(
+        _id: u64,
+        input: &mut dyn std::io::Read,
+        len: usize,
+    ) -> Option<std::io::Result<(Vec<u8>, u64)>> {
+        Some((|| {
+            let mut remaining = len;
+            let mut sum = 0_u64;
+            let mut scratch = [0; 8192];
+            while remaining > 0 {
+                let n = remaining.min(scratch.len());
+                input.read_exact(&mut scratch[..n])?;
+                sum += scratch[..n]
+                    .iter()
+                    .map(|byte| u64::from(*byte))
+                    .sum::<u64>();
+                remaining -= n;
+            }
+            Ok((Vec::new(), sum))
+        })())
+    }
+    #[test]
+    fn prepared_fields_do_not_return_a_serialized_staging_buffer() {
+        let payload = vec![37; 100_000];
+        let blob = crate::state::serialize_state(42, &[7], &[0.25], b"", &payload);
+        let mut pos = 0;
+        let (state, prepared) = read_state_stream_prepared(
+            |dst| {
+                assert!(dst.len() <= 8192);
+                let n = dst.len().min(317).min(blob.len() - pos);
+                dst[..n].copy_from_slice(&blob[pos..pos + n]);
+                pos += n;
+                n as i64
+            },
+            blob.len(),
+            prepare,
+        )
+        .unwrap();
+        assert_eq!(prepared, Some(37 * 100_000));
+        let StreamState::Envelope(StateParse::WrongPlugin { state, .. }) = state else {
+            panic!()
+        };
+        assert!(state.persist.is_empty());
+        assert_eq!(state.params, [(7, 0.25)]);
+    }
+    #[test]
+    fn truncated_trailing_and_underconsumed_preparations_never_escape() {
+        let base = crate::state::serialize_state(42, &[], &[], b"", &[7; 100]);
+        for blob in [
+            &base[..base.len() - 1],
+            &[base.as_slice(), b"junk"].concat(),
+        ] {
+            let mut pos = 0;
+            assert!(
+                read_state_stream_prepared(
+                    |dst| {
+                        let n = dst.len().min(blob.len() - pos);
+                        dst[..n].copy_from_slice(&blob[pos..pos + n]);
+                        pos += n;
+                        n as i64
+                    },
+                    1024,
+                    prepare
+                )
+                .is_none()
+            );
+        }
+        let mut pos = 0;
+        assert!(
+            read_state_stream_prepared(
+                |dst| {
+                    let n = dst.len().min(base.len() - pos);
+                    dst[..n].copy_from_slice(&base[pos..pos + n]);
+                    pos += n;
+                    n as i64
+                },
+                1024,
+                |_, _, _| Some(Ok((Vec::new(), ())))
+            )
+            .is_none()
+        );
     }
 }

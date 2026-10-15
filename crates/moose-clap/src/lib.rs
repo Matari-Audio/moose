@@ -4038,10 +4038,10 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
-        let Some(deserialized) = state::read_or_migrate::<P>(
+        let Some(deserialized) = state::read_and_apply_params::<P>(
             |buf| read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64),
             data.plugin_id_hash,
-            state::PluginFormat::Clap,
+            state::PluginFormat::Clap, None, &*data.params_arc, P::max_host_state_bytes(),
         ) else {
             return false;
         };
@@ -4051,7 +4051,7 @@ unsafe extern "C" fn state_load<P: PluginExport>(
         // `clap_plugin_state.load` see the restored values without
         // first running a process block - clap-validator reads back
         // immediately after a load round-trip.
-        state::apply_params(&*data.params_arc, &deserialized);
+
 
         if data.active.load(Ordering::Relaxed) {
             // Active: the audio thread will drain `pending_state` at the

@@ -1847,18 +1847,18 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         ) else {
             return 0;
         };
-        apply_host_state(inst, deserialized)
+        apply_host_state(inst, deserialized, false)
     })
 }
 
-unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized: state::DeserializedState) -> i32 {
+unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized: state::DeserializedState, params_applied: bool) -> i32 {
     unsafe {
         // Apply params synchronously on the host thread (atomic-safe)
         // so host-side queries that read parameter values right
         // after `setState` see the restored values without first
         // running a process block. pluginval / DAW preset reload
         // both observe this.
-        state::apply_params(&*inst.params_arc, &deserialized);
+        if !params_applied { state::apply_params(&*inst.params_arc, &deserialized); }
         if inst.active.load(Ordering::Relaxed) {
             // Active: the audio thread drains `pending_state` at the top
             // of the next block and applies the custom-state blob under
@@ -1918,10 +1918,10 @@ unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
 ) -> i32 {
     run_extern_callback_with::<P, i32>("vst3", "load_state_stream", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let Some(deserialized) = state::read_or_migrate::<P>(
-            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32), inst.plugin_id_hash, state::PluginFormat::Vst3,
+        let Some(deserialized) = state::read_and_apply_params::<P>(
+            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32), inst.plugin_id_hash, state::PluginFormat::Vst3, None, &*inst.params_arc, P::max_host_state_bytes(),
         ) else { return 0; };
-        apply_host_state(inst, deserialized)
+        apply_host_state(inst, deserialized, true)
     })
 }
 
