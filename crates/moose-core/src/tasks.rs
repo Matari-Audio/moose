@@ -796,6 +796,7 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
         }
         // A notifier-start failure still has a bounded, non-spinning fallback:
         // one designated worker retries registered lanes every millisecond.
+        let capacity_epoch = shared.capacity_epoch.load(Ordering::SeqCst);
         let retry_hint = RETRY_PENDING.swap(false, Ordering::AcqRel);
         let (retried, retry_remaining) = if retry_hint {
             retry_registered(shared)
@@ -805,7 +806,10 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
         if retry_remaining {
             RETRY_PENDING.store(true, Ordering::SeqCst);
         }
-        if retried != 0 || !shared.injector.is_empty() {
+        if retried != 0
+            || !shared.injector.is_empty()
+            || retry_remaining && shared.capacity_epoch.load(Ordering::SeqCst) != capacity_epoch
+        {
             continue;
         }
         if notifier_fallback
@@ -1488,6 +1492,72 @@ mod tests {
         thread::sleep(Duration::from_secs(3));
         waking.spawn_coalescing(42);
         assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), 42);
+    }
+
+    #[test]
+    #[ignore = "isolated registry/capacity race stress; run alone"]
+    fn parked_pool_retry_capacity_audit() {
+        struct Job {
+            retry: AtomicBool,
+            done: std::sync::mpsc::Sender<()>,
+        }
+        impl Drain for Job {
+            fn drain(&self) -> DrainOutcome {
+                self.done.send(()).unwrap();
+                DrainOutcome::Done
+            }
+            fn claim_retry(&self) -> bool {
+                self.retry.swap(false, Ordering::AcqRel)
+            }
+            fn retry_failed(&self) {
+                self.retry.store(true, Ordering::Release);
+            }
+        }
+        let shared = Arc::new(Shared {
+            wake: Arc::new(WakeSignal::default()),
+            capacity_epoch: AtomicUsize::new(0),
+            injector: ArrayQueue::new(2),
+            next_worker: AtomicUsize::new(0),
+            execution_state: AtomicUsize::new(0),
+            notifier_running: AtomicBool::new(true),
+            stopping: AtomicBool::new(false),
+        });
+        let owner = Arc::clone(&shared);
+        let worker = thread::spawn(move || worker_loop(&owner, false));
+        let workers = vec![worker.thread().clone()].into_boxed_slice();
+        shared.wake.workers.set(workers.clone()).ok().unwrap();
+        let owner = Arc::clone(&shared);
+        let notifier = thread::spawn(move || notifier_loop(&owner, &workers));
+        shared
+            .wake
+            .notifier
+            .set(notifier.thread().clone())
+            .ok()
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        for _ in 0..32 {
+            let jobs: Vec<Arc<dyn Drain>> = (0..512)
+                .map(|_| {
+                    Arc::new(Job {
+                        retry: AtomicBool::new(true),
+                        done: send.clone(),
+                    }) as Arc<dyn Drain>
+                })
+                .collect();
+            for job in &jobs {
+                register_lane(job);
+            }
+            RETRY_PENDING.store(true, Ordering::SeqCst);
+            shared.wake.notify();
+            for _ in &jobs {
+                receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        shared.stopping.store(true, Ordering::Release);
+        shared.wake.notify();
+        worker.thread().unpark();
+        worker.join().unwrap();
+        notifier.join().unwrap();
     }
 
     #[test]
