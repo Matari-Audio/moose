@@ -3173,6 +3173,58 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
     resolve_name_override(info.au_name, info.name)
 }
 
+/// Construct the same callback table used by AUv2 and AUv3 registration.
+/// Allows qualification of the Rust AU bridge without Apple frameworks;
+/// native property-list marshalling still requires a macOS/iOS host.
+pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
+    AuCallbacks {
+        abi_version: ffi::MOOSE_AU_ABI_VERSION,
+        create: cb_create::<P>,
+        destroy: cb_destroy::<P>,
+        reset: cb_reset::<P>,
+        process: cb_process::<P>,
+        param_count: cb_param_count::<P>,
+        param_get_value: cb_param_get_value::<P>,
+        param_set_value: cb_param_set_value::<P>,
+        param_format_value: cb_param_format_value::<P>,
+        state_save: cb_state_save::<P>,
+        state_load: cb_state_load::<P>,
+        state_free: cb_state_free,
+        output_event_count: cb_output_event_count::<P>,
+        output_event_at: cb_output_event_at::<P>,
+        output_sysex_count: cb_output_sysex_count::<P>,
+        output_sysex_at: cb_output_sysex_at::<P>,
+        output_ump_count: cb_output_ump_count::<P>,
+        output_ump_at: cb_output_ump_at::<P>,
+        gui_has_editor: cb_gui_has_editor::<P>,
+        gui_get_size: cb_gui_get_size::<P>,
+        gui_open: cb_gui_open::<P>,
+        gui_close: cb_gui_close::<P>,
+        gui_can_resize: cb_gui_can_resize::<P>,
+        gui_set_size: cb_gui_set_size::<P>,
+        factory_preset_count: cb_factory_preset_count::<P>,
+        factory_preset_name: cb_factory_preset_name::<P>,
+        factory_preset_load: cb_factory_preset_load::<P>,
+        push_sysex_input: cb_au_push_sysex_input::<P>,
+        legacy_state_key_count: cb_legacy_state_key_count::<P>,
+        legacy_state_key_at: cb_legacy_state_key_at::<P>,
+        state_load_foreign: cb_state_load_foreign::<P>,
+        latency_samples: cb_latency_samples::<P>,
+        tail_samples: cb_tail_samples::<P>,
+        set_render_mode: cb_set_render_mode::<P>,
+        param_parse_value: cb_param_parse_value::<P>,
+        process_native: cb_process_native::<P>,
+        begin_output_events: cb_begin_output_events::<P>,
+        next_output_event: cb_next_output_event::<P>,
+        push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
+        finish_output_events: cb_finish_output_events::<P>,
+        begin_output_events_v9: cb_begin_output_events_v9::<P>,
+        commit_output_params: cb_commit_output_params::<P>,
+        begin_output_events_v10: cb_begin_output_events_v10::<P>,
+        process_native_v11: cb_process_native_v11::<P>,
+    }
+}
+
 pub fn register_au<P: PluginExport>() {
     // Called from the export macro's `extern "C" fn init()` static
     // initializer. Catch any panic so it doesn't cross the FFI
@@ -3486,52 +3538,7 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         sidechain_in_channels: sidechain_in,
     }));
 
-    let callbacks = Box::leak(Box::new(AuCallbacks {
-        abi_version: ffi::MOOSE_AU_ABI_VERSION,
-        create: cb_create::<P>,
-        destroy: cb_destroy::<P>,
-        reset: cb_reset::<P>,
-        process: cb_process::<P>,
-        param_count: cb_param_count::<P>,
-        param_get_value: cb_param_get_value::<P>,
-        param_set_value: cb_param_set_value::<P>,
-        param_format_value: cb_param_format_value::<P>,
-        state_save: cb_state_save::<P>,
-        state_load: cb_state_load::<P>,
-        state_free: cb_state_free,
-        output_event_count: cb_output_event_count::<P>,
-        output_event_at: cb_output_event_at::<P>,
-        output_sysex_count: cb_output_sysex_count::<P>,
-        output_sysex_at: cb_output_sysex_at::<P>,
-        output_ump_count: cb_output_ump_count::<P>,
-        output_ump_at: cb_output_ump_at::<P>,
-        gui_has_editor: cb_gui_has_editor::<P>,
-        gui_get_size: cb_gui_get_size::<P>,
-        gui_open: cb_gui_open::<P>,
-        gui_close: cb_gui_close::<P>,
-        gui_can_resize: cb_gui_can_resize::<P>,
-        gui_set_size: cb_gui_set_size::<P>,
-        factory_preset_count: cb_factory_preset_count::<P>,
-        factory_preset_name: cb_factory_preset_name::<P>,
-        factory_preset_load: cb_factory_preset_load::<P>,
-        push_sysex_input: cb_au_push_sysex_input::<P>,
-        legacy_state_key_count: cb_legacy_state_key_count::<P>,
-        legacy_state_key_at: cb_legacy_state_key_at::<P>,
-        state_load_foreign: cb_state_load_foreign::<P>,
-        latency_samples: cb_latency_samples::<P>,
-        tail_samples: cb_tail_samples::<P>,
-        set_render_mode: cb_set_render_mode::<P>,
-        param_parse_value: cb_param_parse_value::<P>,
-        process_native: cb_process_native::<P>,
-        begin_output_events: cb_begin_output_events::<P>,
-        next_output_event: cb_next_output_event::<P>,
-        push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
-        finish_output_events: cb_finish_output_events::<P>,
-        begin_output_events_v9: cb_begin_output_events_v9::<P>,
-        commit_output_params: cb_commit_output_params::<P>,
-        begin_output_events_v10: cb_begin_output_events_v10::<P>,
-        process_native_v11: cb_process_native_v11::<P>,
-    }));
+    let callbacks = Box::leak(Box::new(callbacks::<P>()));
 
     let param_descs = param_descs.leak();
 

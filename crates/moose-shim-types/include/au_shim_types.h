@@ -53,7 +53,7 @@
 // v11: appended process-time audio-bus activation metadata.
 #define MOOSE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define MOOSE_AU_ABI_MAGIC 0x54417500u
-#define MOOSE_AU_ABI_VERSION 0x5441750Bu
+#define MOOSE_AU_ABI_VERSION 0x5441750Cu
 
 typedef struct {
     uint8_t component_type[4];
