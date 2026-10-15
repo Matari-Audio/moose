@@ -5,6 +5,8 @@ use moose_core::{PluginRuntime, buffer::AudioBuffer, config::AudioConfig, events
 use std::sync::{Arc, Mutex};
 #[derive(moose_derive::Params)]
 pub struct LargeParams {
+    #[param(id = 0, name = "Dummy", range = "linear(0, 1)")]
+    dummy: moose_params::FloatParam,
     #[persist = "payload"]
     pub payload: Mutex<Vec<u8>>,
 }
