@@ -3983,9 +3983,18 @@ unsafe extern "C" fn state_save<P: PluginExport>(
         // can't stall a block in flight.
         let extra = save_extra(&data.snapshot);
         let persist = data.params_arc.serialize_persist();
-        let Some(write_fn) = (*stream).write else { return false; };
-        state::write_state_stream(data.plugin_id_hash, &ids, &values, &extra, &persist,
-            P::max_host_state_bytes(), |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64))
+        let Some(write_fn) = (*stream).write else {
+            return false;
+        };
+        state::write_state_stream(
+            data.plugin_id_hash,
+            &ids,
+            &values,
+            &extra,
+            &persist,
+            P::max_host_state_bytes(),
+            |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64),
+        )
     })
 }
 
@@ -4029,9 +4038,11 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
-        let Some(deserialized) = state::read_or_migrate::<P>(|buf| {
-            read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64)
-        }, data.plugin_id_hash, state::PluginFormat::Clap) else {
+        let Some(deserialized) = state::read_or_migrate::<P>(
+            |buf| read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64),
+            data.plugin_id_hash,
+            state::PluginFormat::Clap,
+        ) else {
             return false;
         };
 
@@ -6754,38 +6765,58 @@ mod inactive_recall_tests {
 mod large_state_fixture;
 #[cfg(test)]
 mod large_state_tests {
+    use super::large_state_fixture::{LargePlugin, payload};
     use super::*;
-    use super::large_state_fixture::{LargePlugin,payload};
-    type Large=LargePlugin<{64*1024*1024}>;
-    struct Stream { bytes:Vec<u8>, offset:usize }
-    unsafe extern "C" fn write(s:*const clap_ostream, bytes:*const c_void, size:u64)->i64 {
-        let s=unsafe{&mut *((*s).ctx.cast::<Stream>())};
-        let n=(size as usize).min(317);
-        s.bytes.extend_from_slice(unsafe{std::slice::from_raw_parts(bytes.cast::<u8>(),n)}); n as i64
+    type Large = LargePlugin<{ 64 * 1024 * 1024 }>;
+    struct Stream {
+        bytes: Vec<u8>,
+        offset: usize,
     }
-    unsafe extern "C" fn read(s:*const clap_istream, dst:*mut c_void, size:u64)->i64 {
-        let s=unsafe{&mut *((*s).ctx.cast::<Stream>())};
-        let n=(size as usize).min(311).min(s.bytes.len()-s.offset);
-        unsafe{std::ptr::copy_nonoverlapping(s.bytes.as_ptr().add(s.offset),dst.cast(),n)};
-        s.offset+=n; n as i64
+    unsafe extern "C" fn write(s: *const clap_ostream, bytes: *const c_void, size: u64) -> i64 {
+        let s = unsafe { &mut *((*s).ctx.cast::<Stream>()) };
+        let n = (size as usize).min(317);
+        s.bytes
+            .extend_from_slice(unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), n) });
+        n as i64
+    }
+    unsafe extern "C" fn read(s: *const clap_istream, dst: *mut c_void, size: u64) -> i64 {
+        let s = unsafe { &mut *((*s).ctx.cast::<Stream>()) };
+        let n = (size as usize).min(311).min(s.bytes.len() - s.offset);
+        unsafe { std::ptr::copy_nonoverlapping(s.bytes.as_ptr().add(s.offset), dst.cast(), n) };
+        s.offset += n;
+        n as i64
     }
     #[test]
     fn large_host_state_roundtrips_and_default_bound_rejects() {
         unsafe {
-            let mut host:clap_host=std::mem::zeroed(); host.clap_version=clap_sys::version::CLAP_VERSION;
-            let descriptor=DescriptorHolder::new(&Large::info());
-            let plugin=create_plugin_instance::<Large>(&raw const descriptor.descriptor,&raw const host);
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            let descriptor = DescriptorHolder::new(&Large::info());
+            let plugin =
+                create_plugin_instance::<Large>(&raw const descriptor.descriptor, &raw const host);
             assert!(clap_plugin_init::<Large>(plugin));
-            let data=data_from_plugin::<Large>(plugin);
-            *data.params_arc.payload.lock().unwrap()=payload();
-            let mut s=Stream{bytes:Vec::new(),offset:0};
-            let out=clap_ostream{ctx:(&raw mut s).cast(),write:Some(write)};
-            assert!(state_save::<Large>(plugin,&out)); assert!(s.bytes.len()>32*1024*1024);
+            let data = data_from_plugin::<Large>(plugin);
+            *data.params_arc.payload.lock().unwrap() = payload();
+            let mut s = Stream {
+                bytes: Vec::new(),
+                offset: 0,
+            };
+            let out = clap_ostream {
+                ctx: (&raw mut s).cast(),
+                write: Some(write),
+            };
+            assert!(state_save::<Large>(plugin, &out));
+            assert!(s.bytes.len() > 32 * 1024 * 1024);
             data.params_arc.payload.lock().unwrap().clear();
-            let input=clap_istream{ctx:(&raw mut s).cast(),read:Some(read)};
-            assert!(state_load::<Large>(plugin,&input));
-            assert_eq!(*data.params_arc.payload.lock().unwrap(),payload());
-            s.offset=0; s.bytes.pop(); assert!(!state_load::<Large>(plugin,&input));
+            let input = clap_istream {
+                ctx: (&raw mut s).cast(),
+                read: Some(read),
+            };
+            assert!(state_load::<Large>(plugin, &input));
+            assert_eq!(*data.params_arc.payload.lock().unwrap(), payload());
+            s.offset = 0;
+            s.bytes.pop();
+            assert!(!state_load::<Large>(plugin, &input));
             clap_plugin_destroy::<Large>(plugin);
         }
     }
