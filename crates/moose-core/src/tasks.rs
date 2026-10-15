@@ -332,6 +332,7 @@ fn retry_registered(shared: &Shared) -> (usize, bool) {
 /// `Arc` so every worker closure can reach it.
 struct Shared {
     wake: Arc<WakeSignal>,
+    capacity_epoch: AtomicUsize,
     injector: ArrayQueue<Arc<dyn Drain>>,
     /// Non-realtime notifier's round-robin wake cursor.
     next_worker: AtomicUsize,
@@ -405,6 +406,7 @@ fn start_pool(pin_module: bool) -> bool {
 
     let shared = Arc::new(Shared {
         wake: wake_signal(),
+        capacity_epoch: AtomicUsize::new(0),
         injector: ArrayQueue::new(INJECTOR_CAP),
         next_worker: AtomicUsize::new(0),
         execution_state: AtomicUsize::new(0),
@@ -707,6 +709,7 @@ fn notifier_loop(shared: &Shared, workers: &[Thread]) {
             return;
         }
         let current = NOTIFY_EPOCH.load(Ordering::Acquire);
+        let capacity_epoch = shared.capacity_epoch.load(Ordering::SeqCst);
         let retry_hint = RETRY_PENDING.swap(false, Ordering::AcqRel);
         let (retried, retry_remaining) = if retry_hint {
             retry_registered(shared)
@@ -714,12 +717,20 @@ fn notifier_loop(shared: &Shared, workers: &[Thread]) {
             (0, false)
         };
         if retry_remaining {
-            RETRY_PENDING.store(true, Ordering::Release);
+            RETRY_PENDING.store(true, Ordering::SeqCst);
         }
         if first_pass || retried != 0 || current != observed {
             first_pass = false;
             observed = current;
             wake_ready_workers(shared, workers);
+        }
+        // A worker can free the final injector entry while this scan has
+        // temporarily cleared RETRY_PENDING. Either it observes our republished
+        // flag, or the total order exposes its capacity epoch here. Leave a
+        // sticky token in that case so an opt-in parked notifier cannot strand
+        // accepted lane-local work.
+        if retry_remaining && shared.capacity_epoch.load(Ordering::SeqCst) != capacity_epoch {
+            thread::current().unpark();
         }
     }
 }
@@ -748,7 +759,8 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
             deferred.pop_front().or_else(|| shared.injector.pop())
         };
         if let Some(sink) = next_sink {
-            if RETRY_PENDING.load(Ordering::Acquire) {
+            shared.capacity_epoch.fetch_add(1, Ordering::SeqCst);
+            if RETRY_PENDING.load(Ordering::SeqCst) {
                 shared.wake.notify();
             }
             prefer_injector = !prefer_injector;
@@ -791,7 +803,7 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
             (0, false)
         };
         if retry_remaining {
-            RETRY_PENDING.store(true, Ordering::Release);
+            RETRY_PENDING.store(true, Ordering::SeqCst);
         }
         if retried != 0 || !shared.injector.is_empty() {
             continue;
@@ -984,7 +996,7 @@ impl<T: Send + 'static> TaskSpawner<T> {
             if !schedule(sink) {
                 self.sink.scheduled.store(false, Ordering::SeqCst);
                 self.sink.retry_requested.store(true, Ordering::Release);
-                RETRY_PENDING.store(true, Ordering::Release);
+                RETRY_PENDING.store(true, Ordering::SeqCst);
             }
             notify_scheduler();
             if self.sink.wake_on_schedule {
