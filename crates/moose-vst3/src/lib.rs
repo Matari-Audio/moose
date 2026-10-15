@@ -4514,9 +4514,6 @@ mod host_value_tests {
 }
 
 #[cfg(test)]
-#[path = "../../../test-support/host_value_fixture.rs"]
-mod host_value_fixture;
-#[cfg(test)]
 #[path = "../../../test-support/large_state_fixture.rs"]
 mod large_state_fixture;
 #[cfg(test)]
