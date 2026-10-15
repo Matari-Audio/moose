@@ -297,6 +297,8 @@ struct ClapPluginData<P: PluginExport> {
     floating_closed: Arc<AtomicBool>,
     /// Last `Params::parameter_presentation_revision` the host saw.
     presentation_revision: AtomicU64,
+    /// Main-thread discovery cache; audio processing never reads or locks it.
+    remote_pages: Mutex<Vec<(String, Vec<u32>)>>,
     /// Shared transport slot: audio thread writes each block, editor reads.
     transport_slot: Arc<TransportSlot>,
     /// Host-reported GUI scale (via `clap_plugin_gui::set_scale`).
@@ -930,6 +932,9 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
         let revision = data.params_arc.parameter_presentation_revision();
         let info_changed = data.presentation_revision.swap(revision, Ordering::Relaxed) != revision;
         let list_changed = info_changed && refresh_parameter_list(data);
+        if info_changed {
+            refresh_remote_control_pages(data);
+        }
         let values_changed = data.needs_rescan.swap(false, Ordering::Relaxed);
         if (values_changed || info_changed)
             && !data.host_params.is_null()
@@ -3482,17 +3487,8 @@ unsafe fn refresh_parameter_list<P: PluginExport>(data: &ClapPluginData<P>) -> b
     drop(indices);
     data.parameter_restart_pending
         .store(false, Ordering::Relaxed);
-    if !data.host.is_null()
-        && let Some(get_extension) = unsafe { (*data.host).get_extension }
-    {
-        let extension = unsafe { get_extension(data.host, CLAP_EXT_REMOTE_CONTROLS.as_ptr()) }
-            .cast::<clap_host_remote_controls>();
-        if !extension.is_null()
-            && let Some(changed) = unsafe { (*extension).changed }
-        {
-            unsafe { changed(data.host) };
-        }
-    }
+    // SAFETY: this helper is called on the host main thread with live instance data.
+    unsafe { refresh_remote_control_pages(data) };
     true
 }
 
@@ -3785,6 +3781,7 @@ fn split_group(group: &str) -> (&str, &str) {
 /// param) and these slots - so grouping a hidden param for tidiness must
 /// not silently burn one of the user's knobs on something they can't
 /// see or move.
+#[cfg(test)]
 fn remote_control_pages<'a>(
     infos: impl IntoIterator<Item = &'a ParamInfo>,
 ) -> Vec<(&'a str, Vec<u32>)> {
@@ -3806,6 +3803,69 @@ fn remote_control_pages<'a>(
         }
     }
     pages
+}
+
+/// Resolve runtime names, groups and visibility before paginating. IDs and
+/// storage remain static; a hidden/unavailable control never consumes a knob.
+fn presented_remote_control_pages(
+    infos: impl IntoIterator<Item = impl std::borrow::Borrow<ParamInfo>>,
+    mut presentation: impl FnMut(u32) -> Option<moose_params::ParameterPresentation>,
+) -> Vec<(String, Vec<u32>)> {
+    let mut pages: Vec<(String, Vec<u32>)> = Vec::new();
+    for info in infos {
+        let info = info.borrow();
+        let runtime = presentation(info.id);
+        let group = runtime.as_ref().map_or(info.group, |p| p.group.as_str());
+        let hidden = runtime.as_ref().map_or_else(
+            || info.flags.contains(ParamFlags::HIDDEN),
+            |p| p.hidden || !p.available,
+        );
+        if group.is_empty() || hidden || info.flags.contains(ParamFlags::READONLY) {
+            continue;
+        }
+        if let Some(page) = pages
+            .iter_mut()
+            .rfind(|p| p.0 == group && p.1.len() < CLAP_REMOTE_CONTROLS_COUNT)
+        {
+            page.1.push(info.id);
+        } else {
+            pages.push((group.to_owned(), vec![info.id]));
+        }
+    }
+    pages
+}
+
+/// Only structural presentation revisions rebuild the cache, never value flushes.
+unsafe fn refresh_remote_control_pages<P: PluginExport>(data: &ClapPluginData<P>) {
+    let indices = data
+        .exposed_param_indices
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pages =
+        presented_remote_control_pages(indices.iter().map(|&i| &data.param_infos[i]), |id| {
+            data.params_arc.parameter_presentation(id)
+        });
+    drop(indices);
+    let mut current = data
+        .remote_pages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *current == pages {
+        return;
+    }
+    *current = pages;
+    drop(current);
+    if !data.host.is_null()
+        && let Some(get_extension) = unsafe { (*data.host).get_extension }
+    {
+        let extension = unsafe { get_extension(data.host, CLAP_EXT_REMOTE_CONTROLS.as_ptr()) }
+            .cast::<clap_host_remote_controls>();
+        if !extension.is_null()
+            && let Some(changed) = unsafe { (*extension).changed }
+        {
+            unsafe { changed(data.host) };
+        }
+    }
 }
 
 /// Deterministic page id from the group name and its chunk index among
@@ -3830,11 +3890,12 @@ fn remote_controls_page_id(group: &str, chunk_index: usize) -> clap_id {
 unsafe extern "C" fn remote_controls_count<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let indices = data
-            .exposed_param_indices
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        len_u32(remote_control_pages(indices.iter().map(|&i| &data.param_infos[i])).len())
+        len_u32(
+            data.remote_pages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        )
     }
 }
 
@@ -3845,16 +3906,15 @@ unsafe extern "C" fn remote_controls_get<P: PluginExport>(
 ) -> bool {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let indices = data
-            .exposed_param_indices
+        let pages = data
+            .remote_pages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pages = remote_control_pages(indices.iter().map(|&i| &data.param_infos[i]));
         let page_index = page_index as usize;
         if page_index >= pages.len() {
             return false;
         }
-        let group: &str = pages[page_index].0;
+        let group: &str = &pages[page_index].0;
         let ids: &[u32] = &pages[page_index].1;
 
         // Chunk index among pages sharing this group name, so two pages
@@ -5456,6 +5516,9 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let exposed_param_indices = Mutex::new(parameter_indices(&param_infos, |id| {
             params_arc.parameter_presentation(id)
         }));
+        let remote_pages = Mutex::new(presented_remote_control_pages(&param_infos, |id| {
+            params_arc.parameter_presentation(id)
+        }));
         let meter_store = instance.meter_store();
         let snapshot = instance.snapshot_slot();
         let task_spawner = instance.task_spawner();
@@ -5510,6 +5573,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             floating_visible: Arc::new(AtomicBool::new(false)),
             floating_closed: Arc::new(AtomicBool::new(false)),
             presentation_revision: AtomicU64::new(0),
+            remote_pages,
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),
             window_scale: AtomicU64::new(0),
@@ -5958,6 +6022,23 @@ mod remote_controls_tests {
             midi_map: None,
             midi_channel: None,
         }
+    }
+
+    #[test]
+    fn runtime_pages_use_live_groups_and_visibility_without_changing_ids() {
+        let infos = vec![info(7, "OLD"), info(8, "OLD"), info(9, "OLD")];
+        let pages = super::presented_remote_control_pages(&infos, |id| {
+            Some(ParameterPresentation {
+                name: format!("Control {id}"),
+                group: "Modulators/LFO 1".into(),
+                hidden: id == 8,
+                available: id != 9,
+            })
+        });
+        assert_eq!(pages, vec![("Modulators/LFO 1".into(), vec![7])]);
+        assert_eq!(infos.iter().map(|p| p.id).collect::<Vec<_>>(), [7, 8, 9]);
+        let pages = super::presented_remote_control_pages(&infos, |_| None);
+        assert_eq!(pages, vec![("OLD".into(), vec![7, 8, 9])]);
     }
 
     #[test]
