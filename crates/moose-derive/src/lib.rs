@@ -2580,11 +2580,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                 quote! { me.#ident.offset_ids(#base_expr); }
             })
             .collect();
-        let me_binding = if nested_fields.is_empty() {
-            quote! { let me }
-        } else {
-            quote! { let mut me }
-        };
+        let me_binding = quote! { let mut me };
 
         quote! {
             impl #struct_name {
@@ -2597,6 +2593,10 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                         #(#skip_inits,)*
                     };
                     #(#offset_stmts)*
+                    <Self as ::moose::params::Params>::set_edit_epoch(
+                        &mut me,
+                        ::std::sync::Arc::new(::std::sync::atomic::AtomicU64::new(0)),
+                    );
                     // The per-struct compile-time ID check can't see
                     // across nested types; a parent id matching a
                     // (rebased) nested id would silently corrupt state
@@ -2625,6 +2625,23 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // keep their dedicated id range and aren't shifted. Always emitted
     // so a parent can rebase any nested child, leaf or not.
     let own_param_idents: Vec<_> = param_fields.iter().map(|f| &f.ident).collect();
+    let parameter_epoch_expr = if let Some(field) = own_param_idents.first() {
+        quote! { self.#field.parameter_edit_epoch() }
+    } else {
+        quote! {
+            #(if self.#nested_idents.count() != 0 {
+                return self.#nested_idents.parameter_edit_epoch();
+            })*
+            0
+        }
+    };
+    let parameter_epoch_impl = quote! {
+        fn parameter_edit_epoch(&self) -> u64 { #parameter_epoch_expr }
+        fn set_edit_epoch(&mut self, epoch: ::std::sync::Arc<::std::sync::atomic::AtomicU64>) {
+            #(self.#own_param_idents.set_edit_epoch(::std::sync::Arc::clone(&epoch));)*
+            #(self.#nested_idents.set_edit_epoch(::std::sync::Arc::clone(&epoch));)*
+        }
+    };
     let offset_ids_impl = quote! {
         impl #struct_name {
             #[doc(hidden)]
@@ -2945,6 +2962,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         impl ::moose::params::__private::Sealed for #struct_name {}
 
         impl ::moose::params::Params for #struct_name {
+            #parameter_epoch_impl
             fn param_infos(&self) -> Vec<::moose::params::ParamInfo> {
                 #infos_expr
             }
