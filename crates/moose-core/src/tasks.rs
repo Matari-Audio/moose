@@ -67,9 +67,8 @@ pub const TASK_QUEUE_PREALLOC: usize = 256;
 /// Sized well past any realistic simultaneous-instance count.
 const INJECTOR_CAP: usize = 4096;
 
-/// Ordinary worker defensive timeout. If notifier startup fails, exactly one
-/// designated worker uses [`NOTIFIER_INTERVAL`] instead; the others keep this
-/// long park so fallback does not become a thundering herd.
+/// A reversible pool pause may retain work while waiting for execution to
+/// resume. Idle workers themselves park indefinitely.
 const PARK_TIMEOUT: Duration = Duration::from_secs(1);
 /// One non-realtime notifier polls the atomic scheduling epoch at this rate,
 /// retries lanes that missed the bounded injector, and owns all wake syscalls.
@@ -938,7 +937,8 @@ impl<T: Send + 'static> TaskSpawner<T> {
     }
 
     /// Enqueue a task, running it on the pool as soon as a worker is
-    /// free. Wait-free. Returns `Err(task)` if the inbound queue is full
+    /// free. Queue admission is wait-free; [`Self::new_managed_waking`] also
+    /// permits an OS wake. Returns `Err(task)` if the inbound queue is full
     /// (the audio thread decides what to do - drop, or coalesce via
     /// [`Self::spawn_coalescing`] - rather than block).
     ///
