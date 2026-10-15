@@ -14,7 +14,7 @@ pub use sample::{Float, Sample};
 pub use smooth::{Smoother, SmoothingStyle};
 pub use types::{
     BoolParam, EnumParam, FloatParam, FloatParamReadF32, FloatParamReadF64, IntParam, MeterSlot,
-    ParamEnum, bump_edit_epoch, edit_epoch,
+    ParamEnum, bump_edit_epoch, custom_edit_epoch, edit_epoch,
 };
 
 /// Largest host-visible parameter ID. The signed-positive 31-bit
@@ -198,6 +198,17 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
         0
     }
 
+    /// Stored parameter changes in this instance, including nested groups.
+    /// Custom-state publishers remain separate; use their own generations or
+    /// `custom_edit_epoch`. Changed setters perform only bounded atomic work.
+    fn parameter_edit_epoch(&self) -> u64 {
+        edit_epoch()
+    }
+
+    /// Attach the counter of a containing parameter tree during construction.
+    #[doc(hidden)]
+    fn set_edit_epoch(&mut self, _epoch: std::sync::Arc<std::sync::atomic::AtomicU64>) {}
+
     /// All parameter infos, in declaration order.
     fn param_infos(&self) -> Vec<ParamInfo>;
 
@@ -294,10 +305,20 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// [`Self::set_normalized`].
     fn set_plain(&self, id: u32, value: f64);
 
-    /// Format a plain value to display string.
+    /// Format a value in the parameter's declared plain/storage range.
+    /// `#[params(value_format = "method")]` first calls an instance method
+    /// `fn(&self, id: u32, value: f64) -> Option<String>`. Returning `None`
+    /// keeps the generated field/nested formatter. This can give a fixed
+    /// automation slot its current target's musical display without changing
+    /// its range, stored values or automation transport.
     fn format_value(&self, id: u32, value: f64) -> Option<String>;
 
-    /// Parse a display string to plain value.
+    /// Parse display text into the parameter's declared plain/storage range.
+    /// `#[params(value_parse = "method")]` first calls an instance method
+    /// `fn(&self, id: u32, text: &str) -> Result<Option<f64>, ()>`.
+    /// `Ok(Some(value))` handles the input (non-finite values are rejected),
+    /// `Ok(None)` uses generated field/nested parsing, and `Err(())` rejects
+    /// input without falling back to a potentially different numeric meaning.
     fn parse_value(&self, id: u32, text: &str) -> Option<f64>;
 
     /// Reset all smoothers to current values.

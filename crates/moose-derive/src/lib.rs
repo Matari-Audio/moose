@@ -882,6 +882,10 @@ struct ParamsStructAttrs {
     presentation: Option<syn::Ident>,
     /// Inherent `fn(&self) -> u64`.
     presentation_revision: Option<syn::Ident>,
+    /// Inherent `fn(&self, u32, f64) -> Option<String>`; None uses static formatting.
+    value_format: Option<syn::Ident>,
+    /// Inherent `fn(&self, u32, &str) -> Result<Option<f64>, ()>`.
+    value_parse: Option<syn::Ident>,
 }
 
 /// Read the struct-level `#[params(...)]` keys. `id_scheme` defaults
@@ -896,6 +900,8 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
         restore_state: None,
         presentation: None,
         presentation_revision: None,
+        value_format: None,
+        value_parse: None,
     };
     for attr in attrs {
         if !attr.path().is_ident("params") {
@@ -927,11 +933,13 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 "restore_state" => &mut parsed.restore_state,
                 "presentation" => &mut parsed.presentation,
                 "presentation_revision" => &mut parsed.presentation_revision,
+                "value_format" => &mut parsed.value_format,
+                "value_parse" => &mut parsed.value_parse,
                 _ => {
                     return Err(meta.error(
                         "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
-                         `validate_persist`, `restore_state`, `presentation`, or \
-                         `presentation_revision`)",
+                         `validate_persist`, `restore_state`, `presentation`, \
+                         `presentation_revision`, `value_format`, or `value_parse`)",
                     ));
                 }
             };
@@ -2572,11 +2580,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                 quote! { me.#ident.offset_ids(#base_expr); }
             })
             .collect();
-        let me_binding = if nested_fields.is_empty() {
-            quote! { let me }
-        } else {
-            quote! { let mut me }
-        };
+        let me_binding = quote! { let mut me };
 
         quote! {
             impl #struct_name {
@@ -2589,6 +2593,10 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                         #(#skip_inits,)*
                     };
                     #(#offset_stmts)*
+                    <Self as ::moose::params::Params>::set_edit_epoch(
+                        &mut me,
+                        ::std::sync::Arc::new(::std::sync::atomic::AtomicU64::new(0)),
+                    );
                     // The per-struct compile-time ID check can't see
                     // across nested types; a parent id matching a
                     // (rebased) nested id would silently corrupt state
@@ -2617,6 +2625,23 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // keep their dedicated id range and aren't shifted. Always emitted
     // so a parent can rebase any nested child, leaf or not.
     let own_param_idents: Vec<_> = param_fields.iter().map(|f| &f.ident).collect();
+    let parameter_epoch_expr = if let Some(field) = own_param_idents.first() {
+        quote! { self.#field.parameter_edit_epoch() }
+    } else {
+        quote! {
+            #(if self.#nested_idents.count() != 0 {
+                return self.#nested_idents.parameter_edit_epoch();
+            })*
+            0
+        }
+    };
+    let parameter_epoch_impl = quote! {
+        fn parameter_edit_epoch(&self) -> u64 { #parameter_epoch_expr }
+        fn set_edit_epoch(&mut self, epoch: ::std::sync::Arc<::std::sync::atomic::AtomicU64>) {
+            #(self.#own_param_idents.set_edit_epoch(::std::sync::Arc::clone(&epoch));)*
+            #(self.#nested_idents.set_edit_epoch(::std::sync::Arc::clone(&epoch));)*
+        }
+    };
     let offset_ids_impl = quote! {
         impl #struct_name {
             #[doc(hidden)]
@@ -2839,6 +2864,21 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
     });
 
+    let value_format_override = struct_attrs.value_format.as_ref().map(|method| {
+        quote! {
+            if let Some(text) = self.#method(id, value) { return Some(text); }
+        }
+    });
+    let value_parse_override = struct_attrs.value_parse.as_ref().map(|method| {
+        quote! {
+            match self.#method(id, text) {
+                Ok(Some(value)) => return value.is_finite().then_some(value),
+                Ok(None) => {},
+                Err(()) => return None,
+            }
+        }
+    });
+
     // Nothing to carry: leave the empty-`Vec` trait default so a plugin
     // without persisted config adds no bytes to its saved state. A
     // `pre_save` / `post_load` / `validate_persist` hook still needs the
@@ -2922,6 +2962,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         impl ::moose::params::__private::Sealed for #struct_name {}
 
         impl ::moose::params::Params for #struct_name {
+            #parameter_epoch_impl
             fn param_infos(&self) -> Vec<::moose::params::ParamInfo> {
                 #infos_expr
             }
@@ -2972,6 +3013,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn format_value(&self, id: u32, value: f64) -> Option<String> {
+                #value_format_override
                 match id {
                     #(#format_value_arms)*
                     #format_fallthrough
@@ -2979,6 +3021,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn parse_value(&self, id: u32, text: &str) -> Option<f64> {
+                #value_parse_override
                 #parse_value_impl
             }
 

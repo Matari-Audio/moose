@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::info::ParamInfo;
@@ -12,6 +13,30 @@ use crate::smooth::{Smoother, SmoothingStyle};
 /// only its own id, which nesting rebases per instance.
 macro_rules! shared_param_meta {
     () => {
+        /// Counter shared by every field in the owning derived parameter tree.
+        /// Standalone fields retain the legacy process-wide counter.
+        #[doc(hidden)]
+        pub fn parameter_edit_epoch(&self) -> u64 {
+            self.edit_epoch
+                .as_ref()
+                .map_or_else(edit_epoch, |epoch| epoch.load(Ordering::Acquire))
+        }
+
+        #[doc(hidden)]
+        pub fn set_edit_epoch(&mut self, epoch: Arc<AtomicU64>) {
+            self.edit_epoch = Some(epoch);
+        }
+
+        #[inline]
+        fn note_edit(&self, changed: bool) {
+            if changed {
+                EDIT_EPOCH.fetch_add(1, Ordering::Release);
+                if let Some(epoch) = &self.edit_epoch {
+                    epoch.fetch_add(1, Ordering::Release);
+                }
+            }
+        }
+
         /// Parameter metadata carrying this instance's (rebased) id.
         #[must_use]
         pub fn info(&self) -> ParamInfo {
@@ -53,6 +78,7 @@ macro_rules! shared_param_meta {
 
 /// Process-wide signal that at least one stored parameter value changed.
 static EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
+static CUSTOM_EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Equal reads mean no parameter setter (or explicit custom-state edit) ran.
 /// The counter is shared by all plugin instances in this process.
@@ -65,13 +91,15 @@ pub fn edit_epoch() -> u64 {
 #[inline]
 pub fn bump_edit_epoch() {
     EDIT_EPOCH.fetch_add(1, Ordering::Release);
+    CUSTOM_EDIT_EPOCH.fetch_add(1, Ordering::Release);
 }
 
+/// Process-wide custom-state edits only; ordinary parameter setters do not
+/// move this counter. Combine with `Params::parameter_edit_epoch` when a
+/// legacy custom-state publisher has no instance-local generation.
 #[inline]
-fn note_edit(changed: bool) {
-    if changed {
-        bump_edit_epoch();
-    }
+pub fn custom_edit_epoch() -> u64 {
+    CUSTOM_EDIT_EPOCH.load(Ordering::Acquire)
 }
 
 /// Atomic f64 - wraps `AtomicU64` with f64 load/store.
@@ -107,6 +135,7 @@ impl AtomicF64 {
 pub struct FloatParam {
     info: &'static ParamInfo,
     id: u32,
+    edit_epoch: Option<Arc<AtomicU64>>,
     value: AtomicF64,
     smoother: Option<Box<Smoother>>,
 }
@@ -152,6 +181,7 @@ impl FloatParam {
         Self {
             info,
             id: info.id,
+            edit_epoch: None,
             value: AtomicF64::new(default),
             smoother,
         }
@@ -209,7 +239,7 @@ impl FloatParam {
         } else {
             clamped
         };
-        note_edit(self.value.bits.swap(value.to_bits(), Ordering::Relaxed) != value.to_bits());
+        self.note_edit(self.value.bits.swap(value.to_bits(), Ordering::Relaxed) != value.to_bits());
     }
 
     /// Internal: raw target value at `f64` precision (host-side
@@ -498,6 +528,7 @@ impl FloatParamReadF64 for FloatParam {
 pub struct BoolParam {
     info: &'static ParamInfo,
     id: u32,
+    edit_epoch: Option<Arc<AtomicU64>>,
     value: AtomicBool,
 }
 
@@ -524,6 +555,7 @@ impl BoolParam {
         Self {
             info,
             id: info.id,
+            edit_epoch: None,
             value: AtomicBool::new(default),
         }
     }
@@ -533,7 +565,7 @@ impl BoolParam {
     }
 
     pub fn set_value(&self, v: bool) {
-        note_edit(self.value.swap(v, Ordering::Relaxed) != v);
+        self.note_edit(self.value.swap(v, Ordering::Relaxed) != v);
     }
 }
 
@@ -541,6 +573,7 @@ impl BoolParam {
 pub struct IntParam {
     info: &'static ParamInfo,
     id: u32,
+    edit_epoch: Option<Arc<AtomicU64>>,
     value: AtomicI64,
 }
 
@@ -594,6 +627,7 @@ impl IntParam {
         Self {
             info,
             id: info.id,
+            edit_epoch: None,
             value: AtomicI64::new(truncated),
         }
     }
@@ -651,7 +685,7 @@ impl IntParam {
     pub fn set_value(&self, v: i64) {
         let (lo, hi) = (self.info.range.min() as i64, self.info.range.max() as i64);
         let v = v.clamp(lo.min(hi), lo.max(hi));
-        note_edit(self.value.swap(v, Ordering::Relaxed) != v);
+        self.note_edit(self.value.swap(v, Ordering::Relaxed) != v);
     }
 }
 
@@ -668,6 +702,7 @@ pub trait ParamEnum: crate::__private::Sealed + Clone + Copy + Send + Sync + 'st
 pub struct EnumParam<E: ParamEnum> {
     info: &'static ParamInfo,
     id: u32,
+    edit_epoch: Option<Arc<AtomicU64>>,
     value: AtomicU32,
     _phantom: std::marker::PhantomData<E>,
 }
@@ -727,6 +762,7 @@ impl<E: ParamEnum> EnumParam<E> {
         Self {
             info,
             id: info.id,
+            edit_epoch: None,
             value: AtomicU32::new(idx),
             _phantom: std::marker::PhantomData,
         }
@@ -746,7 +782,7 @@ impl<E: ParamEnum> EnumParam<E> {
         // would mean a > 4-billion-variant enum.
         #[allow(clippy::cast_possible_truncation)]
         let idx = v.to_index() as u32;
-        note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
+        self.note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
     }
 
     pub fn set_index(&self, idx: u32) {
@@ -761,7 +797,7 @@ impl<E: ParamEnum> EnumParam<E> {
         #[allow(clippy::cast_possible_truncation)]
         let max = (E::variant_count() as u32).saturating_sub(1);
         let idx = idx.min(max);
-        note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
+        self.note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
     }
 
     pub fn index(&self) -> u32 {
@@ -859,7 +895,8 @@ mod tests {
     fn float_param_is_pointer_sized_metadata() {
         // The borrowed-info layout: a param must not carry `ParamInfo`
         // (or an unused smoother) inline.
-        assert!(std::mem::size_of::<FloatParam>() <= 32);
+        // One optional shared instance-counter pointer, with no per-field allocation.
+        assert!(std::mem::size_of::<FloatParam>() <= 40);
         let p = float(0.0, 1.0);
         assert!(p.smoother().is_none(), "no smoother without a style");
         p.set_value(0.5);
