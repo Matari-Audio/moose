@@ -519,7 +519,9 @@ macro_rules! export_static {
                         // `SERIALIZED` picks one-slot vs concurrent draining
                         // for this lane; the const folds the branch at
                         // compile time.
-                        let __spawner = if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED {
+                        let __spawner = if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::WAKE_ON_SCHEDULE {
+                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed_waking(__task_run, <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED)
+                        } else if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED {
                             $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed_serialized(__task_run)
                         } else {
                             $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed(__task_run)

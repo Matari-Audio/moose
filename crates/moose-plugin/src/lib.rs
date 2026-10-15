@@ -792,6 +792,10 @@ pub trait BackgroundTask: Send + 'static {
     /// (a long serialized handler delays this lane's later tasks). The mode
     /// is per lane, so a concurrent lane in the same plugin is unaffected.
     const SERIALIZED: bool = false;
+    /// Allow a nonblocking OS wake when a task is first queued. Default false
+    /// preserves syscall-free scheduling. Opt-in lanes remain allocation-free;
+    /// when all lanes opt in, idle pool threads park without periodic wakeups.
+    const WAKE_ON_SCHEDULE: bool = false;
     /// Run one task on the pool. See the trait docs for the contract,
     /// including the concurrency note on [`Self::SERIALIZED`].
     fn run(self, params: &Self::Params);
