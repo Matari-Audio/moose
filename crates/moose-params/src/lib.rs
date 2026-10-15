@@ -14,7 +14,7 @@ pub use sample::{Float, Sample};
 pub use smooth::{Smoother, SmoothingStyle};
 pub use types::{
     BoolParam, EnumParam, FloatParam, FloatParamReadF32, FloatParamReadF64, IntParam, MeterSlot,
-    ParamEnum, bump_edit_epoch, edit_epoch,
+    ParamEnum, bump_edit_epoch, custom_edit_epoch, edit_epoch,
 };
 
 /// Largest host-visible parameter ID. The signed-positive 31-bit
@@ -197,6 +197,17 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     fn parameter_presentation_revision(&self) -> u64 {
         0
     }
+
+    /// Stored parameter changes in this instance, including nested groups.
+    /// Custom-state publishers remain separate; use their own generations or
+    /// `custom_edit_epoch`. Changed setters perform only bounded atomic work.
+    fn parameter_edit_epoch(&self) -> u64 {
+        edit_epoch()
+    }
+
+    /// Attach the counter of a containing parameter tree during construction.
+    #[doc(hidden)]
+    fn set_edit_epoch(&mut self, _epoch: std::sync::Arc<std::sync::atomic::AtomicU64>) {}
 
     /// All parameter infos, in declaration order.
     fn param_infos(&self) -> Vec<ParamInfo>;
