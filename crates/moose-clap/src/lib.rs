@@ -3923,33 +3923,9 @@ unsafe extern "C" fn state_save<P: PluginExport>(
         // can't stall a block in flight.
         let extra = save_extra(&data.snapshot);
         let persist = data.params_arc.serialize_persist();
-        let blob = state::serialize_state(data.plugin_id_hash, &ids, &values, &extra, &persist);
-
-        // Write to the CLAP output stream
-        let Some(write_fn) = (*stream).write else {
-            return false;
-        };
-
-        if blob.len() > P::max_host_state_bytes() { return false; }
-        let mut offset = 0usize;
-        while offset < blob.len() {
-            let written = write_fn(
-                stream,
-                blob[offset..].as_ptr().cast::<c_void>(),
-                (blob.len() - offset) as u64,
-            );
-            if written <= 0 {
-                return false;
-            }
-            // `written > 0` checked above; on 32-bit targets the cast
-            // narrows but blob.len() also fits in usize.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let n = written as usize;
-            if n > blob.len() - offset { return false; }
-            offset += n;
-        }
-
-        true
+        let Some(write_fn) = (*stream).write else { return false; };
+        state::write_state_stream(data.plugin_id_hash, &ids, &values, &extra, &persist,
+            P::max_host_state_bytes(), |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64))
     })
 }
 

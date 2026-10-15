@@ -178,3 +178,96 @@ mod tests {
         assert!(parse(&bad, 17, 1024).is_none());
     }
 }
+
+/// Write byte-identical OAST v1 framing without a second full-state buffer.
+/// Reject a state outside the plugin's proven bound before writing any bytes.
+pub fn write_state_stream(
+    plugin_id: u64,
+    ids: &[u32],
+    values: &[f64],
+    extra: &[u8],
+    persist: &[u8],
+    limit: usize,
+    mut write: impl FnMut(&[u8]) -> i64,
+) -> bool {
+    let Some(size) = ids
+        .len()
+        .checked_mul(12)
+        .and_then(|n| n.checked_add(36))
+        .and_then(|n| n.checked_add(extra.len()))
+        .and_then(|n| n.checked_add(persist.len()))
+    else {
+        return false;
+    };
+    if ids.len() != values.len() || ids.len() > u32::MAX as usize || size > limit {
+        return false;
+    }
+    let mut part = |mut bytes: &[u8]| -> bool {
+        while !bytes.is_empty() {
+            let request = &bytes[..bytes.len().min(8192)];
+            let Ok(n) = usize::try_from(write(request)) else {
+                return false;
+            };
+            if n == 0 || n > request.len() {
+                return false;
+            }
+            bytes = &bytes[n..];
+        }
+        true
+    };
+    if !part(b"OAST")
+        || !part(&1_u32.to_le_bytes())
+        || !part(&plugin_id.to_le_bytes())
+        || !part(&(ids.len() as u32).to_le_bytes())
+    {
+        return false;
+    }
+    for (&id, &value) in ids.iter().zip(values) {
+        if !part(&id.to_le_bytes()) || !part(&value.to_le_bytes()) {
+            return false;
+        }
+    }
+    part(&(extra.len() as u64).to_le_bytes())
+        && part(extra)
+        && part(&(persist.len() as u64).to_le_bytes())
+        && part(persist)
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    #[test]
+    fn streamed_output_matches_old_envelopes_and_partial_write_errors_are_honest() {
+        let ids = [1, 7];
+        let values = [-0.0, f64::from_bits(0x3fda_1234_5678_90ab)];
+        let persist = vec![73; 33 * 1024 * 1024];
+        let expected = crate::state::serialize_state(42, &ids, &values, b"extra", &persist);
+        let mut output = Vec::new();
+        assert!(write_state_stream(
+            42,
+            &ids,
+            &values,
+            b"extra",
+            &persist,
+            expected.len(),
+            |bytes| {
+                let n = bytes.len().min(317);
+                output.extend_from_slice(&bytes[..n]);
+                n as i64
+            }
+        ));
+        assert_eq!(output, expected);
+        assert!(!write_state_stream(
+            42,
+            &ids,
+            &values,
+            b"extra",
+            &persist,
+            32 * 1024 * 1024,
+            |_| panic!("oversize wrote bytes")
+        ));
+        for reply in [-1, 0, 10000] {
+            assert!(!write_state_stream(42, &[], &[], b"", b"", 1024, |_| reply));
+        }
+    }
+}

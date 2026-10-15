@@ -1894,6 +1894,24 @@ unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized
         }
 }
 
+unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
+    ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    write: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, u32) -> i64,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "save_state_stream", 0, || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if !inst.active.load(Ordering::Relaxed) && let Some(state) = inst.pending_state.pop() {
+            let mut plugin = enter_plugin(&inst.plugin);
+            state::apply_state(&mut *plugin, &state); plugin.republish_snapshot();
+        }
+        let (ids, values) = inst.params_arc.collect_values();
+        let extra = save_extra(&inst.snapshot);
+        let persist = inst.params_arc.serialize_persist();
+        i32::from(state::write_state_stream(inst.plugin_id_hash, &ids, &values, &extra, &persist,
+            P::max_host_state_bytes(), |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
+    })
+}
+
 unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
     ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
     read: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, u32) -> i64,
@@ -3690,6 +3708,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         state_save: cb_state_save::<P>,
         state_load: cb_state_load::<P>,
         state_load_stream: cb_state_load_stream::<P>,
+        state_save_stream: cb_state_save_stream::<P>,
         state_free: cb_state_free,
         get_latency: cb_get_latency::<P>,
         get_tail: cb_get_tail::<P>,

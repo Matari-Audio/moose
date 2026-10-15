@@ -475,6 +475,7 @@ struct Vst3Callbacks {
      * setState forwards that to the host as kResultFalse. */
     int32_t (*state_load)(void*, const uint8_t*, uint32_t);
     int32_t (*state_load_stream)(void*, void*, int64_t (*)(void*, uint8_t*, uint32_t));
+    int32_t (*state_save_stream)(void*, void*, int64_t (*)(void*, const uint8_t*, uint32_t));
     void (*state_free)(uint8_t*, uint32_t);
     // Latency + tail
     uint32_t (*get_latency)(void*);
@@ -720,6 +721,15 @@ int64_t moose_vst3_read_state_chunk(void* stream, uint8_t* dst, uint32_t request
     const tresult result = vtbl->read(stream, dst, (int32)requested, &count);
     if (count < 0 || (uint32_t)count > requested) return -1;
     if (count == 0 && result != kResultOk && result != kResultFalse) return -1;
+    return count;
+}
+
+int64_t moose_vst3_write_state_chunk(void* stream, const uint8_t* src, uint32_t requested) {
+    if (!stream || !src || requested == 0 || requested > 8192) return -1;
+    auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
+    int32 count = 0;
+    const tresult result = vtbl->write(stream, (void*)src, (int32)requested, &count);
+    if (count <= 0 || (uint32_t)count > requested || result != kResultOk) return -1;
     return count;
 }
 
@@ -1251,13 +1261,8 @@ public:
 
     tresult getState(void* stream) {
         if (!stream || !g_cb || !ctx) return kResultFalse;
-        uint8_t* blob = nullptr;
-        uint32_t len = 0;
-        g_cb->state_save(ctx, &blob, &len);
-        if (!blob) return kResultFalse;
-        const int32_t ok = moose_vst3_write_state_stream(stream, blob, len);
-        g_cb->state_free(blob, len);
-        return ok ? kResultOk : kResultFalse;
+        return g_cb->state_save_stream(ctx, stream, moose_vst3_write_state_chunk)
+            ? kResultOk : kResultFalse;
     }
 
     // --- IAudioProcessor ---

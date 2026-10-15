@@ -234,6 +234,10 @@ pub struct Vst3Callbacks {
         ctx: *mut c_void, stream: *mut c_void,
         read: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i64,
     ) -> i32,
+    pub state_save_stream: unsafe extern "C" fn(
+        ctx: *mut c_void, stream: *mut c_void,
+        write: unsafe extern "C" fn(*mut c_void, *const u8, u32) -> i64,
+    ) -> i32,
     pub state_free: unsafe extern "C" fn(data: *mut u8, len: u32),
     // Latency + tail
     pub get_latency: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
