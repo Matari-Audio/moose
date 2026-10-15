@@ -179,7 +179,12 @@ impl<P: Params> MuiEditor<P> {
 
     fn close_window(&mut self) {
         #[cfg(target_os = "linux")]
-        drop(self.floating.take());
+        {
+            if self.floating.is_some() {
+                self.size = self.size();
+            }
+            drop(self.floating.take());
+        }
         if let Some(Handle(window)) = self.window.take() {
             #[cfg(target_os = "linux")]
             {
