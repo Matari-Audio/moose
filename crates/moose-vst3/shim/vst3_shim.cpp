@@ -710,9 +710,6 @@ struct IBStreamVtbl {
     tresult (*tell)(void*, int64_t*);
 };
 
-// Largest state blob accepted from, or handed to, a host stream.
-static constexpr int32 kMaxHostStateBytes = 32 * 1024 * 1024;
-
 extern "C" {
 
 // Return an arbitrary short host read directly to the bounded Rust parser.
@@ -726,50 +723,9 @@ int64_t moose_vst3_read_state_chunk(void* stream, uint8_t* dst, uint32_t request
     return count;
 }
 
-// Read one bounded state blob from a host IBStream. Returns a malloc'd
-// buffer (caller frees) and its length, or nullptr when the stream is
-// empty, errors before any data, reports a byte count outside the
-// request, or runs past kMaxHostStateBytes. A short final read is
-// valid. Exported so the Rust tests can drive it with a fake stream.
-uint8_t* moose_vst3_read_state_stream(void* stream, int32* outLen) {
-    *outLen = 0;
-    if (!stream) return nullptr;
-    auto* vtbl = *reinterpret_cast<IBStreamVtbl**>(stream);
-    uint8_t buf[4096];
-    uint8_t* data = nullptr;
-    int32 total = 0;
-    int32 capacity = 0;
-    for (;;) {
-        int32 bytesRead = 0;
-        tresult r = vtbl->read(stream, buf, (int32)sizeof(buf), &bytesRead);
-        if (bytesRead < 0 || bytesRead > (int32)sizeof(buf)) { free(data); return nullptr; }
-        if (bytesRead == 0) break;
-        if (total > kMaxHostStateBytes - bytesRead) { free(data); return nullptr; }
-        const int32 nextTotal = total + bytesRead;
-        if (nextTotal > capacity) {
-            // Geometric growth: one realloc per doubling, not per chunk.
-            int32 nextCapacity = capacity == 0 ? (int32)sizeof(buf) : capacity;
-            while (nextCapacity < nextTotal) {
-                nextCapacity = nextCapacity > kMaxHostStateBytes / 2
-                    ? kMaxHostStateBytes : nextCapacity * 2;
-            }
-            auto* grown = (uint8_t*)realloc(data, (size_t)nextCapacity);
-            if (!grown) { free(data); return nullptr; }
-            data = grown;
-            capacity = nextCapacity;
-        }
-        memcpy(data + total, buf, (size_t)bytesRead);
-        total = nextTotal;
-        if (r != kResultOk) break;
-    }
-    if (total == 0) { free(data); return nullptr; }
-    *outLen = total;
-    return data;
-}
-
 // Write a whole state blob to a host IBStream, looping over partial
 // writes. Returns 1 when every byte landed, 0 when the blob is empty or
-// oversized, or the stream reports no progress, a count outside the
+// beyond the signed IBStream range, or the stream reports no progress, a count outside the
 // request, or an error before the blob is complete.
 int32_t moose_vst3_write_state_stream(void* stream, const uint8_t* data, uint32_t len) {
     if (!stream || !data || len == 0 || len > (uint32_t)INT32_MAX) return 0;

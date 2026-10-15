@@ -3992,3 +3992,32 @@ mod tests {
         assert_eq!(au_version_u32("1.2.3-beta"), 0x0001_0200);
     }
 }
+
+#[cfg(test)]
+#[path = "../../../test-support/host_value_fixture.rs"]
+mod host_value_fixture;
+#[cfg(test)]
+#[path = "../../../test-support/large_state_fixture.rs"]
+mod large_state_fixture;
+#[cfg(test)]
+mod large_state_tests {
+    use super::*;
+    use super::large_state_fixture::{LargePlugin,payload};
+    type Large=LargePlugin<{64*1024*1024}>;
+    #[test]
+    fn large_host_state_roundtrips_through_au_callbacks() {
+        unsafe {
+            let ctx=cb_create::<Large>(); assert!(!ctx.is_null());
+            let inst=&*ctx.cast::<AuInstance<Large>>();
+            *inst.params_arc.payload.lock().unwrap()=payload();
+            let mut ptr=std::ptr::null_mut(); let mut len=0;
+            cb_state_save::<Large>(ctx,&raw mut ptr,&raw mut len);
+            assert!(len>32*1024*1024);
+            inst.params_arc.payload.lock().unwrap().clear();
+            assert_eq!(cb_state_load::<Large>(ctx,ptr,len),1);
+            assert_eq!(*inst.params_arc.payload.lock().unwrap(),payload());
+            assert_eq!(cb_state_load::<Large>(ctx,ptr,len-1),0);
+            cb_state_free(ptr,len); cb_destroy::<Large>(ctx);
+        }
+    }
+}

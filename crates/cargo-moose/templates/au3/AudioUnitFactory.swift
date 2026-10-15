@@ -1038,9 +1038,11 @@ class MooseAUAudioUnit: AUAudioUnit {
             super.fullState = newValue
             guard let ctx = rustCtx, let cb = g_callbacks else { return }
             if let blob = newValue?["truce_state"] as? Data {
-                blob.withUnsafeBytes { ptr in
-                    _ = cb.pointee.state_load(ctx, ptr.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(blob.count))
+                guard blob.count <= Int(UInt32.max) else { return }
+                let accepted = blob.withUnsafeBytes { ptr in
+                    cb.pointee.state_load(ctx, ptr.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(blob.count))
                 }
+                guard accepted != 0 else { return }
                 syncParameterTreeFromRust()
                 return
             }
