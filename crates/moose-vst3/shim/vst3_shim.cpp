@@ -720,7 +720,7 @@ int64_t moose_vst3_read_state_chunk(void* stream, uint8_t* dst, uint32_t request
     int32 count = 0;
     const tresult result = vtbl->read(stream, dst, (int32)requested, &count);
     if (count < 0 || (uint32_t)count > requested) return -1;
-    if (count == 0 && result != kResultOk && result != kResultFalse) return -1;
+    if (result != kResultOk && result != kResultFalse) return -1;
     return count;
 }
 
