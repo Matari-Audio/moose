@@ -175,7 +175,7 @@ type GuiChangeQueue = crossbeam_queue::ArrayQueue<GuiParamChange>;
 /// overflow we want most-recent-wins (`force_push`) so a rapid
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
-type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+type StateLoadQueue = state::StateLoadQueue;
 
 // ---------------------------------------------------------------------------
 // Internal wrapper struct held as plugin_data
@@ -3930,6 +3930,7 @@ unsafe extern "C" fn state_save<P: PluginExport>(
             return false;
         };
 
+        if blob.len() > P::max_host_state_bytes() { return false; }
         let mut offset = 0usize;
         while offset < blob.len() {
             let written = write_fn(
@@ -3953,6 +3954,7 @@ unsafe extern "C" fn state_save<P: PluginExport>(
 
 /// Largest state blob a host stream may hand us. Anything bigger is a
 /// misbehaving stream (or an unrelated file), not a moose state.
+#[cfg(test)]
 const MAX_HOST_STATE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Drain a host `clap_istream` into one bounded blob. `read` fills the
@@ -3960,6 +3962,7 @@ const MAX_HOST_STATE_BYTES: usize = 32 * 1024 * 1024;
 /// negative count is a read error. A count larger than the buffer, or a
 /// stream past [`MAX_HOST_STATE_BYTES`], fails the load before any
 /// further allocation.
+#[cfg(test)]
 fn read_host_state(mut read: impl FnMut(&mut [u8]) -> i64) -> Option<Vec<u8>> {
     let mut blob = Vec::new();
     let mut buf = [0u8; 4096];
@@ -3989,25 +3992,9 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
-        let Some(blob) = read_host_state(|buf| {
+        let Some(deserialized) = state::read_or_migrate::<P>(|buf| {
             read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64)
-        }) else {
-            return false;
-        };
-
-        if blob.is_empty() {
-            return false;
-        }
-
-        // Not this plugin's envelope? Offer the bytes to the plugin's
-        // `migrate_state` hook (legacy sessions from a pre-moose
-        // build); `None` fails the load honestly.
-        let Some(deserialized) = state::parse_or_migrate::<P>(
-            &blob,
-            data.plugin_id_hash,
-            state::PluginFormat::Clap,
-            None,
-        ) else {
+        }, data.plugin_id_hash, state::PluginFormat::Clap) else {
             return false;
         };
 

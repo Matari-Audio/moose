@@ -65,7 +65,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 /// overflow we want most-recent-wins (`force_push`) so a rapid
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
-type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+type StateLoadQueue = state::StateLoadQueue;
 
 /// VST3 `RestartFlags::kLatencyChanged`. The audio thread flags this
 /// through `moose_vst3_mark_restart` (an atomic bit-set, no host call);
@@ -1809,6 +1809,7 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let persist = inst.params_arc.serialize_persist();
         let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
         let len = blob.len();
+        if len > P::max_host_state_bytes() { return; }
         let ptr = libc_malloc(len).cast::<u8>();
         if ptr.is_null() {
             // malloc failed - `*out_data` is already null and
@@ -1846,6 +1847,12 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         ) else {
             return 0;
         };
+        apply_host_state(inst, deserialized)
+    })
+}
+
+unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized: state::DeserializedState) -> i32 {
+    unsafe {
         // Apply params synchronously on the host thread (atomic-safe)
         // so host-side queries that read parameter values right
         // after `setState` see the restored values without first
@@ -1884,8 +1891,22 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             editor.state_changed();
         }
         1
+        }
+}
+
+unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
+    ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    read: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, u32) -> i64,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "load_state_stream", 0, || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let Some(deserialized) = state::read_or_migrate::<P>(
+            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32), inst.plugin_id_hash, state::PluginFormat::Vst3,
+        ) else { return 0; };
+        apply_host_state(inst, deserialized)
     })
 }
+
 
 unsafe extern "C" fn cb_state_free(data: *mut u8, _len: u32) {
     unsafe {
@@ -3668,6 +3689,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         param_parse: cb_param_parse::<P>,
         state_save: cb_state_save::<P>,
         state_load: cb_state_load::<P>,
+        state_load_stream: cb_state_load_stream::<P>,
         state_free: cb_state_free,
         get_latency: cb_get_latency::<P>,
         get_tail: cb_get_tail::<P>,

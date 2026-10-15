@@ -74,6 +74,11 @@ pub trait PluginRuntime: Send + 'static {
         false
     }
 
+    /// Maximum serialized host state this plugin can produce. Defaults to the
+    /// historical 32 MiB. Override only with a proven document bound; format
+    /// wrappers enforce it on both save and load, outside audio processing.
+    fn max_host_state_bytes() -> usize where Self: Sized { 32 * 1024 * 1024 }
+
     /// Static metadata about the plugin.
     ///
     /// Use `plugin_info!()` for zero-boilerplate (reads from moose.toml

@@ -95,7 +95,7 @@ use ffi::{
 /// overflow we want most-recent-wins (`force_push`) so a rapid
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
-type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+type StateLoadQueue = state::StateLoadQueue;
 
 /// One `SysEx` message handed from the host thread to the audio thread.
 /// Recycled through a free-list (see [`SysExQueue`]) so the audio thread
@@ -1516,6 +1516,7 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
 
         let len = blob.len();
+        if len > P::max_host_state_bytes() { return; }
         let ptr = malloc(len).cast::<u8>();
         if ptr.is_null() {
             // malloc failed - `*out_data` is already null and
@@ -1532,13 +1533,13 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     data: *const u8,
     len: u32,
-) {
-    run_extern_callback_with::<P, ()>("au", "load_state", (), || unsafe {
+) -> i32 {
+    run_extern_callback_with::<P, i32>("au", "load_state", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         // `slice::from_raw_parts(null, n)` for `n > 0` is UB. Treat
         // `(null, *)` and `(_, 0)` the same as "host gave us nothing".
         if data.is_null() || len == 0 {
-            return;
+            return 0;
         }
         let blob = slice::from_raw_parts(data, len as usize);
         // Not this plugin's envelope? Offer the bytes to the plugin's
@@ -1564,8 +1565,9 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             if let Some(ref mut editor) = inst.gui.enter().editor {
                 editor.state_changed();
             }
-        }
-    });
+            1
+        } else { 0 }
+    })
 }
 
 unsafe extern "C" fn cb_legacy_state_key_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {

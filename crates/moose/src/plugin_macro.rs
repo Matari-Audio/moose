@@ -344,6 +344,10 @@ macro_rules! __plugin_hot_reload {
                 <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::supports_in_place()
             }
 
+            fn max_host_state_bytes() -> usize {
+                <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::max_host_state_bytes()
+            }
+
             fn info() -> $crate::core::info::PluginInfo
             where
                 Self: Sized,

@@ -1514,8 +1514,10 @@ static OSStatus au_v2_set_property(void *self_, AudioUnitPropertyID prop,
             CFDataRef cfData = CFDictionaryGetValue(dict, CFSTR("truce_state"));
             if (cfData && CFGetTypeID(cfData) == CFDataGetTypeID()) {
                 const uint8_t *bytes = CFDataGetBytePtr(cfData);
-                uint32_t len = (uint32_t)CFDataGetLength(cfData);
-                g_callbacks->state_load(inst->rustCtx, bytes, len);
+                CFIndex length = CFDataGetLength(cfData);
+                if (length <= 0 || (uint64_t)length > UINT32_MAX ||
+                    !g_callbacks->state_load(inst->rustCtx, bytes, (uint32_t)length))
+                    return kAudioUnitErr_InvalidPropertyValue;
             } else if (g_callbacks->legacy_state_key_count
                        && g_callbacks->state_load_foreign) {
                 /* No moose entry: a pre-moose build stored its state

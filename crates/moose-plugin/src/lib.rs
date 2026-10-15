@@ -89,6 +89,9 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         false
     }
 
+    /// Maximum serialized host state; size document admission to this bound.
+    fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
+
     /// Supported audio bus configurations. The host picks one. Default:
     /// the standard audio effect - stereo and mono - so it appears on
     /// both track widths. Override for instruments, surround, sidechains.
@@ -248,6 +251,9 @@ macro_rules! plugin_logic_leaf_trait {
             fn supports_in_place() -> bool {
                 false
             }
+
+            /// Maximum serialized host state; size document admission to this bound.
+            fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
 
             /// Supported audio bus configurations. The host picks one;
             /// the others are rejected at bus-config time before
@@ -596,6 +602,9 @@ macro_rules! pure_plugin_leaf_trait {
                 false
             }
 
+            /// Maximum serialized host state; size document admission to this bound.
+            fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
+
             /// Supported audio bus configurations. Same contract as the
             /// stateful leaf's `bus_layouts`. Default: the standard audio
             /// effect - stereo and mono.
@@ -647,6 +656,8 @@ macro_rules! pure_plugin_leaf_trait {
             fn supports_in_place() -> bool {
                 <T as $name>::supports_in_place()
             }
+
+            fn max_host_state_bytes() -> usize { <T as $name>::max_host_state_bytes() }
 
             fn bus_layouts() -> Vec<crate::__plugin_logic_deps::BusLayout> {
                 <T as $name>::bus_layouts()
@@ -838,6 +849,8 @@ macro_rules! plugin_logic_bridge {
             fn supports_in_place() -> bool {
                 <Self as $leaf>::supports_in_place()
             }
+
+            fn max_host_state_bytes() -> usize { <Self as $leaf>::max_host_state_bytes() }
 
             fn bus_layouts() -> Vec<BusLayout> {
                 <Self as $leaf>::bus_layouts()

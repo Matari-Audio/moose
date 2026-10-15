@@ -416,6 +416,10 @@ macro_rules! export_static {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::supports_in_place()
             }
 
+            fn max_host_state_bytes() -> usize {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::max_host_state_bytes()
+            }
+
             fn info() -> $crate::__macro_deps::moose_core::info::PluginInfo
             where
                 Self: Sized,
