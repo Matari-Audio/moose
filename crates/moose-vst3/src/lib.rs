@@ -1806,20 +1806,29 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // Rust global allocator for both save + free; do not cross
         // wires when refactoring `_save_state` paths together.)
         let extra = save_extra(&inst.snapshot);
-        let persist = inst.params_arc.serialize_persist();
-        let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
-        let len = blob.len();
-        if len > P::max_host_state_bytes() { return; }
-        let ptr = libc_malloc(len).cast::<u8>();
-        if ptr.is_null() {
-            // malloc failed - `*out_data` is already null and
-            // `*out_len` already 0 from the pre-zero above; nothing
-            // to do on this branch except return.
-            return;
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
+        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
+        let Ok(host_len) = u32::try_from(len) else { return; };
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) { if !self.0.is_null() { unsafe { libc_free(self.0.cast()); } } }
         }
-        std::ptr::copy_nonoverlapping(blob.as_ptr(), ptr, len);
-        *out_data = ptr;
-        *out_len = len_u32(len);
+        let mut buffer = Buffer(libc_malloc(len).cast::<u8>());
+        if buffer.0.is_null() { return; }
+        let mut offset = 0;
+        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| {
+                if bytes.len() > len - offset { return -1; }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
+                offset += bytes.len(); bytes.len() as i64
+            });
+        if !ok { return; }
+        *out_data = buffer.0; *out_len = host_len;
+        buffer.0 = std::ptr::null_mut();
     });
 }
 

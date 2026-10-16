@@ -5,7 +5,7 @@
 //! `cargo-moose` can emit byte-identical blobs (factory preset files)
 //! without inheriting `moose-core`'s runtime dependency chain.
 
-pub use moose_utils::state_stream::{write_state_stream, write_state_stream_with_persist};
+pub use moose_utils::state_stream::{state_stream_size, write_state_stream, write_state_stream_with_persist};
 
 pub use moose_utils::state::{
     DeserializedState, StateParse, deserialize_state, hash_plugin_id, parse_state,

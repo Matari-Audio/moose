@@ -261,14 +261,8 @@ pub fn write_state_stream_with_persist(
     write: impl FnMut(&[u8]) -> i64,
 ) -> bool {
     use std::io::Write;
-    let Ok(persist_size) = usize::try_from(persist_len) else { return false; };
-    let Some(size) = ids.len().checked_mul(12)
-        .and_then(|n| n.checked_add(36))
-        .and_then(|n| n.checked_add(extra.len()))
-        .and_then(|n| n.checked_add(persist_size))
-    else { return false; };
+    let Some(size) = state_stream_size(ids, values, extra, persist_len, limit) else { return false; };
     let Ok(count) = u32::try_from(ids.len()) else { return false; };
-    if ids.len() != values.len() || size > limit { return false; }
     let mut output = Output { write, remaining: size };
     let result = (|| {
         output.write_all(b"OAST")?;
@@ -285,6 +279,15 @@ pub fn write_state_stream_with_persist(
         persist(&mut output)
     })();
     result.is_ok() && output.remaining == 0
+}
+
+/// Validate all lengths before allocating a contiguous host-owned output.
+#[must_use]
+pub fn state_stream_size(ids: &[u32], values: &[f64], extra: &[u8], persist_len: u64, limit: usize) -> Option<usize> {
+    if ids.len() != values.len() || u32::try_from(ids.len()).is_err() { return None; }
+    let persist_size = usize::try_from(persist_len).ok()?;
+    ids.len().checked_mul(12)?.checked_add(36)?.checked_add(extra.len())?
+        .checked_add(persist_size).filter(|size| *size <= limit)
 }
 
 struct Output<F> {
