@@ -772,47 +772,47 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
             memset(info, 0, sizeof(*info));
             const uint32_t i = moose_au_parameter_index(elem);
             if (i < g_num_params) {
-                    const AuParamDescriptor *pd = &g_param_descriptors[i];
-                    strlcpy(info->name, pd->name, sizeof(info->name));
-                    info->cfNameString = CFStringCreateWithCString(NULL, pd->name,
-                                            kCFStringEncodingUTF8);
-                    /* step_count is values-1: 1 => a 2-value (boolean-like)
-                     * param, >=2 => an indexed/enumerated list. Mapping the
-                     * unit (rather than leaving Generic) is what makes the
-                     * host quantize automation to the steps, offer step
-                     * navigation, and query kAudioUnitProperty_ParameterValueName
-                     * for the per-index names. Continuous params stay Generic. */
-                    info->unit = au_v2_parameter_unit(pd);
-                    info->minValue = (AudioUnitParameterValue)pd->min;
-                    info->maxValue = (AudioUnitParameterValue)pd->max;
-                    info->defaultValue = (AudioUnitParameterValue)pd->default_value;
-                    /* ValuesHaveStrings routes generic views and
-                     * control-surface displays through
-                     * kAudioUnitProperty_ParameterStringFromValue, so
-                     * hosts show "50%" / "-12.0 dB" instead of the raw
-                     * plain value. */
-                    info->flags = kAudioUnitParameterFlag_IsReadable |
-                                  kAudioUnitParameterFlag_IsWritable |
-                                  kAudioUnitParameterFlag_HasCFNameString |
-                                  kAudioUnitParameterFlag_CFNameRelease |
-                                  kAudioUnitParameterFlag_ValuesHaveStrings;
-                    /* Continuous params can be ramped: au_v2_schedule_parameters
-                     * accepts ramped automation and the plugin's smoother
-                     * interpolates. Stepped (bool/enum/discrete) params step,
-                     * so they get no ramp flag. */
-                    if (pd->step_count == 0)
-                        info->flags |= kAudioUnitParameterFlag_CanRamp |
-                                       kAudioUnitParameterFlag_IsHighResolution;
-                    /* Map the param's group to a clump so the host UI nests
-                     * grouped params under a heading (named via
-                     * kAudioUnitProperty_ParameterClumpName). */
-                    uint32_t clump = moose_au_parameter_clump(i);
-                    if (clump != 0) {
-                        info->clumpID = clump;
-                        info->flags |= kAudioUnitParameterFlag_HasClump;
-                    }
-                    *ioSize = sizeof(AudioUnitParameterInfo);
-                    return noErr;
+                const AuParamDescriptor *pd = &g_param_descriptors[i];
+                strlcpy(info->name, pd->name, sizeof(info->name));
+                info->cfNameString = CFStringCreateWithCString(NULL, pd->name,
+                                        kCFStringEncodingUTF8);
+                /* step_count is values-1: 1 => a 2-value (boolean-like)
+                 * param, >=2 => an indexed/enumerated list. Mapping the
+                 * unit (rather than leaving Generic) is what makes the
+                 * host quantize automation to the steps, offer step
+                 * navigation, and query kAudioUnitProperty_ParameterValueName
+                 * for the per-index names. Continuous params retain units. */
+                info->unit = au_v2_parameter_unit(pd);
+                info->minValue = (AudioUnitParameterValue)pd->min;
+                info->maxValue = (AudioUnitParameterValue)pd->max;
+                info->defaultValue = (AudioUnitParameterValue)pd->default_value;
+                /* ValuesHaveStrings routes generic views and
+                 * control-surface displays through
+                 * kAudioUnitProperty_ParameterStringFromValue, so
+                 * hosts show "50%" / "-12.0 dB" instead of the raw
+                 * plain value. */
+                info->flags = kAudioUnitParameterFlag_IsReadable |
+                              kAudioUnitParameterFlag_IsWritable |
+                              kAudioUnitParameterFlag_HasCFNameString |
+                              kAudioUnitParameterFlag_CFNameRelease |
+                              kAudioUnitParameterFlag_ValuesHaveStrings;
+                /* Continuous params can be ramped: au_v2_schedule_parameters
+                 * accepts ramped automation and the plugin's smoother
+                 * interpolates. Stepped (bool/enum/discrete) params step,
+                 * so they get no ramp flag. */
+                if (pd->step_count == 0)
+                    info->flags |= kAudioUnitParameterFlag_CanRamp |
+                                   kAudioUnitParameterFlag_IsHighResolution;
+                /* Map the param's group to a clump so the host UI nests
+                 * grouped params under a heading (named via
+                 * kAudioUnitProperty_ParameterClumpName). */
+                uint32_t clump = moose_au_parameter_clump(i);
+                if (clump != 0) {
+                    info->clumpID = clump;
+                    info->flags |= kAudioUnitParameterFlag_HasClump;
+                }
+                *ioSize = sizeof(AudioUnitParameterInfo);
+                return noErr;
             }
             return kAudioUnitErr_InvalidParameter;
         }

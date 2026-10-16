@@ -60,6 +60,13 @@ static void au_shim_constructor(void) {
     moose_au_init();
 }
 
+/* Framework unload happens after its instances have closed. Release the
+ * process-shared index here rather than leaking it across factory reloads. */
+__attribute__((destructor))
+static void au_shim_destructor(void) {
+    moose_au_catalog_destroy(&g_parameter_catalog);
+}
+
 // Weak stubs for symbols the `export_au!` macro emits in the *consumer*
 // cdylib. They let `moose-au` build its own (unused) cdylib target -
 // which is the only way cargo stops warning about

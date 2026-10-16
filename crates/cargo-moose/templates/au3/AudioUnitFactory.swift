@@ -379,13 +379,13 @@ class MooseAUAudioUnit: AUAudioUnit {
                 // Individual formatting remains available for wide integer
                 // ranges without constructing an unbounded valueStrings list.
                 if desc.step_count <= 1024 {
-                for step in 0...desc.step_count {
-                    let plain = desc.min + (desc.max - desc.min) * Double(step) / Double(desc.step_count)
-                    var buf = [CChar](repeating: 0, count: 128)
-                    let len = cb.param_format_value(rawCtx, desc.id, plain, &buf, 128)
-                    names.append(len > 0 ? String(cString: buf) : "\(step)")
-                }
-                valueStrings = names
+                    for step in 0...desc.step_count {
+                        let plain = desc.min + (desc.max - desc.min) * Double(step) / Double(desc.step_count)
+                        var buf = [CChar](repeating: 0, count: 128)
+                        let len = cb.param_format_value(rawCtx, desc.id, plain, &buf, 128)
+                        names.append(len > 0 ? String(cString: buf) : "\(step)")
+                    }
+                    valueStrings = names
                 }
             }
             var parameterFlags: AudioUnitParameterOptions = [.flag_IsWritable, .flag_IsReadable]

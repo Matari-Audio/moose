@@ -37,7 +37,7 @@ static int moose_au_catalog_build(MooseAuParameterCatalog *out,
                                 const AuParamDescriptor *params, uint32_t count) {
     MooseAuParameterCatalog next = {0};
     if (!count) { *out = next; return 1; }
-    if (!params || count == UINT32_MAX || (size_t)count > SIZE_MAX / 2) return 0;
+    if (!params || count > UINT32_MAX / 2) return 0;
     size_t capacity = 1;
     while (capacity < (size_t)count * 2) {
         if (capacity > SIZE_MAX / 2) return 0;
