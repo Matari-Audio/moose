@@ -5,6 +5,8 @@
 #endif
 #include MOOSE_VST3_SHIM_PATH
 #include <cassert>
+#include <string>
+#include <vector>
 
 int main() {
     std::vector<std::string> groups;
