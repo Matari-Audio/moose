@@ -1,7 +1,9 @@
 //! Generated persistence coverage and cached-payload bypass, without a plugin.
 use moose::core::custom_state::{PersistField, StateCursor};
-use moose::params::{Params, PersistFingerprint, PersistFingerprintVisitor, PreparedPersistWrite,
-    write_prepared_persist};
+use moose::params::{
+    Params, PersistFingerprint, PersistFingerprintVisitor, PreparedPersistWrite,
+    write_prepared_persist,
+};
 use moose_derive::Params;
 use std::sync::{
     Mutex,
@@ -27,7 +29,10 @@ impl PersistField for CachedPayload {
         // hashing policy; this fixture verifies the derive visits the override.
         let mut digest = [0; 32];
         digest[..8].copy_from_slice(&self.value.load(Ordering::Relaxed).to_le_bytes());
-        Some(PersistFingerprint { byte_len: 8, digest })
+        Some(PersistFingerprint {
+            byte_len: 8,
+            digest,
+        })
     }
 }
 
@@ -94,19 +99,25 @@ fn cached_payload_bypasses_serialization_and_nested_fields_are_visited() {
     let events = record(&params);
     assert_eq!(params.prepares.load(Ordering::Relaxed), 1);
     assert_eq!(params.payload.writes.load(Ordering::Relaxed), 0);
-    assert_eq!(events, vec![
-        Event::Begin("payload".into()),
-        Event::Cached(PersistFingerprint { byte_len: 8, digest: [0; 32] }),
-        Event::End,
-        Event::Begin("plain".into()),
-        Event::Bytes(vec![0; 4]),
-        Event::End,
-        Event::Begin("nested".into()),
-        Event::Begin("added-later".into()),
-        Event::Bytes(vec![0]),
-        Event::End,
-        Event::End,
-    ]);
+    assert_eq!(
+        events,
+        vec![
+            Event::Begin("payload".into()),
+            Event::Cached(PersistFingerprint {
+                byte_len: 8,
+                digest: [0; 32]
+            }),
+            Event::End,
+            Event::Begin("plain".into()),
+            Event::Bytes(vec![0; 4]),
+            Event::End,
+            Event::Begin("nested".into()),
+            Event::Begin("added-later".into()),
+            Event::Bytes(vec![0]),
+            Event::End,
+            Event::End,
+        ]
+    );
 }
 
 #[test]
@@ -162,7 +173,9 @@ struct SharedPayload {
 struct SharedSnapshot(std::sync::Arc<Vec<u8>>);
 
 impl PreparedPersistWrite for SharedSnapshot {
-    fn byte_len(&self) -> u64 { self.0.len() as u64 }
+    fn byte_len(&self) -> u64 {
+        self.0.len() as u64
+    }
     fn write_to(&self, output: &mut dyn std::io::Write) -> std::io::Result<()> {
         output.write_all(&self.0)
     }
@@ -195,7 +208,9 @@ struct Empty {
 }
 
 impl Empty {
-    fn prepare(&self) { self.prepares.fetch_add(1, Ordering::Relaxed); }
+    fn prepare(&self) {
+        self.prepares.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -218,4 +233,37 @@ fn large_override_retains_only_shared_payload_and_visits_empty_nested_hook() {
     assert_eq!(output, expected);
     drop(snapshot);
     assert_eq!(std::sync::Arc::strong_count(&payload), 1);
+}
+
+#[test]
+fn write_snapshots_preserve_the_existing_generic_read_commit_api() {
+    let params = Parent::default();
+    let commit: moose::params::PreparedPersist<Parent> = Box::new(|params, _, _| {
+        *params.plain.lock().unwrap() = 19;
+    });
+    commit(&params, &[], &[]);
+    assert_eq!(*params.plain.lock().unwrap(), 19);
+    assert!(Parent::prepare_persist_stream(&mut &[][..], 0).is_none());
+    assert!(params.prepare_persist_write().is_ok());
+}
+
+#[derive(Default)]
+struct Refused;
+impl PersistField for Refused {
+    fn persist_write(&self, _: &mut Vec<u8>) {
+        panic!("failed prepared field fell back to serialization");
+    }
+    fn persist_read(&self, _: &mut StateCursor) {}
+    fn prepare_persist_write(&self) -> std::io::Result<Box<dyn PreparedPersistWrite>> {
+        Err(std::io::Error::other("field unavailable"))
+    }
+}
+#[derive(Params)]
+struct RefusedStore {
+    #[persist]
+    value: Refused,
+}
+#[test]
+fn preparation_error_propagates_without_silent_field_omission() {
+    assert!(RefusedStore::default().prepare_persist_write().is_err());
 }

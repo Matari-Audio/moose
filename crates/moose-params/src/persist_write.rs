@@ -52,7 +52,10 @@ fn write_exact(
     };
     snapshot.write_to(&mut limited)?;
     if limited.remaining != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short persistence snapshot"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short persistence snapshot",
+        ));
     }
     Ok(())
 }
@@ -65,9 +68,18 @@ struct ExactWriter<'a> {
 impl Write for ExactWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() as u64 > self.remaining {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized persistence snapshot"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized persistence snapshot",
+            ));
         }
         let written = self.output.write(bytes)?;
+        if written > bytes.len() || written as u64 > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid persistence write count",
+            ));
+        }
         self.remaining -= written as u64;
         Ok(written)
     }
@@ -99,19 +111,34 @@ impl KeyedPersistWrite {
     /// # Errors
     /// Returns `InvalidInput` when a key, field, count or total cannot be framed.
     pub fn new(fields: Vec<(&'static str, Box<dyn PreparedPersistWrite>)>) -> io::Result<Self> {
-        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "persistence framing exceeds u32");
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "persistence framing exceeds u32",
+            )
+        };
         let count = u32::try_from(fields.len()).map_err(|_| invalid())?;
         let mut byte_len = 4_u64;
         let mut prepared = Vec::with_capacity(fields.len());
         for (key, snapshot) in fields {
             let key_len = u32::try_from(key.len()).map_err(|_| invalid())?;
             let field_len = u32::try_from(snapshot.byte_len()).map_err(|_| invalid())?;
-            byte_len = byte_len.checked_add(8 + u64::from(key_len))
+            byte_len = byte_len
+                .checked_add(8 + u64::from(key_len))
                 .and_then(|len| len.checked_add(u64::from(field_len)))
                 .ok_or_else(invalid)?;
-            prepared.push(KeyedField { key, key_len, byte_len: field_len, snapshot });
+            prepared.push(KeyedField {
+                key,
+                key_len,
+                byte_len: field_len,
+                snapshot,
+            });
         }
-        Ok(Self { fields: prepared, count, byte_len })
+        Ok(Self {
+            fields: prepared,
+            count,
+            byte_len,
+        })
     }
 }
 
@@ -144,7 +171,9 @@ mod tests {
     }
 
     impl PreparedPersistWrite for Declared {
-        fn byte_len(&self) -> u64 { self.len }
+        fn byte_len(&self) -> u64 {
+            self.len
+        }
         fn write_to(&self, output: &mut dyn Write) -> io::Result<()> {
             output.write_all(self.bytes)
         }
@@ -152,7 +181,10 @@ mod tests {
 
     #[test]
     fn rejects_unrepresentable_field_before_writing() {
-        let snapshot = Declared { len: u64::from(u32::MAX) + 1, bytes: &[] };
+        let snapshot = Declared {
+            len: u64::from(u32::MAX) + 1,
+            bytes: &[],
+        };
         assert!(KeyedPersistWrite::new(vec![("huge", Box::new(snapshot))]).is_err());
     }
 
@@ -161,15 +193,24 @@ mod tests {
         for len in [0, 2] {
             let snapshot = Declared { len, bytes: &[1] };
             let mut output = Vec::new();
-            assert_eq!(write_prepared_persist(&snapshot, &mut output).unwrap_err().kind(),
-                io::ErrorKind::InvalidData);
-            if len == 0 { assert!(output.is_empty()); }
+            assert_eq!(
+                write_prepared_persist(&snapshot, &mut output)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            if len == 0 {
+                assert!(output.is_empty());
+            }
         }
     }
 
     #[test]
     fn supports_partial_writes_and_propagates_host_failure() {
-        struct Partial { bytes: Vec<u8>, fail_at: usize }
+        struct Partial {
+            bytes: Vec<u8>,
+            fail_at: usize,
+        }
         impl Write for Partial {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 if self.bytes.len() == self.fail_at {
@@ -179,15 +220,27 @@ mod tests {
                 self.bytes.extend_from_slice(&bytes[..len]);
                 Ok(len)
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let snapshot = vec![1, 2, 3];
-        let mut output = Partial { bytes: Vec::new(), fail_at: usize::MAX };
+        let mut output = Partial {
+            bytes: Vec::new(),
+            fail_at: usize::MAX,
+        };
         write_prepared_persist(&snapshot, &mut output).unwrap();
         assert_eq!(output.bytes, snapshot);
-        let mut output = Partial { bytes: Vec::new(), fail_at: 1 };
-        assert_eq!(write_prepared_persist(&snapshot, &mut output).unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe);
+        let mut output = Partial {
+            bytes: Vec::new(),
+            fail_at: 1,
+        };
+        assert_eq!(
+            write_prepared_persist(&snapshot, &mut output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(output.bytes, [1]);
     }
 }
