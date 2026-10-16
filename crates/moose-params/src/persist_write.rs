@@ -9,7 +9,13 @@ use std::io::{self, Write};
 /// controls must not be reread during output. This is separate from the generic
 /// `PreparedPersist<P>` read/restore commit API.
 pub trait PreparedPersistWrite: Send + Sync {
+    #[must_use]
     fn byte_len(&self) -> u64;
+    /// Emit the frozen snapshot.
+    ///
+    /// # Errors
+    /// Return the encoding or destination error; a failed partial state must
+    /// be discarded by the caller.
     fn write_to(&self, output: &mut dyn Write) -> io::Result<()>;
 }
 
@@ -25,6 +31,9 @@ impl PreparedPersistWrite for Vec<u8> {
 
 /// Write exactly the declared length, detecting a faulty snapshot without
 /// allowing it to consume bytes belonging to the following keyed field.
+///
+/// # Errors
+/// Returns destination/encoding failures or `InvalidData` for a length mismatch.
 pub fn write_prepared_persist(
     snapshot: &dyn PreparedPersistWrite,
     output: &mut dyn Write,
@@ -85,6 +94,10 @@ struct KeyedField {
 }
 
 impl KeyedPersistWrite {
+    /// Freeze framing lengths for the existing keyed persistence format.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when a key, field, count or total cannot be framed.
     pub fn new(fields: Vec<(&'static str, Box<dyn PreparedPersistWrite>)>) -> io::Result<Self> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "persistence framing exceeds u32");
         let count = u32::try_from(fields.len()).map_err(|_| invalid())?;

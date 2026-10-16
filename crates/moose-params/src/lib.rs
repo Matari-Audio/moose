@@ -436,6 +436,9 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// The default retains existing serialization behavior; the derive prepares
     /// keyed fields individually so large immutable fields can avoid staging.
     /// Never call this or the returned writer from an audio callback.
+    ///
+    /// # Errors
+    /// A custom snapshot may reject an unrepresentable or unavailable document.
     fn prepare_persist_write(&self) -> std::io::Result<Box<dyn PreparedPersistWrite>> {
         Ok(Box::new(self.serialize_persist()))
     }

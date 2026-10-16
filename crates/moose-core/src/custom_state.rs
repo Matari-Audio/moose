@@ -154,6 +154,9 @@ pub trait PersistField {
     /// Freeze this field for write-side streaming. Large fields should capture
     /// immutable payload handles and controls here, rather than their encoded
     /// bytes. The default preserves the field's existing serializer.
+    ///
+    /// # Errors
+    /// A custom field may reject an unavailable or unrepresentable document.
     fn prepare_persist_write(
         &self,
     ) -> std::io::Result<Box<dyn moose_params::PreparedPersistWrite>> {
