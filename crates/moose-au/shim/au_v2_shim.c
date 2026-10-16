@@ -657,44 +657,30 @@ static OSStatus au_v2_get_property_info(void *self_, AudioUnitPropertyID prop,
     return noErr;
 }
 
-// Parameter clumps group params under a heading in the host UI. A
-// param's clumpID is the 1-based ordinal of its group among the distinct
-// non-empty group names (declaration order); 0 means ungrouped. Stable
-// across calls so a param's clumpID never changes. O(n^2), negligible for
-// real param counts.
-static uint32_t au_v2_clump_id(const char *group) {
-    if (!group || !group[0]) return 0;
-    uint32_t ordinal = 0;
-    for (uint32_t i = 0; i < g_num_params; i++) {
-        const char *g = g_param_descriptors[i].group;
-        if (!g || !g[0]) continue;
-        int first = 1;
-        for (uint32_t j = 0; j < i; j++) {
-            const char *pg = g_param_descriptors[j].group;
-            if (pg && pg[0] && strcmp(pg, g) == 0) { first = 0; break; }
-        }
-        if (first) ordinal++;
-        if (strcmp(g, group) == 0) return ordinal;
-    }
-    return 0;
-}
+/* Registration freezes clump ordinals in first-seen declaration order.
+ * Metadata reads use the shared indexes instead of rebuilding whole groups. */
+extern uint32_t moose_au_parameter_index(uint32_t id);
+extern uint32_t moose_au_parameter_clump(uint32_t index);
+extern const char *moose_au_parameter_clump_name(uint32_t id);
 
-// Reverse of au_v2_clump_id: the group name for a clumpID, for
-// kAudioUnitProperty_ParameterClumpName. NULL if the id is out of range.
-static const char *au_v2_clump_name(uint32_t clumpID) {
-    if (clumpID == 0) return NULL;
-    uint32_t ordinal = 0;
-    for (uint32_t i = 0; i < g_num_params; i++) {
-        const char *g = g_param_descriptors[i].group;
-        if (!g || !g[0]) continue;
-        int first = 1;
-        for (uint32_t j = 0; j < i; j++) {
-            const char *pg = g_param_descriptors[j].group;
-            if (pg && pg[0] && strcmp(pg, g) == 0) { first = 0; break; }
-        }
-        if (first && ++ordinal == clumpID) return g;
-    }
-    return NULL;
+/* Keep the descriptor's declared musical units for continuous parameters.
+ * Indexed/boolean navigation takes precedence for stepped controls. */
+static UInt32 au_v2_parameter_unit(const AuParamDescriptor *pd) {
+    if (pd->step_count == 1) return kAudioUnitParameterUnit_Boolean;
+    if (pd->step_count > 1) return kAudioUnitParameterUnit_Indexed;
+    const char *unit = pd->unit ? pd->unit : "";
+    if (!strcmp(unit, "Hz")) return kAudioUnitParameterUnit_Hertz;
+    if (!strcmp(unit, "dB")) return kAudioUnitParameterUnit_Decibels;
+    if (!strcmp(unit, "s")) return kAudioUnitParameterUnit_Seconds;
+    if (!strcmp(unit, "ms")) return kAudioUnitParameterUnit_Milliseconds;
+    if (!strcmp(unit, "%")) return kAudioUnitParameterUnit_Percent;
+    if (!strcmp(unit, "st")) return kAudioUnitParameterUnit_RelativeSemiTones;
+    if (!strcmp(unit, "ct")) return kAudioUnitParameterUnit_Cents;
+    if (!strcmp(unit, "oct")) return kAudioUnitParameterUnit_Octaves;
+    if (!strcmp(unit, "°")) return kAudioUnitParameterUnit_Degrees;
+    if (!strcmp(unit, "x")) return kAudioUnitParameterUnit_Rate;
+    if (!strcmp(unit, ":1")) return kAudioUnitParameterUnit_Ratio;
+    return kAudioUnitParameterUnit_Generic;
 }
 
 static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
@@ -784,8 +770,8 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
                 return kAudioUnitErr_InvalidPropertyValue;
             AudioUnitParameterInfo *info = (AudioUnitParameterInfo *)outData;
             memset(info, 0, sizeof(*info));
-            for (uint32_t i = 0; i < g_num_params; i++) {
-                if (g_param_descriptors[i].id == elem) {
+            const uint32_t i = moose_au_parameter_index(elem);
+            if (i < g_num_params) {
                     const AuParamDescriptor *pd = &g_param_descriptors[i];
                     strlcpy(info->name, pd->name, sizeof(info->name));
                     info->cfNameString = CFStringCreateWithCString(NULL, pd->name,
@@ -796,12 +782,7 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
                      * host quantize automation to the steps, offer step
                      * navigation, and query kAudioUnitProperty_ParameterValueName
                      * for the per-index names. Continuous params stay Generic. */
-                    if (pd->step_count == 1)
-                        info->unit = kAudioUnitParameterUnit_Boolean;
-                    else if (pd->step_count >= 2)
-                        info->unit = kAudioUnitParameterUnit_Indexed;
-                    else
-                        info->unit = kAudioUnitParameterUnit_Generic;
+                    info->unit = au_v2_parameter_unit(pd);
                     info->minValue = (AudioUnitParameterValue)pd->min;
                     info->maxValue = (AudioUnitParameterValue)pd->max;
                     info->defaultValue = (AudioUnitParameterValue)pd->default_value;
@@ -820,18 +801,18 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
                      * interpolates. Stepped (bool/enum/discrete) params step,
                      * so they get no ramp flag. */
                     if (pd->step_count == 0)
-                        info->flags |= kAudioUnitParameterFlag_CanRamp;
+                        info->flags |= kAudioUnitParameterFlag_CanRamp |
+                                       kAudioUnitParameterFlag_IsHighResolution;
                     /* Map the param's group to a clump so the host UI nests
                      * grouped params under a heading (named via
                      * kAudioUnitProperty_ParameterClumpName). */
-                    uint32_t clump = au_v2_clump_id(pd->group);
+                    uint32_t clump = moose_au_parameter_clump(i);
                     if (clump != 0) {
                         info->clumpID = clump;
                         info->flags |= kAudioUnitParameterFlag_HasClump;
                     }
                     *ioSize = sizeof(AudioUnitParameterInfo);
                     return noErr;
-                }
             }
             return kAudioUnitErr_InvalidParameter;
         }
@@ -897,10 +878,12 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
              * (step_count > 0) have a value-name list; a host reads this
              * to build the enum's menu. Names come from the plugin's own
              * format_value, so an enum shows "Sine"/"Square". */
-            const AuParamDescriptor *pd = NULL;
-            for (uint32_t i = 0; i < g_num_params; i++)
-                if (g_param_descriptors[i].id == elem) { pd = &g_param_descriptors[i]; break; }
-            if (!pd || pd->step_count == 0) return kAudioUnitErr_InvalidProperty;
+            const uint32_t index = moose_au_parameter_index(elem);
+            const AuParamDescriptor *pd = index < g_num_params ? &g_param_descriptors[index] : NULL;
+            /* This optional list must not allocate billions of strings for
+             * a wide integer range. Hosts can still format individual values. */
+            if (!pd || pd->step_count == 0 || pd->step_count > 1024)
+                return kAudioUnitErr_InvalidProperty;
             if (*ioSize < sizeof(CFArrayRef)) return kAudioUnitErr_InvalidPropertyValue;
             /* step_count is values-1, so there are step_count + 1 values. */
             CFMutableArrayRef arr = CFArrayCreateMutable(NULL, pd->step_count + 1,
@@ -909,7 +892,8 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
             for (uint32_t i = 0; i <= pd->step_count; i++) {
                 char buf[128];
                 uint32_t len = g_callbacks->param_format_value(
-                    inst->rustCtx, elem, pd->min + (double)i, buf, sizeof(buf));
+                    inst->rustCtx, elem, pd->min + (pd->max - pd->min) *
+                    ((double)i / (double)pd->step_count), buf, sizeof(buf));
                 CFStringRef s = CFStringCreateWithCString(
                     NULL, len > 0 ? buf : "", kCFStringEncodingUTF8);
                 if (s) { CFArrayAppendValue(arr, s); CFRelease(s); }
@@ -926,7 +910,7 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
                 return kAudioUnitErr_InvalidPropertyValue;
             AudioUnitParameterNameInfo *cn = (AudioUnitParameterNameInfo *)outData;
             /* inID is the clumpID; hand back the param group's display name. */
-            const char *name = au_v2_clump_name((uint32_t)cn->inID);
+            const char *name = moose_au_parameter_clump_name((uint32_t)cn->inID);
             if (!name) return kAudioUnitErr_InvalidPropertyValue;
             cn->outName = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
             if (!cn->outName) return kAudioUnitErr_InvalidParameter;

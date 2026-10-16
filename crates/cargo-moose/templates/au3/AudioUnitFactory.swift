@@ -345,6 +345,7 @@ class MooseAUAudioUnit: AUAudioUnit {
         let cb = callbacks.pointee
         var params: [AUParameter] = []
         var groups: [String: [AUParameter]] = [:]
+        var groupOrder: [String] = []
 
         for i in 0..<g_num_params {
             let desc = g_param_descriptors.advanced(by: Int(i)).pointee
@@ -357,17 +358,40 @@ class MooseAUAudioUnit: AUAudioUnit {
             // valueStrings carries the per-index names from the plugin's
             // own format_value, so an enum shows its variant names.
             var auUnit: AudioUnitParameterUnit = .generic
+            switch String(cString: desc.unit) {
+            case "Hz": auUnit = .hertz
+            case "dB": auUnit = .decibels
+            case "s": auUnit = .seconds
+            case "ms": auUnit = .milliseconds
+            case "%": auUnit = .percent
+            case "st": auUnit = .relativeSemiTones
+            case "ct": auUnit = .cents
+            case "oct": auUnit = .octaves
+            case "°": auUnit = .degrees
+            case "x": auUnit = .rate
+            case ":1": auUnit = .ratio
+            default: break
+            }
             var valueStrings: [String]? = nil
             if desc.step_count >= 1 {
                 auUnit = desc.step_count == 1 ? .boolean : .indexed
                 var names: [String] = []
+                // Individual formatting remains available for wide integer
+                // ranges without constructing an unbounded valueStrings list.
+                if desc.step_count <= 1024 {
                 for step in 0...desc.step_count {
-                    let plain = desc.min + Double(step)
+                    let plain = desc.min + (desc.max - desc.min) * Double(step) / Double(desc.step_count)
                     var buf = [CChar](repeating: 0, count: 128)
                     let len = cb.param_format_value(rawCtx, desc.id, plain, &buf, 128)
                     names.append(len > 0 ? String(cString: buf) : "\(step)")
                 }
                 valueStrings = names
+                }
+            }
+            var parameterFlags: AudioUnitParameterOptions = [.flag_IsWritable, .flag_IsReadable]
+            if desc.step_count == 0 {
+                parameterFlags.insert(.flag_CanRamp)
+                parameterFlags.insert(.flag_IsHighResolution)
             }
 
             let param = AUParameterTree.createParameter(
@@ -375,16 +399,19 @@ class MooseAUAudioUnit: AUAudioUnit {
                 address: AUParameterAddress(desc.id),
                 min: AUValue(desc.min), max: AUValue(desc.max),
                 unit: auUnit, unitName: nil,
-                flags: [.flag_IsWritable, .flag_IsReadable],
+                flags: parameterFlags,
                 valueStrings: valueStrings, dependentParameters: nil)
             param.value = AUValue(desc.default_value)
             if group.isEmpty { params.append(param) }
-            else { groups[group, default: []].append(param) }
+            else {
+                if groups[group] == nil { groupOrder.append(group) }
+                groups[group, default: []].append(param)
+            }
         }
 
         var children: [AUParameterNode] = params
-        for (gn, gp) in groups {
-            children.append(AUParameterTree.createGroup(withIdentifier: gn, name: gn, children: gp))
+        for gn in groupOrder {
+            children.append(AUParameterTree.createGroup(withIdentifier: gn, name: gn, children: groups[gn]!))
         }
         _parameterTree = AUParameterTree.createTree(withChildren: children)
 
