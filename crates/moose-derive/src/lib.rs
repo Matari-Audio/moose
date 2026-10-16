@@ -3006,6 +3006,12 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     ) = if let Some(provider) = &struct_attrs.projection {
         let api = quote! { <#provider as ::moose::params::ParamProjection<Self>> };
         projected_setters = quote! {
+            fn param_catalog(&self) -> ::std::sync::Arc<::moose::params::ParamCatalog> {
+                static CATALOG: ::std::sync::LazyLock<::std::sync::Arc<::moose::params::ParamCatalog>> =
+                    ::std::sync::LazyLock::new(|| ::std::sync::Arc::new(::moose::params::ParamCatalog::new(
+                        <#struct_name as ::moose::params::Params>::param_infos_static())));
+                ::std::sync::Arc::clone(&CATALOG)
+            }
             fn set_normalized_returning_plain(&self, id: u32, value: f64) -> f64 {
                 if let Some(result) = #api::set_normalized(self, id, value) { return result.plain; }
                 <Self as ::moose::params::Params>::set_normalized(self, id, value);
@@ -3056,6 +3062,34 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         )
     };
 
+    let projection_prefix = |method: &str| {
+        struct_attrs.projection.as_ref().map(|provider| {
+            let method = syn::Ident::new(method, struct_name.span());
+            quote! {
+                if id > ::moose::params::AUTO_PARAM_ID_MASK {
+                    if let Some(value) = <#provider as ::moose::params::ParamProjection<Self>>::#method(self, id) {
+                        return Some(value);
+                    }
+                }
+            }
+        })
+    };
+    let projected_get_plain = projection_prefix("get_plain");
+    let projected_get_normalized = projection_prefix("get_normalized");
+    let projection_write_prefix = |method: &str| {
+        struct_attrs.projection.as_ref().map(|provider| {
+            let method = syn::Ident::new(method, struct_name.span());
+            quote! {
+                if id > ::moose::params::AUTO_PARAM_ID_MASK
+                    && <#provider as ::moose::params::ParamProjection<Self>>::#method(self, id, value).is_some() {
+                    return;
+                }
+            }
+        })
+    };
+    let projected_set_plain = projection_write_prefix("set_plain");
+    let projected_set_normalized = projection_write_prefix("set_normalized");
+
     let expanded = quote! {
         #(#attr_errors)*
 
@@ -3094,6 +3128,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn get_normalized(&self, id: u32) -> Option<f64> {
+                #projected_get_normalized
                 match id {
                     #(#get_normalized_arms)*
                     #get_normalized_fallthrough
@@ -3101,6 +3136,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn set_normalized(&self, id: u32, value: f64) {
+                #projected_set_normalized
                 match id {
                     #(#set_normalized_arms)*
                     #set_normalized_fallthrough
@@ -3108,6 +3144,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn get_plain(&self, id: u32) -> Option<f64> {
+                #projected_get_plain
                 match id {
                     #(#get_plain_arms)*
                     #get_plain_fallthrough
@@ -3115,6 +3152,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn set_plain(&self, id: u32, value: f64) {
+                #projected_set_plain
                 match id {
                     #(#set_plain_arms)*
                     #set_plain_fallthrough

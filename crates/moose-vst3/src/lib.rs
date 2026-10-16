@@ -18,7 +18,7 @@ use moose_core::bus_routing::{
     BusActivation, BusRouting, MAX_AUDIO_BUSES, bus_layouts_fit_routing,
 };
 use moose_core::cast::{len_u32, sample_pos_i64};
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
+use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::editor::EditorBuilder;
 use moose_core::editor::{
@@ -104,7 +104,7 @@ struct Vst3Instance<P: PluginExport> {
     /// Full param-info cache for the chunker's `is_chunked(id)`
     /// lookup. Built once at `cb_create`; static for the life of
     /// the instance.
-    param_infos: Vec<ParamInfo>,
+    param_infos: Arc<moose_params::ParamCatalog>,
     /// `min_subblock_samples` from `moose.toml`'s `[automation]`
     /// table. Read at instance construction and passed to
     /// `chunked_process::process_chunked` every block.
@@ -589,7 +589,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
-            let param_infos: Vec<ParamInfo> = plugin.params().param_infos();
+            let param_infos = plugin.params().param_catalog();
             let mut param_ranges: Vec<(u32, ParamRange)> =
                 param_infos.iter().map(|i| (i.id, i.range)).collect();
             // Sort by id so `binary_search_by_key` works in the hot lookups.
@@ -1463,12 +1463,13 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked_with_bus_routing(
+        process_chunked_with_bus_routing_and_catalog(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
             bus_routing,
+            &inst.param_infos,
         );
         scr.output_events.ensure_sorted_by_offset();
         // End the `audio_buffer` borrow before reaching back into scratch.
@@ -1661,8 +1662,7 @@ unsafe extern "C" fn cb_param_is_chunked<P: PluginExport>(
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let chunked = inst
             .param_infos
-            .iter()
-            .find(|info| info.id == id)
+            .by_id(id)
             .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED));
         i32::from(chunked)
     }
@@ -2261,7 +2261,7 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(ctx: *mut std::ffi:
                     {
                         let valid = *sample_offset < audio.input_num_frames
                             && value.is_finite()
-                            && inst.param_infos.iter().any(|info| info.id == *id);
+                            && inst.param_infos.by_id(*id).is_some();
                         return (!valid).then_some(VST3_EVENT_INVALID);
                     }
                     match encode_vst3_output_event::<P>(

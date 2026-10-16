@@ -16,6 +16,8 @@
 #include <atomic>
 #include <new>
 #include <vector>
+#include <string>
+#include <unordered_map>
 #if __APPLE__
 // libdispatch: an event-driven bridge that marshals a pending
 // restartComponent onto the host's main run loop, so a latency change
@@ -542,44 +544,46 @@ static const Vst3Callbacks* g_cb = nullptr;
 static const Vst3ParamDescriptor* g_params = nullptr;
 static uint32_t g_num_params = 0;
 
-// Unit info (parameter groups) - built at registration time
-static const int kMaxUnits = 64;
-struct UnitEntry { int32 id; int32 parentId; char name[128]; };
-static UnitEntry g_units[kMaxUnits];
+// Immutable unit hierarchy built from the complete registration catalog.
+// No parameter-count or group-count ceiling; no runtime tree restructuring.
+struct UnitEntry { int32 id; int32 parentId; std::string name; };
+static std::vector<UnitEntry> g_units;
 static int g_num_units = 0;
-// Maps param index → unit ID
-static int32 g_param_unit_id[4096];
+static std::vector<int32> g_param_unit_id;
 
 static void build_unit_map() {
-    // Unit 0 = root (always exists)
-    g_num_units = 1;
-    g_units[0].id = 0;
-    g_units[0].parentId = -1; // kNoParentUnitId
-    strncpy(g_units[0].name, "Root", sizeof(g_units[0].name));
-
-    for (uint32_t i = 0; i < g_num_params && i < 4096; i++) {
+    g_units.clear();
+    g_units.push_back({0, -1, "Root"});
+    g_param_unit_id.assign(g_num_params, 0);
+    std::unordered_map<std::string, int32> paths;
+    for (uint32_t i = 0; i < g_num_params; i++) {
         const char* group = g_params[i].group;
-        if (!group || group[0] == 0) {
-            g_param_unit_id[i] = 0; // root unit
-            continue;
-        }
-        // Find or create unit for this group
-        int32 unitId = -1;
-        for (int u = 1; u < g_num_units; u++) {
-            if (strcmp(g_units[u].name, group) == 0) {
-                unitId = g_units[u].id;
-                break;
+        if (!group || !group[0]) continue;
+        int32 parent = 0;
+        std::string path;
+        const std::string full(group);
+        size_t start = 0;
+        while (start < full.size()) {
+            size_t end = full.find('/', start);
+            if (end == std::string::npos) end = full.size();
+            const std::string name = full.substr(start, end - start);
+            start = end + 1;
+            if (name.empty()) continue;
+            if (!path.empty()) path += '/';
+            path += name;
+            auto found = paths.find(path);
+            if (found == paths.end()) {
+                const int32 id = static_cast<int32>(g_units.size());
+                g_units.push_back({id, parent, name});
+                paths.emplace(path, id);
+                parent = id;
+            } else {
+                parent = found->second;
             }
         }
-        if (unitId < 0 && g_num_units < kMaxUnits) {
-            unitId = g_num_units;
-            g_units[g_num_units].id = unitId;
-            g_units[g_num_units].parentId = 0; // parent = root
-            strncpy(g_units[g_num_units].name, group, sizeof(g_units[0].name));
-            g_num_units++;
-        }
-        g_param_unit_id[i] = (unitId >= 0) ? unitId : 0;
+        g_param_unit_id[i] = parent;
     }
+    g_num_units = static_cast<int>(g_units.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -1875,7 +1879,7 @@ public:
         str_to_char16(info->units, p.units, 128);
         info->stepCount = p.step_count;
         info->defaultNormalizedValue = p.default_normalized;
-        info->unitId = ((uint32_t)index < 4096) ? g_param_unit_id[index] : 0;
+        info->unitId = g_param_unit_id[static_cast<size_t>(index)];
         info->flags = p.flags;
         if (g_cb && ctx) {
             char title[512] = {};
@@ -2682,7 +2686,7 @@ static tresult ui_getUnitInfo(void*, int32 idx, UnitInfo* out) {
     if (idx < 0 || idx >= g_num_units || !out) return kInvalidArgument;
     out->id = g_units[idx].id;
     out->parentUnitId = g_units[idx].parentId;
-    str_to_char16(out->name, g_units[idx].name, 128);
+    str_to_char16(out->name, g_units[idx].name.c_str(), 128);
     out->programListId = -1; // kNoProgramListId
     return kResultOk;
 }
