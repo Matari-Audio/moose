@@ -80,7 +80,7 @@ use clap_sys::ext::remote_controls::{
 use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, clap_plugin_render, clap_plugin_render_mode,
 };
-use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
@@ -184,6 +184,7 @@ type StateLoadQueue = state::StateLoadQueue;
 struct ClapPluginData<P: PluginExport> {
     persist_signal: Option<Arc<moose_params::PersistChangeSignal>>,
     persist_pending: Arc<AtomicBool>,
+    host_state: *const clap_host_state,
     /// The user's plugin instance in the wrapper-standard ownership
     /// cell: the audio thread owns it per block, host lifecycle
     /// callbacks own it while processing is stopped, and the two never
@@ -715,6 +716,7 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
             if !ext.is_null() {
                 data.host_params = ext.cast::<clap_host_params>();
             }
+            data.host_state = get_ext(data.host, CLAP_EXT_STATE.as_ptr()).cast::<clap_host_state>();
             let lat_ext = get_ext(data.host, CLAP_EXT_LATENCY.as_ptr());
             if !lat_ext.is_null() {
                 data.host_latency = lat_ext.cast::<clap_host_latency>();
@@ -946,6 +948,13 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
             context.begin_edit(id);
             context.set_param(id, value);
             context.end_edit(id);
+            // State dirtiness must also reach an inactive host that does not
+            // implement params/request_flush. This is a main-thread-only API.
+            if !data.host.is_null() && !data.host_state.is_null()
+                && let Some(mark_dirty) = (*data.host_state).mark_dirty
+            {
+                mark_dirty(data.host);
+            }
         }
         if data.floating_closed.swap(false, Ordering::AcqRel) {
             data.gui.enter().visible = false;
@@ -5635,6 +5644,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let data = Box::new(ClapPluginData::<P> {
             persist_signal: None,
             persist_pending: Arc::new(AtomicBool::new(false)),
+            host_state: ptr::null(),
             plugin: shared_plugin(instance),
             params_arc,
             meter_store,

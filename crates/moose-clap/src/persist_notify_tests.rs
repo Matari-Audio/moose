@@ -1,9 +1,34 @@
 //! Actual CLAP main-thread completion delivery with no editor created.
 use super::host_value_fixture::TestPlugin;
 use super::*;
-#[derive(Default)]
 struct HostCalls {
     requests: AtomicU32,
+    dirty: AtomicU32,
+    main: std::thread::ThreadId,
+}
+impl Default for HostCalls {
+    fn default() -> Self {
+        Self {
+            requests: AtomicU32::new(0),
+            dirty: AtomicU32::new(0),
+            main: std::thread::current().id(),
+        }
+    }
+}
+unsafe extern "C" fn mark_dirty(host: *const clap_host) {
+    let calls = unsafe { &*((*host).host_data.cast::<HostCalls>()) };
+    assert_eq!(std::thread::current().id(), calls.main);
+    calls.dirty.fetch_add(1, Ordering::Relaxed);
+}
+unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+    static STATE: clap_host_state = clap_host_state {
+        mark_dirty: Some(mark_dirty),
+    };
+    if unsafe { CStr::from_ptr(id) } == CLAP_EXT_STATE {
+        (&raw const STATE).cast()
+    } else {
+        std::ptr::null()
+    } // deliberately no params extension or flush
 }
 unsafe extern "C" fn request(host: *const clap_host) {
     // SAFETY: the test retains this host and its counter until destroy returns.
@@ -20,6 +45,7 @@ fn closed_editor_completion_is_main_thread_coalesced_noop_safe_and_teardown_safe
         host.clap_version = clap_sys::version::CLAP_VERSION;
         host.host_data = (&raw const calls).cast_mut().cast();
         host.request_callback = Some(request);
+        host.get_extension = Some(extension);
         let descriptor = DescriptorHolder::new(&TestPlugin::info());
         let plugin =
             create_plugin_instance::<TestPlugin>(&raw const descriptor.descriptor, &raw const host);
@@ -63,9 +89,15 @@ fn closed_editor_completion_is_main_thread_coalesced_noop_safe_and_teardown_safe
         assert!(data.gui_changes.pop().is_none());
         assert_eq!(params.get_normalized(1), Some(0.25));
         assert_eq!(other_params.get_normalized(1), Some(0.5));
+        assert_eq!(calls.dirty.load(Ordering::Relaxed), 1);
         params.completion.complete(5); // completed identical bytes
         clap_plugin_on_main_thread::<TestPlugin>(plugin);
         assert!(data.gui_changes.pop().is_none());
+        assert_eq!(
+            calls.dirty.load(Ordering::Relaxed),
+            1,
+            "no dirty call for identical bytes"
+        );
         let signal = params.completion.signal().unwrap();
         clap_plugin_destroy::<TestPlugin>(plugin);
         let requests = calls.requests.load(Ordering::Relaxed);
