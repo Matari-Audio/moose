@@ -545,6 +545,17 @@ mod tests {
     }
 
     #[test]
+    fn indexed_split_lookup_keeps_wide_ids_and_exact_offsets_without_catalog_scans() {
+        let catalog = moose_params::ParamCatalog::new(vec![info(0x1000000, true), info(97, false)]);
+        let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
+        events.push(Event::new(9, EventBody::ParamChange { id: 97, value: 0.5 }));
+        events.push(Event::new(23, EventBody::ParamChange { id: 0x1000000, value: 0.5 }));
+        let chunked = |id| catalog.by_id(id).is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED));
+        assert_eq!(find_next_split(&events, &chunked, 0, 0), Some((23, 1)));
+        assert_eq!(find_next_split(&events, &chunked, 0, 24), None);
+    }
+
+    #[test]
     fn split_only_on_chunked_params() {
         let infos = [info(0, true), info(1, false)];
         let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
