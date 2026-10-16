@@ -2104,7 +2104,8 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let generate_new = !param_fields.is_empty()
         || !meter_fields.is_empty()
         || !nested_fields.is_empty()
-        || !skip_fields.is_empty();
+        || !skip_fields.is_empty()
+        || empty_named;
 
     // --- Count ---
     let own_count = param_fields.len();

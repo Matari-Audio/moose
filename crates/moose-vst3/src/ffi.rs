@@ -350,7 +350,11 @@ pub struct Vst3Callbacks {
     /// `Params::parameter_presentation_revision`.
     pub param_presentation_revision: unsafe extern "C" fn(ctx: *mut c_void) -> u64,
     pub wants_persist_notifications: unsafe extern "C" fn(*mut c_void) -> bool,
-    pub set_persist_waker: unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void),
+    pub set_persist_waker: unsafe extern "C" fn(
+        *mut c_void,
+        Option<unsafe extern "C" fn(*mut c_void)>,
+        *mut c_void,
+    ),
     pub take_persist_change: unsafe extern "C" fn(*mut c_void, *mut u32, *mut f64) -> bool,
 }
 

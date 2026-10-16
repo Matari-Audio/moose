@@ -30,13 +30,11 @@
 // (the one case the main-thread callback hooks below can't reach).
 #include <dispatch/dispatch.h>
 #endif
-// Linux uses the host's Steinberg::Linux::IRunLoop (queried off the plug
-// frame) with a periodic ITimerHandler to drain a pending restart on the
-// host UI thread - see the run-loop bridge below. It deliberately makes
-// no eventfd / self-pipe syscall: Bitwig instantiates plugins in a
-// seccomp-sandboxed process where a stray syscall is fatal, and a timer
-// needs none. Linux has no process-global main queue, so the no-editor
-// path falls back to the param-poll / edit-gesture flush.
+// Latency still uses the existing view-bound host timer, without RT syscalls.
+// Opt-in persistent-document completion instead registers one nonblocking fd
+// with the host's IRunLoop (factory context, initialize context, or plug frame).
+// Only non-RT workers write it, and it remains registered after view removal.
+// No new periodic timer or background polling is needed for that delivery.
 #if defined(_WIN32)
 // Windows uses a null-HWND thread timer (SetTimer) created on the
 // instantiating thread: WM_TIMER is dispatched by that thread's message
@@ -983,6 +981,7 @@ public:
     std::atomic<int32_t> pendingRestart{0};
     std::atomic<bool> persistPending{false};
     bool persistBound = false;
+    bool persistWanted = false;
 #if defined(__linux__)
     PersistEventHandler persistEvent{&g_persist_event_vtbl, this};
     int persistFd = -1;
@@ -1017,7 +1016,10 @@ public:
         g_cb->set_persist_waker(ctx, wakePersist, this);
     }
     void flushPersistChange() {
-        if (!componentHandler || !persistPending.exchange(false, std::memory_order_acq_rel)) return;
+        if (!componentHandler || !persistWanted) return;
+        if (persistBound && !persistPending.exchange(false, std::memory_order_acq_rel)) return;
+        // Hosts omitting the required Linux runloop still get the completion
+        // on their next existing main-thread callback; no polling job is added.
         uint32_t id = 0;
         double value = 0;
         if (!g_cb || !ctx || !g_cb->take_persist_change(ctx, &id, &value)) return;
@@ -1107,6 +1109,7 @@ public:
         if (g_cb) {
             ctx = g_cb->create();
             if (ctx) {
+                persistWanted = g_cb->wants_persist_notifications(ctx);
                 for (int i = 0; i < kMaxInstances; i++) {
                     if (!g_ctx_map_key[i]) {
                         g_ctx_map_key[i] = ctx;

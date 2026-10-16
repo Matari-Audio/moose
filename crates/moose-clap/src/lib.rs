@@ -731,7 +731,9 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
                 if !pending.swap(true, Ordering::AcqRel)
                     && !host.as_ptr().is_null()
                     && let Some(request) = (*host.as_ptr()).request_callback
-                { request(host.as_ptr()); }
+                {
+                    request(host.as_ptr());
+                }
             }));
             data.params_arc.set_persist_change_signal(Arc::downgrade(&signal));
             data.persist_signal = Some(signal);
@@ -758,7 +760,9 @@ unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *const clap_pl
         let data_ptr = (*plugin).plugin_data.cast::<ClapPluginData<P>>();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Gate workers before any host/instance handle can be released.
-            if let Some(signal) = &(*data_ptr).persist_signal { signal.close(); }
+            if let Some(signal) = &(*data_ptr).persist_signal {
+                signal.close();
+            }
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
         }));
@@ -7022,3 +7026,6 @@ mod large_state_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod persist_notify_tests;

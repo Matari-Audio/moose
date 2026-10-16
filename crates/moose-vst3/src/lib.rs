@@ -687,9 +687,13 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
 
 // All three callbacks run on the host thread. Only the installed wake itself
 // may run on a background worker; close() gates it before the shim tears down.
-unsafe extern "C" fn cb_wants_persist_notifications<P: PluginExport>(ctx: *mut std::ffi::c_void) -> bool {
+unsafe extern "C" fn cb_wants_persist_notifications<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+) -> bool {
     run_extern_callback_with::<P, bool>("vst3", "persist_wants", false, || unsafe {
-        (&*ctx.cast::<Vst3Instance<P>>()).params_arc.wants_persist_notifications()
+        (&*ctx.cast::<Vst3Instance<P>>())
+            .params_arc
+            .wants_persist_notifications()
     })
 }
 unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
@@ -699,26 +703,41 @@ unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
 ) {
     run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
         let instance = &*ctx.cast::<Vst3Instance<P>>();
-        let mut binding = instance.persist_signal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(old) = binding.take() { old.close(); }
+        let mut binding = instance
+            .persist_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(old) = binding.take() {
+            old.close();
+        }
         if let Some(wake) = wake {
             let context = SendPtr::new(wake_context);
             let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
                 wake(context.as_ptr().cast_mut());
             }));
-            instance.params_arc.set_persist_change_signal(Arc::downgrade(&signal));
+            instance
+                .params_arc
+                .set_persist_change_signal(Arc::downgrade(&signal));
             *binding = Some(signal);
         }
     });
 }
 unsafe extern "C" fn cb_take_persist_change<P: PluginExport>(
-    ctx: *mut std::ffi::c_void, id: *mut u32, value: *mut f64,
+    ctx: *mut std::ffi::c_void,
+    id: *mut u32,
+    value: *mut f64,
 ) -> bool {
     run_extern_callback_with::<P, bool>("vst3", "persist_drain", false, || unsafe {
         let params = &(&*ctx.cast::<Vst3Instance<P>>()).params_arc;
-        let Some((changed_id, normalized)) = params.take_persist_change() else { return false; };
-        if !normalized.is_finite() || !(0.0..=1.0).contains(&normalized)
-            || params.get_normalized(changed_id).is_none() { return false; }
+        let Some((changed_id, normalized)) = params.take_persist_change() else {
+            return false;
+        };
+        if !normalized.is_finite()
+            || !(0.0..=1.0).contains(&normalized)
+            || params.get_normalized(changed_id).is_none()
+        {
+            return false;
+        }
         *id = changed_id;
         *value = params.set_normalized_returning_normalized(changed_id, normalized);
         true
@@ -4608,3 +4627,6 @@ mod large_state_tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod persist_notify_tests;

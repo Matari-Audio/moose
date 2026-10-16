@@ -28,9 +28,12 @@ pub struct Bank {
     value_format = "display",
     value_parse = "parse",
     presentation_revision = "revision",
-    presentation_change = "affects_presentation"
+    presentation_change = "affects_presentation",
+    persist_changed = "drain_completion"
 )]
 pub struct TestParams {
+    #[persist]
+    pub completion: Completion,
     #[param(id = 0, name = "Gain", range = "linear(-60, 6)", unit = "dB")]
     gain: FloatParam,
     #[nested(base = 1)]
@@ -43,6 +46,23 @@ pub struct TestParams {
     pub structural_gain: AtomicBool,
 }
 impl TestParams {
+    fn drain_completion(&self) -> Option<(u32, f64)> {
+        if !self.completion.pending.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let content = self.completion.content.load(Ordering::Acquire);
+        if self.completion.reported.swap(content, Ordering::AcqRel) == content {
+            return None;
+        }
+        Some((
+            1,
+            if self.bank.slot.value() < 0.5 {
+                0.75
+            } else {
+                0.25
+            },
+        ))
+    }
     fn affects_presentation(&self, id: u32) -> bool {
         id == 0 && self.structural_gain.load(Ordering::Relaxed)
     }
@@ -84,6 +104,46 @@ impl TestParams {
     }
 }
 
+/// Source fixture only: an independently owned payload completion with exact
+/// no-op detection. Native tests get the instance created on their own thread.
+#[derive(Default)]
+pub struct Completion {
+    signal: std::sync::Mutex<std::sync::Weak<moose_params::PersistChangeSignal>>,
+    pending: AtomicBool,
+    content: AtomicU64,
+    reported: AtomicU64,
+}
+impl Completion {
+    pub fn complete(&self, value: u64) {
+        self.content.store(value, Ordering::Release);
+        self.pending.store(true, Ordering::Release);
+        let signal = self.signal.lock().unwrap().upgrade();
+        if let Some(signal) = signal {
+            signal.notify();
+        }
+    }
+    pub fn signal(&self) -> Option<Arc<moose_params::PersistChangeSignal>> {
+        self.signal.lock().unwrap().upgrade()
+    }
+}
+impl moose_core::custom_state::PersistField for Completion {
+    fn persist_write(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.content.load(Ordering::Acquire).to_le_bytes());
+    }
+    fn persist_read(&self, _: &mut moose_core::custom_state::StateCursor) {}
+    fn set_persist_change_signal(
+        &self,
+        signal: std::sync::Weak<moose_params::PersistChangeSignal>,
+    ) {
+        *self.signal.lock().unwrap() = signal;
+    }
+}
+thread_local! {
+    pub static CREATED: std::cell::RefCell<std::sync::Weak<TestParams>> = const {
+        std::cell::RefCell::new(std::sync::Weak::new())
+    };
+}
+
 pub struct TestPlugin {
     pub params: Arc<TestParams>,
     meters: Arc<MeterStore>,
@@ -92,8 +152,10 @@ pub struct TestPlugin {
 impl PluginExport for TestPlugin {
     type Params = TestParams;
     fn create() -> Self {
+        let params = Arc::new(TestParams::new());
+        CREATED.with(|created| *created.borrow_mut() = Arc::downgrade(&params));
         Self {
-            params: Arc::new(TestParams::new()),
+            params,
             meters: MeterStore::new(),
             snapshot: SnapshotSlot::new(),
         }
