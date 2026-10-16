@@ -18,6 +18,11 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#if defined(__linux__)
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include <cerrno>
+#endif
 #if __APPLE__
 // libdispatch: an event-driven bridge that marshals a pending
 // restartComponent onto the host's main run loop, so a latency change
@@ -25,13 +30,11 @@
 // (the one case the main-thread callback hooks below can't reach).
 #include <dispatch/dispatch.h>
 #endif
-// Linux uses the host's Steinberg::Linux::IRunLoop (queried off the plug
-// frame) with a periodic ITimerHandler to drain a pending restart on the
-// host UI thread - see the run-loop bridge below. It deliberately makes
-// no eventfd / self-pipe syscall: Bitwig instantiates plugins in a
-// seccomp-sandboxed process where a stray syscall is fatal, and a timer
-// needs none. Linux has no process-global main queue, so the no-editor
-// path falls back to the param-poll / edit-gesture flush.
+// Latency still uses the existing view-bound host timer, without RT syscalls.
+// Opt-in persistent-document completion instead registers one nonblocking fd
+// with the host's IRunLoop (factory context, initialize context, or plug frame).
+// Only non-RT workers write it, and it remains registered after view removal.
+// No new periodic timer or background polling is needed for that delivery.
 #if defined(_WIN32)
 // Windows uses a null-HWND thread timer (SetTimer) created on the
 // instantiating thread: WM_TIMER is dispatched by that thread's message
@@ -135,6 +138,9 @@ static const TUID IPlugViewContentScaleSupport_iid =
 // Steinberg::Linux run-loop interfaces: IRunLoop is the host's UI-thread
 // event loop (queried off the plug frame); ITimerHandler is the periodic
 // callback we register with it. Only needed on Linux.
+static const TUID IEventHandler_iid = MAKE_IID(0x561E65C9, 0x13A0496F, 0x813A2C35, 0x654D7983);
+// Host-thread-owned factory context. Components retain their own reference.
+static void* g_factory_run_loop = nullptr;
 static const TUID IRunLoop_iid      = MAKE_IID(0x18C35366, 0x97764F1A, 0x9C5B8385, 0x7A871389);
 static const TUID ITimerHandler_iid = MAKE_IID(0x10BDD94F, 0x41424774, 0x821FAD8F, 0xECA72CA9);
 #endif
@@ -533,6 +539,9 @@ struct Vst3Callbacks {
     int32_t (*param_presentation)(void*, uint32_t, char*, uint32_t);
     // Bumped whenever any param_presentation result changes.
     uint64_t (*param_presentation_revision)(void*);
+    bool (*wants_persist_notifications)(void*);
+    void (*set_persist_waker)(void*, void (*)(void*), void*);
+    bool (*take_persist_change)(void*, uint32_t*, double*);
 };
 
 // ---------------------------------------------------------------------------
@@ -782,6 +791,25 @@ static void moose_vst3_restart_source_event(void* key);
 // thread - the run loop calls it there. A timer, not an fd handler, so
 // nothing here or in the audio-thread path makes a syscall the host's
 // sandbox could reject; the flush just polls the pending-restart bit.
+// A separate fd handler outlives the plug view and does no idle polling.
+struct PersistEventHandler;
+static tresult ph_queryInterface(void*, const TUID, void**);
+static uint32 ph_addRef(void*);
+static uint32 ph_release(void*);
+static void ph_onFDIsSet(void*, int);
+struct PersistEventVtbl {
+    tresult (*queryInterface)(void*, const TUID, void**);
+    uint32 (*addRef)(void*);
+    uint32 (*release)(void*);
+    void (*onFDIsSet)(void*, int);
+};
+static PersistEventVtbl g_persist_event_vtbl = {
+    ph_queryInterface, ph_addRef, ph_release, ph_onFDIsSet,
+};
+struct PersistEventHandler {
+    PersistEventVtbl* vtbl;
+    MooseComponent* comp;
+};
 struct ITimerHandlerVtbl {
     tresult (*queryInterface)(void*, const TUID, void**);
     uint32  (*addRef)(void*);
@@ -951,6 +979,83 @@ public:
     // so restartComponent - which VST3 wants off the audio thread and on
     // the UI thread - never fires from the render or a moose-owned thread.
     std::atomic<int32_t> pendingRestart{0};
+    std::atomic<bool> persistPending{false};
+    bool persistBound = false;
+    bool persistWanted = false;
+#if defined(__linux__)
+    PersistEventHandler persistEvent{&g_persist_event_vtbl, this};
+    int persistFd = -1;
+    void* persistRunLoop = nullptr;
+#endif
+    static void wakePersist(void* context) {
+        auto* comp = static_cast<MooseComponent*>(context);
+        if (comp->persistPending.exchange(true, std::memory_order_acq_rel)) return;
+#if defined(__linux__)
+        const uint64_t one = 1;
+        ssize_t result;
+        do { result = write(comp->persistFd, &one, sizeof(one)); }
+        while (result < 0 && errno == EINTR);
+        // EAGAIN means an earlier wake is already readable. Teardown cannot
+        // close the fd until Rust's signal.close() has joined this request.
+#elif __APPLE__
+        if (comp->restartSource) dispatch_source_merge_data(comp->restartSource, 1);
+#endif
+        // Windows reuses the existing host-thread lifetime timer. No extra
+        // timer, worker or wakeup is introduced there.
+    }
+    void bindPersistSignal() {
+        if (persistBound || !g_cb || !ctx || !g_cb->wants_persist_notifications(ctx)) return;
+#if defined(__linux__)
+        if (persistFd < 0 || !persistRunLoop) return;
+#elif __APPLE__
+        if (!restartSource) return;
+#elif defined(_WIN32)
+        if (!restartTimerId) return;
+#endif
+        persistBound = true;
+        g_cb->set_persist_waker(ctx, wakePersist, this);
+    }
+    void flushPersistChange() {
+        if (!componentHandler || !persistWanted) return;
+        if (persistBound && !persistPending.exchange(false, std::memory_order_acq_rel)) return;
+        // Hosts omitting the required Linux runloop still get the completion
+        // on their next existing main-thread callback; no polling job is added.
+        uint32_t id = 0;
+        double value = 0;
+        if (!g_cb || !ctx || !g_cb->take_persist_change(ctx, &id, &value)) return;
+        auto** vtbl = *(void***)componentHandler;
+        auto begin = (tresult (*)(void*, uint32_t))vtbl[3];
+        auto perform = (tresult (*)(void*, uint32_t, double))vtbl[4];
+        auto end = (tresult (*)(void*, uint32_t))vtbl[5];
+        begin(componentHandler, id);
+        inPerformEdit = true;
+        perform(componentHandler, id, value);
+        inPerformEdit = false;
+        end(componentHandler, id);
+    }
+#if defined(__linux__)
+    void bindPersistRunLoop(void* context) {
+        if (persistRunLoop || !context || !g_cb || !ctx || !g_cb->wants_persist_notifications(ctx)) return;
+        void* rl = nullptr;
+        auto qi = (tresult (*)(void*, const TUID, void**))(*(void***)context)[0];
+        if (qi(context, IRunLoop_iid, &rl) != kResultOk || !rl) return;
+        // Only opted-in plugins with an actual host runloop create an fd.
+        // No fd is created in a context-less scanner or from the audio thread.
+        int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (fd >= 0) {
+            auto reg = (tresult (*)(void*, void*, int))(*(void***)rl)[3];
+            if (reg(rl, &persistEvent, fd) == kResultOk) {
+                persistFd = fd;
+                persistRunLoop = rl;
+                bindPersistSignal();
+                return;
+            }
+            close(fd);
+        }
+        auto release = (uint32 (*)(void*))(*(void***)rl)[2];
+        release(rl);
+    }
+#endif
 #if __APPLE__
     // Main-queue dispatch source. The audio thread signals it (lock-free,
     // alloc-free) on a latency change; its handler drains pendingRestart
@@ -1004,6 +1109,7 @@ public:
         if (g_cb) {
             ctx = g_cb->create();
             if (ctx) {
+                persistWanted = g_cb->wants_persist_notifications(ctx);
                 for (int i = 0; i < kMaxInstances; i++) {
                     if (!g_ctx_map_key[i]) {
                         g_ctx_map_key[i] = ctx;
@@ -1043,11 +1149,27 @@ public:
                     nullptr, 0, (UINT)kRestartTimerIntervalMs,
                     moose_vst3_restart_timer_proc);
 #endif
+#if defined(__linux__)
+                bindPersistRunLoop(g_factory_run_loop);
+#endif
+                bindPersistSignal();
             }
         }
     }
 
     ~MooseComponent() {
+        // Wait for any worker wake before unregistering/closing native handles.
+        if (persistBound && g_cb && ctx) g_cb->set_persist_waker(ctx, nullptr, nullptr);
+#if defined(__linux__)
+        if (persistRunLoop) {
+            auto unreg = (tresult (*)(void*, void*))(*(void***)persistRunLoop)[4];
+            unreg(persistRunLoop, &persistEvent);
+            auto release = (uint32 (*)(void*))(*(void***)persistRunLoop)[2];
+            release(persistRunLoop);
+            persistRunLoop = nullptr;
+        }
+        if (persistFd >= 0) { close(persistFd); persistFd = -1; }
+#endif
         if (componentHandler) {
             auto release_fn = (uint32 (*)(void*))(*(void***)componentHandler)[2];
             release_fn(componentHandler);
@@ -1109,10 +1231,12 @@ public:
 
     // --- IPluginBase ---
 
-    tresult initialize(void* /*context*/) {
-        if (g_cb && ctx) {
-            // initialize is a no-op for now
-        }
+    tresult initialize(void* context) {
+#if defined(__linux__)
+        bindPersistRunLoop(context);
+#else
+        (void)context;
+#endif
         return kResultOk;
     }
 
@@ -1950,6 +2074,7 @@ public:
         if (componentHandler) {
             auto addRef_fn = (uint32 (*)(void*))(*(void***)componentHandler)[1];
             addRef_fn(componentHandler);
+            flushPersistChange();
         }
         return kResultOk;
     }
@@ -1962,6 +2087,7 @@ public:
     uint64_t presentationRevision = 0;
     void flushPendingRestart() {
         if (!componentHandler) return;
+        flushPersistChange();
         uint64_t revision = (g_cb && ctx) ? g_cb->param_presentation_revision(ctx) : 0;
         if (revision != presentationRevision) {
             presentationRevision = revision;
@@ -1982,6 +2108,9 @@ public:
     // detached) rebinds cleanly. Runs on the host UI thread, same as
     // onTimer, so there's no race with the handler.
     void updateRunLoopRegistration(void* frame) {
+        // Keep an independent addRef'd event registration until component
+        // destruction; closing/detaching this view must not strand completion.
+        bindPersistRunLoop(frame);
         if (runLoop) {
             auto unreg = (tresult (*)(void*, void*))
                 (*(void***)runLoop)[kRunLoopUnregisterTimerIndex];
@@ -2014,6 +2143,22 @@ public:
 };
 
 #if defined(__linux__)
+static tresult ph_queryInterface(void* self, const TUID iid, void** obj) {
+    if (iid_equal(iid, FUnknown_iid) || iid_equal(iid, IEventHandler_iid)) {
+        *obj = self; return kResultOk;
+    }
+    *obj = nullptr; return kNoInterface;
+}
+static uint32 ph_addRef(void*) { return 1; }
+static uint32 ph_release(void*) { return 1; }
+static void ph_onFDIsSet(void* self, int fd) {
+    auto* handler = static_cast<PersistEventHandler*>(self);
+    uint64_t value;
+    ssize_t result;
+    do { result = read(fd, &value, sizeof(value)); } while (result < 0 && errno == EINTR);
+    if (handler->comp) handler->comp->flushPersistChange();
+}
+
 // ITimerHandler method bodies - defined here, now that MooseComponent is
 // complete. The handler is embedded in the component and not
 // independently owned, so addRef / release are inert and queryInterface
@@ -2854,6 +2999,13 @@ static uint32 factory_addRef(void* self) {
 
 static uint32 factory_release(void* self) {
     auto r = --(((FactoryCOM*)self)->refCount);
+#if defined(__linux__)
+    if (r == 0 && g_factory_run_loop) {
+        auto release = (uint32 (*)(void*))(*(void***)g_factory_run_loop)[2];
+        release(g_factory_run_loop);
+        g_factory_run_loop = nullptr;
+    }
+#endif
     // Don't free - factory is a global static
     return r;
 }
@@ -2921,7 +3073,23 @@ static tresult factory_getClassInfoW(void*, int32 index, PClassInfoW* info) {
     return kResultOk;
 }
 
-static tresult factory_setHostContext(void*, void*) { return kResultOk; }
+static tresult factory_setHostContext(void*, void* context) {
+#if defined(__linux__)
+    void* next = nullptr;
+    if (context) {
+        auto qi = (tresult (*)(void*, const TUID, void**))(*(void***)context)[0];
+        if (qi(context, IRunLoop_iid, &next) != kResultOk) next = nullptr;
+    }
+    if (g_factory_run_loop) {
+        auto release = (uint32 (*)(void*))(*(void***)g_factory_run_loop)[2];
+        release(g_factory_run_loop);
+    }
+    g_factory_run_loop = next;
+#else
+    (void)context;
+#endif
+    return kResultOk;
+}
 
 static tresult factory_createInstance(void*, FIDString cid, FIDString iid, void** obj) {
     if (!cid || !iid || !obj || !g_desc) return kInvalidArgument;

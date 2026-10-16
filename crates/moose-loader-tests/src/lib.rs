@@ -10,6 +10,9 @@
 //! See `crates/moose-loader/Cargo.toml` for the rationale.
 
 #[cfg(test)]
+mod persist_fingerprint_tests;
+
+#[cfg(test)]
 mod instance_edit_epoch_tests {
     use moose::prelude::*;
 

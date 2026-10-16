@@ -80,7 +80,7 @@ use clap_sys::ext::remote_controls::{
 use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, clap_plugin_render, clap_plugin_render_mode,
 };
-use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
@@ -182,6 +182,9 @@ type StateLoadQueue = state::StateLoadQueue;
 // ---------------------------------------------------------------------------
 
 struct ClapPluginData<P: PluginExport> {
+    persist_signal: Option<Arc<moose_params::PersistChangeSignal>>,
+    persist_pending: Arc<AtomicBool>,
+    host_state: *const clap_host_state,
     /// The user's plugin instance in the wrapper-standard ownership
     /// cell: the audio thread owns it per block, host lifecycle
     /// callbacks own it while processing is stopped, and the two never
@@ -713,6 +716,7 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
             if !ext.is_null() {
                 data.host_params = ext.cast::<clap_host_params>();
             }
+            data.host_state = get_ext(data.host, CLAP_EXT_STATE.as_ptr()).cast::<clap_host_state>();
             let lat_ext = get_ext(data.host, CLAP_EXT_LATENCY.as_ptr());
             if !lat_ext.is_null() {
                 data.host_latency = lat_ext.cast::<clap_host_latency>();
@@ -721,6 +725,20 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
             if !tail_ext.is_null() {
                 data.host_tail = tail_ext.cast::<clap_host_tail>();
             }
+        }
+        if data.params_arc.wants_persist_notifications() {
+            let host = SendPtr::new(data.host);
+            let pending = data.persist_pending.clone();
+            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+                if !pending.swap(true, Ordering::AcqRel)
+                    && !host.as_ptr().is_null()
+                    && let Some(request) = (*host.as_ptr()).request_callback
+                {
+                    request(host.as_ptr());
+                }
+            }));
+            data.params_arc.set_persist_change_signal(Arc::downgrade(&signal));
+            data.persist_signal = Some(signal);
         }
         true
     })
@@ -743,6 +761,10 @@ unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *const clap_pl
         let plugin_ptr = plugin.cast_mut();
         let data_ptr = (*plugin).plugin_data.cast::<ClapPluginData<P>>();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Gate workers before any host/instance handle can be released.
+            if let Some(signal) = &(*data_ptr).persist_signal {
+                signal.close();
+            }
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
         }));
@@ -916,6 +938,24 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
+        if data.persist_pending.swap(false, Ordering::AcqRel)
+            && let Some((id, value)) = data.params_arc.take_persist_change()
+            && value.is_finite() && (0.0..=1.0).contains(&value)
+            && data.params_arc.get_normalized(id).is_some()
+        {
+            // The ordinary gesture queue works independently of GUI creation.
+            let context = editor_context::<P>(plugin);
+            context.begin_edit(id);
+            context.set_param(id, value);
+            context.end_edit(id);
+            // State dirtiness must also reach an inactive host that does not
+            // implement params/request_flush. This is a main-thread-only API.
+            if !data.host.is_null() && !data.host_state.is_null()
+                && let Some(mark_dirty) = (*data.host_state).mark_dirty
+            {
+                mark_dirty(data.host);
+            }
+        }
         if data.floating_closed.swap(false, Ordering::AcqRel) {
             data.gui.enter().visible = false;
             if !data.host.is_null()
@@ -3991,17 +4031,18 @@ unsafe extern "C" fn state_save<P: PluginExport>(
         // thread publishes each block. Never touches the plugin, so it
         // can't stall a block in flight.
         let extra = save_extra(&data.snapshot);
-        let persist = data.params_arc.serialize_persist();
+        let Ok(persist) = data.params_arc.prepare_persist_write() else { return false; };
         let Some(write_fn) = (*stream).write else {
             return false;
         };
-        state::write_state_stream(
+        state::write_state_stream_with_persist(
             data.plugin_id_hash,
             &ids,
             &values,
             &extra,
-            &persist,
+            persist.byte_len(),
             P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
             |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64),
         )
     })
@@ -5601,6 +5642,9 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             .unwrap_or(0);
 
         let data = Box::new(ClapPluginData::<P> {
+            persist_signal: None,
+            persist_pending: Arc::new(AtomicBool::new(false)),
+            host_state: ptr::null(),
             plugin: shared_plugin(instance),
             params_arc,
             meter_store,
@@ -6992,3 +7036,6 @@ mod large_state_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod persist_notify_tests;

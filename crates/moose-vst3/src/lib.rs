@@ -75,6 +75,7 @@ type StateLoadQueue = state::StateLoadQueue;
 const K_LATENCY_CHANGED: i32 = 8;
 
 struct Vst3Instance<P: PluginExport> {
+    persist_signal: std::sync::Mutex<Option<Arc<moose_params::PersistChangeSignal>>>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -618,6 +619,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 })
                 .collect();
             let instance = Box::new(Vst3Instance::<P> {
+                persist_signal: std::sync::Mutex::new(None),
                 plugin: shared_plugin(plugin),
                 params_arc,
                 meter_store,
@@ -674,9 +676,72 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     // keeps a live host alive; the instance is being torn down regardless.
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
-            drop(Box::from_raw(ctx.cast::<Vst3Instance<P>>()));
+            let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
+            if let Some(signal) = instance.persist_signal.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                signal.close();
+            }
+            drop(instance);
         }
     });
+}
+
+// All three callbacks run on the host thread. Only the installed wake itself
+// may run on a background worker; close() gates it before the shim tears down.
+unsafe extern "C" fn cb_wants_persist_notifications<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "persist_wants", false, || unsafe {
+        (&*ctx.cast::<Vst3Instance<P>>())
+            .params_arc
+            .wants_persist_notifications()
+    })
+}
+unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    wake_context: *mut std::ffi::c_void,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
+        let instance = &*ctx.cast::<Vst3Instance<P>>();
+        let mut binding = instance
+            .persist_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(old) = binding.take() {
+            old.close();
+        }
+        if let Some(wake) = wake {
+            let context = SendPtr::new(wake_context);
+            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+                wake(context.as_ptr().cast_mut());
+            }));
+            instance
+                .params_arc
+                .set_persist_change_signal(Arc::downgrade(&signal));
+            *binding = Some(signal);
+        }
+    });
+}
+unsafe extern "C" fn cb_take_persist_change<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: *mut u32,
+    value: *mut f64,
+) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "persist_drain", false, || unsafe {
+        let params = &(&*ctx.cast::<Vst3Instance<P>>()).params_arc;
+        let Some((changed_id, normalized)) = params.take_persist_change() else {
+            return false;
+        };
+        if !normalized.is_finite()
+            || !(0.0..=1.0).contains(&normalized)
+            || params.get_normalized(changed_id).is_none()
+        {
+            return false;
+        }
+        *id = changed_id;
+        *value = params.set_normalized_returning_normalized(changed_id, normalized);
+        true
+    })
 }
 
 /// Map a VST3 `ProcessModes` value (`kRealtime` 0, `kPrefetch` 1,
@@ -1806,20 +1871,29 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // Rust global allocator for both save + free; do not cross
         // wires when refactoring `_save_state` paths together.)
         let extra = save_extra(&inst.snapshot);
-        let persist = inst.params_arc.serialize_persist();
-        let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
-        let len = blob.len();
-        if len > P::max_host_state_bytes() { return; }
-        let ptr = libc_malloc(len).cast::<u8>();
-        if ptr.is_null() {
-            // malloc failed - `*out_data` is already null and
-            // `*out_len` already 0 from the pre-zero above; nothing
-            // to do on this branch except return.
-            return;
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
+        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
+        let Ok(host_len) = u32::try_from(len) else { return; };
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) { if !self.0.is_null() { unsafe { libc_free(self.0.cast()); } } }
         }
-        std::ptr::copy_nonoverlapping(blob.as_ptr(), ptr, len);
-        *out_data = ptr;
-        *out_len = len_u32(len);
+        let mut buffer = Buffer(libc_malloc(len).cast::<u8>());
+        if buffer.0.is_null() { return; }
+        let mut offset = 0;
+        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| {
+                if bytes.len() > len - offset { return -1; }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
+                offset += bytes.len(); bytes.len() as i64
+            });
+        if !ok { return; }
+        *out_data = buffer.0; *out_len = host_len;
+        buffer.0 = std::ptr::null_mut();
     });
 }
 
@@ -1906,9 +1980,11 @@ unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
         }
         let (ids, values) = inst.params_arc.collect_values();
         let extra = save_extra(&inst.snapshot);
-        let persist = inst.params_arc.serialize_persist();
-        i32::from(state::write_state_stream(inst.plugin_id_hash, &ids, &values, &extra, &persist,
-            P::max_host_state_bytes(), |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return 0; };
+        i32::from(state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
     })
 }
 
@@ -3736,6 +3812,9 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         param_is_chunked: cb_param_is_chunked::<P>,
         param_presentation: cb_param_presentation::<P>,
         param_presentation_revision: cb_param_presentation_revision::<P>,
+        wants_persist_notifications: cb_wants_persist_notifications::<P>,
+        set_persist_waker: cb_set_persist_waker::<P>,
+        take_persist_change: cb_take_persist_change::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every
@@ -4548,3 +4627,6 @@ mod large_state_tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod persist_notify_tests;
