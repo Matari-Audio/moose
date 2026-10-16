@@ -2862,6 +2862,42 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .post_load
         .as_ref()
         .map(|m| quote! { self.#m(); });
+
+    // Use precisely the persistence inventory above: new fields and nested
+    // stores participate automatically, without a second handwritten catalog.
+    let persist_fingerprint_stmts = persist_fields.iter().map(|(ident, key, _)| {
+        quote! {
+            __visitor.begin_field(#key);
+            if let Some(__fingerprint) =
+                ::moose::core::custom_state::PersistField::persist_fingerprint(&self.#ident)
+            {
+                __visitor.fingerprint(__fingerprint);
+            } else {
+                let mut __bytes = ::std::vec::Vec::new();
+                ::moose::core::custom_state::PersistField::persist_write(&self.#ident, &mut __bytes);
+                __visitor.serialized(&__bytes);
+            }
+            __visitor.end_field();
+        }
+    });
+    let nested_fingerprint_stmts = nested_idents.iter().map(|ident| {
+        let key = ident.to_string();
+        quote! {
+            __visitor.begin_field(#key);
+            ::moose::params::Params::visit_persist_fingerprints(&self.#ident, __visitor);
+            __visitor.end_field();
+        }
+    });
+    let persist_fingerprint_impl = quote! {
+        fn visit_persist_fingerprints(
+            &self,
+            __visitor: &mut dyn ::moose::params::PersistFingerprintVisitor,
+        ) {
+            #pre_save
+            #(#persist_fingerprint_stmts)*
+            #(#nested_fingerprint_stmts)*
+        }
+    };
     let validate_impl = struct_attrs.validate_persist.as_ref().map(|m| {
         quote! {
             fn validate_persist(data: &[u8]) -> bool where Self: Sized { Self::#m(data) }
@@ -3204,6 +3240,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             #persist_impl
+            #persist_fingerprint_impl
         }
     };
 

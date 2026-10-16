@@ -150,6 +150,18 @@ pub trait PersistField {
     /// Read a value from `cursor` and store it in place. A short or
     /// malformed read leaves the current value untouched.
     fn persist_read(&self, cursor: &mut StateCursor);
+
+    /// Optional cheap content identity for dirty detection. Compute expensive
+    /// payload digests on the field's publishing worker, rather than in this
+    /// accessor. Keep the identity stable on no-op mutations; include all
+    /// persisted controls and exact float bits, excluding derived caches.
+    ///
+    /// Return `Some` consistently when opting in: switching between cached and
+    /// serialized representations could otherwise look like a content change.
+    /// The default leaves existing fields on the ordinary serialization path.
+    fn persist_fingerprint(&self) -> Option<moose_params::PersistFingerprint> {
+        None
+    }
 }
 
 impl<T: StateField> PersistField for std::sync::RwLock<T> {

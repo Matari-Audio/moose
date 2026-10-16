@@ -182,6 +182,31 @@ impl Default for ParameterPresentation {
 /// their final immutable representation instead of a serialized staging buffer.
 pub type PreparedPersist<P> = Box<dyn FnOnce(&P, &[(u32, f64)], &[u8]) + Send>;
 
+/// A compact identity prepared by the owner of a persisted field.
+///
+/// `byte_len` describes the canonical input represented by `digest`, not a host
+/// stream size limit. Producers must include every persisted value, preserve
+/// float bits, and keep the identity stable for unchanged content. Immutable
+/// payload owners can cache a 256-bit digest when preparing their data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistFingerprint {
+    pub byte_len: u64,
+    pub digest: [u8; 32],
+}
+
+/// Visits a derived persistence tree without constructing its complete blob.
+///
+/// Each field is bracketed by `begin_field`/`end_field`; nested parameter stores
+/// recurse inside their own bracket. A leaf supplies either its cached identity
+/// or its ordinary serialized bytes. Consumers own their hashing policy and
+/// must frame names and lengths to distinguish nested/adjacent fields.
+pub trait PersistFingerprintVisitor {
+    fn begin_field(&mut self, key: &str);
+    fn end_field(&mut self);
+    fn fingerprint(&mut self, value: PersistFingerprint);
+    fn serialized(&mut self, bytes: &[u8]);
+}
+
 /// Trait implemented by #[derive(Params)] on a struct.
 /// Format wrappers use this to enumerate, read, and write parameters.
 ///
@@ -403,6 +428,17 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     #[must_use]
     fn serialize_persist(&self) -> Vec<u8> {
         Vec::new()
+    }
+
+    /// Visit every persisted field, including nested stores and pre-save hooks.
+    /// The derive emits this from the same field inventory as serialization.
+    ///
+    /// This is non-realtime: a field without a cached identity uses its existing
+    /// serializer and may allocate or lock. Large fields should provide a cheap
+    /// identity prepared at mutation/publication time. The default preserves
+    /// manual implementations by exposing their complete serialized state.
+    fn visit_persist_fingerprints(&self, visitor: &mut dyn PersistFingerprintVisitor) {
+        visitor.serialized(&self.serialize_persist());
     }
 
     /// Restore this store's `#[persist]` fields from a blob produced by
