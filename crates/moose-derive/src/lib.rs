@@ -866,6 +866,7 @@ enum IdScheme {
 
 /// Struct-level `#[params(...)]` settings.
 struct ParamsStructAttrs {
+    projection: Option<syn::TypePath>,
     id_scheme: IdScheme,
     /// Inherent `fn(&self)` run at the end of `load_persist`, after
     /// values and persist fields are both restored (migrations).
@@ -895,6 +896,7 @@ struct ParamsStructAttrs {
 /// Errors on an unknown key/value.
 fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAttrs, syn::Error> {
     let mut parsed = ParamsStructAttrs {
+        projection: None,
         id_scheme: IdScheme::Hash,
         post_load: None,
         pre_save: None,
@@ -930,6 +932,12 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 };
                 return Ok(());
             }
+            if key == "projection" {
+                if parsed.projection.is_some() { return Err(meta.error("duplicate projection provider")); }
+                parsed.projection = Some(syn::parse_str::<syn::TypePath>(&value.value())
+                    .map_err(|_| meta.error("projection must name a ParamProjection provider type"))?);
+                return Ok(());
+            }
             let slot = match key.as_str() {
                 "post_load" => &mut parsed.post_load,
                 "pre_save" => &mut parsed.pre_save,
@@ -945,7 +953,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                     return Err(meta.error(
                         "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
                          `validate_persist`, `restore_state`, `presentation`, \
-                         `presentation_revision`, `presentation_change`, `value_format`, or `value_parse`)",
+                         `presentation_revision`, `presentation_change`, `projection`, `value_format`, or `value_parse`)",
                     ));
                 }
             };
@@ -2205,6 +2213,15 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
         }
     };
+    let static_infos_body = if let Some(provider) = &struct_attrs.projection {
+        quote! {
+            {
+                let mut infos = { #static_infos_body };
+                ::moose::params::append_projected_infos::<#struct_name, #provider>(&mut infos);
+                infos
+            }
+        }
+    } else { static_infos_body };
     let param_infos_static_impl = quote! {
         fn param_infos_static() -> Vec<::moose::params::ParamInfo>
         where
@@ -2971,6 +2988,58 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Projection dispatch is emitted only for opted-in stores. Declared IDs keep
+    // their original match arms; alias storage never enters state collection.
+    let mut projected_setters = quote! {};
+    let (count_expr, infos_expr, append_infos_impl,
+         get_plain_fallthrough, get_normalized_fallthrough,
+         set_plain_fallthrough, set_normalized_fallthrough,
+         format_fallthrough, parse_value_impl) =
+    if let Some(provider) = &struct_attrs.projection {
+        let api = quote! { <#provider as ::moose::params::ParamProjection<Self>> };
+        projected_setters = quote! {
+            fn set_normalized_returning_plain(&self, id: u32, value: f64) -> f64 {
+                if let Some(result) = #api::set_normalized(self, id, value) { return result.plain; }
+                <Self as ::moose::params::Params>::set_normalized(self, id, value);
+                <Self as ::moose::params::Params>::get_plain(self, id).unwrap_or(0.0)
+            }
+            fn set_normalized_returning_normalized(&self, id: u32, value: f64) -> f64 {
+                if let Some(result) = #api::set_normalized(self, id, value) { return result.normalized; }
+                <Self as ::moose::params::Params>::set_normalized(self, id, value);
+                <Self as ::moose::params::Params>::get_normalized(self, id).unwrap_or(0.0)
+            }
+        };
+        (
+            quote! { (#count_expr) + #api::param_infos().len() },
+            quote! {
+                let mut infos = { #infos_expr };
+                ::moose::params::append_projected_infos::<Self, #provider>(&mut infos);
+                infos
+            },
+            quote! {
+                fn append_param_infos(&self, into: &mut Vec<::moose::params::ParamInfo>) {
+                    #(into.push(#own_infos);)*
+                    #(self.#nested_idents.append_param_infos(into);)*
+                    ::moose::params::append_projected_infos::<Self, #provider>(into);
+                }
+            },
+            quote! { _ => { (match id { #get_plain_fallthrough }).or_else(|| #api::get_plain(self, id)) } },
+            quote! { _ => { (match id { #get_normalized_fallthrough }).or_else(|| #api::get_normalized(self, id)) } },
+            quote! { _ => {
+                if #api::set_plain(self, id, value).is_none() { match id { #set_plain_fallthrough } }
+            } },
+            quote! { _ => {
+                if #api::set_normalized(self, id, value).is_none() { match id { #set_normalized_fallthrough } }
+            } },
+            quote! { _ => { (match id { #format_fallthrough }).or_else(|| #api::format_value(self, id, value)) } },
+            quote! { (#parse_value_impl).or_else(|| #api::parse_value(self, id, text).filter(|value| value.is_finite())) },
+        )
+    } else {
+        (count_expr, infos_expr, append_infos_impl, get_plain_fallthrough,
+         get_normalized_fallthrough, set_plain_fallthrough,
+         set_normalized_fallthrough, format_fallthrough, parse_value_impl)
+    };
+
     let expanded = quote! {
         #(#attr_errors)*
 
@@ -2984,6 +3053,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
 
         impl ::moose::params::Params for #struct_name {
             #parameter_epoch_impl
+            #projected_setters
             fn param_infos(&self) -> Vec<::moose::params::ParamInfo> {
                 #infos_expr
             }
