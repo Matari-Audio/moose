@@ -883,6 +883,7 @@ struct ParamsStructAttrs {
     presentation: Option<syn::Ident>,
     /// Inherent `fn(&self) -> u64`.
     presentation_revision: Option<syn::Ident>,
+    presentation_change: Option<syn::Ident>,
     /// Inherent `fn(&self, u32, f64) -> Option<String>`; None uses static formatting.
     value_format: Option<syn::Ident>,
     /// Inherent `fn(&self, u32, &str) -> Result<Option<f64>, ()>`.
@@ -902,6 +903,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
         prepare_persist_stream: None,
         presentation: None,
         presentation_revision: None,
+        presentation_change: None,
         value_format: None,
         value_parse: None,
     };
@@ -936,13 +938,14 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 "prepare_persist_stream" => &mut parsed.prepare_persist_stream,
                 "presentation" => &mut parsed.presentation,
                 "presentation_revision" => &mut parsed.presentation_revision,
+                "presentation_change" => &mut parsed.presentation_change,
                 "value_format" => &mut parsed.value_format,
                 "value_parse" => &mut parsed.value_parse,
                 _ => {
                     return Err(meta.error(
                         "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
                          `validate_persist`, `restore_state`, `presentation`, \
-                         `presentation_revision`, `value_format`, or `value_parse`)",
+                         `presentation_revision`, `presentation_change`, `value_format`, or `value_parse`)",
                     ));
                 }
             };
@@ -2876,6 +2879,12 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         }
     });
 
+    let presentation_change_impl = struct_attrs.presentation_change.as_ref().map(|m| {
+        quote! {
+            fn parameter_affects_presentation(&self, id: u32) -> bool { self.#m(id) }
+        }
+    });
+
     let value_format_override = struct_attrs.value_format.as_ref().map(|method| {
         quote! {
             if let Some(text) = self.#method(id, value) { return Some(text); }
@@ -2985,6 +2994,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
 
             #presentation_impl
             #presentation_revision_impl
+            #presentation_change_impl
             #validate_impl
             #restore_impl
             #prepare_stream_impl

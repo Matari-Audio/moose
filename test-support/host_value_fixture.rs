@@ -27,7 +27,8 @@ pub struct Bank {
 #[params(
     value_format = "display",
     value_parse = "parse",
-    presentation_revision = "revision"
+    presentation_revision = "revision",
+    presentation_change = "affects_presentation"
 )]
 pub struct TestParams {
     #[param(id = 0, name = "Gain", range = "linear(-60, 6)", unit = "dB")]
@@ -38,9 +39,20 @@ pub struct TestParams {
     pub rebound: AtomicBool,
     #[skip]
     pub generation: AtomicU64,
+    #[skip]
+    pub structural_gain: AtomicBool,
 }
 impl TestParams {
+    fn affects_presentation(&self, id: u32) -> bool {
+        id == 0 && self.structural_gain.load(Ordering::Relaxed)
+    }
     fn revision(&self) -> u64 {
+        if self.structural_gain.load(Ordering::Relaxed) {
+            let rebound = self.gain.value() > -30.;
+            if self.rebound.swap(rebound, Ordering::Relaxed) != rebound {
+                self.generation.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.generation.load(Ordering::Relaxed)
     }
     fn display(&self, id: u32, value: f64) -> Option<String> {

@@ -209,10 +209,21 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     }
 
     /// Bump whenever any [`Self::parameter_presentation`] result changes;
-    /// wrappers poll it and ask the host to rescan parameters.
+    /// wrappers read it on the host main thread and ask the host to rescan.
+    /// It may refresh derived metadata; it is never an audio-thread poll.
     /// Derive: `#[params(presentation_revision = "method")]`.
     fn parameter_presentation_revision(&self) -> u64 {
         0
+    }
+
+    /// Whether a write to this ID can change another parameter's name, group
+    /// or visibility. Called only for changed-event IDs, including on audio
+    /// threads: do not allocate, lock, or rebuild presentation here. Wrappers
+    /// coalesce a main-thread callback; the revision getter may then refresh
+    /// derived metadata off audio. Ordinary numeric IDs should return false.
+    /// Derive: `#[params(presentation_change = "method")]`.
+    fn parameter_affects_presentation(&self, _id: u32) -> bool {
+        false
     }
 
     /// Stored parameter changes in this instance, including nested groups.
