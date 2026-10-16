@@ -5572,7 +5572,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let exposed_param_indices = Mutex::new(parameter_indices(&param_infos, |id| {
             params_arc.parameter_presentation(id)
         }));
-        let remote_pages = Mutex::new(presented_remote_control_pages(&param_infos, |id| {
+        let remote_pages = Mutex::new(presented_remote_control_pages(param_infos.iter(), |id| {
             params_arc.parameter_presentation(id)
         }));
         let meter_store = instance.meter_store();
@@ -6083,8 +6083,12 @@ mod remote_controls_tests {
 
     #[test]
     fn runtime_pages_use_live_groups_and_visibility_without_changing_ids() {
-        let infos = vec![info(7, "OLD"), info(8, "OLD"), info(9, "OLD")];
-        let pages = super::presented_remote_control_pages(&infos, |id| {
+        let infos = std::sync::Arc::new(moose_params::ParamCatalog::new(vec![
+            info(7, "OLD"),
+            info(8, "OLD"),
+            info(9, "OLD"),
+        ]));
+        let pages = super::presented_remote_control_pages(infos.iter(), |id| {
             Some(ParameterPresentation {
                 name: format!("Control {id}"),
                 group: "Modulators/LFO 1".into(),
@@ -6094,7 +6098,7 @@ mod remote_controls_tests {
         });
         assert_eq!(pages, vec![("Modulators/LFO 1".into(), vec![7])]);
         assert_eq!(infos.iter().map(|p| p.id).collect::<Vec<_>>(), [7, 8, 9]);
-        let pages = super::presented_remote_control_pages(&infos, |_| None);
+        let pages = super::presented_remote_control_pages(infos.iter(), |_| None);
         assert_eq!(pages, vec![("OLD".into(), vec![7, 8, 9])]);
     }
 
