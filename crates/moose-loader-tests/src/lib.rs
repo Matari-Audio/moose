@@ -60,3 +60,6 @@ mod instance_edit_epoch_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod parameter_projection_tests;

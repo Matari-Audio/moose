@@ -2,6 +2,7 @@
 
 mod info;
 mod param_text;
+mod projection;
 mod range;
 pub mod sample;
 mod smooth;
@@ -9,6 +10,7 @@ mod types;
 
 pub use info::{MidiSource, ParamFlags, ParamInfo, ParamUnit, ParamValueKind, map_source_to_param};
 pub use param_text::parse_formatted_value;
+pub use projection::{ParamProjection, ProjectedValue, append_projected_infos};
 pub use range::ParamRange;
 pub use sample::{Float, Sample};
 pub use smooth::{Smoother, SmoothingStyle};
@@ -418,44 +420,25 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Called automatically by the derive-generated `Self::new()`.
     /// Plugin code shouldn't need to invoke it directly.
     fn assert_no_id_collisions(&self) {
-        let mut all = self.param_infos();
-        // Borrow the names from the existing infos so the panic
-        // message can identify *which* IDs collided.
-        let mut seen: Vec<(u32, &'static str)> = Vec::with_capacity(all.len());
-        for info in all.drain(..) {
-            for (prev_id, prev_name) in &seen {
-                assert!(
-                    *prev_id != info.id,
-                    "duplicate parameter ID {}: '{}' and '{}' (likely a \
-                     parent / nested-struct collision; the per-struct \
-                     compile-time check can't see across nested types)",
-                    info.id,
-                    prev_name,
-                    info.name,
+        let all = self.param_infos();
+        let mut seen = std::collections::HashMap::with_capacity(all.len());
+        for info in all {
+            if let Some(previous) = seen.insert(info.id, info.name) {
+                panic!(
+                    "duplicate parameter ID {}: '{}' and '{}' (including nested/projection descriptors)",
+                    info.id, previous, info.name
                 );
             }
-            seen.push((info.id, info.name));
         }
-        let mut seen_meters: Vec<u32> = Vec::new();
+        let mut seen_meters = std::collections::HashSet::new();
         for meter_id in self.meter_ids() {
-            for (prev_id, prev_name) in &seen {
-                assert!(
-                    *prev_id != meter_id,
-                    "meter ID {meter_id} collides with parameter ID for '{prev_name}'",
-                );
+            if let Some(previous) = seen.get(&meter_id) {
+                panic!("meter ID {meter_id} collides with parameter ID for '{previous}'");
             }
-            // Meter IDs auto-assign per struct from a shared base, so two
-            // `#[nested]` structs that each declare a meter hand back the
-            // same ID and would alias in meter storage. The per-struct
-            // compile-time check can't see across nested types; surface it
-            // as a construction panic instead of silent aliasing.
             assert!(
-                !seen_meters.contains(&meter_id),
-                "duplicate meter ID {meter_id} (two #[nested] structs each \
-                 declare a meter; nested meters aren't supported - keep \
-                 meters in a single Params struct)",
+                seen_meters.insert(meter_id),
+                "duplicate meter ID {meter_id} (two #[nested] structs each declare a meter; nested meters aren't supported - keep meters in a single Params struct)"
             );
-            seen_meters.push(meter_id);
         }
     }
 }
