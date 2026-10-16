@@ -297,6 +297,8 @@ struct ClapPluginData<P: PluginExport> {
     floating_closed: Arc<AtomicBool>,
     /// Last `Params::parameter_presentation_revision` the host saw.
     presentation_revision: AtomicU64,
+    /// Coalesces structural changed-ID notifications without a values rescan.
+    presentation_pending: Arc<AtomicBool>,
     /// Main-thread discovery cache; audio processing never reads or locks it.
     remote_pages: Mutex<Vec<(String, Vec<u32>)>>,
     /// Shared transport slot: audio thread writes each block, editor reads.
@@ -929,6 +931,7 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
         }
         // Runtime presentation metadata is re-read on RESCAN_INFO. A change
         // to the exposed list requests a restart and is published inactive.
+        data.presentation_pending.store(false, Ordering::Release);
         let revision = data.params_arc.parameter_presentation_revision();
         let info_changed = data.presentation_revision.swap(revision, Ordering::Relaxed) != revision;
         let list_changed = info_changed && refresh_parameter_list(data);
@@ -2846,6 +2849,10 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             bus_routing,
         );
 
+        // Parameters have reached their sample offsets before discovery is
+        // scheduled. No metadata lookup or catalog walk runs on audio.
+        request_changed_presentation(data, &scr.event_list);
+
         // Convert + copy back to host outputs for every channel that
         // rendered into scratch (wire precision differed from
         // `P::Sample`). Zero-copy channels leave their scratch slot
@@ -3737,6 +3744,7 @@ unsafe extern "C" fn params_flush<P: PluginExport>(
                 defer_param_change(&mut scr.deferred_params, id, value);
             }
         }
+        request_changed_presentation(data, &scr.event_list);
         let _ = flush_gui_changes::<P>(data, out_events);
     });
 }
@@ -4084,6 +4092,33 @@ unsafe extern "C" fn state_load<P: PluginExport>(
 
         true
     })
+}
+
+/// Metadata work belongs on the host main thread, including when an active
+/// plugin receives `params.flush` on its audio thread (CLAP 1.2.7 params.h).
+unsafe fn request_presentation_refresh(pending: &AtomicBool, host: *const clap_host) {
+    // SAFETY: the wrapper retains the host for this instance's full lifetime.
+    unsafe {
+        if !pending.swap(true, Ordering::AcqRel)
+            && !host.is_null()
+            && let Some(request) = (*host).request_callback
+        {
+            request(host);
+        }
+    }
+}
+
+unsafe fn request_changed_presentation<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    events: &EventList,
+) {
+    if events.iter().any(|event| {
+        matches!(event.body, EventBody::ParamChange { id, .. }
+            if data.params_arc.parameter_affects_presentation(id))
+    }) {
+        // SAFETY: data owns the pending flag and retains its CLAP host.
+        unsafe { request_presentation_refresh(&data.presentation_pending, data.host) };
+    }
 }
 
 /// A recalled state may change every parameter behind the host's back, and
@@ -4852,6 +4887,7 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
         let request_flush2 = request_flush;
         let request_flush3 = request_flush;
         let needs_rescan = data.needs_rescan.clone();
+        let presentation_pending = data.presentation_pending.clone();
         let host_for_callback = SendPtr::new(data.host);
         let params_for_set = params.clone();
         let params_for_get = params.clone();
@@ -4874,6 +4910,12 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
                 }),
                 set_param: Box::new(move |id, value| {
                     let plain = params_for_set.set_normalized_returning_plain(id, value);
+                    if params_for_set.parameter_affects_presentation(id) {
+                        request_presentation_refresh(
+                            &presentation_pending,
+                            host_for_callback.as_ptr(),
+                        );
+                    }
                     let queued = gui_changes2.push(GuiParamChange::Value(id, plain)).is_ok();
                     request_flush2();
                     // The queued PARAM_VALUE event is how the host hears
@@ -5586,6 +5628,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             floating_visible: Arc::new(AtomicBool::new(false)),
             floating_closed: Arc::new(AtomicBool::new(false)),
             presentation_revision: AtomicU64::new(0),
+            presentation_pending: Arc::new(AtomicBool::new(false)),
             remote_pages,
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),
@@ -6373,6 +6416,127 @@ mod host_value_tests {
     }
     unsafe extern "C" fn refuse(_: *const clap_output_events, _: *const clap_event_header) -> bool {
         false
+    }
+
+    #[test]
+    #[allow(unused_assignments, reason = "the ABI reader follows ctx after each event write")]
+    fn structural_flush_and_gui_edits_request_discovery_without_numeric_rescans() {
+        #[derive(Default)]
+        struct Calls {
+            callbacks: AtomicU32,
+            rescans: AtomicU32,
+        }
+        unsafe extern "C" fn request(host: *const clap_host) {
+            // SAFETY: the test retains Calls until after plugin destruction.
+            let calls = unsafe { &*((*host).host_data.cast::<Calls>()) };
+            calls.callbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn rescan(host: *const clap_host, flags: u32) {
+            // SAFETY: same owned host/counter lifetime as request.
+            let calls = unsafe { &*((*host).host_data.cast::<Calls>()) };
+            calls.rescans.fetch_or(flags, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn extension(_: *const clap_host, name: *const c_char) -> *const c_void {
+            static PARAMS: clap_host_params = clap_host_params {
+                rescan: Some(rescan),
+                clear: None,
+                request_flush: None,
+            };
+            // SAFETY: the wrapper supplies a terminated CLAP identifier.
+            if unsafe { CStr::from_ptr(name) } == CLAP_EXT_PARAMS {
+                (&raw const PARAMS).cast()
+            } else {
+                ptr::null()
+            }
+        }
+        unsafe extern "C" fn count(_: *const clap_input_events) -> u32 {
+            1
+        }
+        unsafe extern "C" fn event(
+            events: *const clap_input_events,
+            _: u32,
+        ) -> *const clap_event_header {
+            // SAFETY: ctx points to the value event retained through flush.
+            unsafe { (*events).ctx.cast() }
+        }
+        // SAFETY: this test owns every ABI pointer and destroys the instance
+        // before its descriptor, host, counters and event buffers go away.
+        unsafe {
+            let calls = Calls::default();
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.host_data = (&raw const calls).cast_mut().cast();
+            host.get_extension = Some(extension);
+            host.request_callback = Some(request);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let params = data_from_plugin::<TestPlugin>(plugin).params_arc.clone();
+            params.set_plain(0, -60.);
+            params.structural_gain.store(true, Ordering::Relaxed);
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            let mut value = clap_event_param_value {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_param_value>(),
+                    time: 0,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_PARAM_VALUE,
+                    flags: 0,
+                },
+                param_id: 1,
+                cookie: ptr::null_mut(),
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value: 0.25,
+            };
+            let inputs = clap_input_events {
+                ctx: (&raw mut value).cast(),
+                size: Some(count),
+                get: Some(event),
+            };
+            for _ in 0..128 {
+                params_flush::<TestPlugin>(plugin, &raw const inputs, ptr::null());
+            }
+            assert_eq!(calls.callbacks.load(Ordering::Relaxed), 0);
+            assert_eq!(calls.rescans.load(Ordering::Relaxed), 0);
+            value.param_id = 0;
+            value.value = -12.;
+            params_flush::<TestPlugin>(plugin, &raw const inputs, ptr::null());
+            value.value = -6.;
+            params_flush::<TestPlugin>(plugin, &raw const inputs, ptr::null());
+            assert_eq!(
+                calls.callbacks.load(Ordering::Relaxed),
+                1,
+                "coalesced without metadata polling"
+            );
+            assert_eq!(
+                calls.rescans.load(Ordering::Relaxed),
+                0,
+                "host notification waits for main"
+            );
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert!(params.rebound.load(Ordering::Relaxed));
+            assert_eq!(
+                calls.rescans.swap(0, Ordering::Relaxed),
+                CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT
+            );
+            let context = editor_context::<TestPlugin>(plugin);
+            context.set_param(0_u32, 0.);
+            assert_eq!(calls.callbacks.load(Ordering::Relaxed), 2);
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert!(!params.rebound.load(Ordering::Relaxed));
+            assert_eq!(
+                calls.rescans.load(Ordering::Relaxed),
+                CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT
+            );
+            drop(context);
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
     }
 
     /// GUI values reach the host as events. A values rescan is only the
