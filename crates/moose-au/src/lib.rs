@@ -32,7 +32,7 @@ use moose_core::editor::Editor;
 // AppKit/UiKit variants don't exist on Linux/Windows. Importing them
 // from a non-apple module would also trigger the unused-import lint
 // there.
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
+use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use moose_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr};
@@ -331,7 +331,7 @@ struct AuInstance<P: PluginExport> {
     #[cfg(target_os = "macos")]
     param_notify: Option<ParamNotifier>,
     /// Cached param-info table for the chunker's split predicate.
-    param_infos: Vec<ParamInfo>,
+    param_infos: Arc<moose_params::ParamCatalog>,
     /// `min_subblock_samples` from `moose.toml`'s `[automation]`.
     min_subblock_samples: u32,
     input_bus_count: usize,
@@ -485,7 +485,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 .first()
                 .and_then(|layout| layout.inputs.get(1))
                 .map_or(0, |bus| bus.channels.channel_count());
-            let param_infos = plugin.params().param_infos();
+            let param_infos = plugin.params().param_catalog();
             let params_arc = plugin.params_arc();
             let latency_cache = AtomicU32::new(plugin.latency());
             let tail_cache = AtomicU32::new(plugin.tail());
@@ -1306,12 +1306,13 @@ unsafe fn cb_process_impl<P: PluginExport>(
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked_with_bus_routing(
+        process_chunked_with_bus_routing_and_catalog(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
             bus_routing,
+            &inst.param_infos,
         );
         let _ = audio_buffer;
         // Narrow rendered f64 output back to host f32 when needed.

@@ -214,3 +214,19 @@ impl ParamProjection<CollisionStore> for CollisionViews {
 fn projection_ids_cannot_replace_declared_endpoints() {
     let _ = CollisionStore::default();
 }
+
+#[test]
+fn immutable_projection_catalog_is_shared_between_instances_and_keeps_order() {
+    let first = Store::default();
+    let second = Store::default();
+    let a = first.param_catalog();
+    let b = second.param_catalog();
+    assert!(std::sync::Arc::ptr_eq(&a, &b));
+    assert_eq!(
+        a.iter().map(|info| info.id).collect::<Vec<_>>(),
+        [0, 1, VIEW]
+    );
+    assert_eq!(a.by_id(VIEW).unwrap().kind, ParamValueKind::Int);
+    assert!(a.by_id(VIEW + 1).is_none());
+    assert_eq!(first.collect_values().0, [0, 1]);
+}

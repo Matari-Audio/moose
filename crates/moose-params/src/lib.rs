@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod catalog;
 mod info;
 mod param_text;
 mod projection;
@@ -8,6 +9,7 @@ pub mod sample;
 mod smooth;
 mod types;
 
+pub use catalog::ParamCatalog;
 pub use info::{MidiSource, ParamFlags, ParamInfo, ParamUnit, ParamValueKind, map_source_to_param};
 pub use param_text::parse_formatted_value;
 pub use projection::{ParamProjection, ProjectedValue, append_projected_infos};
@@ -242,6 +244,14 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// All parameter infos, in declaration order.
     fn param_infos(&self) -> Vec<ParamInfo>;
 
+    /// Cached immutable metadata for format adapters. The default builds the
+    /// instance's current table. Root projection stores use one process-shared
+    /// catalog because their complete ID list and ranges are immutable.
+    fn param_catalog(&self) -> std::sync::Arc<ParamCatalog> {
+        std::sync::Arc::new(ParamCatalog::new(self.param_infos()))
+    }
+
+
     /// Append parameter infos onto an existing buffer. Default impl
     /// delegates to [`Self::param_infos`] and `extend`s; the derive
     /// macro overrides for nested structs so deep trees don't pay
@@ -420,20 +430,11 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Called automatically by the derive-generated `Self::new()`.
     /// Plugin code shouldn't need to invoke it directly.
     fn assert_no_id_collisions(&self) {
-        let all = self.param_infos();
-        let mut seen = std::collections::HashMap::with_capacity(all.len());
-        for info in all {
-            if let Some(previous) = seen.insert(info.id, info.name) {
-                panic!(
-                    "duplicate parameter ID {}: '{}' and '{}' (including nested/projection descriptors)",
-                    info.id, previous, info.name
-                );
-            }
-        }
+        let catalog = self.param_catalog();
         let mut seen_meters = std::collections::HashSet::new();
         for meter_id in self.meter_ids() {
-            if let Some(previous) = seen.get(&meter_id) {
-                panic!("meter ID {meter_id} collides with parameter ID for '{previous}'");
+            if let Some(previous) = catalog.by_id(meter_id) {
+                panic!("meter ID {meter_id} collides with parameter ID for '{}'", previous.name);
             }
             assert!(
                 seen_meters.insert(meter_id),

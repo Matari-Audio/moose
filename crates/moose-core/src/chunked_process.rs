@@ -121,6 +121,37 @@ where
     S: Sample,
     P: PluginRuntime<Sample = S>,
 {
+    let infos = args.param_infos;
+    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing,
+        |id| is_chunked(id, infos))
+}
+
+/// Indexed twin of the routed chunker. Format wrappers retain this catalog
+/// from construction; each changed parameter needs one ID lookup, not a scan.
+pub fn process_chunked_with_bus_routing_and_catalog<S, P>(
+    plugin: &mut P,
+    params: &dyn Params,
+    buffer: &mut AudioBuffer<S>,
+    args: ChunkedProcess<'_>,
+    bus_routing: BusRouting,
+    catalog: &moose_params::ParamCatalog,
+) -> ProcessStatus
+where S: Sample, P: PluginRuntime<Sample = S>,
+{
+    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing,
+        |id| catalog.by_id(id).is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED)))
+}
+
+fn process_chunked_with_lookup<S, P>(
+    plugin: &mut P,
+    params: &dyn Params,
+    buffer: &mut AudioBuffer<S>,
+    args: ChunkedProcess<'_>,
+    bus_routing: BusRouting,
+    chunked: impl Fn(u32) -> bool,
+) -> ProcessStatus
+where S: Sample, P: PluginRuntime<Sample = S>,
+{
     let ChunkedProcess {
         events,
         sub_event_scratch,
@@ -130,7 +161,7 @@ where
         output_events,
         params_fn,
         meters_fn,
-        param_infos,
+        param_infos: _,
         min_subblock_samples,
     } = args;
 
@@ -165,7 +196,7 @@ where
         // `block_start + min_sub`. Anything before that coalesces
         // into this sub-block's leading apply batch.
         let coalesce_until = block_start.saturating_add(min_sub).min(total);
-        let next_split = find_next_split(events, param_infos, event_idx, coalesce_until);
+        let next_split = find_next_split(events, &chunked, event_idx, coalesce_until);
         let block_end = next_split.map_or(total, |(s, _)| s.min(total));
 
         // Apply every event with sample_offset < block_end that's
@@ -239,7 +270,7 @@ where
 /// per-voice offset and subdividing the audio block doesn't help.
 fn find_next_split(
     events: &EventList,
-    param_infos: &[ParamInfo],
+    chunked: &impl Fn(u32) -> bool,
     from: usize,
     min_offset: usize,
 ) -> Option<(usize, usize)> {
@@ -248,19 +279,19 @@ fn find_next_split(
         if offset < min_offset {
             continue;
         }
-        if is_split_event(&ev.body, param_infos) {
+        if is_split_event(&ev.body, chunked) {
             return Some((offset, i));
         }
     }
     None
 }
 
-fn is_split_event(body: &EventBody, param_infos: &[ParamInfo]) -> bool {
+fn is_split_event(body: &EventBody, chunked: &impl Fn(u32) -> bool) -> bool {
     match body {
         EventBody::ParamChange { id, .. }
         | EventBody::ParamMod {
             id, note_id: -1, ..
-        } => is_chunked(*id, param_infos),
+        } => chunked(*id),
         EventBody::Transport(_) => true,
         _ => false,
     }
@@ -526,7 +557,7 @@ mod tests {
             EventBody::ParamChange { id: 0, value: 0.5 },
         ));
         // Non-chunked param at 100 doesn't split; chunked at 200 does.
-        let next = find_next_split(&events, &infos, 0, 0);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0);
         assert_eq!(next, Some((200, 1)));
     }
 
@@ -537,7 +568,7 @@ mod tests {
         events.push(Event::new(5, EventBody::ParamChange { id: 0, value: 0.5 }));
         events.push(Event::new(50, EventBody::ParamChange { id: 0, value: 0.6 }));
         // min_offset = 32: first event (offset 5) coalesces, second (50) splits.
-        let next = find_next_split(&events, &infos, 0, 32);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 32);
         assert_eq!(next, Some((50, 1)));
     }
 
@@ -553,7 +584,7 @@ mod tests {
                 value: 0.1,
             },
         ));
-        let next = find_next_split(&events, &infos, 0, 0);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0);
         assert_eq!(next, None);
     }
 
@@ -598,7 +629,7 @@ mod tests {
             100,
             EventBody::Transport(TransportInfo::default()),
         ));
-        let next = find_next_split(&events, &infos, 0, 0);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0);
         assert_eq!(next, Some((100, 0)));
     }
 
@@ -619,9 +650,9 @@ mod tests {
             EventBody::Transport(TransportInfo::default()),
         ));
         // Unclamped (0): the offset-0 event splits at 0 - the hang.
-        assert_eq!(find_next_split(&events, &infos, 0, 0), Some((0, 0)));
+        assert_eq!(find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0), Some((0, 0)));
         // Clamped (>= 1): coalesced, no split at the block start.
-        assert_eq!(find_next_split(&events, &infos, 0, 1), None);
+        assert_eq!(find_next_split(&events, &|id| is_chunked(id, &infos), 0, 1), None);
     }
 
     /// A sub-block that starts `delta` samples into the host block sees a

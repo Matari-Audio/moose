@@ -106,7 +106,7 @@ use moose_core::buffer::AudioBuffer;
 use moose_core::bus::{BusConfig, BusKind, ChannelConfig};
 use moose_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
 use moose_core::cast::{len_u32, size_of_u32};
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
+use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::editor::{
     ClosureBridge, Editor, EditorBuilder, PluginContext, RawWindowHandle, SendPtr, fit_logical_size,
@@ -235,7 +235,7 @@ struct ClapPluginData<P: PluginExport> {
     /// stopped - so the cell is never held twice at once.
     audio: PluginCell<ClapAudio<P>>,
     /// Cached parameter infos (built once at init).
-    param_infos: Vec<ParamInfo>,
+    param_infos: Arc<moose_params::ParamCatalog>,
     /// Visible CLAP indices; backing parameter IDs and storage stay fixed.
     exposed_param_indices: Mutex<Vec<usize>>,
     parameter_restart_pending: AtomicBool,
@@ -700,7 +700,7 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
         {
             let mut instance = enter_plugin(&data.plugin);
             instance.init();
-            data.param_infos = instance.params().param_infos();
+            data.param_infos = instance.params().param_catalog();
             data.exposed_param_indices = Mutex::new(parameter_indices(&data.param_infos, |id| {
                 data.params_arc.parameter_presentation(id)
             }));
@@ -1918,7 +1918,7 @@ unsafe fn emit_exact_clap(
 fn preflight_clap_output(
     events: &EventList,
     info: &PluginInfo,
-    param_infos: &[ParamInfo],
+    param_infos: &moose_params::ParamCatalog,
     frames_count: u32,
 ) -> OutputEventStatus {
     for replay in events.lossless_iter() {
@@ -1951,7 +1951,7 @@ fn preflight_clap_output(
             return OutputEventStatus::Invalid;
         }
         match &event.body {
-            EventBody::ParamChange { id, .. } if !param_infos.iter().any(|info| info.id == *id) => {
+            EventBody::ParamChange { id, .. } if param_infos.by_id(*id).is_none() => {
                 return OutputEventStatus::Invalid;
             }
             EventBody::SysEx { .. } => {
@@ -2841,12 +2841,13 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             param_infos: &data.param_infos,
             min_subblock_samples: data.info.automation.min_subblock_samples,
         };
-        let status = process_chunked_with_bus_routing(
+        let status = process_chunked_with_bus_routing_and_catalog(
             &mut *instance,
             data.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
             bus_routing,
+            &data.param_infos,
         );
 
         // Parameters have reached their sample offsets before discovery is
@@ -5565,7 +5566,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let instance = P::create();
         let info = P::info();
         let plugin_id_hash = state::hash_plugin_id(info.clap_id);
-        let param_infos = instance.params().param_infos();
+        let param_infos = instance.params().param_catalog();
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let exposed_param_indices = Mutex::new(parameter_indices(&param_infos, |id| {
