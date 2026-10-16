@@ -3,6 +3,7 @@
 mod catalog;
 mod info;
 mod param_text;
+mod persist_write;
 mod projection;
 mod range;
 pub mod sample;
@@ -12,6 +13,7 @@ mod types;
 pub use catalog::ParamCatalog;
 pub use info::{MidiSource, ParamFlags, ParamInfo, ParamUnit, ParamValueKind, map_source_to_param};
 pub use param_text::parse_formatted_value;
+pub use persist_write::{KeyedPersistWrite, PreparedPersistWrite, write_prepared_persist};
 pub use projection::{ParamProjection, ProjectedValue, append_projected_infos};
 pub use range::ParamRange;
 pub use sample::{Float, Sample};
@@ -428,6 +430,14 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     #[must_use]
     fn serialize_persist(&self) -> Vec<u8> {
         Vec::new()
+    }
+
+    /// Freeze persisted controls and payload ownership for incremental output.
+    /// The default retains existing serialization behavior; the derive prepares
+    /// keyed fields individually so large immutable fields can avoid staging.
+    /// Never call this or the returned writer from an audio callback.
+    fn prepare_persist_write(&self) -> std::io::Result<Box<dyn PreparedPersistWrite>> {
+        Ok(Box::new(self.serialize_persist()))
     }
 
     /// Visit every persisted field, including nested stores and pre-save hooks.

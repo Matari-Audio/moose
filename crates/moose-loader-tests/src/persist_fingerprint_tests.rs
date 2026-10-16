@@ -1,6 +1,7 @@
 //! Generated persistence coverage and cached-payload bypass, without a plugin.
 use moose::core::custom_state::{PersistField, StateCursor};
-use moose::params::{Params, PersistFingerprint, PersistFingerprintVisitor};
+use moose::params::{Params, PersistFingerprint, PersistFingerprintVisitor, PreparedPersistWrite,
+    write_prepared_persist};
 use moose_derive::Params;
 use std::sync::{
     Mutex,
@@ -132,4 +133,89 @@ fn fingerprint_visit_does_not_change_saved_bytes() {
     let _ = record(&params);
     assert_eq!(params.payload.writes.load(Ordering::Relaxed), 1);
     assert_eq!(params.serialize_persist(), before);
+}
+
+#[test]
+fn prepared_write_matches_existing_keyed_bytes_and_freezes_controls() {
+    let params = Parent::default();
+    *params.plain.lock().unwrap() = 7;
+    *params.nested.flag.lock().unwrap() = true;
+    let expected = params.serialize_persist();
+    let before = params.prepares.load(Ordering::Relaxed);
+    let snapshot = params.prepare_persist_write().unwrap();
+    assert_eq!(params.prepares.load(Ordering::Relaxed), before + 1);
+    *params.plain.lock().unwrap() = 8;
+    *params.nested.flag.lock().unwrap() = false;
+    let mut output = Vec::new();
+    write_prepared_persist(snapshot.as_ref(), &mut output).unwrap();
+    assert_eq!(snapshot.byte_len(), expected.len() as u64);
+    assert_eq!(output, expected);
+    assert_ne!(output, params.serialize_persist());
+}
+
+#[derive(Default)]
+struct SharedPayload {
+    bytes: Mutex<std::sync::Arc<Vec<u8>>>,
+    writes: AtomicUsize,
+}
+
+struct SharedSnapshot(std::sync::Arc<Vec<u8>>);
+
+impl PreparedPersistWrite for SharedSnapshot {
+    fn byte_len(&self) -> u64 { self.0.len() as u64 }
+    fn write_to(&self, output: &mut dyn std::io::Write) -> std::io::Result<()> {
+        output.write_all(&self.0)
+    }
+}
+
+impl PersistField for SharedPayload {
+    fn persist_write(&self, bytes: &mut Vec<u8>) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        bytes.extend_from_slice(&self.bytes.lock().unwrap());
+    }
+    fn persist_read(&self, _: &mut StateCursor) {}
+    fn prepare_persist_write(&self) -> std::io::Result<Box<dyn PreparedPersistWrite>> {
+        Ok(Box::new(SharedSnapshot(self.bytes.lock().unwrap().clone())))
+    }
+}
+
+#[derive(Params)]
+struct Streamed {
+    #[persist]
+    payload: SharedPayload,
+    #[nested]
+    empty: Empty,
+}
+
+#[derive(Params)]
+#[params(pre_save = "prepare")]
+struct Empty {
+    #[skip]
+    prepares: AtomicUsize,
+}
+
+impl Empty {
+    fn prepare(&self) { self.prepares.fetch_add(1, Ordering::Relaxed); }
+}
+
+#[test]
+fn large_override_retains_only_shared_payload_and_visits_empty_nested_hook() {
+    let params = Streamed::default();
+    let payload = std::sync::Arc::new(vec![17; 1024 * 1024]);
+    *params.payload.bytes.lock().unwrap() = payload.clone();
+    let expected = params.serialize_persist();
+    assert_eq!(params.empty.prepares.load(Ordering::Relaxed), 1);
+    let snapshot = params.prepare_persist_write().unwrap();
+    assert_eq!(params.payload.writes.load(Ordering::Relaxed), 1);
+    assert_eq!(std::sync::Arc::strong_count(&payload), 3);
+    assert_eq!(params.empty.prepares.load(Ordering::Relaxed), 2);
+    // Destroy the store before output: the writer must be owned, not borrowing
+    // live locks or reading controls that could have changed in the meantime.
+    drop(params);
+    assert_eq!(std::sync::Arc::strong_count(&payload), 2);
+    let mut output = Vec::new();
+    write_prepared_persist(snapshot.as_ref(), &mut output).unwrap();
+    assert_eq!(output, expected);
+    drop(snapshot);
+    assert_eq!(std::sync::Arc::strong_count(&payload), 1);
 }

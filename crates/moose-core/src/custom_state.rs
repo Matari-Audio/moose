@@ -151,6 +151,17 @@ pub trait PersistField {
     /// malformed read leaves the current value untouched.
     fn persist_read(&self, cursor: &mut StateCursor);
 
+    /// Freeze this field for write-side streaming. Large fields should capture
+    /// immutable payload handles and controls here, rather than their encoded
+    /// bytes. The default preserves the field's existing serializer.
+    fn prepare_persist_write(
+        &self,
+    ) -> std::io::Result<Box<dyn moose_params::PreparedPersistWrite>> {
+        let mut bytes = Vec::new();
+        self.persist_write(&mut bytes);
+        Ok(Box::new(bytes))
+    }
+
     /// Optional cheap content identity for dirty detection. Compute expensive
     /// payload digests on the field's publishing worker, rather than in this
     /// accessor. Keep the identity stable on no-op mutations; include all

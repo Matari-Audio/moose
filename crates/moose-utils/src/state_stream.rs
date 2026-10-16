@@ -237,49 +237,76 @@ pub fn write_state_stream(
     extra: &[u8],
     persist: &[u8],
     limit: usize,
-    mut write: impl FnMut(&[u8]) -> i64,
+    write: impl FnMut(&[u8]) -> i64,
 ) -> bool {
-    let Some(size) = ids
-        .len()
-        .checked_mul(12)
+    write_state_stream_with_persist(
+        plugin_id, ids, values, extra, persist.len() as u64, limit,
+        |output| output.write_all(persist), write,
+    )
+}
+
+/// Stream a frozen persistence snapshot without an encoded lane-sized buffer.
+/// `persist_len` is checked against the envelope bound before any host write.
+/// The producer must emit exactly that length; short/long output and host
+/// errors return false. Callers must discard any partial state on failure.
+#[allow(clippy::too_many_arguments)]
+pub fn write_state_stream_with_persist(
+    plugin_id: u64,
+    ids: &[u32],
+    values: &[f64],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+    persist: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    write: impl FnMut(&[u8]) -> i64,
+) -> bool {
+    use std::io::Write;
+    let Ok(persist_size) = usize::try_from(persist_len) else { return false; };
+    let Some(size) = ids.len().checked_mul(12)
         .and_then(|n| n.checked_add(36))
         .and_then(|n| n.checked_add(extra.len()))
-        .and_then(|n| n.checked_add(persist.len()))
-    else {
-        return false;
-    };
-    if ids.len() != values.len() || ids.len() > u32::MAX as usize || size > limit {
-        return false;
-    }
-    let mut part = |mut bytes: &[u8]| -> bool {
-        while !bytes.is_empty() {
-            let request = &bytes[..bytes.len().min(8192)];
-            let Ok(n) = usize::try_from(write(request)) else {
-                return false;
-            };
-            if n == 0 || n > request.len() {
-                return false;
-            }
-            bytes = &bytes[n..];
+        .and_then(|n| n.checked_add(persist_size))
+    else { return false; };
+    let Ok(count) = u32::try_from(ids.len()) else { return false; };
+    if ids.len() != values.len() || size > limit { return false; }
+    let mut output = Output { write, remaining: size };
+    let result = (|| {
+        output.write_all(b"OAST")?;
+        output.write_all(&1_u32.to_le_bytes())?;
+        output.write_all(&plugin_id.to_le_bytes())?;
+        output.write_all(&count.to_le_bytes())?;
+        for (&id, &value) in ids.iter().zip(values) {
+            output.write_all(&id.to_le_bytes())?;
+            output.write_all(&value.to_le_bytes())?;
         }
-        true
-    };
-    if !part(b"OAST")
-        || !part(&1_u32.to_le_bytes())
-        || !part(&plugin_id.to_le_bytes())
-        || !part(&(ids.len() as u32).to_le_bytes())
-    {
-        return false;
-    }
-    for (&id, &value) in ids.iter().zip(values) {
-        if !part(&id.to_le_bytes()) || !part(&value.to_le_bytes()) {
-            return false;
+        output.write_all(&(extra.len() as u64).to_le_bytes())?;
+        output.write_all(extra)?;
+        output.write_all(&persist_len.to_le_bytes())?;
+        persist(&mut output)
+    })();
+    result.is_ok() && output.remaining == 0
+}
+
+struct Output<F> {
+    write: F,
+    remaining: usize,
+}
+
+impl<F: FnMut(&[u8]) -> i64> std::io::Write for Output<F> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other("oversized state output"));
         }
+        let request = &bytes[..bytes.len().min(8192)];
+        let n = usize::try_from((self.write)(request))
+            .map_err(|_| std::io::Error::other("host state write failed"))?;
+        if n > request.len() {
+            return Err(std::io::Error::other("invalid host state write count"));
+        }
+        self.remaining -= n;
+        Ok(n)
     }
-    part(&(extra.len() as u64).to_le_bytes())
-        && part(extra)
-        && part(&(persist.len() as u64).to_le_bytes())
-        && part(persist)
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 #[cfg(test)]
@@ -318,6 +345,46 @@ mod writer_tests {
         for reply in [-1, 0, 10000] {
             assert!(!write_state_stream(42, &[], &[], b"", b"", 1024, |_| reply));
         }
+    }
+
+    #[test]
+    fn prepared_lane_streams_without_staging_and_preserves_float_bits() {
+        let ids = [5];
+        let values = [-0.0];
+        let payload = vec![31; 65_537];
+        let expected = crate::state::serialize_state(42, &ids, &values, b"extra", &payload);
+        let mut output = Vec::new();
+        assert!(write_state_stream_with_persist(42, &ids, &values, b"extra",
+            payload.len() as u64, expected.len(), |writer| {
+                // Multiple payload segments, including one larger than the
+                // host callback's bounded request size, need no staging blob.
+                writer.write_all(&payload[..1])?;
+                writer.write_all(&payload[1..])
+            }, |bytes| {
+                assert!(bytes.len() <= 8192);
+                let len = bytes.len().min(13);
+                output.extend_from_slice(&bytes[..len]);
+                len as i64
+            }));
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn prepared_lane_bound_and_length_failures_are_honest() {
+        for len in [u64::MAX, 1025] {
+            assert!(!write_state_stream_with_persist(42, &[], &[], b"", len, 1024,
+                |_| panic!("oversize prepared its output"),
+                |_| panic!("oversize wrote bytes")));
+        }
+        for actual in [0, 2] {
+            let mut bytes = Vec::new();
+            assert!(!write_state_stream_with_persist(42, &[], &[], b"", 1, 1024,
+                |writer| writer.write_all(&[9; 2][..actual]),
+                |part| { bytes.extend_from_slice(part); part.len() as i64 }));
+            assert!(bytes.len() <= 37);
+        }
+        assert!(!write_state_stream_with_persist(42, &[], &[], b"", 1, 1024,
+            |_| Err(std::io::Error::other("encoding failed")), |part| part.len() as i64));
     }
 }
 

@@ -2898,6 +2898,39 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #(#nested_fingerprint_stmts)*
         }
     };
+    let prepare_write_fields = persist_fields.iter().map(|(ident, key, _)| {
+        quote! {
+            __fields.push((#key,
+                ::moose::core::custom_state::PersistField::prepare_persist_write(&self.#ident)?));
+        }
+    });
+    let prepare_write_nested = nested_idents.iter().map(|ident| {
+        let key = ident.to_string();
+        quote! {
+            __fields.push((#key,
+                ::moose::params::Params::prepare_persist_write(&self.#ident)?));
+        }
+    });
+    let prepare_write_body = if persist_count == 0 {
+        // A store without fields has historically serialized no count word.
+        quote! { Ok(Box::new(::std::vec::Vec::<u8>::new())) }
+    } else {
+        quote! {
+            let mut __fields: ::std::vec::Vec<(&'static str,
+                Box<dyn ::moose::params::PreparedPersistWrite>)> = ::std::vec::Vec::new();
+            #(#prepare_write_fields)*
+            #(#prepare_write_nested)*
+            Ok(Box::new(::moose::params::KeyedPersistWrite::new(__fields)?))
+        }
+    };
+    let prepare_write_impl = quote! {
+        fn prepare_persist_write(&self)
+            -> ::std::io::Result<Box<dyn ::moose::params::PreparedPersistWrite>>
+        {
+            #pre_save
+            #prepare_write_body
+        }
+    };
     let validate_impl = struct_attrs.validate_persist.as_ref().map(|m| {
         quote! {
             fn validate_persist(data: &[u8]) -> bool where Self: Sized { Self::#m(data) }
@@ -3241,6 +3274,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
 
             #persist_impl
             #persist_fingerprint_impl
+            #prepare_write_impl
         }
     };
 

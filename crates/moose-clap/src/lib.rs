@@ -3991,17 +3991,18 @@ unsafe extern "C" fn state_save<P: PluginExport>(
         // thread publishes each block. Never touches the plugin, so it
         // can't stall a block in flight.
         let extra = save_extra(&data.snapshot);
-        let persist = data.params_arc.serialize_persist();
+        let Ok(persist) = data.params_arc.prepare_persist_write() else { return false; };
         let Some(write_fn) = (*stream).write else {
             return false;
         };
-        state::write_state_stream(
+        state::write_state_stream_with_persist(
             data.plugin_id_hash,
             &ids,
             &values,
             &extra,
-            &persist,
+            persist.byte_len(),
             P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
             |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64),
         )
     })

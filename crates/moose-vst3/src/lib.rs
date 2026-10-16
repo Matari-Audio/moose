@@ -1906,9 +1906,11 @@ unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
         }
         let (ids, values) = inst.params_arc.collect_values();
         let extra = save_extra(&inst.snapshot);
-        let persist = inst.params_arc.serialize_persist();
-        i32::from(state::write_state_stream(inst.plugin_id_hash, &ids, &values, &extra, &persist,
-            P::max_host_state_bytes(), |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return 0; };
+        i32::from(state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
     })
 }
 
