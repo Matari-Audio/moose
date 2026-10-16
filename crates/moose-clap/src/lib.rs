@@ -6419,6 +6419,7 @@ mod host_value_tests {
     }
 
     #[test]
+    #[allow(unused_assignments, reason = "the ABI reader follows ctx after each event write")]
     fn structural_flush_and_gui_edits_request_discovery_without_numeric_rescans() {
         #[derive(Default)]
         struct Calls {

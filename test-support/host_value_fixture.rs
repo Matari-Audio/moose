@@ -11,7 +11,7 @@ use moose_core::{
     snapshot::SnapshotSlot,
 };
 use moose_derive::Params;
-use moose_params::FloatParam;
+use moose_params::{FloatParam, FloatParamReadF64};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
