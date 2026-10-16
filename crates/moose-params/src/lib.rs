@@ -424,8 +424,10 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
         let mut seen = std::collections::HashMap::with_capacity(all.len());
         for info in all {
             if let Some(previous) = seen.insert(info.id, info.name) {
-                panic!("duplicate parameter ID {}: '{}' and '{}' (including nested/projection descriptors)",
-                    info.id, previous, info.name);
+                panic!(
+                    "duplicate parameter ID {}: '{}' and '{}' (including nested/projection descriptors)",
+                    info.id, previous, info.name
+                );
             }
         }
         let mut seen_meters = std::collections::HashSet::new();
@@ -433,8 +435,10 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
             if let Some(previous) = seen.get(&meter_id) {
                 panic!("meter ID {meter_id} collides with parameter ID for '{previous}'");
             }
-            assert!(seen_meters.insert(meter_id),
-                "duplicate meter ID {meter_id} (two #[nested] structs each declare a meter; nested meters aren't supported - keep meters in a single Params struct)");
+            assert!(
+                seen_meters.insert(meter_id),
+                "duplicate meter ID {meter_id} (two #[nested] structs each declare a meter; nested meters aren't supported - keep meters in a single Params struct)"
+            );
         }
     }
 }

@@ -2221,7 +2221,9 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
                 infos
             }
         }
-    } else { static_infos_body };
+    } else {
+        static_infos_body
+    };
     let param_infos_static_impl = quote! {
         fn param_infos_static() -> Vec<::moose::params::ParamInfo>
         where
@@ -2991,11 +2993,17 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // Projection dispatch is emitted only for opted-in stores. Declared IDs keep
     // their original match arms; alias storage never enters state collection.
     let mut projected_setters = quote! {};
-    let (count_expr, infos_expr, append_infos_impl,
-         get_plain_fallthrough, get_normalized_fallthrough,
-         set_plain_fallthrough, set_normalized_fallthrough,
-         format_fallthrough, parse_value_impl) =
-    if let Some(provider) = &struct_attrs.projection {
+    let (
+        count_expr,
+        infos_expr,
+        append_infos_impl,
+        get_plain_fallthrough,
+        get_normalized_fallthrough,
+        set_plain_fallthrough,
+        set_normalized_fallthrough,
+        format_fallthrough,
+        parse_value_impl,
+    ) = if let Some(provider) = &struct_attrs.projection {
         let api = quote! { <#provider as ::moose::params::ParamProjection<Self>> };
         projected_setters = quote! {
             fn set_normalized_returning_plain(&self, id: u32, value: f64) -> f64 {
@@ -3035,9 +3043,17 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             quote! { (#parse_value_impl).or_else(|| #api::parse_value(self, id, text).filter(|value| value.is_finite())) },
         )
     } else {
-        (count_expr, infos_expr, append_infos_impl, get_plain_fallthrough,
-         get_normalized_fallthrough, set_plain_fallthrough,
-         set_normalized_fallthrough, format_fallthrough, parse_value_impl)
+        (
+            count_expr,
+            infos_expr,
+            append_infos_impl,
+            get_plain_fallthrough,
+            get_normalized_fallthrough,
+            set_plain_fallthrough,
+            set_normalized_fallthrough,
+            format_fallthrough,
+            parse_value_impl,
+        )
     };
 
     let expanded = quote! {
