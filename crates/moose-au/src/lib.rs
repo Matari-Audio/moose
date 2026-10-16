@@ -284,7 +284,13 @@ impl Drop for ParamNotifier {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod persist_notify;
+
 struct AuInstance<P: PluginExport> {
+    // First field: close worker requests before any native/editor teardown.
+    #[cfg(target_os = "macos")]
+    persist_dispatch: Option<persist_notify::Dispatcher<P>>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -490,6 +496,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let latency_cache = AtomicU32::new(plugin.latency());
             let tail_cache = AtomicU32::new(plugin.tail());
             let instance = Box::new(AuInstance::<P> {
+                #[cfg(target_os = "macos")]
+                persist_dispatch: None,
                 params_arc,
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 meter_store: plugin.meter_store(),
@@ -560,6 +568,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
                 let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
+                (*raw).persist_dispatch = persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
                 (*raw).param_notify = ParamNotifier::spawn(ctx);
             }
             raw.cast::<std::ffi::c_void>()

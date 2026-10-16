@@ -182,6 +182,8 @@ type StateLoadQueue = state::StateLoadQueue;
 // ---------------------------------------------------------------------------
 
 struct ClapPluginData<P: PluginExport> {
+    persist_signal: Option<Arc<moose_params::PersistChangeSignal>>,
+    persist_pending: Arc<AtomicBool>,
     /// The user's plugin instance in the wrapper-standard ownership
     /// cell: the audio thread owns it per block, host lifecycle
     /// callbacks own it while processing is stopped, and the two never
@@ -722,6 +724,18 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
                 data.host_tail = tail_ext.cast::<clap_host_tail>();
             }
         }
+        if data.params_arc.wants_persist_notifications() {
+            let host = SendPtr::new(data.host);
+            let pending = data.persist_pending.clone();
+            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+                if !pending.swap(true, Ordering::AcqRel)
+                    && !host.as_ptr().is_null()
+                    && let Some(request) = (*host.as_ptr()).request_callback
+                { request(host.as_ptr()); }
+            }));
+            data.params_arc.set_persist_change_signal(Arc::downgrade(&signal));
+            data.persist_signal = Some(signal);
+        }
         true
     })
 }
@@ -743,6 +757,8 @@ unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *const clap_pl
         let plugin_ptr = plugin.cast_mut();
         let data_ptr = (*plugin).plugin_data.cast::<ClapPluginData<P>>();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Gate workers before any host/instance handle can be released.
+            if let Some(signal) = &(*data_ptr).persist_signal { signal.close(); }
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
         }));
@@ -916,6 +932,17 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
+        if data.persist_pending.swap(false, Ordering::AcqRel)
+            && let Some((id, value)) = data.params_arc.take_persist_change()
+            && value.is_finite() && (0.0..=1.0).contains(&value)
+            && data.params_arc.get_normalized(id).is_some()
+        {
+            // The ordinary gesture queue works independently of GUI creation.
+            let context = editor_context::<P>(plugin);
+            context.begin_edit(id);
+            context.set_param(id, value);
+            context.end_edit(id);
+        }
         if data.floating_closed.swap(false, Ordering::AcqRel) {
             data.gui.enter().visible = false;
             if !data.host.is_null()
@@ -5602,6 +5629,8 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             .unwrap_or(0);
 
         let data = Box::new(ClapPluginData::<P> {
+            persist_signal: None,
+            persist_pending: Arc::new(AtomicBool::new(false)),
             plugin: shared_plugin(instance),
             params_arc,
             meter_store,

@@ -866,6 +866,7 @@ enum IdScheme {
 
 /// Struct-level `#[params(...)]` settings.
 struct ParamsStructAttrs {
+    persist_changed: Option<syn::Ident>,
     projection: Option<syn::TypePath>,
     id_scheme: IdScheme,
     /// Inherent `fn(&self)` run at the end of `load_persist`, after
@@ -896,6 +897,7 @@ struct ParamsStructAttrs {
 /// Errors on an unknown key/value.
 fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAttrs, syn::Error> {
     let mut parsed = ParamsStructAttrs {
+        persist_changed: None,
         projection: None,
         id_scheme: IdScheme::Hash,
         post_load: None,
@@ -939,6 +941,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 return Ok(());
             }
             let slot = match key.as_str() {
+                "persist_changed" => &mut parsed.persist_changed,
                 "post_load" => &mut parsed.post_load,
                 "pre_save" => &mut parsed.pre_save,
                 "validate_persist" => &mut parsed.validate_persist,
@@ -952,7 +955,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 _ => {
                     return Err(meta.error(
                         "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
-                         `validate_persist`, `restore_state`, `presentation`, \
+                         `validate_persist`, `restore_state`, `persist_changed`, `presentation`, \
                          `presentation_revision`, `presentation_change`, `projection`, `value_format`, or `value_parse`)",
                     ));
                 }
@@ -1921,10 +1924,16 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         _ => Vec::new(),
     };
 
-    if param_fields.is_empty() && nested_fields.is_empty() && meter_fields.is_empty() {
+    // A persistence-only subtree still needs constructor/offset and traversal
+    // code. Explicit skipped fields (and an empty named store) are useful for
+    // lifecycle hooks without exposing a fake host parameter.
+    let empty_named = matches!(fields, Fields::Named(named) if named.named.is_empty());
+    if param_fields.is_empty() && nested_fields.is_empty() && meter_fields.is_empty()
+        && skip_fields.is_empty() && !empty_named
+    {
         return syn::Error::new_spanned(
             &ast,
-            "Params derive: no recognized fields (FloatParam, BoolParam, IntParam, EnumParam, MeterSlot, or #[nested])",
+            "Params derive: no recognized fields (FloatParam, BoolParam, IntParam, EnumParam, MeterSlot, #[nested], #[persist], or #[skip])",
         )
         .to_compile_error()
         .into();
@@ -2898,6 +2907,24 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #(#nested_fingerprint_stmts)*
         }
     };
+    let persist_signal_fields = persist_fields.iter().map(|(ident, _, _)| quote! {
+        ::moose::core::custom_state::PersistField::set_persist_change_signal(
+            &self.#ident, __signal.clone());
+    });
+    let persist_changed_impl = struct_attrs.persist_changed.as_ref().map(|method| quote! {
+        fn wants_persist_notifications(&self) -> bool { true }
+        fn take_persist_change(&self) -> Option<(u32, f64)> { self.#method() }
+    });
+    let persist_signal_impl = quote! {
+        fn set_persist_change_signal(
+            &self, __signal: ::std::sync::Weak<::moose::params::PersistChangeSignal>,
+        ) {
+            #(#persist_signal_fields)*
+            #(::moose::params::Params::set_persist_change_signal(
+                &self.#nested_idents, __signal.clone());)*
+        }
+        #persist_changed_impl
+    };
     let prepare_write_fields = persist_fields.iter().map(|(ident, key, _)| {
         quote! {
             __fields.push((#key,
@@ -3274,6 +3301,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
 
             #persist_impl
             #persist_fingerprint_impl
+            #persist_signal_impl
             #prepare_write_impl
         }
     };

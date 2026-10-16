@@ -267,3 +267,114 @@ struct RefusedStore {
 fn preparation_error_propagates_without_silent_field_omission() {
     assert!(RefusedStore::default().prepare_persist_write().is_err());
 }
+
+#[derive(Params)]
+struct ZeroFields {}
+
+#[test]
+fn persistence_only_and_empty_stores_have_no_fake_host_parameters() {
+    let mut nested = Nested::default();
+    nested.offset_ids(100);
+    assert_eq!(nested.count(), 0);
+    assert!(nested.param_infos().is_empty());
+    assert_eq!(nested.collect_values(), (vec![], vec![]));
+    assert_eq!(nested.get_normalized(100), None);
+    nested.set_normalized(100, 0.5);
+    assert_eq!(*nested.flag.lock().unwrap(), false);
+    let empty = ZeroFields::default();
+    assert_eq!(empty.count(), 0);
+    assert!(empty.serialize_persist().is_empty());
+    assert_eq!(empty.prepare_persist_write().unwrap().byte_len(), 0);
+    assert!(record(&empty).is_empty());
+    let skipped = Empty::default();
+    assert_eq!(skipped.count(), 0);
+    assert!(record(&skipped).is_empty());
+    assert_eq!(skipped.prepares.load(Ordering::Relaxed), 1);
+}
+
+#[derive(Default)]
+struct NotifyingPayload {
+    signal: Mutex<std::sync::Weak<moose::params::PersistChangeSignal>>,
+    pending: std::sync::atomic::AtomicBool,
+}
+impl PersistField for NotifyingPayload {
+    fn persist_write(&self, bytes: &mut Vec<u8>) {
+        bytes.push(0);
+    }
+    fn persist_read(&self, _: &mut StateCursor) {}
+    fn set_persist_change_signal(
+        &self,
+        signal: std::sync::Weak<moose::params::PersistChangeSignal>,
+    ) {
+        *self.signal.lock().unwrap() = signal;
+    }
+}
+impl NotifyingPayload {
+    fn complete(&self) {
+        self.pending.store(true, Ordering::Release);
+        let signal = self.signal.lock().unwrap().upgrade();
+        if let Some(signal) = signal {
+            signal.notify();
+        }
+    }
+}
+#[derive(Params)]
+struct NotificationLeaf {
+    #[persist]
+    payload: NotifyingPayload,
+}
+#[derive(Params)]
+#[params(persist_changed = "drain_completion")]
+struct NotificationRoot {
+    #[nested]
+    child: NotificationLeaf,
+}
+impl NotificationRoot {
+    fn drain_completion(&self) -> Option<(u32, f64)> {
+        self.child
+            .payload
+            .pending
+            .swap(false, Ordering::AcqRel)
+            .then_some((7, 0.25))
+    }
+}
+#[test]
+fn completion_signal_traverses_nested_fields_without_an_editor_and_closes_safely() {
+    let params = NotificationRoot::default();
+    assert!(params.wants_persist_notifications());
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let signal = std::sync::Arc::new(moose::params::PersistChangeSignal::new(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+    }));
+    params.set_persist_change_signal(std::sync::Arc::downgrade(&signal));
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| params.child.payload.complete())
+            .join()
+            .unwrap();
+    });
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(params.take_persist_change(), Some((7, 0.25)));
+    assert_eq!(params.take_persist_change(), None);
+    signal.close();
+    params.child.payload.complete();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "no host access after teardown gate closes"
+    );
+    drop(signal);
+    assert!(
+        params
+            .child
+            .payload
+            .signal
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_none()
+    );
+    assert!(!Nested::default().wants_persist_notifications());
+    assert_eq!(Nested::default().take_persist_change(), None);
+}

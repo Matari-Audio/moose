@@ -75,6 +75,7 @@ type StateLoadQueue = state::StateLoadQueue;
 const K_LATENCY_CHANGED: i32 = 8;
 
 struct Vst3Instance<P: PluginExport> {
+    persist_signal: std::sync::Mutex<Option<Arc<moose_params::PersistChangeSignal>>>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -618,6 +619,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 })
                 .collect();
             let instance = Box::new(Vst3Instance::<P> {
+                persist_signal: std::sync::Mutex::new(None),
                 plugin: shared_plugin(plugin),
                 params_arc,
                 meter_store,
@@ -674,9 +676,53 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     // keeps a live host alive; the instance is being torn down regardless.
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
-            drop(Box::from_raw(ctx.cast::<Vst3Instance<P>>()));
+            let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
+            if let Some(signal) = instance.persist_signal.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                signal.close();
+            }
+            drop(instance);
         }
     });
+}
+
+// All three callbacks run on the host thread. Only the installed wake itself
+// may run on a background worker; close() gates it before the shim tears down.
+unsafe extern "C" fn cb_wants_persist_notifications<P: PluginExport>(ctx: *mut std::ffi::c_void) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "persist_wants", false, || unsafe {
+        (&*ctx.cast::<Vst3Instance<P>>()).params_arc.wants_persist_notifications()
+    })
+}
+unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    wake_context: *mut std::ffi::c_void,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
+        let instance = &*ctx.cast::<Vst3Instance<P>>();
+        let mut binding = instance.persist_signal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(old) = binding.take() { old.close(); }
+        if let Some(wake) = wake {
+            let context = SendPtr::new(wake_context);
+            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+                wake(context.as_ptr().cast_mut());
+            }));
+            instance.params_arc.set_persist_change_signal(Arc::downgrade(&signal));
+            *binding = Some(signal);
+        }
+    });
+}
+unsafe extern "C" fn cb_take_persist_change<P: PluginExport>(
+    ctx: *mut std::ffi::c_void, id: *mut u32, value: *mut f64,
+) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "persist_drain", false, || unsafe {
+        let params = &(&*ctx.cast::<Vst3Instance<P>>()).params_arc;
+        let Some((changed_id, normalized)) = params.take_persist_change() else { return false; };
+        if !normalized.is_finite() || !(0.0..=1.0).contains(&normalized)
+            || params.get_normalized(changed_id).is_none() { return false; }
+        *id = changed_id;
+        *value = params.set_normalized_returning_normalized(changed_id, normalized);
+        true
+    })
 }
 
 /// Map a VST3 `ProcessModes` value (`kRealtime` 0, `kPrefetch` 1,
@@ -3747,6 +3793,9 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         param_is_chunked: cb_param_is_chunked::<P>,
         param_presentation: cb_param_presentation::<P>,
         param_presentation_revision: cb_param_presentation_revision::<P>,
+        wants_persist_notifications: cb_wants_persist_notifications::<P>,
+        set_persist_waker: cb_set_persist_waker::<P>,
+        take_persist_change: cb_take_persist_change::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every

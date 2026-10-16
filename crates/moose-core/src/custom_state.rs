@@ -151,6 +151,14 @@ pub trait PersistField {
     /// malformed read leaves the current value untouched.
     fn persist_read(&self, cursor: &mut StateCursor);
 
+    /// Optional background completion signal, forwarded by Params derive over
+    /// the same persist/nested inventory as the serializer. Store only Weak.
+    fn set_persist_change_signal(
+        &self,
+        _signal: std::sync::Weak<moose_params::PersistChangeSignal>,
+    ) {
+    }
+
     /// Freeze this field for write-side streaming. Large fields should capture
     /// immutable payload handles and controls here, rather than their encoded
     /// bytes. The default preserves the field's existing serializer.

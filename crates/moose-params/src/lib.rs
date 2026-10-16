@@ -184,6 +184,37 @@ impl Default for ParameterPresentation {
 /// their final immutable representation instead of a serialized staging buffer.
 pub type PreparedPersist<P> = Box<dyn FnOnce(&P, &[(u32, f64)], &[u8]) + Send>;
 
+/// A non-realtime completion wake. The wrapper closes this gate before
+/// releasing host handles; workers retain only Weak handles to it. The wake
+/// must schedule a host-thread callback, never synchronously run the drain.
+pub struct PersistChangeSignal {
+    wake: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+impl PersistChangeSignal {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            wake: std::sync::Mutex::new(Some(Box::new(wake))),
+        }
+    }
+    /// Background workers only. Not audio safe (may lock and wake the host).
+    pub fn notify(&self) {
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(wake) = wake.as_ref() {
+            wake();
+        }
+    }
+    /// Waits for an in-flight request, then permanently disables host access.
+    pub fn close(&self) {
+        self.wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 /// A compact identity prepared by the owner of a persisted field.
 ///
 /// `byte_len` describes the canonical input represented by `digest`, not a host
@@ -227,8 +258,12 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// return small validation bytes plus a host-thread commit. The wrapper
     /// validates framing, EOF and `validate_persist` before invoking the commit.
     fn prepare_persist_stream(
-        _read: &mut dyn std::io::Read, _len: usize,
-    ) -> Option<std::io::Result<(Vec<u8>, PreparedPersist<Self>)>> where Self: Sized {
+        _read: &mut dyn std::io::Read,
+        _len: usize,
+    ) -> Option<std::io::Result<(Vec<u8>, PreparedPersist<Self>)>>
+    where
+        Self: Sized,
+    {
         None
     }
 
@@ -441,6 +476,23 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// A custom snapshot may reject an unrepresentable or unavailable document.
     fn prepare_persist_write(&self) -> std::io::Result<Box<dyn PreparedPersistWrite>> {
         Ok(Box::new(self.serialize_persist()))
+    }
+
+    /// Opt-in asynchronous persistent-document completion. No polling is
+    /// needed: a field wakes its wrapper through the weak signal below.
+    fn wants_persist_notifications(&self) -> bool {
+        false
+    }
+
+    /// Bound once by the format wrapper, independently of editor lifetime.
+    fn set_persist_change_signal(&self, _signal: std::sync::Weak<PersistChangeSignal>) {}
+
+    /// Host/UI thread only, after a completion wake. Return a small parameter
+    /// beacon only for a real, not-yet-announced persistent change. The wrapper
+    /// delivers the normal begin/value/end gesture; return None for no-ops.
+    /// `#[params(persist_changed = "method")]` supplies this optional hook.
+    fn take_persist_change(&self) -> Option<(u32, f64)> {
+        None
     }
 
     /// Visit every persisted field, including nested stores and pre-save hooks.
