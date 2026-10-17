@@ -608,7 +608,7 @@ impl<P: ?Sized> PluginContext<P> {
     }
 
     #[must_use]
-    pub fn notification_delivery(&self) -> EditorNotificationDelivery {
+    pub const fn notification_delivery(&self) -> EditorNotificationDelivery {
         self.notification_delivery
     }
 
