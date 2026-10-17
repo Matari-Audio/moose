@@ -5043,6 +5043,7 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
             params_for_ctx,
         )
         .with_tasks(task_spawner_for_ctx)
+        .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedEdits)
     }
 }
 
