@@ -101,6 +101,18 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     fn init(params: &Self::Params, cx: &InitContext) -> Self::DspState;
 
     fn reset(state: &mut Self::DspState, params: &Self::Params, config: &AudioConfig);
+    /// Worker/fallible-preparation logic must declare this requirement. Legacy
+    /// synchronous users retain false. Hot loaders refuse true until executable
+    /// worker lifetime and fallible cross-generation preparation are qualified.
+    fn requires_fallible_preparation()->bool{false}
+    fn prepare(state: &mut Self::DspState, params: &Self::Params,
+        config: &moose_core::plugin::PreparationConfig,
+    ) -> Result<(), moose_core::plugin::PreparationError> {
+        config.validate()?;
+        Self::reset(state, params, &config.audio);
+        Ok(())
+    }
+
 
     fn process(
         state: &mut Self::DspState,
@@ -292,6 +304,18 @@ macro_rules! plugin_logic_leaf_trait {
                 config: &$crate::__plugin_logic_deps::AudioConfig,
             ) {
                 let _ = (state, params, config);
+            }
+
+            /// Fallible offaudio activation. Default forwards the ordinary
+            /// reset exactly once; worker plugins override this and only return
+            /// success after their real finite policy/readiness is admitted.
+            fn requires_fallible_preparation()->bool{false}
+            fn prepare(state: &mut Self::DspState, params: &Self::Params,
+                config: &$crate::__plugin_logic_deps::PreparationConfig,
+            ) -> Result<(), $crate::__plugin_logic_deps::PreparationError> {
+                config.validate()?;
+                <Self as $name>::reset(state, params, &config.audio);
+                Ok(())
             }
 
             /// Process one block of audio. Real-time - no allocations,
@@ -501,6 +525,7 @@ pub mod __plugin_logic_deps {
     pub use moose_core::buffer::AudioBuffer;
     pub use moose_core::bus::BusLayout;
     pub use moose_core::config::AudioConfig;
+    pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::editor::Editor;
     pub use moose_core::events::EventList;
     pub use moose_core::process::{ProcessContext, ProcessStatus};
@@ -848,6 +873,13 @@ macro_rules! plugin_logic_bridge {
 
             fn reset(state: &mut Self::DspState, params: &Self::Params, config: &AudioConfig) {
                 <Self as $leaf>::reset(state, params, config);
+            }
+
+            fn requires_fallible_preparation()->bool{<Self as $leaf>::requires_fallible_preparation()}
+            fn prepare(state: &mut Self::DspState, params: &Self::Params,
+                config: &moose_core::plugin::PreparationConfig,
+            ) -> Result<(), moose_core::plugin::PreparationError> {
+                <Self as $leaf>::prepare(state, params, config)
             }
 
             fn process(

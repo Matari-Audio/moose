@@ -377,6 +377,22 @@ macro_rules! __plugin_hot_reload {
                 self.inner.init();
             }
 
+            fn requires_fallible_preparation(&self)->bool{
+                <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::requires_fallible_preparation()
+                    ||self.inner.requires_fallible_preparation()
+            }
+
+            fn prepare(&mut self,config:&$crate::core::plugin::PreparationConfig)
+                ->Result<(),$crate::core::plugin::PreparationError>{
+                config.validate()?;
+                if <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::requires_fallible_preparation(){
+                    return Err($crate::core::plugin::PreparationError::ExecutableLifetime);
+                }
+                // Actual HotShell checks its current admitted nonempty loader.
+                // A reloaded required class never reaches that loader's state.
+                self.inner.prepare(config)
+            }
+
             fn reset(&mut self, config: &$crate::core::config::AudioConfig) {
                 self.inner.reset(config);
             }

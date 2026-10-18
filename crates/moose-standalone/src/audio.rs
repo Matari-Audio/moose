@@ -653,11 +653,13 @@ pub fn start_audio<P: PluginExport>(opts: &Options) -> Result<AudioHandles<P>, B
     // Capacity 1, newest-wins: only the most recent editor state-load matters
     // if several arrive before the audio thread drains one.
     let pending_state: Arc<ArrayQueue<Vec<u8>>> = Arc::new(ArrayQueue::new(1));
-    let initial_max_frames = config.buffer_size_max_frames(&default_config);
+    let (initial_max_frames,initial_frame_bound) = config.buffer_size_geometry(&default_config);
     let plugin = Arc::new(Mutex::new({
         let mut p = P::create();
         p.init();
-        p.reset(&AudioConfig::new(sample_rate, initial_max_frames));
+        p.prepare(&moose_core::plugin::PreparationConfig::new(
+            AudioConfig::new(sample_rate, initial_max_frames), initial_frame_bound,
+        )).map_err(|error| format!("plugin preparation refused: {error:?}"))?;
         // Apply `--state <path>` BEFORE snapping smoothers so the
         // first audio block sees the restored values, not defaults
         // ramping toward them.
@@ -1410,24 +1412,22 @@ fn open_output_stream<P: PluginExport>(
     let supported = device
         .default_output_config()
         .map_err(|e| format!("could not query the output config for the scratch bound: {e}"))?;
-    let frame_bound = config.buffer_size_max_frames(&supported);
-    // The plugin sized its DSP for the bound it was last `reset()`
-    // with; a device whose maximum exceeds it could deliver blocks
-    // past that promise. Renew it before the stream opens (no
-    // callback is running - the old stream is already dropped). A
-    // layout switch also has to re-prepare the plugin for the new
-    // channel arrangement, so `force_reset` triggers it regardless.
-    let bound_grew = frame_bound > res.promised_max_frames.load(Ordering::Relaxed);
-    if bound_grew {
-        res.promised_max_frames
-            .store(frame_bound, Ordering::Relaxed);
+    let (frame_bound,frame_provenance) = config.buffer_size_geometry(&supported);
+    // Renew the actual request for this device and its actual provenance;
+    // scratch sizing alone is not a renewed DSP/native preparation contract.
+    let bound_grew=frame_bound>res.promised_max_frames.load(Ordering::Relaxed);
+    {
+        let mut p=plugin_a.lock().expect("plugin mutex poisoned at audio setup");
+        // Workers renew on EACH actual device open, including equal-B changes
+        // in provenance/device. Legacy retains its old reset timing, so an
+        // initial state/preset load is not erased by a gratuitous second reset.
+        if renew_device_preparation(p.requires_fallible_preparation(),bound_grew,force_reset){
+            p.prepare(&moose_core::plugin::PreparationConfig::new(
+                AudioConfig::new(sample_rate,frame_bound),frame_provenance,
+            )).map_err(|error|format!("plugin device preparation refused: {error:?}"))?;
+        }
     }
-    if bound_grew || force_reset {
-        let mut p = plugin_a
-            .lock()
-            .expect("plugin mutex poisoned at audio setup");
-        p.reset(&AudioConfig::new(sample_rate, frame_bound));
-    }
+    if bound_grew{res.promised_max_frames.store(frame_bound,Ordering::Relaxed);}
     scratch.ensure_capacity(num_in, num_out, frame_bound);
     let bus_routing = bus_routing_at_index::<P>(layout_index);
     // `num_main_in` (the main/sidechain split of the selected layout) is
@@ -1876,33 +1876,57 @@ fn resolve_config(
     }
 }
 
+fn renew_device_preparation(required:bool,bound_grew:bool,force_reset:bool)->bool{
+    required||bound_grew||force_reset
+}
+
 trait BufferSizeMax {
-    fn buffer_size_max_frames(&self, supported: &cpal::SupportedStreamConfig) -> usize;
+    fn buffer_size_geometry(&self,supported:&cpal::SupportedStreamConfig)->(usize,moose_core::plugin::PreparationFrameBound);
+}
+fn preparation_buffer_geometry(requested:cpal::BufferSize,supported:&cpal::SupportedBufferSize)
+    ->(usize,moose_core::plugin::PreparationFrameBound){
+    use moose_core::plugin::PreparationFrameBound as Bound;
+    match requested{
+        cpal::BufferSize::Fixed(n)=>(n as usize,Bound::RequestedFixedDevice),
+        cpal::BufferSize::Default=>match supported{
+            cpal::SupportedBufferSize::Range{max:max @ 1..=32_768,..}=>(*max as usize,Bound::AdvertisedDeviceMaximum),
+            // Defensive scratch fallback is explicitly NOT a device promise,
+            // including unusable Range maxima (WASAPI 0/u32::MAX cases).
+            _=>(8192,Bound::UnprovenDeviceFallback),
+        }
+    }
 }
 impl BufferSizeMax for cpal::StreamConfig {
-    fn buffer_size_max_frames(&self, supported: &cpal::SupportedStreamConfig) -> usize {
-        match self.buffer_size {
-            cpal::BufferSize::Fixed(n) => n as usize,
-            // `Default` leaves the callback size to the device: bound
-            // by the size range the device itself reports, so `reset`
-            // and the scratch pre-grow cover whatever it delivers. A
-            // device that reports no usable range gets the same
-            // generous fallback the VST3 wrapper uses for hosts that
-            // skip `setupProcessing`. "Usable" matters: cpal's WASAPI
-            // backend reports `Range { min: 0, max: u32::MAX }` (not
-            // `Unknown`) whenever `GetBufferSizeLimits` is unsupported
-            // - every software audio stack - and sizing per-channel
-            // scratch to that bound is a 17 GB allocation. Anything
-            // beyond a plausible hardware maximum routes to the
-            // fallback instead.
-            cpal::BufferSize::Default => match supported.buffer_size() {
-                cpal::SupportedBufferSize::Range {
-                    max: max @ 1..=32_768,
-                    ..
-                } => *max as usize,
-                _ => 8192,
-            },
+    fn buffer_size_geometry(&self,supported:&cpal::SupportedStreamConfig)->(usize,moose_core::plugin::PreparationFrameBound){
+        preparation_buffer_geometry(self.buffer_size,supported.buffer_size())
+    }
+}
+
+#[cfg(test)]
+mod preparation_geometry172_tests{
+    use super::*;
+    #[test]fn legacy_initial_state_is_not_reset_again_but_workers_renew_equal_b_admission(){
+        let mut restored_state=71;let mut resets=1;
+        if renew_device_preparation(false,false,false){restored_state=0;resets+=1;}
+        assert_eq!((restored_state,resets),(71,1));
+        for (old,new) in [(cpal::SupportedBufferSize::Range{min:1,max:8192},cpal::SupportedBufferSize::Unknown),
+            (cpal::SupportedBufferSize::Range{min:1,max:8192},cpal::SupportedBufferSize::Range{min:0,max:0})]{
+            let (old_b,_)=preparation_buffer_geometry(cpal::BufferSize::Default,&old);
+            let (new_b,provenance)=preparation_buffer_geometry(cpal::BufferSize::Default,&new);
+            assert_eq!(old_b,new_b);assert_eq!(provenance,moose_core::plugin::PreparationFrameBound::UnprovenDeviceFallback);
+            assert!(renew_device_preparation(true,new_b>old_b,false),"worker cannot reuse an equal numeric prior proof");
         }
+        assert!(renew_device_preparation(false,true,false));assert!(renew_device_preparation(false,false,true));
+    }
+    #[test]fn fallback_is_never_labeled_as_a_proven_device_bound(){
+        use moose_core::plugin::PreparationFrameBound as Bound;
+        for supported in [cpal::SupportedBufferSize::Unknown,cpal::SupportedBufferSize::Range{min:0,max:0},
+            cpal::SupportedBufferSize::Range{min:0,max:u32::MAX},cpal::SupportedBufferSize::Range{min:1,max:32_769}]{
+            assert_eq!(preparation_buffer_geometry(cpal::BufferSize::Default,&supported),(8192,Bound::UnprovenDeviceFallback));
+        }
+        for max in [1,8192,32_768]{assert_eq!(preparation_buffer_geometry(cpal::BufferSize::Default,
+            &cpal::SupportedBufferSize::Range{min:1,max}),(max as usize,Bound::AdvertisedDeviceMaximum));}
+        assert_eq!(preparation_buffer_geometry(cpal::BufferSize::Fixed(71),&cpal::SupportedBufferSize::Unknown),(71,Bound::RequestedFixedDevice));
     }
 }
 

@@ -205,6 +205,15 @@ macro_rules! export_plugin {
             <$logic as $crate::PluginLogicCore<Sample>>::PRESERVE_DSP_STATE
         }
 
+        /// Independently versioned scalar classification, no state pointer and
+        /// no canary layout change. Prior exporters omit this symbol and retain
+        /// the historical synchronous class. New required logic is rejected by
+        /// hot loading before any task/state symbol can be invoked.
+        #[unsafe(no_mangle)]
+        pub fn moose_preparation_class_v1()->u32 {
+            u32::from(<$logic as $crate::PluginLogicCore<Sample>>::requires_fallible_preparation())
+        }
+
         #[unsafe(no_mangle)]
         pub fn moose_reset(
             state: *mut (),

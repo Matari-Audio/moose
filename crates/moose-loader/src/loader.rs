@@ -72,6 +72,10 @@ pub struct StateOrigin {
     pub save: fn(*const ()) -> Vec<u8>,
 }
 
+/// A scalar class is not an executable lease. Only legacy synchronous logic
+/// may enter this loader until worker teardown/reload lifetime is qualified.
+fn legacy_preparation_class(class:Option<u32>)->bool{matches!(class,None|Some(0))}
+
 /// The flat function-pointer table resolved from a loaded dylib. Every
 /// entry operates on an opaque `*mut ()` / `*const ()` state pointer
 /// (an erased `Box<State>`) plus a `*const ()` params pointer (the
@@ -341,6 +345,15 @@ impl<S: Sample> NativeLoader<S> {
             drop(lib);
             let _ = std::fs::remove_file(temp);
         };
+
+        // This scalar export has its own versioned name and no erased state.
+        // Missing means an existing synchronous exporter. Required or unknown
+        // classes are refused BEFORE canary/LogicSymbols/tasks/state/swap.
+        let preparation_class=unsafe{lib.get::<fn()->u32>(b"moose_preparation_class_v1")}.ok().map(|class|class());
+        if !legacy_preparation_class(preparation_class){
+            log::warn!("hot logic requires unsupported fallible preparation or has unknown preparation class");
+            cleanup_temp(lib,&temp);return None;
+        }
 
         // The versioned symbol makes canary-layout evolution safe: the
         // struct returns by value, so a shell must never call a canary
@@ -876,4 +889,12 @@ fn crc32_file(path: &std::path::Path) -> Option<u32> {
         }
     }
     Some(hasher.finalize())
+}
+
+#[cfg(test)]
+mod preparation_class172_tests{
+    #[test]fn only_missing_prior_export_or_explicit_legacy_is_accepted(){
+        assert!(super::legacy_preparation_class(None));assert!(super::legacy_preparation_class(Some(0)));
+        for value in [1,2,u32::MAX]{assert!(!super::legacy_preparation_class(Some(value)));}
+    }
 }

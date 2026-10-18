@@ -834,10 +834,16 @@ impl<P: PluginExport> PluginDriver<P> {
         // Build + activate.
         let mut plugin = P::create();
         plugin.init();
-        plugin.reset(
-            &AudioConfig::new(self.sample_rate, self.block_size)
-                .with_process_mode(self.process_mode),
+        let preparation = moose_core::plugin::PreparationConfig::new(
+            AudioConfig::new(self.sample_rate, self.block_size).with_process_mode(self.process_mode),
+            moose_core::plugin::PreparationFrameBound::ExplicitDriver,
         );
+        // Driver::run is an assertion-style harness (its IO/state/render errors
+        // already fail the run). Refusal happens before the first process and
+        // cannot become a successful all-silent DriverResult.
+        if let Err(error) = plugin.prepare(&preparation) {
+            panic!("driver plugin preparation refused: {error:?}");
+        }
 
         // 1. State load (if any). Reads from disk here rather than at
         // builder time, so the I/O failure (if any) surfaces as a

@@ -61,7 +61,11 @@ use moose_gui_types::theme::{Color, Theme};
 /// Epoch 8: task-pool warmup reports failure and logic dylibs export bounded
 /// quiesce plus shutdown/join operations. A stale epoch-7 dylib has immortal
 /// workers and the old warmer signature, so it must be rejected before load.
-pub const ABI_EPOCH: u32 = 8;
+/// Epoch 9: EventList's private StoredExactEvent carrier/row stride changed.
+/// Event/ExactEventBody wire fields staying unchanged cannot make an old logic
+/// dylib safe to process/clear the new private Vec representation. Old hot logic
+/// must rebuild; reject by existing epoch before any state/process invocation.
+pub const ABI_EPOCH: u32 = 9;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///
@@ -229,6 +233,13 @@ mod tests {
         b.abi_epoch = ABI_EPOCH - 1;
         assert!(!a.matches(&b));
         assert!(a.diff_report(&b).contains("abi_epoch"));
+    }
+
+    #[test]
+    fn old_stored_exact_row_epoch_is_rejected_even_when_public_sizes_match(){
+        let current=AbiCanary::current::<f32>();let mut old=AbiCanary::current::<f32>();old.abi_epoch=8;
+        assert_eq!(current.event_size,old.event_size);assert_eq!(current.event_body_size,old.event_body_size);
+        assert_eq!(current.abi_epoch,9);assert!(!current.matches(&old));assert!(current.diff_report(&old).contains("abi_epoch"));
     }
 
     #[test]
