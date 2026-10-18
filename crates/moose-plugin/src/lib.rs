@@ -89,6 +89,9 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         false
     }
 
+    /// Maximum serialized host state; size document admission to this bound.
+    fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
+
     /// Supported audio bus configurations. The host picks one. Default:
     /// the standard audio effect - stereo and mono - so it appears on
     /// both track widths. Override for instruments, surround, sidechains.
@@ -260,6 +263,9 @@ macro_rules! plugin_logic_leaf_trait {
             fn supports_in_place() -> bool {
                 false
             }
+
+            /// Maximum serialized host state; size document admission to this bound.
+            fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
 
             /// Supported audio bus configurations. The host picks one;
             /// the others are rejected at bus-config time before
@@ -621,6 +627,9 @@ macro_rules! pure_plugin_leaf_trait {
                 false
             }
 
+            /// Maximum serialized host state; size document admission to this bound.
+            fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
+
             /// Supported audio bus configurations. Same contract as the
             /// stateful leaf's `bus_layouts`. Default: the standard audio
             /// effect - stereo and mono.
@@ -672,6 +681,8 @@ macro_rules! pure_plugin_leaf_trait {
             fn supports_in_place() -> bool {
                 <T as $name>::supports_in_place()
             }
+
+            fn max_host_state_bytes() -> usize { <T as $name>::max_host_state_bytes() }
 
             fn bus_layouts() -> Vec<crate::__plugin_logic_deps::BusLayout> {
                 <T as $name>::bus_layouts()
@@ -817,6 +828,10 @@ pub trait BackgroundTask: Send + 'static {
     /// (a long serialized handler delays this lane's later tasks). The mode
     /// is per lane, so a concurrent lane in the same plugin is unaffected.
     const SERIALIZED: bool = false;
+    /// Allow a nonblocking OS wake when a task is first queued. Default false
+    /// preserves syscall-free scheduling. Opt-in lanes remain allocation-free;
+    /// when all lanes opt in, idle pool threads park without periodic wakeups.
+    const WAKE_ON_SCHEDULE: bool = false;
     /// Run one task on the pool. See the trait docs for the contract,
     /// including the concurrency note on [`Self::SERIALIZED`].
     fn run(self, params: &Self::Params);
@@ -859,6 +874,8 @@ macro_rules! plugin_logic_bridge {
             fn supports_in_place() -> bool {
                 <Self as $leaf>::supports_in_place()
             }
+
+            fn max_host_state_bytes() -> usize { <Self as $leaf>::max_host_state_bytes() }
 
             fn bus_layouts() -> Vec<BusLayout> {
                 <Self as $leaf>::bus_layouts()

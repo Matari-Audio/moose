@@ -49,7 +49,7 @@ use std::ffi::c_void;
 #[cfg(all(unix, not(miri)))]
 use std::ffi::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -67,9 +67,8 @@ pub const TASK_QUEUE_PREALLOC: usize = 256;
 /// Sized well past any realistic simultaneous-instance count.
 const INJECTOR_CAP: usize = 4096;
 
-/// Ordinary worker defensive timeout. If notifier startup fails, exactly one
-/// designated worker uses [`NOTIFIER_INTERVAL`] instead; the others keep this
-/// long park so fallback does not become a thundering herd.
+/// A reversible pool pause may retain work while waiting for execution to
+/// resume. Idle workers themselves park indefinitely.
 const PARK_TIMEOUT: Duration = Duration::from_secs(1);
 /// One non-realtime notifier polls the atomic scheduling epoch at this rate,
 /// retries lanes that missed the bounded injector, and owns all wake syscalls.
@@ -107,10 +106,44 @@ static NOTIFY_EPOCH: AtomicUsize = AtomicUsize::new(0);
 /// and republishes it when the injector is still saturated.
 static RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 
+// Built/registered off-thread. Lanes and the pool share this owner, so waking
+// never dereferences the raw pool pointer during teardown.
+#[derive(Default)]
+struct WakeSignal {
+    notifier: OnceLock<Thread>,
+    workers: OnceLock<Box<[Thread]>>,
+    polling_lanes: AtomicUsize,
+}
+impl WakeSignal {
+    fn notify(&self) {
+        if let Some(notifier) = self.notifier.get() {
+            notifier.unpark();
+        } else if let Some(workers) = self.workers.get() {
+            for worker in workers {
+                worker.unpark();
+            }
+        }
+    }
+}
+static WAKE_SIGNAL: Mutex<Weak<WakeSignal>> = Mutex::new(Weak::new());
+fn wake_signal() -> Arc<WakeSignal> {
+    let mut weak = WAKE_SIGNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(signal) = weak.upgrade() {
+        return signal;
+    }
+    let signal = Arc::new(WakeSignal::default());
+    *weak = Arc::downgrade(&signal);
+    signal
+}
+
 /// Per-instance inbound queue plus the monomorphized handler. Shared
 /// (`Arc`) between the schedulers (audio thread / editor / init, via
 /// [`TaskSpawner`]) and the pool worker that drains it.
 struct Sink<T: Send + 'static> {
+    wake: Arc<WakeSignal>,
+    wake_on_schedule: bool,
     /// `try_spawn`: FIFO, every queued task runs.
     queue: ArrayQueue<T>,
     /// `spawn_coalescing`: a single slot. `force_push` keeps only the
@@ -253,6 +286,15 @@ impl<T: Send + 'static> Drain for Sink<T> {
     }
 }
 
+impl<T: Send + 'static> Drop for Sink<T> {
+    fn drop(&mut self) {
+        if !self.wake_on_schedule {
+            self.wake.polling_lanes.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.wake.notify();
+    }
+}
+
 fn register_lane(sink: &Arc<dyn Drain>) {
     REGISTERED_LANES
         .lock()
@@ -289,6 +331,8 @@ fn retry_registered(shared: &Shared) -> (usize, bool) {
 /// Worker-visible pool state: the injector of ready sinks. Held in an
 /// `Arc` so every worker closure can reach it.
 struct Shared {
+    wake: Arc<WakeSignal>,
+    capacity_epoch: AtomicUsize,
     injector: ArrayQueue<Arc<dyn Drain>>,
     /// Non-realtime notifier's round-robin wake cursor.
     next_worker: AtomicUsize,
@@ -361,6 +405,8 @@ fn start_pool(pin_module: bool) -> bool {
     }
 
     let shared = Arc::new(Shared {
+        wake: wake_signal(),
+        capacity_epoch: AtomicUsize::new(0),
         injector: ArrayQueue::new(INJECTOR_CAP),
         next_worker: AtomicUsize::new(0),
         execution_state: AtomicUsize::new(0),
@@ -408,6 +454,13 @@ fn start_pool(pin_module: bool) -> bool {
         .notifier_running
         .store(notifier_join.is_some(), Ordering::Release);
     let notifier = notifier_join.as_ref().map(|handle| handle.thread().clone());
+    let _ = shared.wake.workers.set(workers.clone().into_boxed_slice());
+    if let Some(thread) = &notifier {
+        let _ = shared.wake.notifier.set(thread.clone());
+    }
+    // Close registration-vs-first-park races while handles were being bound.
+    shared.wake.notify();
+
     let available = !workers.is_empty();
     let pool = Box::new(Pool {
         shared,
@@ -647,11 +700,16 @@ fn notifier_loop(shared: &Shared, workers: &[Thread]) {
     let mut observed = NOTIFY_EPOCH.load(Ordering::Acquire);
     let mut first_pass = true;
     loop {
-        thread::park_timeout(NOTIFIER_INTERVAL);
+        if shared.wake.polling_lanes.load(Ordering::Acquire) == 0 {
+            thread::park();
+        } else {
+            thread::park_timeout(NOTIFIER_INTERVAL);
+        }
         if shared.stopping.load(Ordering::Acquire) {
             return;
         }
         let current = NOTIFY_EPOCH.load(Ordering::Acquire);
+        let capacity_epoch = shared.capacity_epoch.load(Ordering::SeqCst);
         let retry_hint = RETRY_PENDING.swap(false, Ordering::AcqRel);
         let (retried, retry_remaining) = if retry_hint {
             retry_registered(shared)
@@ -659,12 +717,20 @@ fn notifier_loop(shared: &Shared, workers: &[Thread]) {
             (0, false)
         };
         if retry_remaining {
-            RETRY_PENDING.store(true, Ordering::Release);
+            RETRY_PENDING.store(true, Ordering::SeqCst);
         }
         if first_pass || retried != 0 || current != observed {
             first_pass = false;
             observed = current;
             wake_ready_workers(shared, workers);
+        }
+        // A worker can free the final injector entry while this scan has
+        // temporarily cleared RETRY_PENDING. Either it observes our republished
+        // flag, or the total order exposes its capacity epoch here. Leave a
+        // sticky token in that case so an opt-in parked notifier cannot strand
+        // accepted lane-local work.
+        if retry_remaining && shared.capacity_epoch.load(Ordering::SeqCst) != capacity_epoch {
+            thread::current().unpark();
         }
     }
 }
@@ -693,6 +759,10 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
             deferred.pop_front().or_else(|| shared.injector.pop())
         };
         if let Some(sink) = next_sink {
+            shared.capacity_epoch.fetch_add(1, Ordering::SeqCst);
+            if RETRY_PENDING.load(Ordering::SeqCst) {
+                shared.wake.notify();
+            }
             prefer_injector = !prefer_injector;
             loop {
                 if shared.stopping.load(Ordering::Acquire) {
@@ -726,6 +796,7 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
         }
         // A notifier-start failure still has a bounded, non-spinning fallback:
         // one designated worker retries registered lanes every millisecond.
+        let capacity_epoch = shared.capacity_epoch.load(Ordering::SeqCst);
         let retry_hint = RETRY_PENDING.swap(false, Ordering::AcqRel);
         let (retried, retry_remaining) = if retry_hint {
             retry_registered(shared)
@@ -733,17 +804,22 @@ fn worker_loop(shared: &Shared, notifier_fallback: bool) {
             (0, false)
         };
         if retry_remaining {
-            RETRY_PENDING.store(true, Ordering::Release);
+            RETRY_PENDING.store(true, Ordering::SeqCst);
         }
-        if retried != 0 || !shared.injector.is_empty() {
+        if retried != 0
+            || !shared.injector.is_empty()
+            || retry_remaining && shared.capacity_epoch.load(Ordering::SeqCst) != capacity_epoch
+        {
             continue;
         }
-        let timeout = if notifier_fallback && !shared.notifier_running.load(Ordering::Acquire) {
-            NOTIFIER_INTERVAL
+        if notifier_fallback
+            && !shared.notifier_running.load(Ordering::Acquire)
+            && shared.wake.polling_lanes.load(Ordering::Acquire) != 0
+        {
+            thread::park_timeout(NOTIFIER_INTERVAL);
         } else {
-            PARK_TIMEOUT
-        };
-        thread::park_timeout(timeout);
+            thread::park();
+        }
     }
 }
 
@@ -834,7 +910,31 @@ impl<T: Send + 'static> TaskSpawner<T> {
     }
 
     fn with_mode(run: impl Fn(T) -> Option<T> + Send + Sync + 'static, serialized: bool) -> Self {
+        Self::with_wake_mode(run, serialized, false)
+    }
+
+    /// Explicitly permit a scheduler wake syscall, retaining no allocation or
+    /// blocking locks on enqueue. When every live lane opts in, the notifier
+    /// parks indefinitely instead of polling an atomic epoch.
+    pub fn new_managed_waking(
+        run: impl Fn(T) -> Option<T> + Send + Sync + 'static,
+        serialized: bool,
+    ) -> Self {
+        Self::with_wake_mode(run, serialized, true)
+    }
+
+    fn with_wake_mode(
+        run: impl Fn(T) -> Option<T> + Send + Sync + 'static,
+        serialized: bool,
+        wake_on_schedule: bool,
+    ) -> Self {
+        let wake = wake_signal();
+        if !wake_on_schedule {
+            wake.polling_lanes.fetch_add(1, Ordering::AcqRel);
+        }
         let sink = Arc::new(Sink {
+            wake,
+            wake_on_schedule,
             queue: ArrayQueue::new(TASK_QUEUE_PREALLOC),
             coalesced: ArrayQueue::new(1),
             continuation: ArrayQueue::new(TASK_QUEUE_PREALLOC),
@@ -848,11 +948,13 @@ impl<T: Send + 'static> TaskSpawner<T> {
         });
         let erased = Arc::clone(&sink) as Arc<dyn Drain>;
         register_lane(&erased);
+        sink.wake.notify();
         Self { sink }
     }
 
     /// Enqueue a task, running it on the pool as soon as a worker is
-    /// free. Wait-free. Returns `Err(task)` if the inbound queue is full
+    /// free. Queue admission is wait-free; [`Self::new_managed_waking`] also
+    /// permits an OS wake. Returns `Err(task)` if the inbound queue is full
     /// (the audio thread decides what to do - drop, or coalesce via
     /// [`Self::spawn_coalescing`] - rather than block).
     ///
@@ -898,9 +1000,12 @@ impl<T: Send + 'static> TaskSpawner<T> {
             if !schedule(sink) {
                 self.sink.scheduled.store(false, Ordering::SeqCst);
                 self.sink.retry_requested.store(true, Ordering::Release);
-                RETRY_PENDING.store(true, Ordering::Release);
+                RETRY_PENDING.store(true, Ordering::SeqCst);
             }
             notify_scheduler();
+            if self.sink.wake_on_schedule {
+                self.sink.wake.notify();
+            }
         }
     }
 }
@@ -1345,6 +1450,114 @@ mod tests {
         // `sum` write before the read below, so the Relaxed sum is exact.
         latch.wait_for(10);
         assert_eq!(sum.load(Ordering::Relaxed), 55, "all ten tasks ran");
+    }
+
+    #[test]
+    fn explicitly_waking_lane_runs_after_idle_without_changing_default_policy() {
+        warm_pool();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waking = TaskSpawner::new_managed_waking(
+            move |value: u32| {
+                send.send(value).unwrap();
+                None
+            },
+            true,
+        );
+        assert!(waking.sink.wake_on_schedule);
+        for value in 0..16 {
+            waking.spawn_coalescing(value);
+            assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), value);
+        }
+        let ordinary = TaskSpawner::new(|_: u32| {});
+        assert!(!ordinary.sink.wake_on_schedule);
+    }
+
+    #[test]
+    #[ignore = "manual process-isolated idle wakeup audit"]
+    fn parked_pool_idle_audit() {
+        warm_pool();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waking = TaskSpawner::new_managed_waking(
+            move |value: u32| {
+                send.send(value).unwrap();
+                None
+            },
+            true,
+        );
+        for value in 0..4 {
+            waking.spawn_coalescing(value);
+            assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), value);
+        }
+        eprintln!("PARKED_POOL_READY {}", std::process::id());
+        thread::sleep(Duration::from_secs(3));
+        waking.spawn_coalescing(42);
+        assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap(), 42);
+    }
+
+    #[test]
+    #[ignore = "isolated registry/capacity race stress; run alone"]
+    fn parked_pool_retry_capacity_audit() {
+        struct Job {
+            retry: AtomicBool,
+            done: std::sync::mpsc::Sender<()>,
+        }
+        impl Drain for Job {
+            fn drain(&self) -> DrainOutcome {
+                self.done.send(()).unwrap();
+                DrainOutcome::Done
+            }
+            fn claim_retry(&self) -> bool {
+                self.retry.swap(false, Ordering::AcqRel)
+            }
+            fn retry_failed(&self) {
+                self.retry.store(true, Ordering::Release);
+            }
+        }
+        let shared = Arc::new(Shared {
+            wake: Arc::new(WakeSignal::default()),
+            capacity_epoch: AtomicUsize::new(0),
+            injector: ArrayQueue::new(2),
+            next_worker: AtomicUsize::new(0),
+            execution_state: AtomicUsize::new(0),
+            notifier_running: AtomicBool::new(true),
+            stopping: AtomicBool::new(false),
+        });
+        let owner = Arc::clone(&shared);
+        let worker = thread::spawn(move || worker_loop(&owner, false));
+        let workers = vec![worker.thread().clone()].into_boxed_slice();
+        shared.wake.workers.set(workers.clone()).ok().unwrap();
+        let owner = Arc::clone(&shared);
+        let notifier = thread::spawn(move || notifier_loop(&owner, &workers));
+        shared
+            .wake
+            .notifier
+            .set(notifier.thread().clone())
+            .ok()
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        for _ in 0..32 {
+            let jobs: Vec<Arc<dyn Drain>> = (0..512)
+                .map(|_| {
+                    Arc::new(Job {
+                        retry: AtomicBool::new(true),
+                        done: send.clone(),
+                    }) as Arc<dyn Drain>
+                })
+                .collect();
+            for job in &jobs {
+                register_lane(job);
+            }
+            RETRY_PENDING.store(true, Ordering::SeqCst);
+            shared.wake.notify();
+            for _ in &jobs {
+                receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        shared.stopping.store(true, Ordering::Release);
+        shared.wake.notify();
+        worker.thread().unpark();
+        worker.join().unwrap();
+        notifier.join().unwrap();
     }
 
     #[test]

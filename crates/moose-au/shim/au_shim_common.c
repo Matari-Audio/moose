@@ -8,6 +8,7 @@
  */
 
 #include "au_shim_types.h"
+#include "au_parameter_catalog.h"
 #include <stdio.h>
 
 // Global state shared between v2 and v3 shims.
@@ -19,6 +20,17 @@ __attribute__((visibility("default"))) const AuParamDescriptor *g_param_descript
 __attribute__((visibility("default"))) uint32_t g_num_params = 0;
 
 static int g_registered = 0;
+static MooseAuParameterCatalog g_parameter_catalog = {0};
+
+uint32_t moose_au_parameter_index(uint32_t id) {
+    return moose_au_catalog_index(&g_parameter_catalog, id);
+}
+uint32_t moose_au_parameter_clump(uint32_t index) {
+    return moose_au_catalog_clump(&g_parameter_catalog, index);
+}
+const char *moose_au_parameter_clump_name(uint32_t id) {
+    return moose_au_catalog_clump_name(&g_parameter_catalog, id);
+}
 
 /* `_v2` so a pre-2.0 Rust staticlib (which calls `moose_au_register`)
  * fails to link against a 2.x framework build instead of registering
@@ -30,6 +42,10 @@ void moose_au_register_v2(
     uint32_t num_params
 ) {
     if (g_registered) return;
+    if (!moose_au_catalog_build(&g_parameter_catalog, param_descriptors, num_params)) {
+        fprintf(stderr, "moose: AU parameter catalog allocation or ID validation failed\n");
+        return;
+    }
 
     g_descriptor = descriptor;
     g_callbacks = callbacks;
@@ -42,6 +58,13 @@ void moose_au_register_v2(
 __attribute__((constructor))
 static void au_shim_constructor(void) {
     moose_au_init();
+}
+
+/* Framework unload happens after its instances have closed. Release the
+ * process-shared index here rather than leaking it across factory reloads. */
+__attribute__((destructor))
+static void au_shim_destructor(void) {
+    moose_au_catalog_destroy(&g_parameter_catalog);
 }
 
 // Weak stubs for symbols the `export_au!` macro emits in the *consumer*

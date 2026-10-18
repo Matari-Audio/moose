@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/au_v2_shim.c");
     println!("cargo:rerun-if-changed=shim/au_v2_view.m");
     println!("cargo:rerun-if-changed=shim/au_shim_common.c");
+    println!("cargo:rerun-if-changed=shim/au_parameter_catalog.h");
     println!("cargo:rerun-if-env-changed=MOOSE_AU_PLUGIN_ID");
     let shim_include = moose_shim_types::include_dir();
     println!(

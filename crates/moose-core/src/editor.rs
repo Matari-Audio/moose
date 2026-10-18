@@ -103,6 +103,27 @@ pub trait Editor: Send {
     /// Create the GUI as a child of the host-provided parent window.
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext);
 
+    /// Whether this editor implements Linux CLAP floating Wayland windows.
+    /// Embedded Wayland surfaces are not part of the CLAP GUI contract.
+    fn supports_floating_wayland(&self) -> bool {
+        false
+    }
+
+    /// Open a floating Wayland toplevel. Called by CLAP show, after create.
+    /// `closed` signals a compositor close; it must never call host GUI APIs
+    /// directly. The wrapper marshals it to the main thread.
+    fn open_floating_wayland(
+        &mut self,
+        _context: PluginContext,
+        _title: &str,
+        _closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        false
+    }
+
+    /// Update the native floating title, when supported.
+    fn set_floating_title(&mut self, _title: &str) {}
+
     /// Destroy the GUI.
     fn close(&mut self);
 
@@ -276,6 +297,22 @@ impl Editor for TaskBoundEditor {
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
         self.editor
             .open(parent, context.with_tasks(self.tasks.clone()));
+    }
+
+    fn supports_floating_wayland(&self) -> bool {
+        self.editor.supports_floating_wayland()
+    }
+    fn open_floating_wayland(
+        &mut self,
+        context: PluginContext,
+        title: &str,
+        closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        self.editor
+            .open_floating_wayland(context.with_tasks(self.tasks.clone()), title, closed)
+    }
+    fn set_floating_title(&mut self, title: &str) {
+        self.editor.set_floating_title(title);
     }
 
     fn close(&mut self) {
@@ -495,6 +532,21 @@ impl EditorBridge for ClosureBridge {
     }
 }
 
+/// Which editor notifications the format already makes safe from any thread.
+/// Reads and `set_state` are plugin-local operations; these flags describe only
+/// automation gestures and host window resize requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorNotificationDelivery {
+    /// The editor must marshal gestures and resize requests to its opening thread.
+    #[default]
+    HostThread,
+    /// Gestures already use the format's thread-safe queue (CLAP). Resize still
+    /// requires the host thread. Do not put another queue in front of gestures.
+    QueuedEdits,
+    /// Both gestures and resize are thread-safe (standalone).
+    QueuedAll,
+}
+
 /// Context passed to [`Editor::open`]. Carries:
 ///
 /// - An `Arc<dyn EditorBridge>` - the host-plugin protocol surface
@@ -514,6 +566,7 @@ impl EditorBridge for ClosureBridge {
 /// freely.
 pub struct PluginContext<P: ?Sized = dyn Params> {
     bridge: Arc<dyn EditorBridge>,
+    notification_delivery: EditorNotificationDelivery,
     /// Background-task spawner bundle (one lane per declared task type),
     /// stamped by the format wrapper from `PluginExport::task_spawner`
     /// when the plugin wired `tasks:`. Lets the editor schedule work via
@@ -526,6 +579,7 @@ impl<P: ?Sized> Clone for PluginContext<P> {
     fn clone(&self) -> Self {
         Self {
             bridge: Arc::clone(&self.bridge),
+            notification_delivery: self.notification_delivery,
             tasks: self.tasks.clone(),
             params: Arc::clone(&self.params),
         }
@@ -539,9 +593,31 @@ impl<P: ?Sized> PluginContext<P> {
     pub fn new(bridge: Arc<dyn EditorBridge>, params: Arc<P>) -> Self {
         Self {
             bridge,
+            notification_delivery: EditorNotificationDelivery::HostThread,
             tasks: None,
             params,
         }
+    }
+
+    /// Declare which notifications the format already queues safely. This is
+    /// metadata only: it does not change when or how any bridge method runs.
+    #[must_use]
+    pub fn with_notification_delivery(mut self, delivery: EditorNotificationDelivery) -> Self {
+        self.notification_delivery = delivery;
+        self
+    }
+
+    #[must_use]
+    pub const fn notification_delivery(&self) -> EditorNotificationDelivery {
+        self.notification_delivery
+    }
+
+    /// Install an editor-side bridge adapter without losing task lanes, the
+    /// typed parameter store, or the format's delivery capabilities.
+    #[must_use]
+    pub fn with_bridge(mut self, bridge: Arc<dyn EditorBridge>) -> Self {
+        self.bridge = bridge;
+        self
     }
 
     /// Attach the background-task spawner (from
@@ -584,6 +660,7 @@ impl<P: ?Sized> PluginContext<P> {
     pub fn with_params<Q: ?Sized>(&self, params: Arc<Q>) -> PluginContext<Q> {
         PluginContext {
             bridge: Arc::clone(&self.bridge),
+            notification_delivery: self.notification_delivery,
             tasks: self.tasks.clone(),
             params,
         }
@@ -656,6 +733,7 @@ impl PluginContext<dyn Params> {
     pub fn from_closures(bridge: ClosureBridge, params: Arc<dyn Params>) -> Self {
         Self {
             bridge: Arc::new(bridge),
+            notification_delivery: EditorNotificationDelivery::HostThread,
             tasks: None,
             params,
         }
@@ -669,6 +747,7 @@ impl<P: Params + 'static> PluginContext<P> {
     pub fn dyn_erase(self) -> PluginContext<dyn Params> {
         PluginContext {
             bridge: self.bridge,
+            notification_delivery: self.notification_delivery,
             tasks: self.tasks,
             params: self.params as Arc<dyn Params>,
         }
@@ -1086,5 +1165,54 @@ mod fit_tests {
             assert!((i64::from(rw) * 9 - i64::from(rh) * 16).abs() <= 16);
             assert!(rw >= 320 && rh >= 180);
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_delivery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn adapting_context_preserves_delivery_params_and_tasks_without_dispatching() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let set_calls = Arc::clone(&calls);
+        let bridge: Arc<dyn EditorBridge> = Arc::new(ClosureBridge {
+            begin_edit: Box::new(|_| {}),
+            set_param: Box::new(move |_, _| {
+                set_calls.fetch_add(1, Ordering::Relaxed);
+            }),
+            end_edit: Box::new(|_| {}),
+            request_resize: Box::new(|_, _| true),
+            get_param: Box::new(|_| 0.0),
+            get_param_plain: Box::new(|_| 0.0),
+            format_param: Box::new(|_| String::new()),
+            get_meter: Box::new(|_| 0.0),
+            get_state: Box::new(Vec::new),
+            set_state: Box::new(|_| {}),
+            transport: Box::new(|| None),
+        });
+        let tasks = TaskSpawner::<u8>::new(|_| {});
+        let params = Arc::new(());
+        let context = PluginContext::new(Arc::clone(&bridge), Arc::clone(&params))
+            .with_tasks(Some(AnyTaskSpawner::new(&tasks)))
+            .with_notification_delivery(EditorNotificationDelivery::QueuedEdits);
+        let adapted = context
+            .clone()
+            .with_params(Arc::clone(&params))
+            .with_bridge(bridge);
+        assert_eq!(
+            adapted.notification_delivery(),
+            EditorNotificationDelivery::QueuedEdits
+        );
+        assert!(Arc::ptr_eq(adapted.params(), &params));
+        assert!(adapted.tasks::<u8>().is_some());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        adapted.set_param(1_u32, 0.5);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "capabilities add no queue or latency"
+        );
     }
 }

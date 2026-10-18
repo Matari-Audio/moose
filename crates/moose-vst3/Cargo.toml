@@ -21,3 +21,6 @@ cc = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+moose-derive = { workspace = true }

@@ -1,4 +1,4 @@
-﻿use std::ffi::c_void;
+use std::ffi::c_void;
 use std::num::NonZeroIsize;
 use std::ptr::NonNull;
 use windows_sys::Win32::Foundation::HINSTANCE;

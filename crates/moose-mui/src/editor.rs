@@ -23,6 +23,8 @@ pub(crate) struct Session<P: Params> {
     /// The size `build` was designed at, fitted to the window; `None` is
     /// [`MuiEditor::fixed_zoom`].
     design: Option<Size>,
+    #[cfg(target_os = "linux")]
+    native_requests: std::sync::Weak<Requests>,
 }
 
 impl<P: Params> View for Session<P> {
@@ -41,6 +43,13 @@ impl<P: Params> View for Session<P> {
         })
     }
     fn request_resize(&mut self, width: u32, height: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(requests) = self.native_requests.upgrade()
+            && requests.wayland_open()
+        {
+            requests.resize(width, height);
+            return true;
+        }
         self.bridge
             .context()
             .is_some_and(|c| c.request_resize(width, height))
@@ -89,6 +98,8 @@ pub struct MuiEditor<P: Params> {
     min: Option<(u32, u32)>,
     pub(crate) scale: HostScale,
     window: Option<Handle>,
+    #[cfg(target_os = "linux")]
+    floating: Option<window::wayland::FloatingWindow>,
 }
 
 /// Whole logical points, as the host's window API takes them.
@@ -129,6 +140,8 @@ impl<P: Params> MuiEditor<P> {
             build: Box::new(build),
             changed: None,
             design: Some(size),
+            #[cfg(target_os = "linux")]
+            native_requests: std::sync::Weak::new(),
         };
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
@@ -138,6 +151,8 @@ impl<P: Params> MuiEditor<P> {
             min: None,
             scale: HostScale::default(),
             window: None,
+            #[cfg(target_os = "linux")]
+            floating: None,
         }
     }
 
@@ -165,6 +180,13 @@ impl<P: Params> MuiEditor<P> {
     }
 
     fn close_window(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.floating.is_some() {
+                self.size = self.size();
+            }
+            drop(self.floating.take());
+        }
         if let Some(Handle(window)) = self.window.take() {
             #[cfg(target_os = "linux")]
             {
@@ -178,7 +200,25 @@ impl<P: Params> MuiEditor<P> {
 
 impl<P: Params> Editor for MuiEditor<P> {
     fn size(&self) -> (u32, u32) {
-        self.size
+        #[cfg(target_os = "linux")]
+        if let Some(window) = &self.floating {
+            let ((w, h), scale) = window.size();
+            return points(Size::new(f64::from(w) / scale, f64::from(h) / scale));
+        }
+        // The open window, not the last `set_size`: on X11 the window follows
+        // its parent without the host calling `set_size`, and a stale answer
+        // here makes the host snap the editor back to the old size.
+        match self
+            .window
+            .as_ref()
+            .filter(|w| self.min.is_some() && w.0.is_open())
+        {
+            Some(open) => {
+                let l = open.0.size().logical;
+                points(Size::new(l.width, l.height))
+            }
+            None => self.size,
+        }
     }
 
     fn can_resize(&self) -> bool {
@@ -208,6 +248,52 @@ impl<P: Params> Editor for MuiEditor<P> {
             Arc::clone(&self.requests),
         )
         .map(Handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supports_floating_wayland(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_floating_wayland(
+        &mut self,
+        context: PluginContext,
+        title: &str,
+        closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        self.close();
+        lock(&self.shared)
+            .view
+            .bridge
+            .attach(context.with_params(Arc::clone(&self.params)));
+        self.requests = Arc::default();
+        lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
+        match window::wayland::open(
+            title,
+            self.size,
+            self.min_size(),
+            Arc::clone(&self.shared),
+            Arc::clone(&self.requests),
+            closed,
+        ) {
+            Ok(window) => {
+                self.floating = Some(window);
+                true
+            }
+            Err(error) => {
+                lock(&self.shared).view.log(&format!("Wayland: {error}"));
+                self.close();
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_floating_title(&mut self, title: &str) {
+        if let Some(window) = &self.floating {
+            window.title(title.into());
+        }
     }
 
     fn close(&mut self) {
@@ -240,6 +326,10 @@ impl<P: Params> Editor for MuiEditor<P> {
     }
 
     fn window_scale(&self) -> Option<f64> {
+        #[cfg(target_os = "linux")]
+        if let Some(window) = &self.floating {
+            return Some(window.size().1);
+        }
         let open = self.window.as_ref().filter(|w| w.0.is_open())?;
         (!cfg!(target_os = "macos")).then(|| open.0.size().scale_factor)
     }

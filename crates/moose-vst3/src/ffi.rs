@@ -229,6 +229,15 @@ pub struct Vst3Callbacks {
     /// `migrate_state` translated it), `0` when the load failed -
     /// the shim's `setState` forwards that as `kResultFalse`.
     pub state_load: unsafe extern "C" fn(ctx: *mut c_void, data: *const u8, len: u32) -> i32,
+    /// Incremental host IBStream reader; no C++ staging copy.
+    pub state_load_stream: unsafe extern "C" fn(
+        ctx: *mut c_void, stream: *mut c_void,
+        read: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i64,
+    ) -> i32,
+    pub state_save_stream: unsafe extern "C" fn(
+        ctx: *mut c_void, stream: *mut c_void,
+        write: unsafe extern "C" fn(*mut c_void, *const u8, u32) -> i64,
+    ) -> i32,
     pub state_free: unsafe extern "C" fn(data: *mut u8, len: u32),
     // Latency + tail
     pub get_latency: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
@@ -340,6 +349,13 @@ pub struct Vst3Callbacks {
         unsafe extern "C" fn(ctx: *mut c_void, id: u32, name: *mut c_char, capacity: u32) -> i32,
     /// `Params::parameter_presentation_revision`.
     pub param_presentation_revision: unsafe extern "C" fn(ctx: *mut c_void) -> u64,
+    pub wants_persist_notifications: unsafe extern "C" fn(*mut c_void) -> bool,
+    pub set_persist_waker: unsafe extern "C" fn(
+        *mut c_void,
+        Option<unsafe extern "C" fn(*mut c_void)>,
+        *mut c_void,
+    ),
+    pub take_persist_change: unsafe extern "C" fn(*mut c_void, *mut u32, *mut f64) -> bool,
 }
 
 unsafe extern "C" {

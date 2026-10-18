@@ -32,7 +32,7 @@ use moose_core::editor::Editor;
 // AppKit/UiKit variants don't exist on Linux/Windows. Importing them
 // from a non-apple module would also trigger the unused-import lint
 // there.
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
+use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use moose_core::editor::{ClosureBridge, PluginContext, RawWindowHandle, SendPtr};
@@ -95,7 +95,7 @@ use ffi::{
 /// overflow we want most-recent-wins (`force_push`) so a rapid
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
-type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+type StateLoadQueue = state::StateLoadQueue;
 
 /// One `SysEx` message handed from the host thread to the audio thread.
 /// Recycled through a free-list (see [`SysExQueue`]) so the audio thread
@@ -284,7 +284,13 @@ impl Drop for ParamNotifier {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod persist_notify;
+
 struct AuInstance<P: PluginExport> {
+    // First field: close worker requests before any native/editor teardown.
+    #[cfg(target_os = "macos")]
+    persist_dispatch: Option<persist_notify::Dispatcher<P>>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -331,7 +337,7 @@ struct AuInstance<P: PluginExport> {
     #[cfg(target_os = "macos")]
     param_notify: Option<ParamNotifier>,
     /// Cached param-info table for the chunker's split predicate.
-    param_infos: Vec<ParamInfo>,
+    param_infos: Arc<moose_params::ParamCatalog>,
     /// `min_subblock_samples` from `moose.toml`'s `[automation]`.
     min_subblock_samples: u32,
     input_bus_count: usize,
@@ -485,11 +491,13 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 .first()
                 .and_then(|layout| layout.inputs.get(1))
                 .map_or(0, |bus| bus.channels.channel_count());
-            let param_infos = plugin.params().param_infos();
+            let param_infos = plugin.params().param_catalog();
             let params_arc = plugin.params_arc();
             let latency_cache = AtomicU32::new(plugin.latency());
             let tail_cache = AtomicU32::new(plugin.tail());
             let instance = Box::new(AuInstance::<P> {
+                #[cfg(target_os = "macos")]
+                persist_dispatch: None,
                 params_arc,
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 meter_store: plugin.meter_store(),
@@ -560,6 +568,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
                 let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
+                (*raw).persist_dispatch = persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
                 (*raw).param_notify = ParamNotifier::spawn(ctx);
             }
             raw.cast::<std::ffi::c_void>()
@@ -1306,12 +1315,13 @@ unsafe fn cb_process_impl<P: PluginExport>(
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked_with_bus_routing(
+        process_chunked_with_bus_routing_and_catalog(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
             bus_routing,
+            &inst.param_infos,
         );
         let _ = audio_buffer;
         // Narrow rendered f64 output back to host f32 when needed.
@@ -1512,19 +1522,29 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // the AU shim frees with libc `free`. The Rust global allocator
         // must not appear on either side; mixing allocators is UB.
         let extra = save_extra(&inst.snapshot);
-        let persist = inst.params_arc.serialize_persist();
-        let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
-
-        let len = blob.len();
-        let ptr = malloc(len).cast::<u8>();
-        if ptr.is_null() {
-            // malloc failed - `*out_data` is already null and
-            // `*out_len` already 0 from the pre-zero above.
-            return;
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
+        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
+        let Ok(host_len) = u32::try_from(len) else { return; };
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) { if !self.0.is_null() { unsafe { free(self.0.cast()); } } }
         }
-        std::ptr::copy_nonoverlapping(blob.as_ptr(), ptr, len);
-        *out_data = ptr;
-        *out_len = len_u32(len);
+        let mut buffer = Buffer(malloc(len).cast::<u8>());
+        if buffer.0.is_null() { return; }
+        let mut offset = 0;
+        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| {
+                if bytes.len() > len - offset { return -1; }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
+                offset += bytes.len(); bytes.len() as i64
+            });
+        if !ok { return; }
+        *out_data = buffer.0; *out_len = host_len;
+        buffer.0 = std::ptr::null_mut();
     });
 }
 
@@ -1532,30 +1552,30 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     data: *const u8,
     len: u32,
-) {
-    run_extern_callback_with::<P, ()>("au", "load_state", (), || unsafe {
+) -> i32 {
+    run_extern_callback_with::<P, i32>("au", "load_state", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         // `slice::from_raw_parts(null, n)` for `n > 0` is UB. Treat
         // `(null, *)` and `(_, 0)` the same as "host gave us nothing".
         if data.is_null() || len == 0 {
-            return;
+            return 0;
         }
-        let blob = slice::from_raw_parts(data, len as usize);
+        let mut blob = slice::from_raw_parts(data, len as usize);
         // Not this plugin's envelope? Offer the bytes to the plugin's
         // `migrate_state` hook (legacy sessions from a pre-moose
         // build that stored foreign bytes under moose's key, or a
         // renamed plugin's envelope).
-        if let Some(deserialized) = state::parse_or_migrate::<P>(
-            blob,
+        if let Some(deserialized) = state::read_and_apply_params::<P>(
+            |dst| std::io::Read::read(&mut blob, dst).map_or(-1, |n| n as i64),
             inst.plugin_id_hash,
             state::PluginFormat::Au,
-            Some("truce_state"),
+            Some("truce_state"), &*inst.params_arc, len as usize,
         ) {
             // Apply params synchronously on the host thread (atomic-safe)
             // so host queries that read parameter values right after
             // `setFullState:` see the restored values without first
             // running a render block.
-            state::apply_params(&*inst.params_arc, &deserialized);
+
             // Hand the deserialized state to the audio thread for
             // application. `force_push` overwrites any older pending
             // blob - see the `pending_state` field comment for why
@@ -1564,8 +1584,9 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             if let Some(ref mut editor) = inst.gui.enter().editor {
                 editor.state_changed();
             }
-        }
-    });
+            1
+        } else { 0 }
+    })
 }
 
 unsafe extern "C" fn cb_legacy_state_key_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
@@ -3171,6 +3192,58 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
     resolve_name_override(info.au_name, info.name)
 }
 
+/// Construct the same callback table used by AUv2 and AUv3 registration.
+/// Allows qualification of the Rust AU bridge without Apple frameworks;
+/// native property-list marshalling still requires a macOS/iOS host.
+pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
+    AuCallbacks {
+        abi_version: ffi::MOOSE_AU_ABI_VERSION,
+        create: cb_create::<P>,
+        destroy: cb_destroy::<P>,
+        reset: cb_reset::<P>,
+        process: cb_process::<P>,
+        param_count: cb_param_count::<P>,
+        param_get_value: cb_param_get_value::<P>,
+        param_set_value: cb_param_set_value::<P>,
+        param_format_value: cb_param_format_value::<P>,
+        state_save: cb_state_save::<P>,
+        state_load: cb_state_load::<P>,
+        state_free: cb_state_free,
+        output_event_count: cb_output_event_count::<P>,
+        output_event_at: cb_output_event_at::<P>,
+        output_sysex_count: cb_output_sysex_count::<P>,
+        output_sysex_at: cb_output_sysex_at::<P>,
+        output_ump_count: cb_output_ump_count::<P>,
+        output_ump_at: cb_output_ump_at::<P>,
+        gui_has_editor: cb_gui_has_editor::<P>,
+        gui_get_size: cb_gui_get_size::<P>,
+        gui_open: cb_gui_open::<P>,
+        gui_close: cb_gui_close::<P>,
+        gui_can_resize: cb_gui_can_resize::<P>,
+        gui_set_size: cb_gui_set_size::<P>,
+        factory_preset_count: cb_factory_preset_count::<P>,
+        factory_preset_name: cb_factory_preset_name::<P>,
+        factory_preset_load: cb_factory_preset_load::<P>,
+        push_sysex_input: cb_au_push_sysex_input::<P>,
+        legacy_state_key_count: cb_legacy_state_key_count::<P>,
+        legacy_state_key_at: cb_legacy_state_key_at::<P>,
+        state_load_foreign: cb_state_load_foreign::<P>,
+        latency_samples: cb_latency_samples::<P>,
+        tail_samples: cb_tail_samples::<P>,
+        set_render_mode: cb_set_render_mode::<P>,
+        param_parse_value: cb_param_parse_value::<P>,
+        process_native: cb_process_native::<P>,
+        begin_output_events: cb_begin_output_events::<P>,
+        next_output_event: cb_next_output_event::<P>,
+        push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
+        finish_output_events: cb_finish_output_events::<P>,
+        begin_output_events_v9: cb_begin_output_events_v9::<P>,
+        commit_output_params: cb_commit_output_params::<P>,
+        begin_output_events_v10: cb_begin_output_events_v10::<P>,
+        process_native_v11: cb_process_native_v11::<P>,
+    }
+}
+
 pub fn register_au<P: PluginExport>() {
     // Called from the export macro's `extern "C" fn init()` static
     // initializer. Catch any panic so it doesn't cross the FFI
@@ -3484,52 +3557,7 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         sidechain_in_channels: sidechain_in,
     }));
 
-    let callbacks = Box::leak(Box::new(AuCallbacks {
-        abi_version: ffi::MOOSE_AU_ABI_VERSION,
-        create: cb_create::<P>,
-        destroy: cb_destroy::<P>,
-        reset: cb_reset::<P>,
-        process: cb_process::<P>,
-        param_count: cb_param_count::<P>,
-        param_get_value: cb_param_get_value::<P>,
-        param_set_value: cb_param_set_value::<P>,
-        param_format_value: cb_param_format_value::<P>,
-        state_save: cb_state_save::<P>,
-        state_load: cb_state_load::<P>,
-        state_free: cb_state_free,
-        output_event_count: cb_output_event_count::<P>,
-        output_event_at: cb_output_event_at::<P>,
-        output_sysex_count: cb_output_sysex_count::<P>,
-        output_sysex_at: cb_output_sysex_at::<P>,
-        output_ump_count: cb_output_ump_count::<P>,
-        output_ump_at: cb_output_ump_at::<P>,
-        gui_has_editor: cb_gui_has_editor::<P>,
-        gui_get_size: cb_gui_get_size::<P>,
-        gui_open: cb_gui_open::<P>,
-        gui_close: cb_gui_close::<P>,
-        gui_can_resize: cb_gui_can_resize::<P>,
-        gui_set_size: cb_gui_set_size::<P>,
-        factory_preset_count: cb_factory_preset_count::<P>,
-        factory_preset_name: cb_factory_preset_name::<P>,
-        factory_preset_load: cb_factory_preset_load::<P>,
-        push_sysex_input: cb_au_push_sysex_input::<P>,
-        legacy_state_key_count: cb_legacy_state_key_count::<P>,
-        legacy_state_key_at: cb_legacy_state_key_at::<P>,
-        state_load_foreign: cb_state_load_foreign::<P>,
-        latency_samples: cb_latency_samples::<P>,
-        tail_samples: cb_tail_samples::<P>,
-        set_render_mode: cb_set_render_mode::<P>,
-        param_parse_value: cb_param_parse_value::<P>,
-        process_native: cb_process_native::<P>,
-        begin_output_events: cb_begin_output_events::<P>,
-        next_output_event: cb_next_output_event::<P>,
-        push_sysex_input_native: cb_au_push_sysex_input_native::<P>,
-        finish_output_events: cb_finish_output_events::<P>,
-        begin_output_events_v9: cb_begin_output_events_v9::<P>,
-        commit_output_params: cb_commit_output_params::<P>,
-        begin_output_events_v10: cb_begin_output_events_v10::<P>,
-        process_native_v11: cb_process_native_v11::<P>,
-    }));
+    let callbacks = Box::leak(Box::new(callbacks::<P>()));
 
     let param_descs = param_descs.leak();
 
@@ -3988,5 +4016,40 @@ mod tests {
         // Unparseable components fall back per position (major -> 1).
         assert_eq!(au_version_u32(""), 0x0001_0000);
         assert_eq!(au_version_u32("1.2.3-beta"), 0x0001_0200);
+    }
+}
+
+#[cfg(test)]
+extern crate self as moose;
+#[cfg(test)]
+use moose_core as core;
+#[cfg(test)]
+use moose_params as params;
+#[cfg(test)]
+#[path = "../../../test-support/host_value_fixture.rs"]
+mod host_value_fixture;
+#[cfg(test)]
+#[path = "../../../test-support/large_state_fixture.rs"]
+mod large_state_fixture;
+#[cfg(test)]
+mod large_state_tests {
+    use super::*;
+    use super::large_state_fixture::{LargePlugin,payload};
+    type Large=LargePlugin<{64*1024*1024}>;
+    #[test]
+    fn large_host_state_roundtrips_through_au_callbacks() {
+        unsafe {
+            let ctx=cb_create::<Large>(); assert!(!ctx.is_null());
+            let inst=&*ctx.cast::<AuInstance<Large>>();
+            *inst.params_arc.payload.lock().unwrap()=payload();
+            let mut ptr=std::ptr::null_mut(); let mut len=0;
+            cb_state_save::<Large>(ctx,&raw mut ptr,&raw mut len);
+            assert!(len>32*1024*1024);
+            inst.params_arc.payload.lock().unwrap().clear();
+            assert_eq!(cb_state_load::<Large>(ctx,ptr,len),1);
+            assert_eq!(*inst.params_arc.payload.lock().unwrap(),payload());
+            assert_eq!(cb_state_load::<Large>(ctx,ptr,len-1),0);
+            cb_state_free(ptr,len); cb_destroy::<Large>(ctx);
+        }
     }
 }

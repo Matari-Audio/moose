@@ -158,3 +158,5 @@ mod safe_filename_tests {
         assert_eq!(safe_filename("///"), "");
     }
 }
+
+pub mod state_stream;

@@ -4,6 +4,10 @@ Notable changes per release.
 
 ## Unreleased
 
+- CLAP GUI drags notify the host through parameter events; rescan values only when the queue or host refuses an edit. Test the real editor bridge together with instance-local edit epochs.
+
+- Add `Params::parameter_edit_epoch`, shared across each derived parameter tree, so automation in another plugin instance does not invalidate local parameter caches. Keep legacy global and custom-state edit counters available.
+
 - Preserve distinct same-name object files when deduplicating macOS bundle archives (Truce #224).
 - Feed declared audio inputs to Analyzer/Tool plugins in the offline driver and standalone host, independent of category (Truce #223).
 - Track Truce issues, PRs and main commits with a daily upstream review report.

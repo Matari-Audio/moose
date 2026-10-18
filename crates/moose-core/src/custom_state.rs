@@ -150,6 +150,40 @@ pub trait PersistField {
     /// Read a value from `cursor` and store it in place. A short or
     /// malformed read leaves the current value untouched.
     fn persist_read(&self, cursor: &mut StateCursor);
+
+    /// Optional background completion signal, forwarded by Params derive over
+    /// the same persist/nested inventory as the serializer. Store only Weak.
+    fn set_persist_change_signal(
+        &self,
+        _signal: std::sync::Weak<moose_params::PersistChangeSignal>,
+    ) {
+    }
+
+    /// Freeze this field for write-side streaming. Large fields should capture
+    /// immutable payload handles and controls here, rather than their encoded
+    /// bytes. The default preserves the field's existing serializer.
+    ///
+    /// # Errors
+    /// A custom field may reject an unavailable or unrepresentable document.
+    fn prepare_persist_write(
+        &self,
+    ) -> std::io::Result<Box<dyn moose_params::PreparedPersistWrite>> {
+        let mut bytes = Vec::new();
+        self.persist_write(&mut bytes);
+        Ok(Box::new(bytes))
+    }
+
+    /// Optional cheap content identity for dirty detection. Compute expensive
+    /// payload digests on the field's publishing worker, rather than in this
+    /// accessor. Keep the identity stable on no-op mutations; include all
+    /// persisted controls and exact float bits, excluding derived caches.
+    ///
+    /// Return `Some` consistently when opting in: switching between cached and
+    /// serialized representations could otherwise look like a content change.
+    /// The default leaves existing fields on the ordinary serialization path.
+    fn persist_fingerprint(&self) -> Option<moose_params::PersistFingerprint> {
+        None
+    }
 }
 
 impl<T: StateField> PersistField for std::sync::RwLock<T> {

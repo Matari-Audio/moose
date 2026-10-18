@@ -1134,4 +1134,5 @@ where
         params_for_ctx,
     )
     .with_tasks(task_spawner)
+    .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedAll)
 }

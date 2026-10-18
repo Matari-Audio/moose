@@ -662,7 +662,7 @@ persist = "cGF0Y2g="
         let second = read_presets_dir(&dir, false, None).unwrap();
         assert_eq!(second[0].meta.uuid, stamped);
         assert_eq!(second[0].meta.name, "Init");
-        assert!(second[0].persist.is_empty());
+        assert_eq!(second[0].persist, []);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -34,6 +34,7 @@ moose-shim-types = { workspace = true }
 # in `lib.rs` - the runtime AU shim talks to the header through C,
 # not through this Rust string view.
 [dev-dependencies]
+moose-derive = { workspace = true }
 moose-shim-types = { workspace = true }
 
 [lints]

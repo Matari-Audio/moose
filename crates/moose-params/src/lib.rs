@@ -1,20 +1,26 @@
 #![forbid(unsafe_code)]
 
+mod catalog;
 mod info;
 mod param_text;
+mod persist_write;
+mod projection;
 mod range;
 pub mod sample;
 mod smooth;
 mod types;
 
+pub use catalog::ParamCatalog;
 pub use info::{MidiSource, ParamFlags, ParamInfo, ParamUnit, ParamValueKind, map_source_to_param};
 pub use param_text::parse_formatted_value;
+pub use persist_write::{KeyedPersistWrite, PreparedPersistWrite, write_prepared_persist};
+pub use projection::{ParamProjection, ProjectedValue, append_projected_infos};
 pub use range::ParamRange;
 pub use sample::{Float, Sample};
 pub use smooth::{Smoother, SmoothingStyle};
 pub use types::{
     BoolParam, EnumParam, FloatParam, FloatParamReadF32, FloatParamReadF64, IntParam, MeterSlot,
-    ParamEnum, bump_edit_epoch, edit_epoch,
+    ParamEnum, bump_edit_epoch, custom_edit_epoch, edit_epoch,
 };
 
 /// Largest host-visible parameter ID. The signed-positive 31-bit
@@ -173,6 +179,67 @@ impl Default for ParameterPresentation {
     }
 }
 
+/// Host-thread commit of a fully read and validated persistence document.
+/// Preparation must not mutate plugin state. Large fields may be decoded into
+/// their final immutable representation instead of a serialized staging buffer.
+pub type PreparedPersist<P> = Box<dyn FnOnce(&P, &[(u32, f64)], &[u8]) + Send>;
+
+/// A non-realtime completion wake. The wrapper closes this gate before
+/// releasing host handles; workers retain only Weak handles to it. The wake
+/// must schedule a host-thread callback, never synchronously run the drain.
+pub struct PersistChangeSignal {
+    wake: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+impl PersistChangeSignal {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            wake: std::sync::Mutex::new(Some(Box::new(wake))),
+        }
+    }
+    /// Background workers only. Not audio safe (may lock and wake the host).
+    pub fn notify(&self) {
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(wake) = wake.as_ref() {
+            wake();
+        }
+    }
+    /// Waits for an in-flight request, then permanently disables host access.
+    pub fn close(&self) {
+        self.wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// A compact identity prepared by the owner of a persisted field.
+///
+/// `byte_len` describes the canonical input represented by `digest`, not a host
+/// stream size limit. Producers must include every persisted value, preserve
+/// float bits, and keep the identity stable for unchanged content. Immutable
+/// payload owners can cache a 256-bit digest when preparing their data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistFingerprint {
+    pub byte_len: u64,
+    pub digest: [u8; 32],
+}
+
+/// Visits a derived persistence tree without constructing its complete blob.
+///
+/// Each field is bracketed by `begin_field`/`end_field`; nested parameter stores
+/// recurse inside their own bracket. A leaf supplies either its cached identity
+/// or its ordinary serialized bytes. Consumers own their hashing policy and
+/// must frame names and lengths to distinguish nested/adjacent fields.
+pub trait PersistFingerprintVisitor {
+    fn begin_field(&mut self, key: &str);
+    fn end_field(&mut self);
+    fn fingerprint(&mut self, value: PersistFingerprint);
+    fn serialized(&mut self, bytes: &[u8]);
+}
+
 /// Trait implemented by #[derive(Params)] on a struct.
 /// Format wrappers use this to enumerate, read, and write parameters.
 ///
@@ -183,7 +250,23 @@ impl Default for ParameterPresentation {
 /// rather than expecting one on the trait - `#[derive(Params)]` emits
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
+
 pub trait Params: __private::Sealed + Send + Sync + 'static {
+    /// Optional incremental persistence preparation. Return `None` without
+    /// reading to keep the ordinary buffered path. `Some(Err)` rejects before
+    /// any parameter changes; `Some(Ok)` must consume exactly `len` bytes and
+    /// return small validation bytes plus a host-thread commit. The wrapper
+    /// validates framing, EOF and `validate_persist` before invoking the commit.
+    fn prepare_persist_stream(
+        _read: &mut dyn std::io::Read,
+        _len: usize,
+    ) -> Option<std::io::Result<(Vec<u8>, PreparedPersist<Self>)>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Runtime name / group / visibility / availability for `id`, read on the
     /// host main thread. `None` keeps the static [`ParamInfo`] label.
     /// Derive: `#[params(presentation = "method")]`.
@@ -192,14 +275,44 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     }
 
     /// Bump whenever any [`Self::parameter_presentation`] result changes;
-    /// wrappers poll it and ask the host to rescan parameters.
+    /// wrappers read it on the host main thread and ask the host to rescan.
+    /// It may refresh derived metadata; it is never an audio-thread poll.
     /// Derive: `#[params(presentation_revision = "method")]`.
     fn parameter_presentation_revision(&self) -> u64 {
         0
     }
 
+    /// Whether a write to this ID can change another parameter's name, group
+    /// or visibility. Called only for changed-event IDs, including on audio
+    /// threads: do not allocate, lock, or rebuild presentation here. Wrappers
+    /// coalesce a main-thread callback; the revision getter may then refresh
+    /// derived metadata off audio. Ordinary numeric IDs should return false.
+    /// Derive: `#[params(presentation_change = "method")]`.
+    fn parameter_affects_presentation(&self, _id: u32) -> bool {
+        false
+    }
+
+    /// Stored parameter changes in this instance, including nested groups.
+    /// Custom-state publishers remain separate; use their own generations or
+    /// `custom_edit_epoch`. Changed setters perform only bounded atomic work.
+    fn parameter_edit_epoch(&self) -> u64 {
+        edit_epoch()
+    }
+
+    /// Attach the counter of a containing parameter tree during construction.
+    #[doc(hidden)]
+    fn set_edit_epoch(&mut self, _epoch: std::sync::Arc<std::sync::atomic::AtomicU64>) {}
+
     /// All parameter infos, in declaration order.
     fn param_infos(&self) -> Vec<ParamInfo>;
+
+    /// Cached immutable metadata for format adapters. The default builds the
+    /// instance's current table. Root projection stores use one process-shared
+    /// catalog because their complete ID list and ranges are immutable.
+    fn param_catalog(&self) -> std::sync::Arc<ParamCatalog> {
+        std::sync::Arc::new(ParamCatalog::new(self.param_infos()))
+    }
+
 
     /// Append parameter infos onto an existing buffer. Default impl
     /// delegates to [`Self::param_infos`] and `extend`s; the derive
@@ -294,10 +407,20 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// [`Self::set_normalized`].
     fn set_plain(&self, id: u32, value: f64);
 
-    /// Format a plain value to display string.
+    /// Format a value in the parameter's declared plain/storage range.
+    /// `#[params(value_format = "method")]` first calls an instance method
+    /// `fn(&self, id: u32, value: f64) -> Option<String>`. Returning `None`
+    /// keeps the generated field/nested formatter. This can give a fixed
+    /// automation slot its current target's musical display without changing
+    /// its range, stored values or automation transport.
     fn format_value(&self, id: u32, value: f64) -> Option<String>;
 
-    /// Parse a display string to plain value.
+    /// Parse display text into the parameter's declared plain/storage range.
+    /// `#[params(value_parse = "method")]` first calls an instance method
+    /// `fn(&self, id: u32, text: &str) -> Result<Option<f64>, ()>`.
+    /// `Ok(Some(value))` handles the input (non-finite values are rejected),
+    /// `Ok(None)` uses generated field/nested parsing, and `Err(())` rejects
+    /// input without falling back to a potentially different numeric meaning.
     fn parse_value(&self, id: u32, text: &str) -> Option<f64>;
 
     /// Reset all smoothers to current values.
@@ -344,6 +467,45 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Freeze persisted controls and payload ownership for incremental output.
+    /// The default retains existing serialization behavior; the derive prepares
+    /// keyed fields individually so large immutable fields can avoid staging.
+    /// Never call this or the returned writer from an audio callback.
+    ///
+    /// # Errors
+    /// A custom snapshot may reject an unrepresentable or unavailable document.
+    fn prepare_persist_write(&self) -> std::io::Result<Box<dyn PreparedPersistWrite>> {
+        Ok(Box::new(self.serialize_persist()))
+    }
+
+    /// Opt-in asynchronous persistent-document completion. No polling is
+    /// needed: a field wakes its wrapper through the weak signal below.
+    fn wants_persist_notifications(&self) -> bool {
+        false
+    }
+
+    /// Bound once by the format wrapper, independently of editor lifetime.
+    fn set_persist_change_signal(&self, _signal: std::sync::Weak<PersistChangeSignal>) {}
+
+    /// Host/UI thread only, after a completion wake. Return a small parameter
+    /// beacon only for a real, not-yet-announced persistent change. The wrapper
+    /// delivers the normal begin/value/end gesture; return None for no-ops.
+    /// `#[params(persist_changed = "method")]` supplies this optional hook.
+    fn take_persist_change(&self) -> Option<(u32, f64)> {
+        None
+    }
+
+    /// Visit every persisted field, including nested stores and pre-save hooks.
+    /// The derive emits this from the same field inventory as serialization.
+    ///
+    /// This is non-realtime: a field without a cached identity uses its existing
+    /// serializer and may allocate or lock. Large fields should provide a cheap
+    /// identity prepared at mutation/publication time. The default preserves
+    /// manual implementations by exposing their complete serialized state.
+    fn visit_persist_fingerprints(&self, visitor: &mut dyn PersistFingerprintVisitor) {
+        visitor.serialized(&self.serialize_persist());
+    }
+
     /// Restore this store's `#[persist]` fields from a blob produced by
     /// [`Self::serialize_persist`]. Unknown / missing keys are skipped,
     /// leaving those fields at their current value. Default: no-op.
@@ -369,44 +531,16 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Called automatically by the derive-generated `Self::new()`.
     /// Plugin code shouldn't need to invoke it directly.
     fn assert_no_id_collisions(&self) {
-        let mut all = self.param_infos();
-        // Borrow the names from the existing infos so the panic
-        // message can identify *which* IDs collided.
-        let mut seen: Vec<(u32, &'static str)> = Vec::with_capacity(all.len());
-        for info in all.drain(..) {
-            for (prev_id, prev_name) in &seen {
-                assert!(
-                    *prev_id != info.id,
-                    "duplicate parameter ID {}: '{}' and '{}' (likely a \
-                     parent / nested-struct collision; the per-struct \
-                     compile-time check can't see across nested types)",
-                    info.id,
-                    prev_name,
-                    info.name,
-                );
-            }
-            seen.push((info.id, info.name));
-        }
-        let mut seen_meters: Vec<u32> = Vec::new();
+        let catalog = self.param_catalog();
+        let mut seen_meters = std::collections::HashSet::new();
         for meter_id in self.meter_ids() {
-            for (prev_id, prev_name) in &seen {
-                assert!(
-                    *prev_id != meter_id,
-                    "meter ID {meter_id} collides with parameter ID for '{prev_name}'",
-                );
+            if let Some(previous) = catalog.by_id(meter_id) {
+                panic!("meter ID {meter_id} collides with parameter ID for '{}'", previous.name);
             }
-            // Meter IDs auto-assign per struct from a shared base, so two
-            // `#[nested]` structs that each declare a meter hand back the
-            // same ID and would alias in meter storage. The per-struct
-            // compile-time check can't see across nested types; surface it
-            // as a construction panic instead of silent aliasing.
             assert!(
-                !seen_meters.contains(&meter_id),
-                "duplicate meter ID {meter_id} (two #[nested] structs each \
-                 declare a meter; nested meters aren't supported - keep \
-                 meters in a single Params struct)",
+                seen_meters.insert(meter_id),
+                "duplicate meter ID {meter_id} (two #[nested] structs each declare a meter; nested meters aren't supported - keep meters in a single Params struct)"
             );
-            seen_meters.push(meter_id);
         }
     }
 }

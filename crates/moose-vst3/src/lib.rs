@@ -18,7 +18,7 @@ use moose_core::bus_routing::{
     BusActivation, BusRouting, MAX_AUDIO_BUSES, bus_layouts_fit_routing,
 };
 use moose_core::cast::{len_u32, sample_pos_i64};
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing};
+use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::editor::EditorBuilder;
 use moose_core::editor::{
@@ -65,7 +65,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 /// overflow we want most-recent-wins (`force_push`) so a rapid
 /// double-recall doesn't get the audio thread to apply a stale state
 /// after the host already moved on.
-type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
+type StateLoadQueue = state::StateLoadQueue;
 
 /// VST3 `RestartFlags::kLatencyChanged`. The audio thread flags this
 /// through `moose_vst3_mark_restart` (an atomic bit-set, no host call);
@@ -75,6 +75,7 @@ type StateLoadQueue = crossbeam_queue::ArrayQueue<state::DeserializedState>;
 const K_LATENCY_CHANGED: i32 = 8;
 
 struct Vst3Instance<P: PluginExport> {
+    persist_signal: std::sync::Mutex<Option<Arc<moose_params::PersistChangeSignal>>>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -104,7 +105,7 @@ struct Vst3Instance<P: PluginExport> {
     /// Full param-info cache for the chunker's `is_chunked(id)`
     /// lookup. Built once at `cb_create`; static for the life of
     /// the instance.
-    param_infos: Vec<ParamInfo>,
+    param_infos: Arc<moose_params::ParamCatalog>,
     /// `min_subblock_samples` from `moose.toml`'s `[automation]`
     /// table. Read at instance construction and passed to
     /// `chunked_process::process_chunked` every block.
@@ -589,7 +590,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
-            let param_infos: Vec<ParamInfo> = plugin.params().param_infos();
+            let param_infos = plugin.params().param_catalog();
             let mut param_ranges: Vec<(u32, ParamRange)> =
                 param_infos.iter().map(|i| (i.id, i.range)).collect();
             // Sort by id so `binary_search_by_key` works in the hot lookups.
@@ -618,6 +619,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 })
                 .collect();
             let instance = Box::new(Vst3Instance::<P> {
+                persist_signal: std::sync::Mutex::new(None),
                 plugin: shared_plugin(plugin),
                 params_arc,
                 meter_store,
@@ -674,9 +676,72 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     // keeps a live host alive; the instance is being torn down regardless.
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
-            drop(Box::from_raw(ctx.cast::<Vst3Instance<P>>()));
+            let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
+            if let Some(signal) = instance.persist_signal.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                signal.close();
+            }
+            drop(instance);
         }
     });
+}
+
+// All three callbacks run on the host thread. Only the installed wake itself
+// may run on a background worker; close() gates it before the shim tears down.
+unsafe extern "C" fn cb_wants_persist_notifications<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "persist_wants", false, || unsafe {
+        (&*ctx.cast::<Vst3Instance<P>>())
+            .params_arc
+            .wants_persist_notifications()
+    })
+}
+unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    wake_context: *mut std::ffi::c_void,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
+        let instance = &*ctx.cast::<Vst3Instance<P>>();
+        let mut binding = instance
+            .persist_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(old) = binding.take() {
+            old.close();
+        }
+        if let Some(wake) = wake {
+            let context = SendPtr::new(wake_context);
+            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+                wake(context.as_ptr().cast_mut());
+            }));
+            instance
+                .params_arc
+                .set_persist_change_signal(Arc::downgrade(&signal));
+            *binding = Some(signal);
+        }
+    });
+}
+unsafe extern "C" fn cb_take_persist_change<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: *mut u32,
+    value: *mut f64,
+) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "persist_drain", false, || unsafe {
+        let params = &(&*ctx.cast::<Vst3Instance<P>>()).params_arc;
+        let Some((changed_id, normalized)) = params.take_persist_change() else {
+            return false;
+        };
+        if !normalized.is_finite()
+            || !(0.0..=1.0).contains(&normalized)
+            || params.get_normalized(changed_id).is_none()
+        {
+            return false;
+        }
+        *id = changed_id;
+        *value = params.set_normalized_returning_normalized(changed_id, normalized);
+        true
+    })
 }
 
 /// Map a VST3 `ProcessModes` value (`kRealtime` 0, `kPrefetch` 1,
@@ -1463,12 +1528,13 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
-        process_chunked_with_bus_routing(
+        process_chunked_with_bus_routing_and_catalog(
             &mut *plugin,
             inst.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
             bus_routing,
+            &inst.param_infos,
         );
         scr.output_events.ensure_sorted_by_offset();
         // End the `audio_buffer` borrow before reaching back into scratch.
@@ -1661,8 +1727,7 @@ unsafe extern "C" fn cb_param_is_chunked<P: PluginExport>(
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let chunked = inst
             .param_infos
-            .iter()
-            .find(|info| info.id == id)
+            .by_id(id)
             .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED));
         i32::from(chunked)
     }
@@ -1806,19 +1871,29 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // Rust global allocator for both save + free; do not cross
         // wires when refactoring `_save_state` paths together.)
         let extra = save_extra(&inst.snapshot);
-        let persist = inst.params_arc.serialize_persist();
-        let blob = state::serialize_state(inst.plugin_id_hash, &ids, &values, &extra, &persist);
-        let len = blob.len();
-        let ptr = libc_malloc(len).cast::<u8>();
-        if ptr.is_null() {
-            // malloc failed - `*out_data` is already null and
-            // `*out_len` already 0 from the pre-zero above; nothing
-            // to do on this branch except return.
-            return;
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
+        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
+        let Ok(host_len) = u32::try_from(len) else { return; };
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) { if !self.0.is_null() { unsafe { libc_free(self.0.cast()); } } }
         }
-        std::ptr::copy_nonoverlapping(blob.as_ptr(), ptr, len);
-        *out_data = ptr;
-        *out_len = len_u32(len);
+        let mut buffer = Buffer(libc_malloc(len).cast::<u8>());
+        if buffer.0.is_null() { return; }
+        let mut offset = 0;
+        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| {
+                if bytes.len() > len - offset { return -1; }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
+                offset += bytes.len(); bytes.len() as i64
+            });
+        if !ok { return; }
+        *out_data = buffer.0; *out_len = host_len;
+        buffer.0 = std::ptr::null_mut();
     });
 }
 
@@ -1831,7 +1906,7 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         // `slice::from_raw_parts(null, n)` for `n > 0` is UB. Treat
         // `(null, *)` and `(_, 0)` the same as "host gave us nothing".
-        if data.is_null() || len == 0 {
+        if data.is_null() || len == 0 || len as usize > P::max_host_state_bytes() {
             return 0;
         }
         let blob = slice::from_raw_parts(data, len as usize);
@@ -1846,12 +1921,18 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         ) else {
             return 0;
         };
+        apply_host_state(inst, deserialized, false)
+    })
+}
+
+unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized: state::DeserializedState, params_applied: bool) -> i32 {
+    unsafe {
         // Apply params synchronously on the host thread (atomic-safe)
         // so host-side queries that read parameter values right
         // after `setState` see the restored values without first
         // running a process block. pluginval / DAW preset reload
         // both observe this.
-        state::apply_params(&*inst.params_arc, &deserialized);
+        if !params_applied { state::apply_params(&*inst.params_arc, &deserialized); }
         if inst.active.load(Ordering::Relaxed) {
             // Active: the audio thread drains `pending_state` at the top
             // of the next block and applies the custom-state blob under
@@ -1884,8 +1965,42 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             editor.state_changed();
         }
         1
+        }
+}
+
+unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
+    ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    write: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, u32) -> i64,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "save_state_stream", 0, || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if !inst.active.load(Ordering::Relaxed) && let Some(state) = inst.pending_state.pop() {
+            let mut plugin = enter_plugin(&inst.plugin);
+            state::apply_state(&mut *plugin, &state); plugin.republish_snapshot();
+        }
+        let (ids, values) = inst.params_arc.collect_values();
+        let extra = save_extra(&inst.snapshot);
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return 0; };
+        i32::from(state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
+            persist.byte_len(), P::max_host_state_bytes(),
+            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+            |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
     })
 }
+
+unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
+    ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    read: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, u32) -> i64,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "load_state_stream", 0, || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let Some(deserialized) = state::read_and_apply_params::<P>(
+            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32), inst.plugin_id_hash, state::PluginFormat::Vst3, None, &*inst.params_arc, P::max_host_state_bytes(),
+        ) else { return 0; };
+        apply_host_state(inst, deserialized, true)
+    })
+}
+
 
 unsafe extern "C" fn cb_state_free(data: *mut u8, _len: u32) {
     unsafe {
@@ -2222,7 +2337,7 @@ unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(ctx: *mut std::ffi:
                     {
                         let valid = *sample_offset < audio.input_num_frames
                             && value.is_finite()
-                            && inst.param_infos.iter().any(|info| info.id == *id);
+                            && inst.param_infos.by_id(*id).is_some();
                         return (!valid).then_some(VST3_EVENT_INVALID);
                     }
                     match encode_vst3_output_event::<P>(
@@ -3668,6 +3783,8 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         param_parse: cb_param_parse::<P>,
         state_save: cb_state_save::<P>,
         state_load: cb_state_load::<P>,
+        state_load_stream: cb_state_load_stream::<P>,
+        state_save_stream: cb_state_save_stream::<P>,
         state_free: cb_state_free,
         get_latency: cb_get_latency::<P>,
         get_tail: cb_get_tail::<P>,
@@ -3695,6 +3812,9 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         param_is_chunked: cb_param_is_chunked::<P>,
         param_presentation: cb_param_presentation::<P>,
         param_presentation_revision: cb_param_presentation_revision::<P>,
+        wants_persist_notifications: cb_wants_persist_notifications::<P>,
+        set_persist_waker: cb_set_persist_waker::<P>,
+        take_persist_change: cb_take_persist_change::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every
@@ -3981,7 +4101,7 @@ mod tests {
     }
 
     unsafe extern "C" {
-        fn moose_vst3_read_state_stream(stream: *mut c_void, out_len: *mut i32) -> *mut u8;
+        fn moose_vst3_read_state_chunk(stream: *mut c_void, dst: *mut u8, len: u32) -> i64;
         fn moose_vst3_write_state_stream(stream: *mut c_void, data: *const u8, len: u32) -> i32;
     }
 
@@ -4028,26 +4148,14 @@ mod tests {
         }
     }
 
-    fn read(replies: &[(i32, i32)]) -> Option<i32> {
-        let mut s = fake(replies);
-        let mut len = 0;
-        let data = unsafe { moose_vst3_read_state_stream((&raw mut s).cast(), &raw mut len) };
-        if data.is_null() {
-            return None;
-        }
-        unsafe { libc_free(data.cast()) };
-        Some(len)
-    }
-
     #[test]
-    fn state_read_is_bounded() {
-        assert_eq!(read(&[(0, 4096), (0, 10), (0, 0)]), Some(4106));
-        // Empty stream, negative or overlong counts fail the load.
-        assert_eq!(read(&[(0, 0)]), None);
-        assert_eq!(read(&[(0, -1)]), None);
-        assert_eq!(read(&[(0, 4097)]), None);
-        // A stream that never ends stops at the 32 MiB cap.
-        assert_eq!(read(&vec![(0, i32::MAX); 8200]), None);
+    fn state_read_chunk_preserves_short_reads_and_rejects_bad_counts() {
+        let mut s=fake(&[(0,317),(1,17),(0,0),(0,-1),(0,8193)]);
+        let mut buf=[0_u8;8192];
+        for expected in [317,17,0,-1,-1] {
+            let count=unsafe { moose_vst3_read_state_chunk((&raw mut s).cast(),buf.as_mut_ptr(),buf.len() as u32) };
+            assert_eq!(count,expected);
+        }
     }
 
     #[test]
@@ -4411,3 +4519,114 @@ mod tests {
         ));
     }
 }
+
+// The derive's umbrella paths resolve locally for this shared test fixture.
+#[cfg(test)]
+extern crate self as moose;
+#[cfg(test)]
+use moose_core as core;
+#[cfg(test)]
+use moose_params as params;
+#[cfg(test)]
+#[path = "../../../test-support/host_value_fixture.rs"]
+mod host_value_fixture;
+
+#[cfg(test)]
+mod host_value_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    use moose_params::Params;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "unchanged storage values must compare exactly"
+    )]
+    fn ffi_text_hooks_preserve_static_plain_and_normalized_storage() {
+        // SAFETY: own the instance and bounded buffers for all callback calls.
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            assert!(!ctx.is_null());
+            let params = (&*ctx.cast::<Vst3Instance<TestPlugin>>())
+                .params_arc
+                .clone();
+            let normalized = 49. / 96.;
+            let plain = cb_param_denormalize::<TestPlugin>(ctx, 1, normalized);
+            assert_eq!(plain, normalized);
+            let mut buffer = [0_i8; 128];
+            assert!(cb_param_format::<TestPlugin>(ctx, 1, plain, buffer.as_mut_ptr(), 128) > 0);
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "+1 st");
+            let mut parsed = -999.;
+            assert_eq!(
+                cb_param_parse::<TestPlugin>(ctx, 1, c"+1 st".as_ptr(), &raw mut parsed),
+                1
+            );
+            assert_eq!(cb_param_normalize::<TestPlugin>(ctx, 1, parsed), normalized);
+            cb_param_set_value::<TestPlugin>(ctx, 1, parsed);
+            assert_eq!(params.get_plain(1), Some(normalized));
+            for invalid in [c"0.5", c"nan"] {
+                assert_eq!(
+                    cb_param_parse::<TestPlugin>(ctx, 1, invalid.as_ptr(), &raw mut parsed),
+                    0
+                );
+            }
+            assert_eq!(
+                cb_param_parse::<TestPlugin>(ctx, 0, c"-6 dB".as_ptr(), &raw mut parsed),
+                1
+            );
+            assert_eq!(parsed, -6.);
+            params.rebound.store(true, Ordering::Relaxed);
+            assert!(
+                cb_param_format::<TestPlugin>(ctx, 1, normalized, buffer.as_mut_ptr(), 128) > 0
+            );
+            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "51%");
+            assert_eq!(
+                cb_param_parse::<TestPlugin>(ctx, 1, c"25%".as_ptr(), &raw mut parsed),
+                1
+            );
+            assert_eq!(parsed, 0.25);
+            assert_eq!(params.get_plain(1), Some(normalized));
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../test-support/large_state_fixture.rs"]
+mod large_state_fixture;
+#[cfg(test)]
+mod large_state_tests {
+    use super::*;
+    use super::large_state_fixture::{LargePlugin,payload};
+    type Large=LargePlugin<{64*1024*1024}>;
+    struct Input { bytes:Vec<u8>, offset:usize }
+    unsafe extern "C" fn read(ctx:*mut std::ffi::c_void, dst:*mut u8, size:u32)->i64 {
+        let input=unsafe{&mut *ctx.cast::<Input>()};
+        let n=(size as usize).min(317).min(input.bytes.len()-input.offset);
+        unsafe{std::ptr::copy_nonoverlapping(input.bytes.as_ptr().add(input.offset),dst,n)};
+        input.offset+=n;n as i64
+    }
+    #[test]
+    fn large_host_state_roundtrips_through_stream_callback() {
+        unsafe {
+            let ctx=cb_create::<Large>(); assert!(!ctx.is_null());
+            let inst=&*ctx.cast::<Vst3Instance<Large>>();
+            *inst.params_arc.payload.lock().unwrap()=payload();
+            let mut ptr=std::ptr::null_mut(); let mut len=0;
+            cb_state_save::<Large>(ctx,&raw mut ptr,&raw mut len);
+            assert!(len>32*1024*1024);
+            let bytes=std::slice::from_raw_parts(ptr,len as usize).to_vec(); cb_state_free(ptr,len);
+            inst.params_arc.payload.lock().unwrap().clear();
+            let mut input=Input{bytes,offset:0};
+            assert_eq!(cb_state_load_stream::<Large>(ctx,(&raw mut input).cast(),read),1);
+            assert_eq!(*inst.params_arc.payload.lock().unwrap(),payload());
+            input.bytes.pop();input.offset=0;
+            assert_eq!(cb_state_load_stream::<Large>(ctx,(&raw mut input).cast(),read),0);
+            cb_destroy::<Large>(ctx);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod persist_notify_tests;
