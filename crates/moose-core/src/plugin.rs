@@ -6,6 +6,31 @@ use crate::info::PluginInfo;
 use crate::process::{ProcessContext, ProcessStatus};
 use moose_params::sample::Sample;
 
+/// Provenance of the frame upper bound supplied by the actual adapter.
+/// An internal render quantum or a defensive scratch floor is never a bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationFrameBound {
+    NegotiatedHost, RequestedFixedDevice, AdvertisedDeviceMaximum,
+    ExplicitDriver, UnprovenDeviceFallback,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationError { InvalidGeometry, MissingPolicy, UnqualifiedService,
+    UnsupportedMode, ResourceBudget, NotReady, ExecutableLifetime }
+/// Offaudio activation request, distinct from a bounded audio-thread reset.
+/// Keeps the exact maximum and its provenance; never substitutes scratch size.
+pub struct PreparationConfig {
+    pub audio: AudioConfig,
+    pub frame_bound: PreparationFrameBound,
+}
+impl PreparationConfig {
+    pub fn new(audio: AudioConfig, frame_bound: PreparationFrameBound) -> Self { Self { audio, frame_bound } }
+    pub fn validate(&self) -> Result<(), PreparationError> {
+        if !self.audio.sample_rate.is_finite() || self.audio.sample_rate <= 0.
+            || self.audio.max_block_size == 0 { return Err(PreparationError::InvalidGeometry); }
+        Ok(())
+    }
+}
+
 /// The format-facing plugin runtime trait. **Plugin authors do NOT
 /// implement this directly.**
 ///
@@ -116,6 +141,20 @@ pub trait PluginRuntime: Send + 'static {
     /// mode-dependent buffers off `config.process_mode`. Not real-time
     /// safe.
     fn reset(&mut self, config: &AudioConfig);
+
+    /// Fallible OFFAUDIO activation. Native adapters call this before marking
+    /// active/opening a stream. Default preserves ordinary synchronous plugins.
+    /// Audio-thread reset must never call this potentially waiting operation.
+    /// Explicit worker/fallible requirement, never inferred from an override.
+    /// Legacy synchronous runtimes keep false and their existing reset timing.
+    fn requires_fallible_preparation(&self)->bool{false}
+
+    fn prepare(&mut self, config: &PreparationConfig) -> Result<(), PreparationError> {
+        config.validate()?;
+        self.reset(&config.audio);
+        Ok(())
+    }
+
 
     /// Real-time audio processing.
     fn process(

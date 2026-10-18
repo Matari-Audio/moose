@@ -301,6 +301,26 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
 
     fn init(&mut self) {}
 
+    fn prepare(&mut self,config:&moose_core::plugin::PreparationConfig)
+        ->Result<(),moose_core::plugin::PreparationError>{
+        use moose_core::plugin::PreparationError;
+        config.validate()?;
+        // Concrete offaudio activation; no baked Logic is called on opaque hot
+        // state. Every admitted loader generation passed the scalar class gate,
+        // including reloading. A rejected/missing initial state cannot succeed
+        // by calling reset over null then returning permanently silent output.
+        let loader_arc=Arc::clone(&self.loader);let loader=loader_arc.lock();
+        if !loader.is_loaded(){return Err(PreparationError::NotReady);}
+        if !self.reconcile_state(&loader)||self.state.is_null(){return Err(PreparationError::NotReady);}
+        self.params.set_sample_rate(config.audio.sample_rate);self.params.snap_smoothers();
+        loader.reset(self.state,&config.audio);
+        self.sample_rate=config.audio.sample_rate;self.max_block_size=config.audio.max_block_size;
+        self.process_mode=config.audio.process_mode;self.reset_pending=false;
+        self.latency_cache.store(loader.latency(self.state),Ordering::Relaxed);
+        self.tail_cache.store(loader.tail(self.state),Ordering::Relaxed);
+        Ok(())
+    }
+
     fn reset(&mut self, config: &AudioConfig) {
         self.sample_rate = config.sample_rate;
         self.max_block_size = config.max_block_size;
