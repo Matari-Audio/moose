@@ -4,6 +4,8 @@ Notable changes per release.
 
 ## Unreleased
 
+- Two parameter range shapes: `offset_log(min, max, offset)` (logarithmic over `[min + offset, max + offset]`, for a frequency axis that is near-linear at the bottom) and `pivoted_log(min, max, mid)` (logarithmic with a power bend that puts `mid` at the knob midpoint, for a Q or width whose default belongs at the centre).
+
 - CLAP GUI drags notify the host through parameter events; rescan values only when the queue or host refuses an edit. Test the real editor bridge together with instance-local edit epochs.
 
 - Add `Params::parameter_edit_epoch`, shared across each derived parameter tree, so automation in another plugin instance does not invalidate local parameter caches. Keep legacy global and custom-state edit counters available.

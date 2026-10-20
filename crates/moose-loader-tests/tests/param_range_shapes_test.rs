@@ -19,6 +19,10 @@ struct ShapesParams {
     skewed: moose_params::FloatParam,
     #[param(name = "Pan", range = "sym_skewed(-1, 1, 2, 0)")]
     pan: moose_params::FloatParam,
+    #[param(name = "Offset log", range = "offset_log(20, 20000, 150)", default = 1700.8)]
+    offset_log: moose_params::FloatParam,
+    #[param(name = "Pivoted log", range = "pivoted_log(0.1, 10, 0.707)", default = 0.707)]
+    pivoted_log: moose_params::FloatParam,
     #[param(name = "Reversed", range = "reversed(linear(0, 100))")]
     reversed: moose_params::FloatParam,
     #[param(
@@ -53,6 +57,12 @@ fn dsl_shapes_produce_the_expected_ranges() {
     // sym_skewed anchors `center` at the knob midpoint.
     assert_eq!(by_name("Pan").normalize(0.0), 0.5);
     assert_eq!(by_name("Pan").denormalize(0.5), 0.0);
+
+    // offset_log: the midpoint is the geometric mean of the shifted ends.
+    assert!((by_name("Offset log").denormalize(0.5) - 1700.8).abs() < 0.1);
+
+    // pivoted_log: `mid` sits at the knob midpoint.
+    assert!((by_name("Pivoted log").normalize(0.707) - 0.5).abs() < 1e-9);
 
     // reversed(linear): min at the top of the knob, max at the bottom.
     let rev = by_name("Reversed");
