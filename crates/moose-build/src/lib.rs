@@ -275,6 +275,11 @@ pub struct PluginDef {
     pub bundle_id: String,
     #[serde(rename = "crate")]
     pub crate_name: String,
+    /// The crate that defines the root `Params` struct, when it is not the
+    /// plugin crate itself (a plugin crate that only hosts `moose::plugin!`
+    /// over an engine library). The parameter index lives under this crate.
+    #[serde(default)]
+    pub params_crate: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     /// User-facing one-paragraph description shown in distribution
@@ -393,6 +398,22 @@ pub struct PluginDef {
     /// holds the foreign bytes.
     #[serde(default)]
     pub legacy_state: Option<LegacyStateConfig>,
+}
+
+impl PluginDef {
+    /// The crate whose `derive(Params)` sidecars and `param_index.toml`
+    /// belong to this plugin: [`Self::params_crate`], else the plugin crate.
+    #[must_use]
+    pub fn params_crate_name(&self) -> &str {
+        self.params_crate.as_deref().unwrap_or(&self.crate_name)
+    }
+
+    /// Whether package `pkg` resolves to this plugin: the plugin crate, or
+    /// its params crate (which may read `plugin_info!()` for its own state).
+    #[must_use]
+    pub fn serves(&self, pkg: &str) -> bool {
+        self.crate_name == pkg || self.params_crate.as_deref() == Some(pkg)
+    }
 }
 
 #[derive(Deserialize)]

@@ -61,25 +61,28 @@ fn ensure_preset_sidecars(plugins: &[&PluginDef], root: &Path) -> Res {
         if !ships_presets {
             continue;
         }
-        let sidecar = moose_build::param_index_dir(&moose_build::target_dir(root), &p.crate_name)
-            .join("param_index.toml");
+        let sidecar =
+            moose_build::param_index_dir(&moose_build::target_dir(root), p.params_crate_name())
+                .join("param_index.toml");
         if sidecar.exists() {
             continue;
         }
+        // The params crate writes the sidecars; cleaning it rebuilds the
+        // plugin crate that aggregates them too.
+        let owner = p.params_crate_name();
         crate::vprintln!(
-            "  Param manifest for {} is missing; cleaning it so the build regenerates it.",
+            "  Param manifest for {} is missing; cleaning {owner} so the build regenerates it.",
             p.crate_name
         );
         let status = std::process::Command::new("cargo")
             .arg("clean")
             .arg("-p")
-            .arg(&p.crate_name)
+            .arg(owner)
             .status()
-            .map_err(|e| format!("running `cargo clean -p {}`: {e}", p.crate_name))?;
+            .map_err(|e| format!("running `cargo clean -p {owner}`: {e}"))?;
         if !status.success() {
             return Err(format!(
-                "`cargo clean -p {}` failed; needed to regenerate its preset param manifest",
-                p.crate_name
+                "`cargo clean -p {owner}` failed; needed to regenerate its preset param manifest"
             )
             .into());
         }

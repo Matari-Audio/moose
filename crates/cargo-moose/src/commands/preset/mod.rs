@@ -116,8 +116,10 @@ impl PluginCtx<'_> {
     }
 
     fn annotations(&self) -> BTreeMap<u32, ParamAnnotation> {
-        let sidecars =
-            moose_build::param_index_dir(&moose_build::target_dir(&self.root), &self.p.crate_name);
+        let sidecars = moose_build::param_index_dir(
+            &moose_build::target_dir(&self.root),
+            self.p.params_crate_name(),
+        );
         moose_build::presets::read_param_annotations(&sidecars)
     }
 

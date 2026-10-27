@@ -520,6 +520,7 @@ mod suite_tests {
                 name: crate_name.into(),
                 bundle_id: bundle_id.into(),
                 crate_name: crate_name.into(),
+                params_crate: None,
                 version: None,
                 description: None,
                 fourcc: None,
