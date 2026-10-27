@@ -407,6 +407,13 @@ impl PluginDef {
     pub fn params_crate_name(&self) -> &str {
         self.params_crate.as_deref().unwrap_or(&self.crate_name)
     }
+
+    /// Whether package `pkg` resolves to this plugin: the plugin crate, or
+    /// its params crate (which may read `plugin_info!()` for its own state).
+    #[must_use]
+    pub fn serves(&self, pkg: &str) -> bool {
+        self.crate_name == pkg || self.params_crate.as_deref() == Some(pkg)
+    }
 }
 
 #[derive(Deserialize)]

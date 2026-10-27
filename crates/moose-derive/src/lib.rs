@@ -34,7 +34,7 @@ pub(crate) fn try_resolve_plugin() -> Result<(Config, String, std::path::PathBuf
 
     let pkg_name =
         std::env::var("CARGO_PKG_NAME").map_err(|_| "CARGO_PKG_NAME not set".to_string())?;
-    if !config.plugin.iter().any(|p| p.crate_name == pkg_name) {
+    if !config.plugin.iter().any(|p| p.serves(&pkg_name)) {
         let available: Vec<_> = config
             .plugin
             .iter()
@@ -61,7 +61,7 @@ fn find_plugin<'a>(config: &'a Config, pkg_name: &str) -> &'a PluginDef {
     config
         .plugin
         .iter()
-        .find(|p| p.crate_name == pkg_name)
+        .find(|p| p.serves(pkg_name))
         .expect("try_resolve_plugin verified this entry exists")
 }
 
@@ -339,7 +339,7 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
 #[doc(hidden)]
 #[proc_macro]
 pub fn plugin_vst3_class_id(_input: TokenStream) -> TokenStream {
-    let (_config, pkg_name, moose_toml_path) = match try_resolve_plugin() {
+    let (config, pkg_name, moose_toml_path) = match try_resolve_plugin() {
         Ok(value) => value,
         Err(msg) => {
             return syn::Error::new(proc_macro2::Span::call_site(), msg)
@@ -347,10 +347,11 @@ pub fn plugin_vst3_class_id(_input: TokenStream) -> TokenStream {
                 .into();
         }
     };
+    let plugin_crate = &find_plugin(&config, &pkg_name).crate_name;
     match moose_build::load_vst3_class_ids(&moose_toml_path) {
         Ok(ids) => match ids
             .into_iter()
-            .find(|(crate_name, _)| crate_name == &pkg_name)
+            .find(|(crate_name, _)| crate_name == plugin_crate)
         {
             Some((_, bytes)) => quote! { Some([#(#bytes),*]) }.into(),
             None => quote! { None }.into(),
