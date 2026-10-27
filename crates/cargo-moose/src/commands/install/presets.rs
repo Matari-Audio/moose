@@ -146,7 +146,8 @@ pub(crate) fn load_factory_presets(
         return Ok(None);
     }
 
-    let sidecar_dir = moose_build::param_index_dir(&moose_build::target_dir(root), &p.crate_name);
+    let sidecar_dir =
+        moose_build::param_index_dir(&moose_build::target_dir(root), p.params_crate_name());
     let annotations = moose_build::presets::read_param_annotations(&sidecar_dir);
     let names = moose_build::presets::ParamNameMap::from_annotations(&annotations);
     let authored = moose_build::presets::read_presets_dir(&dir, true, Some(&names))?;

@@ -104,10 +104,10 @@ pub(crate) fn emit_root_impl(input: TokenStream) -> TokenStream {
     let Ok((config, pkg_name, moose_toml_path)) = crate::try_resolve_plugin() else {
         return TokenStream::new();
     };
-    if !config.plugin.iter().any(|p| p.crate_name == pkg_name) {
+    let Some(plugin) = config.plugin.iter().find(|p| p.crate_name == pkg_name) else {
         return TokenStream::new();
-    }
-    let Some(sidecar_dir) = sidecar_dir_for(&pkg_name, &moose_toml_path) else {
+    };
+    let Some(sidecar_dir) = sidecar_dir_for(plugin.params_crate_name(), &moose_toml_path) else {
         return TokenStream::new();
     };
 
