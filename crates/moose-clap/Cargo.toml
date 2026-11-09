@@ -33,4 +33,5 @@ objc = "0.2"
 workspace = true
 
 [dev-dependencies]
+moose-core = { workspace = true, features = ["rt-paranoid"] }
 moose-derive = { workspace = true }

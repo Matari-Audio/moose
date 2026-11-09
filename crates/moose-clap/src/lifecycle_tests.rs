@@ -7,6 +7,7 @@ struct Probe {
     inner: TestPlugin,
     resets: usize,
     pressed: bool,
+    processed_frames: usize,
 }
 
 impl PluginExport for Probe {
@@ -16,6 +17,7 @@ impl PluginExport for Probe {
             inner: TestPlugin::create(),
             resets: 0,
             pressed: false,
+            processed_frames: 0,
         }
     }
     fn params(&self) -> &TestParams {
@@ -48,12 +50,203 @@ impl PluginRuntime for Probe {
     }
     fn process(
         &mut self,
-        _: &mut AudioBuffer,
+        audio: &mut AudioBuffer,
         _: &EventList,
         _: &mut ProcessContext,
     ) -> ProcessStatus {
+        self.processed_frames += audio.num_samples();
+        for channel in 0..audio.channels() {
+            let (input, output) = audio.io(channel);
+            output.copy_from_slice(input);
+        }
         ProcessStatus::Normal
     }
+}
+
+#[global_allocator]
+static TEST_ALLOC: moose_core::rt::RtCheckAlloc = moose_core::rt::RtCheckAlloc::new();
+
+fn with_probe(test: impl FnOnce(*const clap_plugin)) {
+    // SAFETY: host and descriptor outlive the serial vtable calls and destruction.
+    unsafe {
+        let mut host: clap_host = std::mem::zeroed();
+        host.clap_version = clap_sys::version::CLAP_VERSION;
+        host.get_extension = Some(no_extension);
+        let descriptor = DescriptorHolder::new(&Probe::info());
+        let plugin =
+            create_plugin_instance::<Probe>(&raw const descriptor.descriptor, &raw const host);
+        assert!(!plugin.is_null());
+        assert!((*plugin).init.unwrap()(plugin));
+        test(plugin);
+        (*plugin).destroy.unwrap()(plugin);
+    }
+}
+
+fn audited_process(plugin: *const clap_plugin, process: &clap_process) -> (i32, u32) {
+    moose_core::rt::audit(|| {
+        let _rt = RtSection::enter();
+        // SAFETY: the caller owns the live plugin and all process buffers.
+        unsafe { (*plugin).process.unwrap()(plugin, process) }
+    })
+}
+
+#[test]
+fn larger_reactivation_processes_in_place_without_allocating() {
+    for first_frames in [0, 64, 1024] {
+        with_probe(|plugin| {
+            // SAFETY: each block owns its sample buffers; lifecycle calls are serial.
+            unsafe {
+                let callbacks = &*plugin;
+                let mut left = vec![0.25_f32; 2048];
+                let mut right = vec![-0.5_f32; 2048];
+                let mut channels = [left.as_mut_ptr(), right.as_mut_ptr()];
+                let input = clap_audio_buffer {
+                    data32: channels.as_mut_ptr(),
+                    data64: ptr::null_mut(),
+                    channel_count: 2,
+                    latency: 0,
+                    constant_mask: 0,
+                };
+                let mut output = input;
+                let mut process = clap_process {
+                    steady_time: 0,
+                    frames_count: first_frames,
+                    transport: ptr::null(),
+                    audio_inputs: &raw const input,
+                    audio_outputs: &raw mut output,
+                    audio_inputs_count: 1,
+                    audio_outputs_count: 1,
+                    in_events: ptr::null(),
+                    out_events: ptr::null(),
+                };
+                assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+                assert!(callbacks.start_processing.unwrap()(plugin));
+                assert_eq!(
+                    audited_process(plugin, &process),
+                    (CLAP_PROCESS_CONTINUE, 0)
+                );
+                callbacks.stop_processing.unwrap()(plugin);
+                callbacks.deactivate.unwrap()(plugin);
+                assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 2048));
+                assert!(callbacks.start_processing.unwrap()(plugin));
+                process.frames_count = 2048;
+                let (status, allocations) = audited_process(plugin, &process);
+                assert_eq!(status, CLAP_PROCESS_CONTINUE);
+                assert_eq!(allocations, 0, "first block had {first_frames} frames");
+                assert!(
+                    left.iter()
+                        .all(|sample| sample.to_bits() == 0.25_f32.to_bits())
+                );
+                assert!(
+                    right
+                        .iter()
+                        .all(|sample| sample.to_bits() == (-0.5_f32).to_bits())
+                );
+                assert_eq!(
+                    enter_plugin(&data_from_plugin::<Probe>(plugin).plugin).processed_frames,
+                    first_frames as usize + 2048
+                );
+                callbacks.stop_processing.unwrap()(plugin);
+                callbacks.deactivate.unwrap()(plugin);
+            }
+        });
+    }
+}
+
+#[test]
+fn larger_reactivation_processes_disconnected_channels_without_allocating() {
+    with_probe(|plugin| {
+        // SAFETY: null data arrays represent disconnected buses with declared channels.
+        unsafe {
+            let callbacks = &*plugin;
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+            callbacks.deactivate.unwrap()(plugin);
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 2048));
+            assert!(callbacks.start_processing.unwrap()(plugin));
+            let input = clap_audio_buffer {
+                data32: ptr::null_mut(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let mut output = input;
+            let process = clap_process {
+                steady_time: 0,
+                frames_count: 2048,
+                transport: ptr::null(),
+                audio_inputs: &raw const input,
+                audio_outputs: &raw mut output,
+                audio_inputs_count: 1,
+                audio_outputs_count: 1,
+                in_events: ptr::null(),
+                out_events: ptr::null(),
+            };
+            assert_eq!(
+                audited_process(plugin, &process),
+                (CLAP_PROCESS_CONTINUE, 0)
+            );
+            callbacks.stop_processing.unwrap()(plugin);
+            callbacks.deactivate.unwrap()(plugin);
+        }
+    });
+}
+
+#[test]
+fn invalid_process_shape_is_rejected_before_plugin_or_buffer_access() {
+    with_probe(|plugin| {
+        // SAFETY: deliberately invalid counts use null arrays, which must not be read.
+        unsafe {
+            let callbacks = &*plugin;
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+            assert!(callbacks.start_processing.unwrap()(plugin));
+            for (frames, inputs, outputs) in [(2048, 1, 1), (64, 2, 1), (64, 1, 2), (64, 0, 0)] {
+                let process = clap_process {
+                    steady_time: 0,
+                    frames_count: frames,
+                    transport: ptr::null(),
+                    audio_inputs: ptr::null(),
+                    audio_outputs: ptr::null_mut(),
+                    audio_inputs_count: inputs,
+                    audio_outputs_count: outputs,
+                    in_events: ptr::null(),
+                    out_events: ptr::null(),
+                };
+                assert_eq!(audited_process(plugin, &process), (CLAP_PROCESS_ERROR, 0));
+            }
+            for (inputs, outputs) in [(1, 2), (3, 2), (2, 1), (2, 3)] {
+                let input = clap_audio_buffer {
+                    data32: ptr::null_mut(),
+                    data64: ptr::null_mut(),
+                    channel_count: inputs,
+                    latency: 0,
+                    constant_mask: 0,
+                };
+                let mut output = clap_audio_buffer {
+                    channel_count: outputs,
+                    ..input
+                };
+                let process = clap_process {
+                    steady_time: 0,
+                    frames_count: 64,
+                    transport: ptr::null(),
+                    audio_inputs: &raw const input,
+                    audio_outputs: &raw mut output,
+                    audio_inputs_count: 1,
+                    audio_outputs_count: 1,
+                    in_events: ptr::null(),
+                    out_events: ptr::null(),
+                };
+                assert_eq!(audited_process(plugin, &process), (CLAP_PROCESS_ERROR, 0));
+            }
+            assert_eq!(
+                enter_plugin(&data_from_plugin::<Probe>(plugin).plugin).processed_frames,
+                0
+            );
+            callbacks.stop_processing.unwrap()(plugin);
+            callbacks.deactivate.unwrap()(plugin);
+        }
+    });
 }
 
 unsafe extern "C" fn no_extension(_: *const clap_host, _: *const c_char) -> *const c_void {

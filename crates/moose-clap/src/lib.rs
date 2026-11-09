@@ -109,7 +109,7 @@ use clap_sys::version::CLAP_VERSION;
 use moose_core::TransportSlot;
 use moose_core::buffer::AudioBuffer;
 use moose_core::bus::{BusConfig, BusKind, ChannelConfig};
-use moose_core::bus_routing::{BusActivation, BusRouting, bus_layouts_fit_routing};
+use moose_core::bus_routing::{BusActivation, BusRoute, BusRouting, bus_layouts_fit_routing};
 use moose_core::cast::{len_u32, size_of_u32};
 use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
@@ -904,7 +904,7 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             }
             for buf in &mut scr.input_widen {
                 if buf.capacity() < max_block {
-                    buf.reserve_exact(max_block - buf.capacity());
+                    buf.reserve_exact(max_block - buf.len());
                 }
             }
             while scr.output_narrow.len() < max_out {
@@ -912,7 +912,7 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             }
             for buf in &mut scr.output_narrow {
                 if buf.capacity() < max_block {
-                    buf.reserve_exact(max_block - buf.capacity());
+                    buf.reserve_exact(max_block - buf.len());
                 }
             }
             while scr.host_out_ptrs.len() < max_out {
@@ -2700,11 +2700,35 @@ unsafe fn flush_gui_changes<P: PluginExport>(
 // Process callback
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// Non-null bus arrays must contain `count` readable CLAP buffers.
+unsafe fn audio_bus_channels_match(
+    buffers: *const clap_audio_buffer,
+    count: u32,
+    channels: impl Iterator<Item = usize>,
+) -> bool {
+    if count != 0 && buffers.is_null() {
+        return false;
+    }
+    let mut channels = channels.filter(|&count| count != 0);
+    for index in 0..count {
+        let Some(expected) = channels.next() else {
+            return false;
+        };
+        // SAFETY: the caller supplies a live array; excess buses are rejected above.
+        if unsafe { (*buffers.add(index as usize)).channel_count as usize } != expected {
+            return false;
+        }
+    }
+    channels.next().is_none()
+}
+
 #[allow(clippy::too_many_lines)]
 unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
     plugin: *const clap_plugin,
     process: *const clap_process,
 ) -> i32 {
+    let mut audio_buffers_valid = false;
     let result = run_audio_block_with::<P, i32>("CLAP", CLAP_PROCESS_ERROR, || unsafe {
         if process.is_null() {
             return CLAP_PROCESS_ERROR;
@@ -2718,6 +2742,25 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             params_flush::<P>(plugin, proc.in_events, proc.out_events);
             return CLAP_PROCESS_CONTINUE;
         }
+
+        {
+            let audio = data.audio.enter();
+            if num_frames > audio.max_block_size
+                || !audio_bus_channels_match(
+                    proc.audio_inputs,
+                    proc.audio_inputs_count,
+                    audio.bus_routing.inputs().map(BusRoute::channel_count),
+                )
+                || !audio_bus_channels_match(
+                    proc.audio_outputs,
+                    proc.audio_outputs_count,
+                    audio.bus_routing.outputs().map(BusRoute::channel_count),
+                )
+            {
+                return CLAP_PROCESS_ERROR;
+            }
+        }
+        audio_buffers_valid = true;
 
         // Take ownership of the plugin for the whole block: an
         // uncontended `Acquire`, never a wait, since the host contract
@@ -2791,13 +2834,6 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         //    pass-through must do `output.copy_from_slice(input)`
         //    themselves; auto-copying clobbers the previous-block tail
         //    that delay/reverb feedback paths read back from the output.
-        debug_assert!(
-            num_frames <= scr.max_block_size,
-            "host violated CLAP contract: process() got {num_frames} frames \
-             but activate() declared max {}",
-            scr.max_block_size
-        );
-
         // Build per-channel slices preserving channel index across
         // every bus. A null bus (neither data pointer set) emits
         // empty slices for each of its declared channels rather than
@@ -2821,20 +2857,12 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         for buf in &mut scr.input_widen {
             buf.clear();
         }
-        // The outer Vec is pre-sized in `clap_plugin_activate`; the
-        // while-loops below only run as a fallback if the pre-grow
-        // didn't cover the bus layout the host actually picked.
-        // `Vec::new()` keeps the fallback allocation-free; the inner
-        // scratch only allocates if that channel actually converts.
         let mut flat_in_idx = 0usize;
         let bus_routing = scr.bus_routing;
         for bus_idx in 0..proc.audio_inputs_count {
             let buf = &*proc.audio_inputs.add(bus_idx as usize);
             let bus_is_f64 = !buf.data64.is_null();
             for ch in 0..buf.channel_count {
-                while scr.input_widen.len() <= flat_in_idx {
-                    scr.input_widen.push(Vec::new());
-                }
                 let scratch = &mut scr.input_widen[flat_in_idx];
                 let slice: &'static [P::Sample] = if bus_is_f64 {
                     let host_ptr: *const f64 = *buf.data64.add(ch as usize);
@@ -2887,9 +2915,6 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             let buf = &mut *proc.audio_outputs.add(bus_idx as usize);
             let bus_is_f64 = !buf.data64.is_null();
             for ch in 0..buf.channel_count {
-                while scr.output_narrow.len() <= flat_out_idx {
-                    scr.output_narrow.push(Vec::new());
-                }
                 let scratch = &mut scr.output_narrow[flat_out_idx];
                 let slice: &'static mut [P::Sample] = if bus_is_f64 {
                     let host_ptr: *mut f64 = *buf.data64.add(ch as usize);
@@ -3380,9 +3405,8 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
     // the `CLAP_PROCESS_ERROR` fallback - but the plugin may have left the
     // output buffers half-written. Zero them so the host doesn't play stale
     // garbage for a block before it reacts to the error, matching VST3 / VST2
-    // / AAX. (`CLAP_PROCESS_ERROR` is otherwise only the null-process guard,
-    // where the zero is a no-op.)
-    if result == CLAP_PROCESS_ERROR {
+    // / AAX. An invalid host shape has no validated storage to clear.
+    if result == CLAP_PROCESS_ERROR && audio_buffers_valid {
         unsafe { zero_clap_output_buffers(process) };
     }
     result
