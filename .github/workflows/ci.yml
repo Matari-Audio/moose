@@ -36,7 +36,7 @@ jobs:
   changes:
     runs-on: ubuntu-24.04
     outputs:
-      # JSON lists of runner labels, e.g. ["macos-14"]
+      # JSON lists of runner labels, e.g. ["macos-15"]
       oses: ${{ steps.pick.outputs.oses }}
       rt_oses: ${{ steps.pick.outputs.rt_oses }}
     steps:
@@ -57,7 +57,7 @@ jobs:
           for o in $picked; do
             case $o in
               linux) oses+=(ubuntu-24.04); rt+=(ubuntu-24.04) ;;
-              macos) oses+=(macos-14) ;;
+              macos) oses+=(macos-15) ;;
               windows) oses+=(windows-latest); rt+=(windows-latest) ;;
             esac
           done

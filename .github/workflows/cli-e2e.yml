@@ -57,8 +57,8 @@ jobs:
         exclude:
           - {os: ubuntu-24.04, part: plugins}
           - {os: ubuntu-24.04, part: scaffolds}
-          - {os: macos-14, part: plugins}
-          - {os: macos-14, part: scaffolds}
+          - {os: macos-15, part: plugins}
+          - {os: macos-15, part: scaffolds}
           - {os: windows-latest, part: all}
     runs-on: ${{ matrix.os }}
     defaults:

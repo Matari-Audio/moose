@@ -125,8 +125,8 @@ jobs:
 
   macos:
     if: contains(inputs.platforms, 'macos')
-    name: bake (macos-14)
-    runs-on: macos-14
+    name: bake (macos-15)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -151,7 +151,7 @@ jobs:
       # history if this needs revisiting.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: bake-macos-14
+          key: bake-macos-15
           cache-bin: false
 
       - name: Build cargo-moose
