@@ -470,6 +470,36 @@ impl<P: Params> Editor for MuiEditor<P> {
     }
 
     #[cfg(target_os = "linux")]
+    fn supports_floating_x11(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_floating_x11(
+        &mut self,
+        context: PluginContext,
+        title: &str,
+        closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        self.close();
+        lock(&self.shared)
+            .view
+            .bridge
+            .attach(context.with_params(Arc::clone(&self.params)));
+        self.reset_requests();
+        self.requests.on_close(closed);
+        self.window = window::open_floating_threaded(
+            title,
+            self.size,
+            self.scale.policy(),
+            Arc::clone(&self.shared),
+            Arc::clone(&self.requests),
+        )
+        .map(Handle);
+        self.window.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
     fn supports_floating_wayland(&self) -> bool {
         true
     }

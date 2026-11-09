@@ -399,13 +399,20 @@ struct ClapAudio<P: PluginExport> {
     bus_routing: BusRouting,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuiMode {
+    Embedded,
+    FloatingX11,
+    FloatingWayland,
+}
+
 /// Main/UI-thread-owned editor state (see [`ClapPluginData::gui`]).
 struct ClapGui {
     /// GUI editor (created by the plugin, if it implements `editor()`).
     editor: Option<Box<dyn Editor>>,
     /// Whether the GUI has been created via the gui extension.
     gui_created: bool,
-    floating: bool,
+    mode: GuiMode,
     visible: bool,
     title: String,
 }
@@ -469,6 +476,7 @@ unsafe fn input_channel_slice<S: Sample, H: Sample>(
     host_ptr: *const H,
     num_frames: usize,
     scratch: &mut Vec<S>,
+    copy: bool,
 ) -> &'static [S] {
     if host_ptr.is_null() {
         // Unconnected channel (an unrouted sidechain port). The plugin
@@ -481,18 +489,56 @@ unsafe fn input_channel_slice<S: Sample, H: Sample>(
         return unsafe { std::slice::from_raw_parts(scratch.as_ptr(), num_frames) };
     }
     unsafe {
-        if S::IS_F64 == H::IS_F64 {
+        if S::IS_F64 == H::IS_F64 && !copy {
             // SAFETY: sealed traits - equal IS_F64 means S == H.
             return std::slice::from_raw_parts(host_ptr.cast::<S>(), num_frames);
         }
         scratch.clear();
         scratch.reserve(num_frames);
-        let host = std::slice::from_raw_parts(host_ptr, num_frames);
-        for &h in host {
-            scratch.push(S::from_f64(h.to_f64()));
+        if S::IS_F64 == H::IS_F64 {
+            scratch.extend_from_slice(std::slice::from_raw_parts(host_ptr.cast::<S>(), num_frames));
+        } else {
+            let host = std::slice::from_raw_parts(host_ptr, num_frames);
+            for &h in host {
+                scratch.push(S::from_f64(h.to_f64()));
+            }
         }
         std::slice::from_raw_parts(scratch.as_ptr(), num_frames)
     }
+}
+
+// Detect overlap before creating any mutable output references.
+unsafe fn input_overlaps_outputs(input: *const u8, len: usize, process: &clap_process) -> bool {
+    if input.is_null() || len == 0 {
+        return false;
+    }
+    let start = input as usize;
+    let end = start.saturating_add(len);
+    for bus in 0..process.audio_outputs_count {
+        let output = unsafe { &*process.audio_outputs.add(bus as usize) };
+        for channel in 0..output.channel_count {
+            let (ptr, bytes) = if !output.data64.is_null() {
+                (
+                    unsafe { *output.data64.add(channel as usize) } as usize,
+                    size_of::<f64>(),
+                )
+            } else if !output.data32.is_null() {
+                (
+                    unsafe { *output.data32.add(channel as usize) } as usize,
+                    size_of::<f32>(),
+                )
+            } else {
+                continue;
+            };
+            if ptr != 0
+                && start < ptr.saturating_add((process.frames_count as usize).saturating_mul(bytes))
+                && ptr < end
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Output twin of [`input_channel_slice`]: zero-copy into host
@@ -2789,14 +2835,37 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                 let scratch = &mut scr.input_widen[flat_in_idx];
                 let slice: &'static [P::Sample] = if bus_is_f64 {
                     let host_ptr: *const f64 = *buf.data64.add(ch as usize);
-                    input_channel_slice::<P::Sample, f64>(host_ptr, num_frames, scratch)
+                    input_channel_slice::<P::Sample, f64>(
+                        host_ptr,
+                        num_frames,
+                        scratch,
+                        input_overlaps_outputs(
+                            host_ptr.cast(),
+                            num_frames * size_of::<f64>(),
+                            proc,
+                        ),
+                    )
                 } else if buf.data32.is_null() {
                     // Whole input port disconnected (null channel-pointer
                     // array): feed this channel block-length silence.
-                    input_channel_slice::<P::Sample, f32>(std::ptr::null(), num_frames, scratch)
+                    input_channel_slice::<P::Sample, f32>(
+                        std::ptr::null(),
+                        num_frames,
+                        scratch,
+                        false,
+                    )
                 } else {
                     let host_ptr: *const f32 = *buf.data32.add(ch as usize);
-                    input_channel_slice::<P::Sample, f32>(host_ptr, num_frames, scratch)
+                    input_channel_slice::<P::Sample, f32>(
+                        host_ptr,
+                        num_frames,
+                        scratch,
+                        input_overlaps_outputs(
+                            host_ptr.cast(),
+                            num_frames * size_of::<f32>(),
+                            proc,
+                        ),
+                    )
                 };
                 scr.input_slices.push(slice);
                 flat_in_idx += 1;
@@ -4596,6 +4665,18 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
                 .as_ref()
                 .is_some_and(|editor| editor.supports_floating_wayland());
         }
+        #[cfg(target_os = "linux")]
+        if api == CLAP_WINDOW_API_X11 && is_floating {
+            let data = data_from_plugin::<P>(plugin);
+            let mut gui = data.gui.enter();
+            if gui.editor.is_none() {
+                gui.editor = (data.editor_builder)(data.params_arc.clone());
+            }
+            return gui
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.supports_floating_x11());
+        }
         if is_floating {
             return false;
         }
@@ -4674,8 +4755,15 @@ unsafe extern "C" fn gui_create<P: PluginExport>(
         }
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
+        let mode = if !is_floating {
+            GuiMode::Embedded
+        } else if CStr::from_ptr(api).to_bytes() == b"x11" {
+            GuiMode::FloatingX11
+        } else {
+            GuiMode::FloatingWayland
+        };
         if gui.gui_created {
-            return gui.floating == is_floating;
+            return gui.mode == mode;
         }
         // Built through the cached lock-free editor factory, so opening
         // the GUI never stalls the audio thread (and `--shell` rebuilds
@@ -4683,7 +4771,7 @@ unsafe extern "C" fn gui_create<P: PluginExport>(
         if gui.editor.is_none() {
             gui.editor = (data.editor_builder)(data.params_arc.clone());
         }
-        gui.floating = is_floating;
+        gui.mode = mode;
         data.floating_mode.store(is_floating, Ordering::Release);
         if is_floating {
             data.host_scale.store(0, Ordering::Relaxed);
@@ -4742,7 +4830,7 @@ unsafe extern "C" fn gui_set_scale<P: PluginExport>(
             return false;
         }
         let data = data_from_plugin::<P>(plugin);
-        if data.gui.enter().floating {
+        if data.gui.enter().mode != GuiMode::Embedded {
             return false;
         }
         data.set_host_scale(scale);
@@ -4858,7 +4946,7 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
         }
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
-        if !gui.gui_created || gui.floating {
+        if !gui.gui_created || gui.mode != GuiMode::Embedded {
             return false;
         }
         let Some(editor) = gui.editor.as_mut() else {
@@ -5134,10 +5222,14 @@ unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_plugin) -> bo
         if !gui.gui_created {
             return false;
         }
-        if !gui.floating || gui.visible {
+        if gui.mode == GuiMode::Embedded
+            || (gui.visible && data.floating_visible.load(Ordering::Acquire))
+        {
             return true;
         }
+        gui.visible = false;
         let title = gui.title.clone();
+        let mode = gui.mode;
         let Some(editor) = gui.editor.as_mut() else {
             return false;
         };
@@ -5145,21 +5237,26 @@ unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_plugin) -> bo
         let closed = data.floating_closed.clone();
         let host = SendPtr::new(data.host);
         visible.store(true, Ordering::Release);
-        let opened = editor.open_floating_wayland(
-            editor_context::<P>(plugin),
-            &title,
-            Arc::new(move || {
-                if visible.swap(false, Ordering::AcqRel) {
-                    closed.store(true, Ordering::Release);
-                    let host = host.as_ptr();
-                    if !host.is_null()
-                        && let Some(request) = (*host).request_callback
-                    {
-                        request(host);
-                    }
+        let on_close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if visible.swap(false, Ordering::AcqRel) {
+                closed.store(true, Ordering::Release);
+                let host = host.as_ptr();
+                if !host.is_null()
+                    && let Some(request) = (*host).request_callback
+                {
+                    request(host);
                 }
-            }),
-        );
+            }
+        });
+        let opened = match mode {
+            GuiMode::FloatingX11 => {
+                editor.open_floating_x11(editor_context::<P>(plugin), &title, on_close)
+            }
+            GuiMode::FloatingWayland => {
+                editor.open_floating_wayland(editor_context::<P>(plugin), &title, on_close)
+            }
+            GuiMode::Embedded => false,
+        };
         data.floating_visible.store(opened, Ordering::Release);
         data.note_window_scale(editor.as_ref());
         gui.visible = opened;
@@ -5174,7 +5271,7 @@ unsafe extern "C" fn gui_hide<P: PluginExport>(plugin: *const clap_plugin) -> bo
         if !gui.gui_created {
             return false;
         }
-        if gui.floating {
+        if gui.mode != GuiMode::Embedded {
             data.floating_visible.store(false, Ordering::Release);
             if let Some(editor) = gui.editor.as_mut() {
                 editor.close();
@@ -5241,7 +5338,7 @@ unsafe extern "C" fn gui_suggest_title<P: PluginExport>(
         let mut gui = data.gui.enter();
         gui.title = CStr::from_ptr(title).to_string_lossy().into_owned();
         let title = gui.title.clone();
-        if gui.floating
+        if gui.mode != GuiMode::Embedded
             && let Some(editor) = gui.editor.as_mut()
         {
             editor.set_floating_title(&title);
@@ -5707,7 +5804,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             gui: PluginCell::new(ClapGui {
                 editor: None,
                 gui_created: false,
-                floating: false,
+                mode: GuiMode::Embedded,
                 visible: false,
                 title: String::new(),
             }),
@@ -5906,9 +6003,45 @@ mod channel_slice_tests {
         let mut scratch = Vec::<f32>::new();
         // SAFETY: the null pointer is the unconnected-port case under test;
         // `scratch` outlives the returned slice within this call.
-        let slice = unsafe { input_channel_slice::<f32, f32>(std::ptr::null(), nf, &mut scratch) };
+        let slice =
+            unsafe { input_channel_slice::<f32, f32>(std::ptr::null(), nf, &mut scratch, false) };
         assert_eq!(slice.len(), nf);
         assert!(slice.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn in_place_host_input_survives_output_writes() {
+        use super::{clap_audio_buffer, clap_process, input_overlaps_outputs};
+        let mut samples = [0.25_f32, -0.75, 0.5];
+        let input_ptr = samples.as_mut_ptr();
+        let mut outputs = [input_ptr];
+        let mut bus = clap_audio_buffer {
+            data32: outputs.as_mut_ptr(),
+            data64: std::ptr::null_mut(),
+            channel_count: 1,
+            latency: 0,
+            constant_mask: 0,
+        };
+        // SAFETY: all-zero is valid for the unused CLAP fields, which are not read here.
+        let mut process: clap_process = unsafe { std::mem::zeroed() };
+        process.audio_outputs = &raw mut bus;
+        process.audio_outputs_count = 1;
+        process.frames_count = samples.len() as u32;
+        let mut scratch = Vec::with_capacity(samples.len());
+        // SAFETY: the bus, channel pointer, and sample array are alive for this call.
+        let copy = unsafe {
+            input_overlaps_outputs(input_ptr.cast(), std::mem::size_of_val(&samples), &process)
+        };
+        let input = unsafe {
+            input_channel_slice::<f32, f32>(input_ptr, samples.len(), &mut scratch, copy)
+        };
+        // SAFETY: input now refers to scratch, not the host output array.
+        let output =
+            unsafe { output_channel_slice::<f32, f32>(input_ptr, samples.len(), &mut Vec::new()) };
+        for (dst, src) in output.iter_mut().zip(input) {
+            *dst = *src * 2.0;
+        }
+        assert_eq!(samples, [0.5, -1.5, 1.0]);
     }
 
     /// A null output channel is a block-length discard buffer the plugin
@@ -6821,6 +6954,18 @@ mod floating_gui_tests {
                 closed();
             }
         }
+        fn supports_floating_x11(&self) -> bool {
+            true
+        }
+        fn open_floating_x11(
+            &mut self,
+            _: PluginContext,
+            _: &str,
+            closed: Arc<dyn Fn() + Send + Sync>,
+        ) -> bool {
+            *self.0.lock().unwrap() = Some(closed);
+            true
+        }
         fn supports_floating_wayland(&self) -> bool {
             true
         }
@@ -6902,7 +7047,7 @@ mod floating_gui_tests {
                 CLAP_WINDOW_API_X11.as_ptr(),
                 false
             ));
-            assert!(!gui_is_api_supported::<TestPlugin>(
+            assert!(gui_is_api_supported::<TestPlugin>(
                 plugin,
                 CLAP_WINDOW_API_X11.as_ptr(),
                 true
@@ -6916,6 +7061,11 @@ mod floating_gui_tests {
             assert!(gui_create::<TestPlugin>(
                 plugin,
                 CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                true
+            ));
+            assert!(!gui_create::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_X11.as_ptr(),
                 true
             ));
             assert!(!gui_set_scale::<TestPlugin>(plugin, 2.));
@@ -6933,6 +7083,19 @@ mod floating_gui_tests {
                 1,
                 "programmatic hide must not notify close"
             );
+            gui_destroy::<TestPlugin>(plugin);
+            data.gui.enter().editor = Some(Box::new(Probe(hook.clone())));
+            assert!(gui_create::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_X11.as_ptr(),
+                true
+            ));
+            assert!(gui_show::<TestPlugin>(plugin));
+            assert!(gui_hide::<TestPlugin>(plugin));
+            assert!(gui_show::<TestPlugin>(plugin));
+            hook.lock().unwrap().take().unwrap()();
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(counters[1].load(Ordering::Relaxed), 2);
             gui_destroy::<TestPlugin>(plugin);
             clap_plugin_destroy::<TestPlugin>(plugin);
         }
