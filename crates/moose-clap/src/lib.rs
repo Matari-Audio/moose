@@ -896,6 +896,7 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
             state::apply_state(&mut *instance, &deserialized);
             instance.republish_snapshot();
         }
+        clap_plugin_reset::<P>(plugin);
         if refresh_parameter_list(data)
             && !data.host_params.is_null()
             && !data.host.is_null()
@@ -4116,7 +4117,7 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             // under its exclusive `&mut plugin`. `force_push` overwrites
             // any older pending blob - see the `pending_state` field
             // comment for why "newest wins" is right.
-            let _ = data.pending_state.force_push(deserialized);
+            data.pending_state.force_push(deserialized);
         } else {
             // A stopped-transport params.flush may have queued a value for
             // the next block. Recall supersedes it just as active recall
@@ -4244,7 +4245,7 @@ unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         // keeps offline preset browsing from stranding the custom-state
         // blob (sample buffers, wavetables) on the queue.
         if data.active.load(Ordering::Relaxed) {
-            let _ = data.pending_state.force_push(deserialized);
+            data.pending_state.force_push(deserialized);
         } else {
             let mut instance = enter_plugin(&data.plugin);
             state::apply_state(&mut *instance, &deserialized);
@@ -4567,10 +4568,12 @@ use clap_sys::ext::gui::{
 use clap_sys::ext::gui::{CLAP_WINDOW_API_WAYLAND, CLAP_WINDOW_API_X11};
 
 unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
-    _plugin: *const clap_plugin,
+    plugin: *const clap_plugin,
     api: *const c_char,
     is_floating: bool,
 ) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    let _ = plugin;
     if api.is_null() {
         return false;
     }
@@ -4581,7 +4584,7 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
             if !is_floating {
                 return false;
             }
-            let data = data_from_plugin::<P>(_plugin);
+            let data = data_from_plugin::<P>(plugin);
             let mut gui = data.gui.enter();
             if gui.editor.is_none() {
                 gui.editor = (data.editor_builder)(data.params_arc.clone());
@@ -4611,10 +4614,12 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
 }
 
 unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
-    _plugin: *const clap_plugin,
+    plugin: *const clap_plugin,
     api: *mut *const c_char,
     is_floating: *mut bool,
 ) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    let _ = plugin;
     if api.is_null() || is_floating.is_null() {
         return false;
     }
@@ -4639,7 +4644,7 @@ unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
             // hosts that request it, and is preferred only without X11.
             if std::env::var_os("DISPLAY").is_none()
                 && std::env::var_os("WAYLAND_DISPLAY").is_some()
-                && gui_is_api_supported::<P>(_plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
+                && gui_is_api_supported::<P>(plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
             {
                 *api = CLAP_WINDOW_API_WAYLAND.as_ptr();
                 *is_floating = true;
@@ -5039,7 +5044,7 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
                     // drains the queue while active; while inactive the main
                     // thread drains it in `state_save` / `deactivate`, so an
                     // edit made in that window is neither lost nor stranded.
-                    let _ = pending_state_for_set.force_push(state::DeserializedState {
+                    pending_state_for_set.force_push(state::DeserializedState {
                         params: Vec::new(),
                         extra: Some(bytes),
                         persist: Vec::new(),
@@ -5218,7 +5223,7 @@ unsafe extern "C" fn gui_get_resize_hints<P: PluginExport>(
 }
 
 /// CLAP defines no exported Wayland parent token/connection. A host-owned
-/// wl_surface cannot be used on our independent display connection. Return false
+/// `wl_surface` cannot be used on our independent display connection. Return false
 /// rather than treating a foreign proxy pointer as our own Wayland object.
 unsafe extern "C" fn gui_set_transient<P: PluginExport>(
     _plugin: *const clap_plugin,
@@ -6926,20 +6931,22 @@ mod inactive_recall_tests {
         // SAFETY: the test retains its stream storage and CLAP supplies len bytes.
         unsafe {
             let stream = &mut *(*stream).ctx.cast::<Stream>();
-            stream
-                .bytes
-                .extend_from_slice(std::slice::from_raw_parts(bytes.cast(), len as usize));
-            len as i64
+            stream.bytes.extend_from_slice(std::slice::from_raw_parts(
+                bytes.cast(),
+                usize::try_from(len).expect("test buffer length fits usize"),
+            ));
+            i64::try_from(len).expect("test byte count fits i64")
         }
     }
     unsafe extern "C" fn read(stream: *const clap_istream, bytes: *mut c_void, len: u64) -> i64 {
         // SAFETY: the test retains its stream storage; CLAP supplies len writable bytes.
         unsafe {
             let stream = &mut *(*stream).ctx.cast::<Stream>();
-            let len = (len as usize).min(stream.bytes.len() - stream.offset);
+            let len = (usize::try_from(len).expect("test buffer length fits usize"))
+                .min(stream.bytes.len() - stream.offset);
             ptr::copy_nonoverlapping(stream.bytes.as_ptr().add(stream.offset), bytes.cast(), len);
             stream.offset += len;
-            len as i64
+            i64::try_from(len).expect("test byte count fits i64")
         }
     }
     unsafe extern "C" fn no_extension(_: *const clap_host, _: *const c_char) -> *const c_void {
@@ -7000,17 +7007,19 @@ mod large_state_tests {
     }
     unsafe extern "C" fn write(s: *const clap_ostream, bytes: *const c_void, size: u64) -> i64 {
         let s = unsafe { &mut *((*s).ctx.cast::<Stream>()) };
-        let n = (size as usize).min(317);
+        let n = (usize::try_from(size).expect("test buffer length fits usize")).min(317);
         s.bytes
             .extend_from_slice(unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), n) });
-        n as i64
+        i64::try_from(n).expect("test byte count fits i64")
     }
     unsafe extern "C" fn read(s: *const clap_istream, dst: *mut c_void, size: u64) -> i64 {
         let s = unsafe { &mut *((*s).ctx.cast::<Stream>()) };
-        let n = (size as usize).min(311).min(s.bytes.len() - s.offset);
+        let n = (usize::try_from(size).expect("test buffer length fits usize"))
+            .min(311)
+            .min(s.bytes.len() - s.offset);
         unsafe { std::ptr::copy_nonoverlapping(s.bytes.as_ptr().add(s.offset), dst.cast(), n) };
         s.offset += n;
-        n as i64
+        i64::try_from(n).expect("test byte count fits i64")
     }
     #[test]
     fn large_host_state_roundtrips_and_default_bound_rejects() {
@@ -7031,18 +7040,18 @@ mod large_state_tests {
                 ctx: (&raw mut s).cast(),
                 write: Some(write),
             };
-            assert!(state_save::<Large>(plugin, &out));
+            assert!(state_save::<Large>(plugin, &raw const out));
             assert!(s.bytes.len() > 32 * 1024 * 1024);
             data.params_arc.payload.lock().unwrap().clear();
             let input = clap_istream {
                 ctx: (&raw mut s).cast(),
                 read: Some(read),
             };
-            assert!(state_load::<Large>(plugin, &input));
+            assert!(state_load::<Large>(plugin, &raw const input));
             assert_eq!(*data.params_arc.payload.lock().unwrap(), payload());
             s.offset = 0;
             s.bytes.pop();
-            assert!(!state_load::<Large>(plugin, &input));
+            assert!(!state_load::<Large>(plugin, &raw const input));
             clap_plugin_destroy::<Large>(plugin);
         }
     }
@@ -7050,3 +7059,6 @@ mod large_state_tests {
 
 #[cfg(test)]
 mod persist_notify_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

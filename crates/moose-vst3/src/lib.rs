@@ -1008,9 +1008,6 @@ fn push_vst3_input_event<P: PluginExport>(
                 return VST3_EVENT_INVALID;
             }
             let (kind, length) = if event.kind == VST3_EVENT_NOTE_ON {
-                if event.length < 0 {
-                    return VST3_EVENT_INVALID;
-                }
                 (ExactNoteKind::On, Some(event.length))
             } else {
                 (ExactNoteKind::Off, None)
@@ -1849,6 +1846,18 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         *out_len = 0;
     }
     run_extern_callback_with::<P, ()>("vst3", "save_state", (), || unsafe {
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        libc_free(self.0.cast());
+                    }
+                }
+            }
+        }
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         // While inactive the audio thread never runs, so a state edit the
         // editor queued through `set_state` (or a load) sits undrained in
@@ -1891,18 +1900,6 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let Ok(host_len) = u32::try_from(len) else {
             return;
         };
-        // Own exactly one contiguous host buffer. RAII frees failed or panicked
-        // partial writes; successful transfer retains the original libc ABI.
-        struct Buffer(*mut u8);
-        impl Drop for Buffer {
-            fn drop(&mut self) {
-                if !self.0.is_null() {
-                    unsafe {
-                        libc_free(self.0.cast());
-                    }
-                }
-            }
-        }
         let mut buffer = Buffer(libc_malloc(len).cast::<u8>());
         if buffer.0.is_null() {
             return;
@@ -1922,7 +1919,7 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
                 }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
                 offset += bytes.len();
-                bytes.len() as i64
+                i64::try_from(bytes.len()).unwrap_or(-1)
             },
         );
         if !ok {
@@ -1967,48 +1964,46 @@ unsafe fn apply_host_state<P: PluginExport>(
     deserialized: state::DeserializedState,
     params_applied: bool,
 ) -> i32 {
-    unsafe {
-        // Apply params synchronously on the host thread (atomic-safe)
-        // so host-side queries that read parameter values right
-        // after `setState` see the restored values without first
-        // running a process block. pluginval / DAW preset reload
-        // both observe this.
-        if !params_applied {
-            state::apply_params(&*inst.params_arc, &deserialized);
-        }
-        if inst.active.load(Ordering::Relaxed) {
-            // Active: the audio thread drains `pending_state` at the top
-            // of the next block and applies the custom-state blob under
-            // its exclusive `&mut plugin`. `force_push` overwrites any
-            // older pending blob - see the `pending_state` field comment
-            // for why newest-wins is right.
-            let _ = inst.pending_state.force_push(deserialized);
-        } else {
-            // Inactive: no `cb_process` will run, so apply the full
-            // state (params + extra) synchronously under the plugin
-            // lock - uncontended here since no audio thread is
-            // processing. Otherwise a `getState` before the next
-            // activate would re-serialize stale custom state.
-            let mut plugin = enter_plugin(&inst.plugin);
-            state::apply_state(&mut *plugin, &deserialized);
-            // No `cb_process` will publish, so refresh the snapshot slot
-            // now - a `getState` while still inactive reads live state.
-            plugin.republish_snapshot();
-        }
-        // `try_enter`, not `enter`: a host can deliver `setState`
-        // synchronously from a component-handler callback while an outer
-        // GUI callback (e.g. `cb_gui_open`, which holds the cell across the
-        // author's `editor.open`) still holds the cell. Re-entering with
-        // `enter` would hand out a second aliasing `&mut` in release. When
-        // busy, skip the notify: the editor reads live param/state values as
-        // it finishes opening, so it renders the freshly-loaded state anyway.
-        if let Some(mut gui) = inst.gui.try_enter()
-            && let Some(ref mut editor) = gui.editor
-        {
-            editor.state_changed();
-        }
-        1
+    // Apply params synchronously on the host thread (atomic-safe)
+    // so host-side queries that read parameter values right
+    // after `setState` see the restored values without first
+    // running a process block. pluginval / DAW preset reload
+    // both observe this.
+    if !params_applied {
+        state::apply_params(&*inst.params_arc, &deserialized);
     }
+    if inst.active.load(Ordering::Relaxed) {
+        // Active: the audio thread drains `pending_state` at the top
+        // of the next block and applies the custom-state blob under
+        // its exclusive `&mut plugin`. `force_push` overwrites any
+        // older pending blob - see the `pending_state` field comment
+        // for why newest-wins is right.
+        inst.pending_state.force_push(deserialized);
+    } else {
+        // Inactive: no `cb_process` will run, so apply the full
+        // state (params + extra) synchronously under the plugin
+        // lock - uncontended here since no audio thread is
+        // processing. Otherwise a `getState` before the next
+        // activate would re-serialize stale custom state.
+        let mut plugin = enter_plugin(&inst.plugin);
+        state::apply_state(&mut *plugin, &deserialized);
+        // No `cb_process` will publish, so refresh the snapshot slot
+        // now - a `getState` while still inactive reads live state.
+        plugin.republish_snapshot();
+    }
+    // `try_enter`, not `enter`: a host can deliver `setState`
+    // synchronously from a component-handler callback while an outer
+    // GUI callback (e.g. `cb_gui_open`, which holds the cell across the
+    // author's `editor.open`) still holds the cell. Re-entering with
+    // `enter` would hand out a second aliasing `&mut` in release. When
+    // busy, skip the notify: the editor reads live param/state values as
+    // it finishes opening, so it renders the freshly-loaded state anyway.
+    if let Some(mut gui) = inst.gui.try_enter()
+        && let Some(ref mut editor) = gui.editor
+    {
+        editor.state_changed();
+    }
+    1
 }
 
 unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
@@ -2038,7 +2033,7 @@ unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
             persist.byte_len(),
             P::max_host_state_bytes(),
             |output| moose_params::write_prepared_persist(persist.as_ref(), output),
-            |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32),
+            |bytes| u32::try_from(bytes.len()).map_or(-1, |len| write(stream, bytes.as_ptr(), len)),
         ))
     })
 }
@@ -2051,7 +2046,7 @@ unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
     run_extern_callback_with::<P, i32>("vst3", "load_state_stream", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let Some(deserialized) = state::read_and_apply_params::<P>(
-            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32),
+            |buf| u32::try_from(buf.len()).map_or(-1, |len| read(stream, buf.as_mut_ptr(), len)),
             inst.plugin_id_hash,
             state::PluginFormat::Vst3,
             None,
@@ -2684,7 +2679,7 @@ fn encode_detailed_note<P: PluginExport>(
     }
     let (kind, length, note_id, mutation) = match kind {
         ExactNoteKind::On => {
-            let Some(length) = length.filter(|length| *length >= 0) else {
+            let Some(length) = length else {
                 return Vst3EncodeResult::Invalid;
             };
             let Some((note_id, mutation)) = note_ids.propose_note_on(source, bus, channel, pitch)
@@ -3517,7 +3512,7 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                         // inactive the main thread drains it in `cb_state_save`
                         // / `cb_set_active`, so an edit made in that window is
                         // neither lost nor stranded.
-                        let _ = pending_state_for_set.force_push(state::DeserializedState {
+                        pending_state_for_set.force_push(state::DeserializedState {
                             params: Vec::new(),
                             extra: Some(bytes),
                             persist: Vec::new(),
@@ -4216,7 +4211,11 @@ mod tests {
         let mut buf = [0_u8; 8192];
         for expected in [317, 17, 0, -1, -1] {
             let count = unsafe {
-                moose_vst3_read_state_chunk((&raw mut s).cast(), buf.as_mut_ptr(), buf.len() as u32)
+                moose_vst3_read_state_chunk(
+                    (&raw mut s).cast(),
+                    buf.as_mut_ptr(),
+                    u32::try_from(buf.len()).expect("buffer length fits u32"),
+                )
             };
             assert_eq!(count, expected);
         }
@@ -4675,7 +4674,7 @@ mod large_state_tests {
             .min(input.bytes.len() - input.offset);
         unsafe { std::ptr::copy_nonoverlapping(input.bytes.as_ptr().add(input.offset), dst, n) };
         input.offset += n;
-        n as i64
+        i64::try_from(n).expect("test read size fits i64")
     }
     #[test]
     fn large_host_state_roundtrips_through_stream_callback() {
@@ -4710,3 +4709,6 @@ mod large_state_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod persist_notify_tests;
+
+#[cfg(test)]
+mod native_note_tests;
