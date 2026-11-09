@@ -1,7 +1,15 @@
-//! AUv2 persistent-document completion on the host main queue, without a GUI
+//! `AUv2` persistent-document completion on the host main queue, without a GUI
 //! or a polling worker. Mirrors the VST3 main-queue dispatch-source bridge.
-use super::*;
+use super::{
+    moose_au_v2_host_begin_param_gesture, moose_au_v2_host_end_param_gesture,
+    moose_au_v2_host_set_param,
+};
+use moose_core::editor::SendPtr;
+use moose_core::export::PluginExport;
+use moose_core::wrapper::run_extern_callback_with;
+use moose_params::Params;
 use std::ffi::c_void;
+use std::sync::Arc;
 
 unsafe extern "C" {
     static _dispatch_source_type_data_or: c_void;
@@ -51,17 +59,16 @@ impl<P: PluginExport> Dispatcher<P> {
                 return None;
             }
             let source = SendPtr::new(raw);
-            let mut context = Box::new(Context::<P> {
-                params: params.clone(),
-                host,
-            });
+            let mut context = Box::new(Context::<P> { params, host });
             dispatch_set_context(raw, (&raw mut *context).cast());
             dispatch_source_set_event_handler_f(raw, drain::<P>);
             dispatch_resume(raw);
             let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
                 dispatch_source_merge_data(source.as_ptr().cast_mut(), 1);
             }));
-            params.set_persist_change_signal(Arc::downgrade(&signal));
+            context
+                .params
+                .set_persist_change_signal(Arc::downgrade(&signal));
             Some(Self {
                 signal,
                 source,
