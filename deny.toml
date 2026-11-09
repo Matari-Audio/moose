@@ -51,7 +51,5 @@ multiple-versions = "warn"
 
 [sources]
 unknown-registry = "deny"
-# Only git source: MUI (moose-mui, not on crates.io); baseview is vendored
-# as crates/moose-baseview. Any other git source is unexpected.
 unknown-git = "deny"
-allow-git = ["https://github.com/Matari-Audio/MUI"]
+allow-git = ["https://github.com/Matari-Audio/MUI", "https://github.com/Matari-Audio/matari-audio-drag-and-drop"]

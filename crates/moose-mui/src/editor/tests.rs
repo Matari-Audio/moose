@@ -508,3 +508,126 @@ fn a_resized_window_fits_the_design_size_unless_the_zoom_is_fixed() {
     let fixed = editor(&params).resizable((200, 150)).fixed_zoom();
     assert_eq!(zoom_at(&fixed, (800, 600), 1.0), 1.0);
 }
+
+#[test]
+fn canvas_drag_brackets_values_and_ends_when_absent() {
+    let params = Arc::new(Synth::default());
+    let (context, log) = context(&params);
+    let mut bridge = Bridge::new(params.clone());
+    bridge.attach(context.with_params(params));
+    bridge.drag_gesture(10u32, 0.7);
+    bridge.end_unbound();
+    bridge.drag_gesture(10u32, 0.8);
+    bridge.end_unbound();
+    bridge.end_unbound();
+    assert_eq!(
+        calls(&log),
+        [
+            Call::Begin(10),
+            Call::Set(10, 0.7),
+            Call::Set(10, 0.8),
+            Call::End(10)
+        ]
+    );
+}
+
+#[test]
+fn wheel_hold_is_one_gesture_and_releases_after_an_earlier_unbind() {
+    let params = Arc::new(Synth::default());
+    let (context, log) = context(&params);
+    let mut bridge = Bridge::new(params.clone());
+    bridge.attach(context.with_params(params));
+    let mut ui = Ui::default();
+    bridge.hold(10u32, true);
+    bridge.bind(&mut ui, 10u32, |ui, id, v| {
+        *v = 0.7;
+        knob(ui, id, "Gain", v, 0.0..=1.0)
+    });
+    bridge.end_unbound();
+    bridge.hold(10u32, true);
+    bridge.bind(&mut ui, 10u32, |ui, id, v| {
+        *v = 0.8;
+        knob(ui, id, "Gain", v, 0.0..=1.0)
+    });
+    bridge.end_unbound();
+    bridge.hold(10u32, false);
+    assert_eq!(
+        calls(&log),
+        [
+            Call::Begin(10),
+            Call::Set(10, 0.7),
+            Call::Set(10, 0.8),
+            Call::End(10)
+        ]
+    );
+    bridge.hold(10u32, true);
+    bridge.end_unbound();
+    bridge.hold(10u32, true);
+    bridge.hold(10u32, false);
+    assert_eq!(
+        calls(&log),
+        [
+            Call::Begin(10),
+            Call::End(10),
+            Call::Begin(10),
+            Call::End(10)
+        ]
+    );
+}
+
+#[test]
+fn user_zoom_multiplies_fit_and_rejects_invalid_factors() {
+    let params = Arc::new(Synth::default());
+    let zoomed = editor(&params).user_zoom(|_| 1.5);
+    assert_eq!(zoom_at(&zoomed, (800, 600), 1.0), 3.0);
+    let invalid = editor(&params).user_zoom(|_| f64::NAN);
+    assert_eq!(zoom_at(&invalid, (800, 600), 1.0), 2.0);
+}
+
+#[test]
+fn hooks_receive_input_and_diagnostics_after_requests_are_replaced() {
+    use crate::window::baseview::{EventStatus, WindowEvent};
+    let params = Arc::new(Synth::default());
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let files = events.clone();
+    let cancelled = events.clone();
+    let logged = events.clone();
+    let keys = events.clone();
+    let mut editor = editor(&params)
+        .on_files(move |_, _, paths, dropped| {
+            files
+                .lock()
+                .unwrap()
+                .push(format!("{}:{dropped}", paths[0].display()));
+            true
+        })
+        .on_cancel(move |_| cancelled.lock().unwrap().push("cancel".into()))
+        .on_log(move |line| logged.lock().unwrap().push(line.into()))
+        .on_key(move |_, key| {
+            keys.lock().unwrap().push(format!("key:{}", key.down));
+            true
+        });
+    editor.reset_requests();
+    let (editor, mut handler, _) = open_with(&params, editor);
+    let status = handler.on_event_inner(&Event::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: HostKey::Character("a".into()),
+        ..KeyboardEvent::default()
+    }));
+    assert_eq!(status, EventStatus::Captured);
+    let paths = [std::path::PathBuf::from("sample.wav")];
+    assert!(handler.driver.drop_files(
+        &mut lock(&editor.shared),
+        Point::new(1.0, 2.0),
+        mui::input::Mods::default(),
+        &paths,
+        true
+    ));
+    lock(&editor.shared).view.log("renderer message");
+    handler.on_event_inner(&Event::Window(WindowEvent::Unfocused));
+    handler.step();
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["key:true", "sample.wav:true", "renderer message", "cancel"]
+    );
+}

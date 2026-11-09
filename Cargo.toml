@@ -31,7 +31,6 @@ members = [
     "crates/moose-simd",
     "crates/moose-font",
     "crates/moose-utils",
-    "crates/moose-baseview",
     "examples/moose-example-gain",
     "examples/moose-example-gain-inplace",
     "examples/moose-example-block-gain",
@@ -160,16 +159,10 @@ windows-sys = "0.61"
 # `moose-gpu/Cargo.toml`, then unified across the workspace.
 wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 
-# moose-baseview is upstream baseview 0.3.4 plus MOOSE's additive patches
-# (see crates/moose-baseview/README.md). The `package =` rename keeps every
-# `use baseview::*` in the GUI crates compiling unchanged; GUI crates consume
-# this via `baseview = { workspace = true }`.
-baseview = { package = "moose-baseview", path = "crates/moose-baseview", version = "0.3.4-moose.1" }
-
-# MUI's mui-baseview depends on moose-baseview by git; point that at the
-# path copy so the workspace links one baseview and the window types match.
-[patch."https://github.com/Matari-Audio/moose"]
-moose-baseview = { path = "crates/moose-baseview" }
+# All editor backends share MUI's maintained native window implementation.
+baseview = { package = "moose-baseview", git = "https://github.com/Matari-Audio/MUI", rev = "0c98cd1d7375029466968947872deb59426c1dd5" }
+mui = { git = "https://github.com/Matari-Audio/MUI", rev = "0c98cd1d7375029466968947872deb59426c1dd5", features = ["gpu-effects"] }
+mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "0c98cd1d7375029466968947872deb59426c1dd5" }
 
 # Custom profile for shell-mode (hot-reload) builds. `cargo moose
 # install --shell` invokes `cargo build --profile shell --features

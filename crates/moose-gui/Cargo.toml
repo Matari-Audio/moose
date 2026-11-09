@@ -82,3 +82,6 @@ gpu = ["dep:moose-gpu"]
 [lints]
 workspace = true
 
+[dev-dependencies]
+x11-dl = "2.21.0"
+

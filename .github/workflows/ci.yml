@@ -152,7 +152,7 @@ jobs:
         if: runner.os == 'Linux'
         run: >-
           env -u WAYLAND_DISPLAY xvfb-run -a
-          cargo test -p moose-baseview --locked --test x11_visibility
+          cargo test -p moose-gui --locked --test x11_visibility
           -- --ignored --test-threads=1
       - name: benches (test mode)
         run: cargo test -p moose-simd --benches

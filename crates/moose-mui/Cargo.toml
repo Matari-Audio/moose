@@ -16,8 +16,8 @@ publish = false
 [dependencies]
 moose-core = { workspace = true }
 moose-params = { workspace = true }
-mui = { git = "https://github.com/Matari-Audio/MUI", features = ["gpu-effects"] }
-mui-baseview = { git = "https://github.com/Matari-Audio/MUI" }
+mui = { workspace = true }
+mui-baseview = { workspace = true }
 # baseview's parent handle is raw-window-handle 0.6.
 raw-window-handle = "0.6"
 

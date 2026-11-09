@@ -13,6 +13,10 @@ use crate::window::{self, Requests, Shared, View, lock};
 
 type Build<P> = Box<dyn FnMut(&mut Ui, &mut Bridge<P>) -> El + Send>;
 type Changed = Box<dyn FnMut() -> bool + Send>;
+type FileDrop =
+    Box<dyn FnMut(&Ui, mui::prelude::Point, &[std::path::PathBuf], bool) -> bool + Send>;
+type Cancel = Box<dyn FnMut(&Ui) + Send>;
+type Log = Box<dyn FnMut(&str) + Send>;
 
 /// The model half: the app's build closure and the parameters it binds.
 pub(crate) struct Session<P: Params> {
@@ -20,6 +24,10 @@ pub(crate) struct Session<P: Params> {
     build: Build<P>,
     /// [`MuiEditor::changed`]: model state outside the bridge.
     changed: Option<Changed>,
+    file_drop: Option<FileDrop>,
+    cancel: Option<Cancel>,
+    log: Option<Log>,
+    user_zoom: Option<Box<dyn Fn(Size) -> f64 + Send>>,
     /// The size `build` was designed at, fitted to the window; `None` is
     /// [`MuiEditor::fixed_zoom`].
     design: Option<Size>,
@@ -28,6 +36,29 @@ pub(crate) struct Session<P: Params> {
 }
 
 impl<P: Params> View for Session<P> {
+    fn log(&mut self, line: &str) {
+        if let Some(log) = &mut self.log {
+            log(line);
+        } else {
+            eprintln!("{line}");
+        }
+    }
+    fn drop_files(
+        &mut self,
+        ui: &Ui,
+        at: mui::prelude::Point,
+        paths: &[std::path::PathBuf],
+        dropped: bool,
+    ) -> bool {
+        self.file_drop
+            .as_mut()
+            .is_some_and(|f| f(ui, at, paths, dropped))
+    }
+    fn cancel(&mut self, ui: &Ui) {
+        if let Some(f) = &mut self.cancel {
+            f(ui);
+        }
+    }
     fn build(&mut self, ui: &mut Ui, _: &Input) -> El {
         let root = (self.build)(ui, &mut self.bridge);
         self.bridge.end_unbound();
@@ -38,9 +69,15 @@ impl<P: Params> View for Session<P> {
         self.bridge.changed() | self.changed.as_mut().is_some_and(|f| f())
     }
     fn zoom(&self, window: Size) -> f64 {
-        self.design.map_or(1.0, |d| {
+        let fit = self.design.map_or(1.0, |d| {
             (window.width / d.width).min(window.height / d.height)
-        })
+        });
+        let user = self.user_zoom.as_ref().map_or(1.0, |f| f(window));
+        fit * if user.is_finite() && user > 0.0 {
+            user
+        } else {
+            1.0
+        }
     }
     fn request_resize(&mut self, width: u32, height: u32) -> bool {
         #[cfg(target_os = "linux")]
@@ -93,6 +130,7 @@ impl<P: Params> View for Session<P> {
 pub struct MuiEditor<P: Params> {
     shared: Arc<Mutex<Shared<Session<P>>>>,
     requests: Arc<Requests>,
+    keys: Option<window::KeyHook>,
     params: Arc<P>,
     size: (u32, u32),
     min: Option<(u32, u32)>,
@@ -139,6 +177,10 @@ impl<P: Params> MuiEditor<P> {
             bridge: Bridge::new(Arc::clone(&params)),
             build: Box::new(build),
             changed: None,
+            file_drop: None,
+            cancel: None,
+            log: None,
+            user_zoom: None,
             design: Some(size),
             #[cfg(target_os = "linux")]
             native_requests: std::sync::Weak::new(),
@@ -146,6 +188,7 @@ impl<P: Params> MuiEditor<P> {
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
             requests: Arc::default(),
+            keys: None,
             params,
             size: points(size),
             min: None,
@@ -169,6 +212,56 @@ impl<P: Params> MuiEditor<P> {
     pub fn changed(self, f: impl FnMut() -> bool + Send + 'static) -> Self {
         lock(&self.shared).view.changed = Some(Box::new(f));
         self
+    }
+
+    /// Receive window and renderer diagnostics.
+    #[must_use]
+    pub fn on_log(self, f: impl FnMut(&str) + Send + 'static) -> Self {
+        lock(&self.shared).view.log = Some(Box::new(f));
+        self
+    }
+
+    /// Accept file drags and handle their release at a position in scene units.
+    #[must_use]
+    pub fn on_files(
+        self,
+        f: impl FnMut(&Ui, mui::prelude::Point, &[std::path::PathBuf], bool) -> bool + Send + 'static,
+    ) -> Self {
+        lock(&self.shared).view.file_drop = Some(Box::new(f));
+        self
+    }
+
+    /// Release app-owned gestures when the native host cancels input.
+    #[must_use]
+    pub fn on_cancel(self, f: impl FnMut(&Ui) + Send + 'static) -> Self {
+        lock(&self.shared).view.cancel = Some(Box::new(f));
+        self
+    }
+
+    /// Inspect key events before MUI routes them; return true to consume one.
+    #[must_use]
+    pub fn on_key(
+        mut self,
+        f: impl FnMut(&Ui, &window::KeyEvent) -> bool + Send + 'static,
+    ) -> Self {
+        let hook: window::KeyHook = Arc::new(Mutex::new(f));
+        self.requests.on_key(Arc::clone(&hook));
+        self.keys = Some(hook);
+        self
+    }
+
+    /// Multiply fit zoom by an app-controlled factor based on logical window size.
+    #[must_use]
+    pub fn user_zoom(self, f: impl Fn(Size) -> f64 + Send + 'static) -> Self {
+        lock(&self.shared).view.user_zoom = Some(Box::new(f));
+        self
+    }
+
+    fn reset_requests(&mut self) {
+        self.requests = Arc::default();
+        if let Some(keys) = &self.keys {
+            self.requests.on_key(Arc::clone(keys));
+        }
     }
 
     /// Keep the zoom at 1.0 when the window resizes: the tree lays out into
@@ -238,7 +331,7 @@ impl<P: Params> Editor for MuiEditor<P> {
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
         // A request made while closed was for the last window.
-        self.requests = Arc::default();
+        self.reset_requests();
         self.window = window::open(
             &ParentWindow(parent),
             "MUI",
@@ -267,7 +360,7 @@ impl<P: Params> Editor for MuiEditor<P> {
             .view
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
-        self.requests = Arc::default();
+        self.reset_requests();
         lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
         match window::wayland::open(
             title,

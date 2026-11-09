@@ -22,9 +22,6 @@ while IFS= read -r p; do
     # and build.rs are target_os-gated, other OSes compile an empty shell,
     # and main's push run still builds it everywhere); the Swift au3
     # templates; the macOS-only gui-window scripts; macOS baselines.
-    crates/moose-baseview/src/platform/macos/* | \
-    crates/moose-baseview/src/wrappers/appkit.rs | \
-    crates/moose-baseview/src/wrappers/appkit/* | \
     crates/cargo-moose/src/commands/package/macos.rs | \
     crates/cargo-moose/src/util/bundle_link.rs | \
     crates/moose-standalone/src/menu_macos.rs | \
@@ -39,9 +36,6 @@ while IFS= read -r p; do
     */screenshots/*_macos.png)
       mac=1 ;;
     # cfg(target_os = "windows") (Inno Setup script is generated in windows.rs)
-    crates/moose-baseview/src/platform/win/* | \
-    crates/moose-baseview/src/wrappers/win32.rs | \
-    crates/moose-baseview/src/wrappers/win32/* | \
     crates/cargo-moose/src/commands/package/windows.rs | \
     crates/cargo-moose/src/commands/package/windows_manifest.rs | \
     crates/moose-egui/src/render_thread.rs | \
@@ -50,11 +44,6 @@ while IFS= read -r p; do
     */screenshots/*_windows.png)
       win=1 ;;
     # cfg(target_os = "linux") / X11
-    crates/moose-baseview/src/platform/x11/* | \
-    crates/moose-baseview/src/wrappers/glx.rs | \
-    crates/moose-baseview/src/wrappers/xkbcommon.rs | \
-    crates/moose-baseview/src/wrappers/xlib.rs | \
-    crates/moose-baseview/src/wrappers/xlib/* | \
     crates/moose-standalone/src/windowed_x11.rs | \
     */screenshots/*_linux.png)
       lin=1 ;;
