@@ -94,7 +94,7 @@ fn audited_process(plugin: *const clap_plugin, process: &clap_process) -> (i32, 
 #[test]
 #[cfg(feature = "rt-paranoid")]
 fn process_allocation_checker_detects_an_allocation() {
-    let (_, allocations) = moose_core::rt::audit(|| {
+    let ((), allocations) = moose_core::rt::audit(|| {
         let _rt = RtSection::enter();
         std::hint::black_box(Box::new(std::hint::black_box(1_u32)));
     });
