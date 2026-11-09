@@ -554,13 +554,14 @@ mod tests {
 
     #[test]
     fn indexed_split_lookup_keeps_wide_ids_and_exact_offsets_without_catalog_scans() {
-        let catalog = moose_params::ParamCatalog::new(vec![info(0x1000000, true), info(97, false)]);
+        let catalog =
+            moose_params::ParamCatalog::new(vec![info(0x0100_0000, true), info(97, false)]);
         let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
         events.push(Event::new(9, EventBody::ParamChange { id: 97, value: 0.5 }));
         events.push(Event::new(
             23,
             EventBody::ParamChange {
-                id: 0x1000000,
+                id: 0x0100_0000,
                 value: 0.5,
             },
         ));

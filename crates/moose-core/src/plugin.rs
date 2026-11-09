@@ -33,9 +33,12 @@ pub struct PreparationConfig {
     pub frame_bound: PreparationFrameBound,
 }
 impl PreparationConfig {
+    #[must_use]
     pub fn new(audio: AudioConfig, frame_bound: PreparationFrameBound) -> Self {
         Self { audio, frame_bound }
     }
+    /// # Errors
+    /// Returns `InvalidGeometry` for a nonpositive or nonfinite sample rate or zero block size.
     pub fn validate(&self) -> Result<(), PreparationError> {
         if !self.audio.sample_rate.is_finite()
             || self.audio.sample_rate <= 0.
@@ -119,6 +122,7 @@ pub trait PluginRuntime: Send + 'static {
     /// historical 32 MiB. Override only with a proven document bound; format
     /// CLAP/VST3 wrappers enforce it on both save and load, outside audio
     /// processing. Other formats keep their existing native container bounds.
+    #[must_use]
     fn max_host_state_bytes() -> usize
     where
         Self: Sized,
@@ -172,6 +176,10 @@ pub trait PluginRuntime: Send + 'static {
         false
     }
 
+    /// Prepare the runtime before activation.
+    ///
+    /// # Errors
+    /// Returns an error when the configuration or runtime cannot be prepared.
     fn prepare(&mut self, config: &PreparationConfig) -> Result<(), PreparationError> {
         config.validate()?;
         self.reset(&config.audio);

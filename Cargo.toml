@@ -157,12 +157,15 @@ windows-sys = "0.61"
 # source format) lives here; per-OS backends (`metal`, `dx12`,
 # `vulkan`, `gles`) are added via target-conditional deps in
 # `moose-gpu/Cargo.toml`, then unified across the workspace.
+# wgpu-hal 29 and gpu-allocator 0.28 must use the same Windows API types.
+# Keep the allocator's Cargo.lock edge on windows 0.62, and check downstream
+# lockfiles after dependency updates with a Windows build.
 wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 
 # All editor backends share MUI's maintained native window implementation.
-baseview = { package = "moose-baseview", git = "https://github.com/Matari-Audio/MUI", rev = "beaa78d88b4534a4e316c177c131d31db3644c77" }
-mui = { git = "https://github.com/Matari-Audio/MUI", rev = "beaa78d88b4534a4e316c177c131d31db3644c77", features = ["gpu-effects"] }
-mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "beaa78d88b4534a4e316c177c131d31db3644c77" }
+baseview = { package = "moose-baseview", git = "https://github.com/Matari-Audio/MUI", rev = "7ecbec645affb8a81216854688a2e1f0cf6944e9" }
+mui = { git = "https://github.com/Matari-Audio/MUI", rev = "7ecbec645affb8a81216854688a2e1f0cf6944e9", features = ["gpu-effects"] }
+mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "7ecbec645affb8a81216854688a2e1f0cf6944e9" }
 
 # Custom profile for shell-mode (hot-reload) builds. `cargo moose
 # install --shell` invokes `cargo build --profile shell --features

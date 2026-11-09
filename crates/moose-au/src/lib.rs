@@ -76,7 +76,7 @@ use moose_core::wrapper::{
     log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register, save_extra,
     shared_plugin,
 };
-use moose_params::{MidiSource, ParamFlags, ParamInfo, Params};
+use moose_params::{MidiSource, ParamFlags, Params};
 
 use ffi::{
     AU_NATIVE_CARRIER_BYTES, AU_NATIVE_CARRIER_UMP, AU_NATIVE_EVENT_MIDI1, AU_NATIVE_EVENT_SYSEX,
@@ -1513,6 +1513,18 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         *out_len = 0;
     }
     run_extern_callback_with::<P, ()>("au", "save_state", (), || unsafe {
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        free(self.0.cast());
+                    }
+                }
+            }
+        }
         let inst = &*ctx.cast::<AuInstance<P>>();
         let (ids, values) = inst.params_arc.collect_values();
         // Read the custom state from the lock-free snapshot the audio
@@ -1538,18 +1550,6 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let Ok(host_len) = u32::try_from(len) else {
             return;
         };
-        // Own exactly one contiguous host buffer. RAII frees failed or panicked
-        // partial writes; successful transfer retains the original libc ABI.
-        struct Buffer(*mut u8);
-        impl Drop for Buffer {
-            fn drop(&mut self) {
-                if !self.0.is_null() {
-                    unsafe {
-                        free(self.0.cast());
-                    }
-                }
-            }
-        }
         let mut buffer = Buffer(malloc(len).cast::<u8>());
         if buffer.0.is_null() {
             return;
@@ -1569,7 +1569,7 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
                 }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
                 offset += bytes.len();
-                bytes.len() as i64
+                i64::try_from(bytes.len()).unwrap_or(-1)
             },
         );
         if !ok {
@@ -1599,7 +1599,9 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         // build that stored foreign bytes under moose's key, or a
         // renamed plugin's envelope).
         if let Some(deserialized) = state::read_and_apply_params::<P>(
-            |dst| std::io::Read::read(&mut blob, dst).map_or(-1, |n| n as i64),
+            |dst| {
+                std::io::Read::read(&mut blob, dst).map_or(-1, |n| i64::try_from(n).unwrap_or(-1))
+            },
             inst.plugin_id_hash,
             state::PluginFormat::Au,
             Some("truce_state"),
@@ -1615,7 +1617,7 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             // application. `force_push` overwrites any older pending
             // blob - see the `pending_state` field comment for why
             // newest-wins is the right policy.
-            let _ = inst.pending_state.force_push(deserialized);
+            inst.pending_state.force_push(deserialized);
             if let Some(ref mut editor) = inst.gui.enter().editor {
                 editor.state_changed();
             }
@@ -1673,7 +1675,7 @@ unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
         };
         let deserialized: state::DeserializedState = migrated.into();
         state::apply_params(&*inst.params_arc, &deserialized);
-        let _ = inst.pending_state.force_push(deserialized);
+        inst.pending_state.force_push(deserialized);
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.state_changed();
         }
@@ -1839,7 +1841,7 @@ unsafe extern "C" fn cb_factory_preset_load<P: PluginExport>(
         // the host thread, full state through the audio-thread
         // handoff, editor notified.
         state::apply_params(&*inst.params_arc, &deserialized);
-        let _ = inst.pending_state.force_push(deserialized);
+        inst.pending_state.force_push(deserialized);
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.state_changed();
         }
@@ -3229,9 +3231,10 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
     resolve_name_override(info.au_name, info.name)
 }
 
-/// Construct the same callback table used by AUv2 and AUv3 registration.
+/// Construct the same callback table used by `AUv2` and `AUv3` registration.
 /// Allows qualification of the Rust AU bridge without Apple frameworks;
 /// native property-list marshalling still requires a macOS/iOS host.
+#[must_use]
 pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
     AuCallbacks {
         abi_version: ffi::MOOSE_AU_ABI_VERSION,
@@ -4064,6 +4067,10 @@ use moose_core as core;
 use moose_params as params;
 #[cfg(test)]
 #[path = "../../../test-support/host_value_fixture.rs"]
+#[expect(
+    dead_code,
+    reason = "shared fixture includes completion helpers used by CLAP and VST3 tests"
+)]
 mod host_value_fixture;
 #[cfg(test)]
 #[path = "../../../test-support/large_state_fixture.rs"]

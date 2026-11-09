@@ -6026,7 +6026,7 @@ mod channel_slice_tests {
         let mut process: clap_process = unsafe { std::mem::zeroed() };
         process.audio_outputs = &raw mut bus;
         process.audio_outputs_count = 1;
-        process.frames_count = samples.len() as u32;
+        process.frames_count = u32::try_from(samples.len()).unwrap();
         let mut scratch = Vec::with_capacity(samples.len());
         // SAFETY: the bus, channel pointer, and sample array are alive for this call.
         let copy = unsafe {
@@ -6041,7 +6041,10 @@ mod channel_slice_tests {
         for (dst, src) in output.iter_mut().zip(input) {
             *dst = *src * 2.0;
         }
-        assert_eq!(samples, [0.5, -1.5, 1.0]);
+        assert_eq!(
+            samples.map(f32::to_bits),
+            [0.5_f32, -1.5, 1.0].map(f32::to_bits)
+        );
     }
 
     /// A null output channel is a block-length discard buffer the plugin

@@ -68,7 +68,7 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.26.3"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -81,7 +81,7 @@ dependencies = [
 [[package]]
 name = "accesskit_unix"
 version = "0.22.1"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "accesskit",
  "accesskit_atspi_common",
@@ -109,7 +109,7 @@ dependencies = [
 [[package]]
 name = "accesskit_winit"
 version = "0.33.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "accesskit",
  "accesskit_ios",
@@ -834,6 +834,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1276,7 +1285,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1586,8 +1595,21 @@ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi",
+ "r-efi 5.3.0",
  "wasip2",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "libc",
+ "r-efi 6.0.0",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1681,7 +1703,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.56.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -1874,7 +1896,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2301,7 +2323,7 @@ dependencies = [
 [[package]]
 name = "moose-baseview"
 version = "0.4.1-moose.1"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "block2 0.6.2",
  "bytemuck",
@@ -3192,7 +3214,7 @@ dependencies = [
 [[package]]
 name = "mui"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "color",
  "mui-geometry",
@@ -3210,7 +3232,7 @@ dependencies = [
 [[package]]
 name = "mui-access"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "accesskit",
  "mui-geometry",
@@ -3221,7 +3243,7 @@ dependencies = [
 [[package]]
 name = "mui-baseview"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "accesskit_macos",
  "accesskit_unix",
@@ -3244,7 +3266,7 @@ dependencies = [
 [[package]]
 name = "mui-geometry"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "i_overlay",
  "kurbo",
@@ -3254,7 +3276,7 @@ dependencies = [
 [[package]]
 name = "mui-input"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "mui-geometry",
  "mui-layout",
@@ -3264,7 +3286,7 @@ dependencies = [
 [[package]]
 name = "mui-layout"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "rustc-hash 2.1.3",
  "smallvec",
@@ -3273,7 +3295,7 @@ dependencies = [
 [[package]]
 name = "mui-material"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "mui-scene",
 ]
@@ -3281,12 +3303,12 @@ dependencies = [
 [[package]]
 name = "mui-motion"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 
 [[package]]
 name = "mui-scene"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "mui-geometry",
  "mui-layout",
@@ -3301,7 +3323,7 @@ dependencies = [
 [[package]]
 name = "mui-style"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "color",
  "kurbo",
@@ -3314,12 +3336,12 @@ dependencies = [
 [[package]]
 name = "mui-symbols"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 
 [[package]]
 name = "mui-text"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "harfrust 0.13.3",
  "mui-geometry",
@@ -3333,7 +3355,7 @@ dependencies = [
 [[package]]
 name = "mui-vello"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "glifo 0.4.0",
  "mach-dxcompiler-rs",
@@ -3354,7 +3376,7 @@ dependencies = [
 [[package]]
 name = "mui-weld"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "color",
  "kurbo",
@@ -3364,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "mui-winit"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "accesskit_winit",
  "arboard",
@@ -3516,7 +3538,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4450,6 +4472,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4747,7 +4775,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5335,10 +5363,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5728,9 +5756,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typenum"
@@ -5805,7 +5833,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "vello"
 version = "0.11.0"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "bytemuck",
  "futures-intrusive",
@@ -5816,7 +5844,7 @@ dependencies = [
  "skrifa 0.44.0",
  "static_assertions",
  "thiserror 2.0.18",
- "vello_encoding 0.11.0 (git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77)",
+ "vello_encoding 0.11.0 (git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9)",
  "vello_shaders",
  "wgpu 30.0.1",
 ]
@@ -5868,7 +5896,7 @@ dependencies = [
 [[package]]
 name = "vello_cpu"
 version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "bytemuck",
  "glifo 0.4.0",
@@ -5893,7 +5921,7 @@ dependencies = [
 [[package]]
 name = "vello_encoding"
 version = "0.11.0"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "bytemuck",
  "guillotiere",
@@ -7070,7 +7098,7 @@ checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 [[package]]
 name = "xim-ctext"
 version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "encoding_rs",
 ]
@@ -7078,7 +7106,7 @@ dependencies = [
 [[package]]
 name = "xim-parser"
 version = "0.2.1"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -7231,7 +7259,7 @@ dependencies = [
 [[package]]
 name = "zed-xim"
 version = "0.4.0-zed"
-source = "git+https://github.com/Matari-Audio/MUI?rev=beaa78d88b4534a4e316c177c131d31db3644c77#beaa78d88b4534a4e316c177c131d31db3644c77"
+source = "git+https://github.com/Matari-Audio/MUI?rev=7ecbec645affb8a81216854688a2e1f0cf6944e9#7ecbec645affb8a81216854688a2e1f0cf6944e9"
 dependencies = [
  "ahash",
  "hashbrown 0.14.5",
@@ -7262,16 +7290,42 @@ dependencies = [
 ]
 
 [[package]]
-name = "zip"
-version = "8.6.0"
+name = "zeroize"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "zip"
+version = "9.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0700e6c427aff64acdbf02e85fbfd946c2ee12319d1af013092f3a2178914ff8"
+dependencies = [
+ "constant_time_eq",
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap",
+ "libc",
  "memchr",
+ "nix 0.31.3",
  "typed-path",
+ "windows-sys 0.61.2",
+ "zeroize",
  "zopfli",
 ]
 

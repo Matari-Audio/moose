@@ -61,7 +61,7 @@ use moose_gui_types::theme::{Color, Theme};
 /// Epoch 8: task-pool warmup reports failure and logic dylibs export bounded
 /// quiesce plus shutdown/join operations. A stale epoch-7 dylib has immortal
 /// workers and the old warmer signature, so it must be rejected before load.
-/// Epoch 9: EventList's private StoredExactEvent carrier/row stride changed.
+/// Epoch 9: `EventList`'s private `StoredExactEvent` carrier/row stride changed.
 /// Event/ExactEventBody wire fields staying unchanged cannot make an old logic
 /// dylib safe to process/clear the new private Vec representation. Old hot logic
 /// must rebuild; reject by existing epoch before any state/process invocation.

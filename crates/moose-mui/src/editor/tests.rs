@@ -579,9 +579,15 @@ fn wheel_hold_is_one_gesture_and_releases_after_an_earlier_unbind() {
 fn user_zoom_multiplies_fit_and_rejects_invalid_factors() {
     let params = Arc::new(Synth::default());
     let zoomed = editor(&params).user_zoom(|_| 1.5);
-    assert_eq!(zoom_at(&zoomed, (800, 600), 1.0), 3.0);
+    assert_eq!(
+        zoom_at(&zoomed, (800, 600), 1.0).to_bits(),
+        3.0_f64.to_bits()
+    );
     let invalid = editor(&params).user_zoom(|_| f64::NAN);
-    assert_eq!(zoom_at(&invalid, (800, 600), 1.0), 2.0);
+    assert_eq!(
+        zoom_at(&invalid, (800, 600), 1.0).to_bits(),
+        2.0_f64.to_bits()
+    );
 }
 
 #[test]

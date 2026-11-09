@@ -71,7 +71,7 @@ impl Host {
         unsafe {
             let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
             assert_ne!(
-                (self.lib.XGetWindowAttributes)(self.display, window, &mut attrs),
+                (self.lib.XGetWindowAttributes)(self.display, window, &raw mut attrs),
                 0
             );
             attrs.map_state

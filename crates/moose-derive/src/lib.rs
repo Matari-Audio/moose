@@ -3246,8 +3246,8 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
         })
     };
-    let projected_set_plain = projection_write_prefix("set_plain");
-    let projected_set_normalized = projection_write_prefix("set_normalized");
+    let projected_write_plain = projection_write_prefix("set_plain");
+    let projected_write_normalized = projection_write_prefix("set_normalized");
 
     let expanded = quote! {
         #(#attr_errors)*
@@ -3295,7 +3295,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn set_normalized(&self, id: u32, value: f64) {
-                #projected_set_normalized
+                #projected_write_normalized
                 match id {
                     #(#set_normalized_arms)*
                     #set_normalized_fallthrough
@@ -3311,7 +3311,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn set_plain(&self, id: u32, value: f64) {
-                #projected_set_plain
+                #projected_write_plain
                 match id {
                     #(#set_plain_arms)*
                     #set_plain_fallthrough

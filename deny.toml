@@ -6,6 +6,16 @@
 # first-party dependency - resolves only when an upstream proc-macro dep
 # bumps. Tracked here so a *new* advisory still fails the gate.
 ignore = [
+    # INFO unmaintained, reviewed 2026-11-09; review again by 2027-02-01.
+    # winit/sctk-adwaita use ab_glyph/owned_ttf_parser; their maintainers
+    # need to migrate font parsing to skrifa before this can be removed.
+    "RUSTSEC-2026-0192", # ttf-parser
+    # accesskit_unix and atspi depend on zbus 5 and its separate crates.
+    # Their maintainers need to migrate to zbus 6's names and wire modules.
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0372", # zvariant_derive
+
     "RUSTSEC-2024-0436", # paste - unmaintained (proc-macro, deep transitive)
     # quick-xml 0.39 DoS advisories (quadratic duplicate-attribute check;
     # unbounded NsReader namespace allocation). Rides in via plist <-

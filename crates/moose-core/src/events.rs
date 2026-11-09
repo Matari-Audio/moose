@@ -512,6 +512,7 @@ pub struct LosslessEventCursor {
 
 impl<'a> ExactEventPayload<'a> {
     /// Static eligibility only. This never reads delivery state.
+    #[must_use]
     pub fn is_emittable(self) -> bool {
         self.emittable
     }
@@ -581,36 +582,47 @@ impl<'a> ExactEventPayload<'a> {
 }
 
 impl<'a> ExactEventRef<'a> {
+    #[must_use]
     pub fn payload(self) -> ExactEventPayload<'a> {
         self.payload
     }
+    #[must_use]
     pub fn body(self) -> &'a ExactEventBody {
         self.payload.body()
     }
+    #[must_use]
     pub fn fallback(self) -> Option<&'a Event> {
         self.payload.fallback()
     }
+    #[must_use]
     pub fn qualifiers(self) -> ExactEventQualifiers {
         self.payload.qualifiers()
     }
+    #[must_use]
     pub fn metadata(self) -> ExactEventMetadata {
         self.payload.metadata()
     }
     pub fn companions(self) -> impl Iterator<Item = &'a Event> {
         self.payload.companions()
     }
+    #[must_use]
     pub fn sysex_bytes(self) -> &'a [u8] {
         self.payload.sysex_bytes()
     }
+    #[must_use]
     pub fn sysex_bytes_checked(self) -> Option<&'a [u8]> {
         self.payload.sysex_bytes_checked()
     }
+    #[must_use]
     pub fn sample_offset(self) -> u32 {
         self.payload.sample_offset()
     }
     /// Actual native drain ONLY. Pure payload preflight must not call this.
     /// The returned exclusive emission phase prevents negative finalization
     /// while the actual native sink is executing.
+    ///
+    /// # Errors
+    /// Returns a delivery error if the permit is stale or cannot enter native emission.
     pub fn pending_delivery(self) -> Result<Option<ExactPendingDelivery<'a>>, ExactDeliveryError> {
         match self.delivery {
             ExactDeliveryCarrier::Untracked => Ok(None),
@@ -1009,6 +1021,8 @@ pub struct ExactDeliveryBank {
     storage: Arc<ExactDeliveryStorage>,
 }
 impl ExactDeliveryBank {
+    /// # Errors
+    /// Returns overflow if the requested storage layout cannot be represented.
     pub fn required_bytes(capacity: usize) -> Result<usize, ExactDeliveryError> {
         let slots = std::alloc::Layout::array::<ExactDeliverySlot>(capacity)
             .map_err(|_| ExactDeliveryError::Overflow)?;
@@ -1019,6 +1033,9 @@ impl ExactDeliveryBank {
     }
     /// Requested payload accounting only; caller must additionally price Arc/
     /// allocator layout and all permanent anchors in its whole-product budget.
+    ///
+    /// # Errors
+    /// Returns an error if capacity, budget, allocation, or owner ID is exhausted.
     pub fn new(capacity: usize, payload_budget: usize) -> Result<Self, ExactDeliveryError> {
         if capacity == 0 || Self::required_bytes(capacity)? > payload_budget {
             return Err(ExactDeliveryError::Capacity);
@@ -1047,11 +1064,15 @@ impl ExactDeliveryBank {
             storage: Arc::new(ExactDeliveryStorage { owner, slots }),
         })
     }
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.storage.slots.len()
     }
     /// Fixed one-pass reservation. A racing peer cannot make this spin. Failed
     /// CAS skips that slot; no unbounded retry and no sequence wrap is allowed.
+    ///
+    /// # Errors
+    /// Returns capacity error if no slot can be reserved.
     pub fn reserve(&self, correlation: u64) -> Result<ExactDeliveryPermit, ExactDeliveryError> {
         for (index, slot) in self.storage.slots.iter().enumerate() {
             let old = slot.tagged.load(Ordering::Acquire);
@@ -1107,6 +1128,8 @@ impl ExactDeliveryBank {
             });
         }
     }
+    /// # Errors
+    /// Returns stale if the token is invalid or its delivery is not final.
     pub fn consume(&self, token: ExactDeliveryToken) -> Result<(), ExactDeliveryError> {
         self.consume_after(token, |_| {})
     }
@@ -1157,6 +1180,7 @@ pub struct ExactDeliveryPermit {
     token: ExactDeliveryToken,
 }
 impl ExactDeliveryPermit {
+    #[must_use]
     pub fn token(&self) -> ExactDeliveryToken {
         self.token
     }
@@ -1222,7 +1246,7 @@ impl Drop for ExactDeliveryPermit {
 }
 /// Native drain holds this borrowed capability across exactly one real host
 /// invocation. Neither a finalizer nor a consumer can change EMITTING. After
-/// true, commit_accepted is the FIRST action, before sounding-note bookkeeping.
+/// true, `commit_accepted` is the FIRST action, before sounding-note bookkeeping.
 #[derive(Debug)]
 pub struct ExactPendingDelivery<'a> {
     permit: &'a ExactDeliveryPermit,
@@ -1441,6 +1465,9 @@ impl EventList {
     /// All event capacity is checked before the permit becomes Pending. Failure
     /// returns the permit, so its real owner decides cancellation/credit reuse.
     /// Does not allocate and never changes ordinary untracked staging behavior.
+    ///
+    /// # Errors
+    /// Returns the push error and permit if the lane is full or the permit is stale.
     pub fn try_push_exact_tracked(
         &mut self,
         event: ExactEvent,
@@ -2340,7 +2367,7 @@ mod exact_delivery_tests {
     fn first(events: &EventList) -> ExactEventRef<'_> {
         match events.lossless_iter().next().unwrap() {
             LosslessEventRef::Exact(event) => event,
-            _ => panic!("exact row"),
+            LosslessEventRef::Typed(_) => panic!("exact row"),
         }
     }
     #[test]
@@ -2351,7 +2378,7 @@ mod exact_delivery_tests {
         let mut events = EventList::with_capacity(1);
         events.try_push_exact_tracked(note(1), permit).unwrap();
         {
-            let mut pending = first(&events).pending_delivery().unwrap().unwrap();
+            let pending = first(&events).pending_delivery().unwrap().unwrap();
             pending.commit_accepted();
         }
         let mut phases = 0;
@@ -2443,9 +2470,12 @@ mod exact_delivery_tests {
     fn negative_suffix_preserves_accepted_prefix_and_all_credits_are_bounded() {
         let bank = bank(3);
         let mut events = EventList::with_capacity(3);
-        for i in 0..3 {
+        for i in 0_u32..3 {
             events
-                .try_push_exact_tracked(note(i), bank.reserve(i as u64).unwrap())
+                .try_push_exact_tracked(
+                    note(i32::try_from(i).unwrap()),
+                    bank.reserve(u64::from(i)).unwrap(),
+                )
                 .unwrap();
         }
         let mut it = events.lossless_iter();
@@ -2457,9 +2487,10 @@ mod exact_delivery_tests {
             panic!("exact")
         };
         drop(b.pending_delivery().unwrap().unwrap()); // actual false/unwind
+        drop(it);
         events.finalize_pending_delivery();
         let mut rows = [None; 3];
-        bank.visit(|row| rows[row.correlation as usize] = Some(row));
+        bank.visit(|row| rows[usize::try_from(row.correlation).unwrap()] = Some(row));
         assert_eq!(rows[0].unwrap().outcome, ExactDeliveryOutcome::Accepted);
         for row in &rows[1..] {
             assert_eq!(row.unwrap().outcome, ExactDeliveryOutcome::NotDelivered);

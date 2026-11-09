@@ -183,7 +183,7 @@ mod tests {
                 let n = dst.len().min(chunk).min(bytes.len() - pos);
                 dst[..n].copy_from_slice(&bytes[pos..pos + n]);
                 pos += n;
-                n as i64
+                i64::try_from(n).unwrap()
             },
             limit,
         )
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn malformed_and_overreported_streams_are_rejected() {
         assert!(read_state_stream(|_| -1, 1024).is_none());
-        assert!(read_state_stream(|dst| dst.len() as i64 + 1, 1024).is_none());
+        assert!(read_state_stream(|dst| i64::try_from(dst.len()).unwrap() + 1, 1024).is_none());
         let blob = crate::state::serialize_state(42, &[], &[], b"x", b"y");
         for end in 4..blob.len() {
             // Older envelopes may omit the entire persist lane.
@@ -355,7 +355,7 @@ mod writer_tests {
             |bytes| {
                 let n = bytes.len().min(317);
                 output.extend_from_slice(&bytes[..n]);
-                n as i64
+                i64::try_from(n).unwrap()
             }
         ));
         assert_eq!(output, expected);
@@ -397,7 +397,7 @@ mod writer_tests {
                 assert!(bytes.len() <= 8192);
                 let len = bytes.len().min(13);
                 output.extend_from_slice(&bytes[..len]);
-                len as i64
+                i64::try_from(len).unwrap()
             }
         ));
         assert_eq!(output, expected);
@@ -429,7 +429,7 @@ mod writer_tests {
                 |writer| writer.write_all(&[9; 2][..actual]),
                 |part| {
                     bytes.extend_from_slice(part);
-                    part.len() as i64
+                    i64::try_from(part.len()).unwrap()
                 }
             ));
             assert!(bytes.len() <= 37);
@@ -442,7 +442,7 @@ mod writer_tests {
             1,
             1024,
             |_| Err(std::io::Error::other("encoding failed")),
-            |part| part.len() as i64
+            |part| i64::try_from(part.len()).unwrap()
         ));
     }
 }
@@ -450,6 +450,10 @@ mod writer_tests {
 #[cfg(test)]
 mod prepared_tests {
     use super::*;
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the callback contract permits skipping preparation"
+    )]
     fn prepare(
         _id: u64,
         input: &mut dyn std::io::Read,
@@ -482,7 +486,7 @@ mod prepared_tests {
                 let n = dst.len().min(317).min(blob.len() - pos);
                 dst[..n].copy_from_slice(&blob[pos..pos + n]);
                 pos += n;
-                n as i64
+                i64::try_from(n).unwrap()
             },
             blob.len(),
             prepare,
@@ -509,7 +513,7 @@ mod prepared_tests {
                         let n = dst.len().min(blob.len() - pos);
                         dst[..n].copy_from_slice(&blob[pos..pos + n]);
                         pos += n;
-                        n as i64
+                        i64::try_from(n).unwrap()
                     },
                     1024,
                     prepare
@@ -524,7 +528,7 @@ mod prepared_tests {
                     let n = dst.len().min(base.len() - pos);
                     dst[..n].copy_from_slice(&base[pos..pos + n]);
                     pos += n;
-                    n as i64
+                    i64::try_from(n).unwrap()
                 },
                 1024,
                 |_, _, _| Some(Ok((Vec::new(), ())))

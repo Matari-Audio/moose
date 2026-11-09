@@ -90,6 +90,7 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     }
 
     /// Maximum serialized host state; size document admission to this bound.
+    #[must_use]
     fn max_host_state_bytes() -> usize {
         32 * 1024 * 1024
     }
@@ -109,9 +110,14 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     /// Worker/fallible-preparation logic must declare this requirement. Legacy
     /// synchronous users retain false. Hot loaders refuse true until executable
     /// worker lifetime and fallible cross-generation preparation are qualified.
+    #[must_use]
     fn requires_fallible_preparation() -> bool {
         false
     }
+    /// Prepare the runtime before activation.
+    ///
+    /// # Errors
+    /// Returns an error when configuration or preparation fails.
     fn prepare(
         state: &mut Self::DspState,
         params: &Self::Params,
@@ -321,6 +327,10 @@ macro_rules! plugin_logic_leaf_trait {
             /// reset exactly once; worker plugins override this and only return
             /// success after their real finite policy/readiness is admitted.
             fn requires_fallible_preparation()->bool{false}
+            /// Prepare the runtime before activation.
+            ///
+            /// # Errors
+            /// Returns an error when configuration or preparation fails.
             fn prepare(state: &mut Self::DspState, params: &Self::Params,
                 config: &$crate::__plugin_logic_deps::PreparationConfig,
             ) -> Result<(), $crate::__plugin_logic_deps::PreparationError> {
