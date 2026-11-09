@@ -4592,6 +4592,13 @@ use moose_core as core;
 use moose_params as params;
 #[cfg(test)]
 #[path = "../../../test-support/host_value_fixture.rs"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "shared completion helpers are exercised by the Linux IRunLoop host fixture"
+    )
+)]
 mod host_value_fixture;
 
 #[cfg(test)]
