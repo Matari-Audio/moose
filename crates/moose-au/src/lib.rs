@@ -568,7 +568,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
                 let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
-                (*raw).persist_dispatch = persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
+                (*raw).persist_dispatch =
+                    persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
                 (*raw).param_notify = ParamNotifier::spawn(ctx);
             }
             raw.cast::<std::ffi::c_void>()
@@ -1522,28 +1523,60 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // the AU shim frees with libc `free`. The Rust global allocator
         // must not appear on either side; mixing allocators is UB.
         let extra = save_extra(&inst.snapshot);
-        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
-        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
-        let Ok(host_len) = u32::try_from(len) else { return; };
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else {
+            return;
+        };
+        let Some(len) = state::state_stream_size(
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
+        ) else {
+            return;
+        };
+        let Ok(host_len) = u32::try_from(len) else {
+            return;
+        };
         // Own exactly one contiguous host buffer. RAII frees failed or panicked
         // partial writes; successful transfer retains the original libc ABI.
         struct Buffer(*mut u8);
         impl Drop for Buffer {
-            fn drop(&mut self) { if !self.0.is_null() { unsafe { free(self.0.cast()); } } }
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        free(self.0.cast());
+                    }
+                }
+            }
         }
         let mut buffer = Buffer(malloc(len).cast::<u8>());
-        if buffer.0.is_null() { return; }
+        if buffer.0.is_null() {
+            return;
+        }
         let mut offset = 0;
-        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
-            persist.byte_len(), P::max_host_state_bytes(),
+        let ok = state::write_state_stream_with_persist(
+            inst.plugin_id_hash,
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
             |output| moose_params::write_prepared_persist(persist.as_ref(), output),
             |bytes| {
-                if bytes.len() > len - offset { return -1; }
+                if bytes.len() > len - offset {
+                    return -1;
+                }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
-                offset += bytes.len(); bytes.len() as i64
-            });
-        if !ok { return; }
-        *out_data = buffer.0; *out_len = host_len;
+                offset += bytes.len();
+                bytes.len() as i64
+            },
+        );
+        if !ok {
+            return;
+        }
+        *out_data = buffer.0;
+        *out_len = host_len;
         buffer.0 = std::ptr::null_mut();
     });
 }
@@ -1569,7 +1602,9 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             |dst| std::io::Read::read(&mut blob, dst).map_or(-1, |n| n as i64),
             inst.plugin_id_hash,
             state::PluginFormat::Au,
-            Some("truce_state"), &*inst.params_arc, len as usize,
+            Some("truce_state"),
+            &*inst.params_arc,
+            len as usize,
         ) {
             // Apply params synchronously on the host thread (atomic-safe)
             // so host queries that read parameter values right after
@@ -1585,7 +1620,9 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
                 editor.state_changed();
             }
             1
-        } else { 0 }
+        } else {
+            0
+        }
     })
 }
 
@@ -4033,23 +4070,26 @@ mod host_value_fixture;
 mod large_state_fixture;
 #[cfg(test)]
 mod large_state_tests {
+    use super::large_state_fixture::{LargePlugin, payload};
     use super::*;
-    use super::large_state_fixture::{LargePlugin,payload};
-    type Large=LargePlugin<{64*1024*1024}>;
+    type Large = LargePlugin<{ 64 * 1024 * 1024 }>;
     #[test]
     fn large_host_state_roundtrips_through_au_callbacks() {
         unsafe {
-            let ctx=cb_create::<Large>(); assert!(!ctx.is_null());
-            let inst=&*ctx.cast::<AuInstance<Large>>();
-            *inst.params_arc.payload.lock().unwrap()=payload();
-            let mut ptr=std::ptr::null_mut(); let mut len=0;
-            cb_state_save::<Large>(ctx,&raw mut ptr,&raw mut len);
-            assert!(len>32*1024*1024);
+            let ctx = cb_create::<Large>();
+            assert!(!ctx.is_null());
+            let inst = &*ctx.cast::<AuInstance<Large>>();
+            *inst.params_arc.payload.lock().unwrap() = payload();
+            let mut ptr = std::ptr::null_mut();
+            let mut len = 0;
+            cb_state_save::<Large>(ctx, &raw mut ptr, &raw mut len);
+            assert!(len > 32 * 1024 * 1024);
             inst.params_arc.payload.lock().unwrap().clear();
-            assert_eq!(cb_state_load::<Large>(ctx,ptr,len),1);
-            assert_eq!(*inst.params_arc.payload.lock().unwrap(),payload());
-            assert_eq!(cb_state_load::<Large>(ctx,ptr,len-1),0);
-            cb_state_free(ptr,len); cb_destroy::<Large>(ctx);
+            assert_eq!(cb_state_load::<Large>(ctx, ptr, len), 1);
+            assert_eq!(*inst.params_arc.payload.lock().unwrap(), payload());
+            assert_eq!(cb_state_load::<Large>(ctx, ptr, len - 1), 0);
+            cb_state_free(ptr, len);
+            cb_destroy::<Large>(ctx);
         }
     }
 }

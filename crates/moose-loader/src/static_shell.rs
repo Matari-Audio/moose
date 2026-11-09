@@ -182,11 +182,14 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         L::reset(&mut self.state, &self.params, config);
     }
 
-    fn requires_fallible_preparation(&self)->bool{L::requires_fallible_preparation()}
+    fn requires_fallible_preparation(&self) -> bool {
+        L::requires_fallible_preparation()
+    }
 
-    fn prepare(&mut self, config: &moose_core::plugin::PreparationConfig)
-        -> Result<(), moose_core::plugin::PreparationError>
-    {
+    fn prepare(
+        &mut self,
+        config: &moose_core::plugin::PreparationConfig,
+    ) -> Result<(), moose_core::plugin::PreparationError> {
         config.validate()?;
         self.params.set_sample_rate(config.audio.sample_rate);
         self.params.snap_smoothers();

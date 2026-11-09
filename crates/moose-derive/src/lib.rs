@@ -1983,8 +1983,11 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // code. Explicit skipped fields (and an empty named store) are useful for
     // lifecycle hooks without exposing a fake host parameter.
     let empty_named = matches!(fields, Fields::Named(named) if named.named.is_empty());
-    if param_fields.is_empty() && nested_fields.is_empty() && meter_fields.is_empty()
-        && skip_fields.is_empty() && !empty_named
+    if param_fields.is_empty()
+        && nested_fields.is_empty()
+        && meter_fields.is_empty()
+        && skip_fields.is_empty()
+        && !empty_named
     {
         return syn::Error::new_spanned(
             &ast,
@@ -2963,13 +2966,17 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #(#nested_fingerprint_stmts)*
         }
     };
-    let persist_signal_fields = persist_fields.iter().map(|(ident, _, _)| quote! {
-        ::moose::core::custom_state::PersistField::set_persist_change_signal(
-            &self.#ident, __signal.clone());
+    let persist_signal_fields = persist_fields.iter().map(|(ident, _, _)| {
+        quote! {
+            ::moose::core::custom_state::PersistField::set_persist_change_signal(
+                &self.#ident, __signal.clone());
+        }
     });
-    let persist_changed_impl = struct_attrs.persist_changed.as_ref().map(|method| quote! {
-        fn wants_persist_notifications(&self) -> bool { true }
-        fn take_persist_change(&self) -> Option<(u32, f64)> { self.#method() }
+    let persist_changed_impl = struct_attrs.persist_changed.as_ref().map(|method| {
+        quote! {
+            fn wants_persist_notifications(&self) -> bool { true }
+            fn take_persist_change(&self) -> Option<(u32, f64)> { self.#method() }
+        }
     });
     let persist_signal_impl = quote! {
         fn set_persist_change_signal(

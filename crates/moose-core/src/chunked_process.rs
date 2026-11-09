@@ -122,8 +122,9 @@ where
     P: PluginRuntime<Sample = S>,
 {
     let infos = args.param_infos;
-    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing,
-        |id| is_chunked(id, infos))
+    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing, |id| {
+        is_chunked(id, infos)
+    })
 }
 
 /// Indexed twin of the routed chunker. Format wrappers retain this catalog
@@ -136,10 +137,15 @@ pub fn process_chunked_with_bus_routing_and_catalog<S, P>(
     bus_routing: BusRouting,
     catalog: &moose_params::ParamCatalog,
 ) -> ProcessStatus
-where S: Sample, P: PluginRuntime<Sample = S>,
+where
+    S: Sample,
+    P: PluginRuntime<Sample = S>,
 {
-    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing,
-        |id| catalog.by_id(id).is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED)))
+    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing, |id| {
+        catalog
+            .by_id(id)
+            .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED))
+    })
 }
 
 fn process_chunked_with_lookup<S, P>(
@@ -150,7 +156,9 @@ fn process_chunked_with_lookup<S, P>(
     bus_routing: BusRouting,
     chunked: impl Fn(u32) -> bool,
 ) -> ProcessStatus
-where S: Sample, P: PluginRuntime<Sample = S>,
+where
+    S: Sample,
+    P: PluginRuntime<Sample = S>,
 {
     let ChunkedProcess {
         events,
@@ -549,8 +557,18 @@ mod tests {
         let catalog = moose_params::ParamCatalog::new(vec![info(0x1000000, true), info(97, false)]);
         let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
         events.push(Event::new(9, EventBody::ParamChange { id: 97, value: 0.5 }));
-        events.push(Event::new(23, EventBody::ParamChange { id: 0x1000000, value: 0.5 }));
-        let chunked = |id| catalog.by_id(id).is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED));
+        events.push(Event::new(
+            23,
+            EventBody::ParamChange {
+                id: 0x1000000,
+                value: 0.5,
+            },
+        ));
+        let chunked = |id| {
+            catalog
+                .by_id(id)
+                .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED))
+        };
         assert_eq!(find_next_split(&events, &chunked, 0, 0), Some((23, 1)));
         assert_eq!(find_next_split(&events, &chunked, 0, 24), None);
     }
@@ -661,9 +679,15 @@ mod tests {
             EventBody::Transport(TransportInfo::default()),
         ));
         // Unclamped (0): the offset-0 event splits at 0 - the hang.
-        assert_eq!(find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0), Some((0, 0)));
+        assert_eq!(
+            find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0),
+            Some((0, 0))
+        );
         // Clamped (>= 1): coalesced, no split at the block start.
-        assert_eq!(find_next_split(&events, &|id| is_chunked(id, &infos), 0, 1), None);
+        assert_eq!(
+            find_next_split(&events, &|id| is_chunked(id, &infos), 0, 1),
+            None
+        );
     }
 
     /// A sub-block that starts `delta` samples into the host block sees a

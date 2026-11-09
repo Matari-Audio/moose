@@ -236,10 +236,15 @@ mod tests {
     }
 
     #[test]
-    fn old_stored_exact_row_epoch_is_rejected_even_when_public_sizes_match(){
-        let current=AbiCanary::current::<f32>();let mut old=AbiCanary::current::<f32>();old.abi_epoch=8;
-        assert_eq!(current.event_size,old.event_size);assert_eq!(current.event_body_size,old.event_body_size);
-        assert_eq!(current.abi_epoch,9);assert!(!current.matches(&old));assert!(current.diff_report(&old).contains("abi_epoch"));
+    fn old_stored_exact_row_epoch_is_rejected_even_when_public_sizes_match() {
+        let current = AbiCanary::current::<f32>();
+        let mut old = AbiCanary::current::<f32>();
+        old.abi_epoch = 8;
+        assert_eq!(current.event_size, old.event_size);
+        assert_eq!(current.event_body_size, old.event_body_size);
+        assert_eq!(current.abi_epoch, 9);
+        assert!(!current.matches(&old));
+        assert!(current.diff_report(&old).contains("abi_epoch"));
     }
 
     #[test]

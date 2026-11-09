@@ -140,22 +140,18 @@ pub fn read_state_stream_prepared<T>(
         }
         let mut section = std::io::Read::take(&mut input, len as u64);
         let result = prepare(plugin_id, &mut section, len);
-        let bytes = match result {
-            Some(result) => {
-                let (bytes, commit) = result.ok()?;
-                if section.limit() != 0 {
-                    return None;
-                }
-                prepared = Some(commit);
-                bytes
+        let bytes = if let Some(result) = result {
+            let (bytes, commit) = result.ok()?;
+            if section.limit() != 0 {
+                return None;
             }
-            None => {
-                if section.limit() != len as u64 {
-                    return None;
-                }
-                drop(section);
-                input.bytes(len)?
+            prepared = Some(commit);
+            bytes
+        } else {
+            if section.limit() != len as u64 {
+                return None;
             }
+            input.bytes(len)?
         };
         if input.read(&mut first)? != 0 {
             return None;
@@ -240,8 +236,14 @@ pub fn write_state_stream(
     write: impl FnMut(&[u8]) -> i64,
 ) -> bool {
     write_state_stream_with_persist(
-        plugin_id, ids, values, extra, persist.len() as u64, limit,
-        |output| output.write_all(persist), write,
+        plugin_id,
+        ids,
+        values,
+        extra,
+        persist.len() as u64,
+        limit,
+        |output| output.write_all(persist),
+        write,
     )
 }
 
@@ -261,9 +263,16 @@ pub fn write_state_stream_with_persist(
     write: impl FnMut(&[u8]) -> i64,
 ) -> bool {
     use std::io::Write;
-    let Some(size) = state_stream_size(ids, values, extra, persist_len, limit) else { return false; };
-    let Ok(count) = u32::try_from(ids.len()) else { return false; };
-    let mut output = Output { write, remaining: size };
+    let Some(size) = state_stream_size(ids, values, extra, persist_len, limit) else {
+        return false;
+    };
+    let Ok(count) = u32::try_from(ids.len()) else {
+        return false;
+    };
+    let mut output = Output {
+        write,
+        remaining: size,
+    };
     let result = (|| {
         output.write_all(b"OAST")?;
         output.write_all(&1_u32.to_le_bytes())?;
@@ -283,11 +292,23 @@ pub fn write_state_stream_with_persist(
 
 /// Validate all lengths before allocating a contiguous host-owned output.
 #[must_use]
-pub fn state_stream_size(ids: &[u32], values: &[f64], extra: &[u8], persist_len: u64, limit: usize) -> Option<usize> {
-    if ids.len() != values.len() || u32::try_from(ids.len()).is_err() { return None; }
+pub fn state_stream_size(
+    ids: &[u32],
+    values: &[f64],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+) -> Option<usize> {
+    if ids.len() != values.len() || u32::try_from(ids.len()).is_err() {
+        return None;
+    }
     let persist_size = usize::try_from(persist_len).ok()?;
-    ids.len().checked_mul(12)?.checked_add(36)?.checked_add(extra.len())?
-        .checked_add(persist_size).filter(|size| *size <= limit)
+    ids.len()
+        .checked_mul(12)?
+        .checked_add(36)?
+        .checked_add(extra.len())?
+        .checked_add(persist_size)
+        .filter(|size| *size <= limit)
 }
 
 struct Output<F> {
@@ -309,7 +330,9 @@ impl<F: FnMut(&[u8]) -> i64> std::io::Write for Output<F> {
         self.remaining -= n;
         Ok(n)
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -357,37 +380,70 @@ mod writer_tests {
         let payload = vec![31; 65_537];
         let expected = crate::state::serialize_state(42, &ids, &values, b"extra", &payload);
         let mut output = Vec::new();
-        assert!(write_state_stream_with_persist(42, &ids, &values, b"extra",
-            payload.len() as u64, expected.len(), |writer| {
+        assert!(write_state_stream_with_persist(
+            42,
+            &ids,
+            &values,
+            b"extra",
+            payload.len() as u64,
+            expected.len(),
+            |writer| {
                 // Multiple payload segments, including one larger than the
                 // host callback's bounded request size, need no staging blob.
                 writer.write_all(&payload[..1])?;
                 writer.write_all(&payload[1..])
-            }, |bytes| {
+            },
+            |bytes| {
                 assert!(bytes.len() <= 8192);
                 let len = bytes.len().min(13);
                 output.extend_from_slice(&bytes[..len]);
                 len as i64
-            }));
+            }
+        ));
         assert_eq!(output, expected);
     }
 
     #[test]
     fn prepared_lane_bound_and_length_failures_are_honest() {
         for len in [u64::MAX, 1025] {
-            assert!(!write_state_stream_with_persist(42, &[], &[], b"", len, 1024,
+            assert!(!write_state_stream_with_persist(
+                42,
+                &[],
+                &[],
+                b"",
+                len,
+                1024,
                 |_| panic!("oversize prepared its output"),
-                |_| panic!("oversize wrote bytes")));
+                |_| panic!("oversize wrote bytes")
+            ));
         }
         for actual in [0, 2] {
             let mut bytes = Vec::new();
-            assert!(!write_state_stream_with_persist(42, &[], &[], b"", 1, 1024,
+            assert!(!write_state_stream_with_persist(
+                42,
+                &[],
+                &[],
+                b"",
+                1,
+                1024,
                 |writer| writer.write_all(&[9; 2][..actual]),
-                |part| { bytes.extend_from_slice(part); part.len() as i64 }));
+                |part| {
+                    bytes.extend_from_slice(part);
+                    part.len() as i64
+                }
+            ));
             assert!(bytes.len() <= 37);
         }
-        assert!(!write_state_stream_with_persist(42, &[], &[], b"", 1, 1024,
-            |_| Err(std::io::Error::other("encoding failed")), |part| part.len() as i64));
+        assert!(!write_state_stream_with_persist(
+            42,
+            &[],
+            &[],
+            b"",
+            1,
+            1024,
+            |_| Err(std::io::Error::other("encoding failed")),
+            |part| part.len() as i64
+        ));
     }
 }
 

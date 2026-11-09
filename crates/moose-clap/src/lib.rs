@@ -737,7 +737,8 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
                     request(host.as_ptr());
                 }
             }));
-            data.params_arc.set_persist_change_signal(Arc::downgrade(&signal));
+            data.params_arc
+                .set_persist_change_signal(Arc::downgrade(&signal));
             data.persist_signal = Some(signal);
         }
         true
@@ -940,7 +941,8 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
         let data = data_from_plugin::<P>(plugin);
         if data.persist_pending.swap(false, Ordering::AcqRel)
             && let Some((id, value)) = data.params_arc.take_persist_change()
-            && value.is_finite() && (0.0..=1.0).contains(&value)
+            && value.is_finite()
+            && (0.0..=1.0).contains(&value)
             && data.params_arc.get_normalized(id).is_some()
         {
             // The ordinary gesture queue works independently of GUI creation.
@@ -950,7 +952,8 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
             context.end_edit(id);
             // State dirtiness must also reach an inactive host that does not
             // implement params/request_flush. This is a main-thread-only API.
-            if !data.host.is_null() && !data.host_state.is_null()
+            if !data.host.is_null()
+                && !data.host_state.is_null()
                 && let Some(mark_dirty) = (*data.host_state).mark_dirty
             {
                 mark_dirty(data.host);
@@ -4031,7 +4034,9 @@ unsafe extern "C" fn state_save<P: PluginExport>(
         // thread publishes each block. Never touches the plugin, so it
         // can't stall a block in flight.
         let extra = save_extra(&data.snapshot);
-        let Ok(persist) = data.params_arc.prepare_persist_write() else { return false; };
+        let Ok(persist) = data.params_arc.prepare_persist_write() else {
+            return false;
+        };
         let Some(write_fn) = (*stream).write else {
             return false;
         };
@@ -4091,7 +4096,10 @@ unsafe extern "C" fn state_load<P: PluginExport>(
         let Some(deserialized) = state::read_and_apply_params::<P>(
             |buf| read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64),
             data.plugin_id_hash,
-            state::PluginFormat::Clap, None, &*data.params_arc, P::max_host_state_bytes(),
+            state::PluginFormat::Clap,
+            None,
+            &*data.params_arc,
+            P::max_host_state_bytes(),
         ) else {
             return false;
         };
@@ -4101,7 +4109,6 @@ unsafe extern "C" fn state_load<P: PluginExport>(
         // `clap_plugin_state.load` see the restored values without
         // first running a process block - clap-validator reads back
         // immediately after a load round-trip.
-
 
         if data.active.load(Ordering::Relaxed) {
             // Active: the audio thread will drain `pending_state` at the
@@ -6469,7 +6476,10 @@ mod host_value_tests {
     }
 
     #[test]
-    #[allow(unused_assignments, reason = "the ABI reader follows ctx after each event write")]
+    #[allow(
+        unused_assignments,
+        reason = "the ABI reader follows ctx after each event write"
+    )]
     fn structural_flush_and_gui_edits_request_discovery_without_numeric_rescans() {
         #[derive(Default)]
         struct Calls {

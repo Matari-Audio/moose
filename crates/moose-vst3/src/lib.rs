@@ -677,7 +677,12 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
             let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
-            if let Some(signal) = instance.persist_signal.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            if let Some(signal) = instance
+                .persist_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
                 signal.close();
             }
             drop(instance);
@@ -1871,28 +1876,60 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // Rust global allocator for both save + free; do not cross
         // wires when refactoring `_save_state` paths together.)
         let extra = save_extra(&inst.snapshot);
-        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
-        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
-        let Ok(host_len) = u32::try_from(len) else { return; };
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else {
+            return;
+        };
+        let Some(len) = state::state_stream_size(
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
+        ) else {
+            return;
+        };
+        let Ok(host_len) = u32::try_from(len) else {
+            return;
+        };
         // Own exactly one contiguous host buffer. RAII frees failed or panicked
         // partial writes; successful transfer retains the original libc ABI.
         struct Buffer(*mut u8);
         impl Drop for Buffer {
-            fn drop(&mut self) { if !self.0.is_null() { unsafe { libc_free(self.0.cast()); } } }
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        libc_free(self.0.cast());
+                    }
+                }
+            }
         }
         let mut buffer = Buffer(libc_malloc(len).cast::<u8>());
-        if buffer.0.is_null() { return; }
+        if buffer.0.is_null() {
+            return;
+        }
         let mut offset = 0;
-        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
-            persist.byte_len(), P::max_host_state_bytes(),
+        let ok = state::write_state_stream_with_persist(
+            inst.plugin_id_hash,
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
             |output| moose_params::write_prepared_persist(persist.as_ref(), output),
             |bytes| {
-                if bytes.len() > len - offset { return -1; }
+                if bytes.len() > len - offset {
+                    return -1;
+                }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
-                offset += bytes.len(); bytes.len() as i64
-            });
-        if !ok { return; }
-        *out_data = buffer.0; *out_len = host_len;
+                offset += bytes.len();
+                bytes.len() as i64
+            },
+        );
+        if !ok {
+            return;
+        }
+        *out_data = buffer.0;
+        *out_len = host_len;
         buffer.0 = std::ptr::null_mut();
     });
 }
@@ -1925,14 +1962,20 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
     })
 }
 
-unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized: state::DeserializedState, params_applied: bool) -> i32 {
+unsafe fn apply_host_state<P: PluginExport>(
+    inst: &Vst3Instance<P>,
+    deserialized: state::DeserializedState,
+    params_applied: bool,
+) -> i32 {
     unsafe {
         // Apply params synchronously on the host thread (atomic-safe)
         // so host-side queries that read parameter values right
         // after `setState` see the restored values without first
         // running a process block. pluginval / DAW preset reload
         // both observe this.
-        if !params_applied { state::apply_params(&*inst.params_arc, &deserialized); }
+        if !params_applied {
+            state::apply_params(&*inst.params_arc, &deserialized);
+        }
         if inst.active.load(Ordering::Relaxed) {
             // Active: the audio thread drains `pending_state` at the top
             // of the next block and applies the custom-state blob under
@@ -1965,42 +2008,61 @@ unsafe fn apply_host_state<P: PluginExport>(inst: &Vst3Instance<P>, deserialized
             editor.state_changed();
         }
         1
-        }
+    }
 }
 
 unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
-    ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    ctx: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
     write: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, u32) -> i64,
 ) -> i32 {
     run_extern_callback_with::<P, i32>("vst3", "save_state_stream", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        if !inst.active.load(Ordering::Relaxed) && let Some(state) = inst.pending_state.pop() {
+        if !inst.active.load(Ordering::Relaxed)
+            && let Some(state) = inst.pending_state.pop()
+        {
             let mut plugin = enter_plugin(&inst.plugin);
-            state::apply_state(&mut *plugin, &state); plugin.republish_snapshot();
+            state::apply_state(&mut *plugin, &state);
+            plugin.republish_snapshot();
         }
         let (ids, values) = inst.params_arc.collect_values();
         let extra = save_extra(&inst.snapshot);
-        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return 0; };
-        i32::from(state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
-            persist.byte_len(), P::max_host_state_bytes(),
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else {
+            return 0;
+        };
+        i32::from(state::write_state_stream_with_persist(
+            inst.plugin_id_hash,
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
             |output| moose_params::write_prepared_persist(persist.as_ref(), output),
-            |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32)))
+            |bytes| write(stream, bytes.as_ptr(), bytes.len() as u32),
+        ))
     })
 }
 
 unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
-    ctx: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    ctx: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
     read: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, u32) -> i64,
 ) -> i32 {
     run_extern_callback_with::<P, i32>("vst3", "load_state_stream", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let Some(deserialized) = state::read_and_apply_params::<P>(
-            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32), inst.plugin_id_hash, state::PluginFormat::Vst3, None, &*inst.params_arc, P::max_host_state_bytes(),
-        ) else { return 0; };
+            |buf| read(stream, buf.as_mut_ptr(), buf.len() as u32),
+            inst.plugin_id_hash,
+            state::PluginFormat::Vst3,
+            None,
+            &*inst.params_arc,
+            P::max_host_state_bytes(),
+        ) else {
+            return 0;
+        };
         apply_host_state(inst, deserialized, true)
     })
 }
-
 
 unsafe extern "C" fn cb_state_free(data: *mut u8, _len: u32) {
     unsafe {
@@ -4150,11 +4212,13 @@ mod tests {
 
     #[test]
     fn state_read_chunk_preserves_short_reads_and_rejects_bad_counts() {
-        let mut s=fake(&[(0,317),(1,17),(0,0),(0,-1),(0,8193)]);
-        let mut buf=[0_u8;8192];
-        for expected in [317,17,0,-1,-1] {
-            let count=unsafe { moose_vst3_read_state_chunk((&raw mut s).cast(),buf.as_mut_ptr(),buf.len() as u32) };
-            assert_eq!(count,expected);
+        let mut s = fake(&[(0, 317), (1, 17), (0, 0), (0, -1), (0, 8193)]);
+        let mut buf = [0_u8; 8192];
+        for expected in [317, 17, 0, -1, -1] {
+            let count = unsafe {
+                moose_vst3_read_state_chunk((&raw mut s).cast(), buf.as_mut_ptr(), buf.len() as u32)
+            };
+            assert_eq!(count, expected);
         }
     }
 
@@ -4597,32 +4661,48 @@ mod host_value_tests {
 mod large_state_fixture;
 #[cfg(test)]
 mod large_state_tests {
+    use super::large_state_fixture::{LargePlugin, payload};
     use super::*;
-    use super::large_state_fixture::{LargePlugin,payload};
-    type Large=LargePlugin<{64*1024*1024}>;
-    struct Input { bytes:Vec<u8>, offset:usize }
-    unsafe extern "C" fn read(ctx:*mut std::ffi::c_void, dst:*mut u8, size:u32)->i64 {
-        let input=unsafe{&mut *ctx.cast::<Input>()};
-        let n=(size as usize).min(317).min(input.bytes.len()-input.offset);
-        unsafe{std::ptr::copy_nonoverlapping(input.bytes.as_ptr().add(input.offset),dst,n)};
-        input.offset+=n;n as i64
+    type Large = LargePlugin<{ 64 * 1024 * 1024 }>;
+    struct Input {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+    unsafe extern "C" fn read(ctx: *mut std::ffi::c_void, dst: *mut u8, size: u32) -> i64 {
+        let input = unsafe { &mut *ctx.cast::<Input>() };
+        let n = (size as usize)
+            .min(317)
+            .min(input.bytes.len() - input.offset);
+        unsafe { std::ptr::copy_nonoverlapping(input.bytes.as_ptr().add(input.offset), dst, n) };
+        input.offset += n;
+        n as i64
     }
     #[test]
     fn large_host_state_roundtrips_through_stream_callback() {
         unsafe {
-            let ctx=cb_create::<Large>(); assert!(!ctx.is_null());
-            let inst=&*ctx.cast::<Vst3Instance<Large>>();
-            *inst.params_arc.payload.lock().unwrap()=payload();
-            let mut ptr=std::ptr::null_mut(); let mut len=0;
-            cb_state_save::<Large>(ctx,&raw mut ptr,&raw mut len);
-            assert!(len>32*1024*1024);
-            let bytes=std::slice::from_raw_parts(ptr,len as usize).to_vec(); cb_state_free(ptr,len);
+            let ctx = cb_create::<Large>();
+            assert!(!ctx.is_null());
+            let inst = &*ctx.cast::<Vst3Instance<Large>>();
+            *inst.params_arc.payload.lock().unwrap() = payload();
+            let mut ptr = std::ptr::null_mut();
+            let mut len = 0;
+            cb_state_save::<Large>(ctx, &raw mut ptr, &raw mut len);
+            assert!(len > 32 * 1024 * 1024);
+            let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+            cb_state_free(ptr, len);
             inst.params_arc.payload.lock().unwrap().clear();
-            let mut input=Input{bytes,offset:0};
-            assert_eq!(cb_state_load_stream::<Large>(ctx,(&raw mut input).cast(),read),1);
-            assert_eq!(*inst.params_arc.payload.lock().unwrap(),payload());
-            input.bytes.pop();input.offset=0;
-            assert_eq!(cb_state_load_stream::<Large>(ctx,(&raw mut input).cast(),read),0);
+            let mut input = Input { bytes, offset: 0 };
+            assert_eq!(
+                cb_state_load_stream::<Large>(ctx, (&raw mut input).cast(), read),
+                1
+            );
+            assert_eq!(*inst.params_arc.payload.lock().unwrap(), payload());
+            input.bytes.pop();
+            input.offset = 0;
+            assert_eq!(
+                cb_state_load_stream::<Large>(ctx, (&raw mut input).cast(), read),
+                0
+            );
             cb_destroy::<Large>(ctx);
         }
     }

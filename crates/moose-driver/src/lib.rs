@@ -835,7 +835,8 @@ impl<P: PluginExport> PluginDriver<P> {
         let mut plugin = P::create();
         plugin.init();
         let preparation = moose_core::plugin::PreparationConfig::new(
-            AudioConfig::new(self.sample_rate, self.block_size).with_process_mode(self.process_mode),
+            AudioConfig::new(self.sample_rate, self.block_size)
+                .with_process_mode(self.process_mode),
             moose_core::plugin::PreparationFrameBound::ExplicitDriver,
         );
         // Driver::run is an assertion-style harness (its IO/state/render errors

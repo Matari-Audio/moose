@@ -90,7 +90,9 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     }
 
     /// Maximum serialized host state; size document admission to this bound.
-    fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
+    fn max_host_state_bytes() -> usize {
+        32 * 1024 * 1024
+    }
 
     /// Supported audio bus configurations. The host picks one. Default:
     /// the standard audio effect - stereo and mono - so it appears on
@@ -107,15 +109,18 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     /// Worker/fallible-preparation logic must declare this requirement. Legacy
     /// synchronous users retain false. Hot loaders refuse true until executable
     /// worker lifetime and fallible cross-generation preparation are qualified.
-    fn requires_fallible_preparation()->bool{false}
-    fn prepare(state: &mut Self::DspState, params: &Self::Params,
+    fn requires_fallible_preparation() -> bool {
+        false
+    }
+    fn prepare(
+        state: &mut Self::DspState,
+        params: &Self::Params,
         config: &moose_core::plugin::PreparationConfig,
     ) -> Result<(), moose_core::plugin::PreparationError> {
         config.validate()?;
         Self::reset(state, params, &config.audio);
         Ok(())
     }
-
 
     fn process(
         state: &mut Self::DspState,
@@ -531,9 +536,9 @@ pub mod __plugin_logic_deps {
     pub use moose_core::buffer::AudioBuffer;
     pub use moose_core::bus::BusLayout;
     pub use moose_core::config::AudioConfig;
-    pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::editor::Editor;
     pub use moose_core::events::EventList;
+    pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::process::{ProcessContext, ProcessStatus};
     pub use moose_core::snapshot::SNAPSHOT_PREALLOC;
     pub use moose_core::state::{ForeignState, MigratedState, StateLoadError};
@@ -875,7 +880,9 @@ macro_rules! plugin_logic_bridge {
                 <Self as $leaf>::supports_in_place()
             }
 
-            fn max_host_state_bytes() -> usize { <Self as $leaf>::max_host_state_bytes() }
+            fn max_host_state_bytes() -> usize {
+                <Self as $leaf>::max_host_state_bytes()
+            }
 
             fn bus_layouts() -> Vec<BusLayout> {
                 <Self as $leaf>::bus_layouts()
@@ -892,8 +899,12 @@ macro_rules! plugin_logic_bridge {
                 <Self as $leaf>::reset(state, params, config);
             }
 
-            fn requires_fallible_preparation()->bool{<Self as $leaf>::requires_fallible_preparation()}
-            fn prepare(state: &mut Self::DspState, params: &Self::Params,
+            fn requires_fallible_preparation() -> bool {
+                <Self as $leaf>::requires_fallible_preparation()
+            }
+            fn prepare(
+                state: &mut Self::DspState,
+                params: &Self::Params,
                 config: &moose_core::plugin::PreparationConfig,
             ) -> Result<(), moose_core::plugin::PreparationError> {
                 <Self as $leaf>::prepare(state, params, config)
