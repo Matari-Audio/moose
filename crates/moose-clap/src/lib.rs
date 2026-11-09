@@ -83,6 +83,9 @@ use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, clap_plugin_render, clap_plugin_render_mode,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
+use clap_sys::ext::surround::{
+    CLAP_EXT_SURROUND, CLAP_EXT_SURROUND_COMPAT, CLAP_PORT_SURROUND, clap_plugin_surround,
+};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
@@ -4364,12 +4367,13 @@ unsafe fn selected_layout_index<P: PluginExport>(
     (data.selected_config.load(Ordering::Relaxed) as usize).min(layouts_len - 1)
 }
 
-/// The CLAP main-port-type string for a channel config (`null` for a
-/// custom count, which CLAP leaves untyped).
+/// The CLAP main-port-type string for a channel config. Unsupported custom
+/// counts remain untyped.
 fn clap_port_type_ptr(channels: ChannelConfig) -> *const c_char {
     match channels {
         ChannelConfig::Mono => CLAP_PORT_MONO.as_ptr(),
         ChannelConfig::Stereo => CLAP_PORT_STEREO.as_ptr(),
+        ChannelConfig::Custom(4 | 6 | 8) => CLAP_PORT_SURROUND.as_ptr(),
         ChannelConfig::Custom(_) => ptr::null(),
     }
 }
@@ -4436,15 +4440,68 @@ unsafe extern "C" fn audio_ports_get<P: PluginExport>(
         if <P as PluginRuntime>::Sample::IS_F64 {
             out.flags |= CLAP_AUDIO_PORT_SUPPORTS_64BITS | CLAP_AUDIO_PORT_PREFERS_64BITS;
         }
-        out.port_type = match bus.channels {
-            ChannelConfig::Mono => CLAP_PORT_MONO.as_ptr(),
-            ChannelConfig::Stereo => CLAP_PORT_STEREO.as_ptr(),
-            ChannelConfig::Custom(_) => ptr::null(),
-        };
+        out.port_type = clap_port_type_ptr(bus.channels);
         out.in_place_pair = CLAP_INVALID_ID;
 
         true
     }
+}
+
+// Match the canonical channel arrangements exposed by the VST3 adapter.
+fn surround_channels(channels: ChannelConfig) -> &'static [u8] {
+    match channels {
+        ChannelConfig::Custom(4) => &[0, 1, 4, 5],
+        ChannelConfig::Custom(6) => &[0, 1, 2, 3, 4, 5],
+        ChannelConfig::Custom(8) => &[0, 1, 2, 3, 4, 5, 9, 10],
+        _ => &[],
+    }
+}
+
+unsafe extern "C" fn surround_mask<P: PluginExport>(_: *const clap_plugin, mask: u64) -> bool {
+    P::bus_layouts()
+        .iter()
+        .flat_map(|layout| layout.inputs.iter().chain(&layout.outputs))
+        .filter(|bus| bus.enabled)
+        .any(|bus| {
+            let channels = surround_channels(bus.channels);
+            !channels.is_empty()
+                && channels
+                    .iter()
+                    .fold(0u64, |bits, channel| bits | (1u64 << channel))
+                    == mask
+        })
+}
+
+unsafe extern "C" fn surround_map<P: PluginExport>(
+    plugin: *const clap_plugin,
+    is_input: bool,
+    port: u32,
+    destination: *mut u8,
+    capacity: u32,
+) -> u32 {
+    let layouts = P::bus_layouts();
+    // SAFETY: CLAP supplies a live plugin instance for this main-thread callback.
+    let index = unsafe { selected_layout_index::<P>(plugin, layouts.len()) };
+    let Some(layout) = layouts.get(index) else {
+        return 0;
+    };
+    let buses = if is_input {
+        &layout.inputs
+    } else {
+        &layout.outputs
+    };
+    let Some(bus) = buses.iter().filter(|bus| bus.enabled).nth(port as usize) else {
+        return 0;
+    };
+    let channels = surround_channels(bus.channels);
+    if channels.is_empty() || destination.is_null() || (capacity as usize) < channels.len() {
+        return 0;
+    }
+    // SAFETY: CLAP supplies a writable buffer of capacity bytes, checked above.
+    unsafe {
+        ptr::copy_nonoverlapping(channels.as_ptr(), destination, channels.len());
+    }
+    len_u32(channels.len())
 }
 
 fn make_audio_ports_extension<P: PluginExport>() -> clap_plugin_audio_ports {
@@ -5555,6 +5612,7 @@ struct Extensions<P: PluginExport> {
     preset_load: clap_plugin_preset_load,
     audio_ports: clap_plugin_audio_ports,
     audio_ports_config: clap_plugin_audio_ports_config,
+    surround: clap_plugin_surround,
     note_ports: clap_plugin_note_ports,
     gui: clap_plugin_gui,
     latency: clap_plugin_latency,
@@ -5613,6 +5671,10 @@ impl<P: PluginExport> Extensions<P> {
             preset_load: make_preset_load_extension::<P>(),
             audio_ports: make_audio_ports_extension::<P>(),
             audio_ports_config: make_audio_ports_config_extension::<P>(),
+            surround: clap_plugin_surround {
+                is_channel_mask_supported: Some(surround_mask::<P>),
+                get_channel_map: Some(surround_map::<P>),
+            },
             note_ports: make_note_ports_extension::<P>(),
             gui: make_gui_extension::<P>(),
             latency: clap_plugin_latency {
@@ -5662,6 +5724,9 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         // described by `audio_ports` alone.
         if ext_id == CLAP_EXT_AUDIO_PORTS_CONFIG && P::bus_layouts().len() > 1 {
             return (&raw const extensions.audio_ports_config).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_SURROUND || ext_id == CLAP_EXT_SURROUND_COMPAT {
+            return (&raw const extensions.surround).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_NOTE_PORTS {
             return (&raw const extensions.note_ports).cast::<c_void>();
@@ -7248,3 +7313,129 @@ mod persist_notify_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod surround_tests {
+    use super::host_value_fixture::{TestParams, TestPlugin};
+    use super::*;
+    use moose_core::bus::BusLayout;
+
+    struct Surround(TestPlugin);
+    impl PluginExport for Surround {
+        type Params = TestParams;
+        fn create() -> Self {
+            Self(TestPlugin::create())
+        }
+        fn params(&self) -> &TestParams {
+            self.0.params()
+        }
+        fn params_arc(&self) -> Arc<TestParams> {
+            self.0.params_arc()
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            self.0.meter_store()
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            self.0.snapshot_slot()
+        }
+    }
+    impl PluginRuntime for Surround {
+        type Sample = f32;
+        fn reset(&mut self, _: &AudioConfig) {}
+        fn info() -> PluginInfo {
+            TestPlugin::info()
+        }
+        fn bus_layouts() -> Vec<BusLayout> {
+            [4, 6, 8, 5]
+                .into_iter()
+                .map(|count| {
+                    BusLayout::new()
+                        .with_optional_sidechain_input("disabled", ChannelConfig::Stereo, false)
+                        .with_input("main", ChannelConfig::Custom(count))
+                        .with_output("main", ChannelConfig::Custom(count))
+                })
+                .collect()
+        }
+        fn process(
+            &mut self,
+            _: &mut AudioBuffer,
+            _: &EventList,
+            _: &mut moose_core::process::ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    #[test]
+    fn host_reads_selected_canonical_surround_maps() {
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = clap_sys::version::CLAP_VERSION;
+            let descriptor = DescriptorHolder::new(&Surround::info());
+            let plugin = create_plugin_instance::<Surround>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<Surround>(plugin));
+            let ext = clap_plugin_get_extension::<Surround>(plugin, CLAP_EXT_SURROUND.as_ptr())
+                .cast::<clap_plugin_surround>();
+            assert!(!ext.is_null());
+            let map = (*ext).get_channel_map.unwrap();
+            let supported = (*ext).is_channel_mask_supported.unwrap();
+            for (index, expected) in [
+                &[0, 1, 4, 5][..],
+                &[0, 1, 2, 3, 4, 5],
+                &[0, 1, 2, 3, 4, 5, 9, 10],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(audio_ports_config_select::<Surround>(
+                    plugin,
+                    len_u32(index)
+                ));
+                let mut port_info: clap_audio_port_info = std::mem::zeroed();
+                assert!(audio_ports_get::<Surround>(
+                    plugin,
+                    0,
+                    false,
+                    &raw mut port_info
+                ));
+                assert_eq!(CStr::from_ptr(port_info.port_type), CLAP_PORT_SURROUND);
+                let mask = expected
+                    .iter()
+                    .fold(0u64, |bits, channel| bits | (1 << channel));
+                assert!(supported(plugin, mask));
+                for is_input in [true, false] {
+                    let mut output = [255; 8];
+                    assert_eq!(
+                        map(plugin, is_input, 0, output.as_mut_ptr(), 8),
+                        len_u32(expected.len())
+                    );
+                    assert_eq!(&output[..expected.len()], expected);
+                    assert_eq!(
+                        map(
+                            plugin,
+                            is_input,
+                            0,
+                            output.as_mut_ptr(),
+                            len_u32(expected.len() - 1)
+                        ),
+                        0
+                    );
+                    assert_eq!(map(plugin, is_input, 1, output.as_mut_ptr(), 8), 0);
+                }
+            }
+            assert!(!supported(plugin, 0));
+            assert!(!supported(
+                plugin,
+                (1 << 0) | (1 << 1) | (1 << 9) | (1 << 10)
+            ));
+            assert!(audio_ports_config_select::<Surround>(plugin, 3));
+            let mut output = [255; 8];
+            assert_eq!(map(plugin, true, 0, output.as_mut_ptr(), 8), 0);
+            assert_eq!(map(plugin, true, 0, ptr::null_mut(), 8), 0);
+            clap_plugin_destroy::<Surround>(plugin);
+        }
+    }
+}
