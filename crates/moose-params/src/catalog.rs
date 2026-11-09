@@ -10,6 +10,10 @@ pub struct ParamCatalog {
 }
 
 impl ParamCatalog {
+    /// Build an immutable parameter catalog.
+    ///
+    /// # Panics
+    /// Panics if two descriptors have the same parameter ID.
     #[must_use]
     pub fn new(infos: Vec<ParamInfo>) -> Self {
         let mut indices = HashMap::with_capacity(infos.len());

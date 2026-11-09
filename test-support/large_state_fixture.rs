@@ -20,6 +20,10 @@ pub struct LargeParams {
     pub payload: Mutex<Vec<u8>>,
 }
 impl LargeParams {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the persistence callback signature is optional"
+    )]
     fn prepare_stream(
         input: &mut dyn std::io::Read,
         len: usize,
@@ -112,5 +116,5 @@ impl<const LIMIT: usize> PluginExport for LargePlugin<LIMIT> {
     }
 }
 pub fn payload() -> Vec<u8> {
-    (0..33 * 1024 * 1024).map(|i| (i % 251) as u8).collect()
+    (0_u8..251).cycle().take(33 * 1024 * 1024).collect()
 }

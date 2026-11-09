@@ -250,7 +250,6 @@ pub trait PersistFingerprintVisitor {
 /// rather than expecting one on the trait - `#[derive(Params)]` emits
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
-
 pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Optional incremental persistence preparation. Return `None` without
     /// reading to keep the ordinary buffered path. `Some(Err)` rejects before
