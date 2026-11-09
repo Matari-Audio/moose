@@ -10,7 +10,10 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap_sys::ext::gui::{CLAP_EXT_GUI, CLAP_WINDOW_API_X11, clap_plugin_gui};
+use clap_sys::ext::gui::{
+    CLAP_EXT_GUI, CLAP_WINDOW_API_COCOA, CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11,
+    clap_plugin_gui,
+};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin_descriptor;
 use clap_sys::version::CLAP_VERSION;
@@ -103,7 +106,14 @@ fn reopened_editor_keeps_the_host_scale() {
         assert!((vt.init.unwrap())(plugin));
         let gui =
             &*(vt.get_extension.unwrap())(plugin, CLAP_EXT_GUI.as_ptr()).cast::<clap_plugin_gui>();
-        let api = CLAP_WINDOW_API_X11.as_ptr();
+        let api = if cfg!(target_os = "windows") {
+            CLAP_WINDOW_API_WIN32
+        } else if cfg!(target_os = "macos") {
+            CLAP_WINDOW_API_COCOA
+        } else {
+            CLAP_WINDOW_API_X11
+        }
+        .as_ptr();
 
         // First open: the host sets the scale after `create`.
         assert!((gui.create.unwrap())(plugin, api, false));
