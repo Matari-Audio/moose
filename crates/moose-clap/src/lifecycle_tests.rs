@@ -63,6 +63,7 @@ impl PluginRuntime for Probe {
     }
 }
 
+#[cfg(feature = "rt-paranoid")]
 #[global_allocator]
 static TEST_ALLOC: moose_core::rt::RtCheckAlloc = moose_core::rt::RtCheckAlloc::new();
 
@@ -91,6 +92,20 @@ fn audited_process(plugin: *const clap_plugin, process: &clap_process) -> (i32, 
 }
 
 #[test]
+#[cfg(feature = "rt-paranoid")]
+fn process_allocation_checker_detects_an_allocation() {
+    let (_, allocations) = moose_core::rt::audit(|| {
+        let _rt = RtSection::enter();
+        std::hint::black_box(Box::new(std::hint::black_box(1_u32)));
+    });
+    assert!(
+        allocations > 0,
+        "the process allocation checker must be active"
+    );
+}
+
+#[test]
+#[cfg(feature = "rt-paranoid")]
 fn larger_reactivation_processes_in_place_without_allocating() {
     for first_frames in [0, 64, 1024] {
         with_probe(|plugin| {
@@ -154,6 +169,7 @@ fn larger_reactivation_processes_in_place_without_allocating() {
 }
 
 #[test]
+#[cfg(feature = "rt-paranoid")]
 fn larger_reactivation_processes_disconnected_channels_without_allocating() {
     with_probe(|plugin| {
         // SAFETY: null data arrays represent disconnected buses with declared channels.

@@ -148,6 +148,8 @@ jobs:
         # scaffolded cargo builds) in the parallel `cargo-moose tests
         # (windows-latest)` job below; Linux/macOS keep them here.
         run: cargo test --workspace ${{ runner.os == 'Windows' && '--exclude cargo-moose' || '' }}
+      - name: CLAP activation allocation checks
+        run: cargo test --locked -p moose-clap --features rt-paranoid --lib lifecycle_tests
       - name: X11 hidden host reparenting
         if: runner.os == 'Linux'
         run: >-
