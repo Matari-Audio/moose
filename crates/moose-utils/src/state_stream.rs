@@ -190,7 +190,8 @@ mod tests {
     }
     #[test]
     fn short_reads_large_lanes_and_legacy_are_lossless() {
-        let persist = vec![173; 33 * 1024 * 1024];
+        let limit = if cfg!(miri) { 1024 } else { 32 * 1024 * 1024 };
+        let persist = vec![173; limit + 1024];
         let blob = crate::state::serialize_state(42, &[7], &[0.25], b"extra", &persist);
         let Some(StreamState::Envelope(StateParse::WrongPlugin { found, state })) =
             parse(&blob, 317, blob.len())
@@ -201,7 +202,7 @@ mod tests {
         assert_eq!(state.params, [(7, 0.25)]);
         assert_eq!(state.extra.as_deref(), Some(b"extra".as_slice()));
         assert_eq!(state.persist, persist);
-        assert!(parse(&blob, 8192, 32 * 1024 * 1024).is_none());
+        assert!(parse(&blob, 8192, limit).is_none());
         assert!(matches!(parse(b"old",1,32),Some(StreamState::Foreign(bytes)) if bytes==b"old"));
     }
     #[test]
