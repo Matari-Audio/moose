@@ -631,3 +631,90 @@ fn hooks_receive_input_and_diagnostics_after_requests_are_replaced() {
         ["key:true", "sample.wav:true", "renderer message", "cancel"]
     );
 }
+
+#[test]
+fn close_cancels_app_gestures_and_flushes_persistence() {
+    let params = Arc::new(Synth::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::clone(&events);
+    let closed = Arc::clone(&events);
+    let mut editor = editor(&params)
+        .on_cancel(move |_| cancelled.lock().unwrap().push("cancel"))
+        .on_close(move || closed.lock().unwrap().push("persist"));
+    editor.close();
+    assert_eq!(*events.lock().unwrap(), ["cancel", "persist"]);
+    drop(editor);
+    assert_eq!(*events.lock().unwrap(), ["cancel", "persist", "persist"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an isolated X11 display"]
+fn floating_editor_reopens_with_native_hooks_and_send_controller() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    fn assert_send<T: Send>() {}
+    assert_send::<MuiEditor<Synth>>();
+    assert_send::<Handle>();
+    let params = Arc::new(Synth::default());
+    let (send, receive) = channel();
+    let (pointer_send, pointer_receive) = channel();
+    let mut editor = editor(&params)
+        .on_x11_window(move |id| {
+            send.send(id).unwrap();
+        })
+        .hide_pointer(move |_| {
+            let _ = pointer_send.send(());
+            false
+        })
+        .wheel_policy(window::WheelPolicy::new(3.0, window::WheelAcceleration::Fling).unwrap());
+    for _ in 0..2 {
+        let (context, _) = context(&params);
+        editor.open(RawWindowHandle::X11(0), context);
+        assert!(
+            receive
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .is_some()
+        );
+        pointer_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        editor.close();
+        assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), None);
+    }
+}
+
+#[test]
+fn dialog_owner_is_published_and_cleared_without_owning_the_native_handle() {
+    let params = Arc::new(Synth::default());
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&owners);
+    let mut editor = editor(&params).on_win32_parent(move |owner| {
+        observed.lock().unwrap().push(owner);
+    });
+    editor.publish_win32_parent(Some(RawWindowHandle::Win32(
+        std::ptr::without_provenance_mut(7),
+    )));
+    editor.publish_win32_parent(Some(RawWindowHandle::X11(8)));
+    editor.close();
+    assert_eq!(*owners.lock().unwrap(), [Some(7), None]);
+    let parent = ParentWindow::win32(7);
+    assert!(matches!(parent.0, RawWindowHandle::Win32(pointer) if pointer.addr() == 7));
+}
+
+#[test]
+fn dropping_editor_revokes_the_dialog_owner() {
+    let params = Arc::new(Synth::default());
+    let owner = Arc::new(Mutex::new(None));
+    let observed = Arc::clone(&owner);
+    let mut editor = editor(&params).on_win32_parent(move |value| {
+        *observed.lock().unwrap() = value;
+    });
+    editor.publish_win32_parent(Some(RawWindowHandle::Win32(
+        std::ptr::without_provenance_mut(7),
+    )));
+    assert_eq!(*owner.lock().unwrap(), Some(7));
+    drop(editor);
+    assert_eq!(*owner.lock().unwrap(), None);
+}
