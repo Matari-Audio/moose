@@ -56,6 +56,8 @@ use clap_sys::ext::audio_ports_config::{
     CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config,
 };
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
+#[cfg(feature = "mpe-input")]
+use clap_sys::ext::note_ports::CLAP_NOTE_DIALECT_MIDI_MPE;
 use clap_sys::ext::note_ports::{
     CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI, CLAP_NOTE_DIALECT_MIDI2,
     clap_note_port_info, clap_plugin_note_ports,
@@ -1002,20 +1004,15 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
             rescan(data.host, flags);
         }
 
-        // Latency changed on the audio thread: tell the host here, off
-        // the audio thread. `changed()` re-reads our reported latency;
-        // an active plugin additionally needs `request_restart` to apply
-        // the new delay compensation.
         if data.latency_dirty.swap(false, Ordering::Relaxed) && !data.host.is_null() {
-            if !data.host_latency.is_null()
+            if data.active.load(Ordering::Relaxed) {
+                if let Some(req_restart) = (*data.host).request_restart {
+                    req_restart(data.host);
+                }
+            } else if !data.host_latency.is_null()
                 && let Some(changed) = (*data.host_latency).changed
             {
                 changed(data.host);
-            }
-            if data.active.load(Ordering::Relaxed)
-                && let Some(req_restart) = (*data.host).request_restart
-            {
-                req_restart(data.host);
             }
         }
     }
@@ -2669,6 +2666,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         let num_frames = proc.frames_count as usize;
 
         if num_frames == 0 {
+            params_flush::<P>(plugin, proc.in_events, proc.out_events);
             return CLAP_PROCESS_CONTINUE;
         }
 
@@ -4513,6 +4511,10 @@ unsafe extern "C" fn note_ports_get<P: PluginExport>(
         // preferring MIDI would also pull host input through the
         // raw-MIDI path.
         out.supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
+        #[cfg(feature = "mpe-input")]
+        if is_input {
+            out.supported_dialects |= CLAP_NOTE_DIALECT_MIDI_MPE;
+        }
         out.preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
         // A port that opted into MIDI 2.0 also carries UMP: advertise
         // the MIDI2 dialect so the host routes `CLAP_EVENT_MIDI2` to us
@@ -4667,12 +4669,6 @@ unsafe extern "C" fn gui_create<P: PluginExport>(
     // The editor builder is author code; firewall its construction so a
     // panic can't unwind across the C ABI (false = "no editor created").
     run_extern_callback_with::<P, bool>("CLAP", "gui_create", false, || unsafe {
-        #[cfg(target_os = "linux")]
-        let api = if is_floating && (api.is_null() || *api == 0) {
-            CLAP_WINDOW_API_WAYLAND.as_ptr()
-        } else {
-            api
-        };
         if !gui_is_api_supported::<P>(plugin, api, is_floating) {
             return false;
         }
@@ -5809,7 +5805,10 @@ macro_rules! export_clap {
                 host: *const clap_host,
                 plugin_id: *const c_char,
             ) -> *const clap_plugin {
-                if plugin_id.is_null() {
+                if plugin_id.is_null()
+                    || host.is_null()
+                    || !clap_sys::version::clap_version_is_compatible((*host).clap_version)
+                {
                     return ptr::null();
                 }
                 let requested_id = CStr::from_ptr(plugin_id);
@@ -6655,6 +6654,14 @@ mod host_value_tests {
         use std::sync::Mutex;
 
         struct CaptureEditor(Arc<Mutex<Option<PluginContext>>>);
+        struct DefaultScaleEditor;
+        impl Editor for DefaultScaleEditor {
+            fn size(&self) -> (u32, u32) {
+                (100, 100)
+            }
+            fn open(&mut self, _: RawWindowHandle, _: PluginContext) {}
+            fn close(&mut self) {}
+        }
         impl Editor for CaptureEditor {
             fn size(&self) -> (u32, u32) {
                 (100, 100)
@@ -6730,6 +6737,17 @@ mod host_value_tests {
             assert!(clap_plugin_init::<TestPlugin>(b));
             let data = data_from_plugin::<TestPlugin>(a);
             let other = data_from_plugin::<TestPlugin>(b);
+            data.gui.enter().editor = Some(Box::new(DefaultScaleEditor));
+            let gui =
+                &*((*a).get_extension.unwrap()(a, CLAP_EXT_GUI.as_ptr()).cast::<clap_plugin_gui>());
+            assert!(!gui.create.unwrap()(a, ptr::null(), false));
+            assert!(gui.create.unwrap()(a, CLAP_WINDOW_API_X11.as_ptr(), false));
+            let mut window: clap_window = std::mem::zeroed();
+            window.api = CLAP_WINDOW_API_X11.as_ptr();
+            window.specific.ptr = ptr::dangling_mut::<c_void>();
+            assert!(!gui.set_parent.unwrap()(a, ptr::null()));
+            assert!(gui.set_parent.unwrap()(a, &raw const window));
+            gui.destroy.unwrap()(a);
             let captured = Arc::new(Mutex::new(None));
             data.gui.enter().editor = Some(Box::new(CaptureEditor(captured.clone())));
             assert!(gui_create::<TestPlugin>(
@@ -6737,9 +6755,6 @@ mod host_value_tests {
                 CLAP_WINDOW_API_X11.as_ptr(),
                 false
             ));
-            let mut window: clap_window = std::mem::zeroed();
-            window.api = CLAP_WINDOW_API_X11.as_ptr();
-            window.specific.ptr = ptr::dangling_mut::<c_void>();
             assert!(gui_set_parent::<TestPlugin>(a, &raw const window));
             let context = captured.lock().unwrap().take().unwrap();
             let out = clap_output_events {
@@ -6897,7 +6912,12 @@ mod floating_gui_tests {
                 CLAP_WINDOW_API_WAYLAND.as_ptr(),
                 false
             ));
-            assert!(gui_create::<TestPlugin>(plugin, ptr::null(), true));
+            assert!(!gui_create::<TestPlugin>(plugin, ptr::null(), true));
+            assert!(gui_create::<TestPlugin>(
+                plugin,
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                true
+            ));
             assert!(!gui_set_scale::<TestPlugin>(plugin, 2.));
             assert!(gui_show::<TestPlugin>(plugin));
             let close = hook.lock().unwrap().take().unwrap();
