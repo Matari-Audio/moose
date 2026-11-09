@@ -366,7 +366,10 @@ impl<P: Params> MuiEditor<P> {
         self
     }
 
-    fn has_floating(&self) -> bool {
+    fn has_window(&self) -> bool {
+        if self.window.is_some() {
+            return true;
+        }
         #[cfg(target_os = "linux")]
         {
             self.floating.is_some()
@@ -428,7 +431,7 @@ impl<P: Params> Editor for MuiEditor<P> {
     }
 
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
-        if self.window.is_some() || cfg!(target_os = "linux") && self.has_floating() {
+        if self.has_window() {
             self.close();
         }
         lock(&self.shared)
