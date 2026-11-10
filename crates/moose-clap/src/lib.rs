@@ -5742,7 +5742,16 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
             return (&raw const extensions.params).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_REMOTE_CONTROLS || ext_id == CLAP_EXT_REMOTE_CONTROLS_COMPAT {
-            return (&raw const extensions.remote_controls).cast::<c_void>();
+            let generated = (&raw const extensions.remote_controls).cast::<c_void>();
+            return run_extern_callback_with::<P, *const c_void>(
+                "CLAP",
+                "remote controls",
+                generated,
+                || {
+                    P::clap_extension(CLAP_EXT_REMOTE_CONTROLS)
+                        .map_or(generated, moose_core::export::CustomClapExtension::as_ptr)
+                },
+            );
         }
         if ext_id == CLAP_EXT_STATE {
             return (&raw const extensions.state).cast::<c_void>();

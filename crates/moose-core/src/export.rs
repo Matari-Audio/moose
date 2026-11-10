@@ -44,7 +44,8 @@ impl CustomClapExtension {
 pub trait PluginExport: PluginRuntime + Sized {
     type Params: Params;
 
-    /// Resolve a custom CLAP extension after built-in extensions.
+    /// Resolve a product CLAP extension. A remote-controls table replaces the
+    /// generated grouping; other built-in extensions remain framework-owned.
     #[must_use]
     fn clap_extension(_id: &std::ffi::CStr) -> Option<CustomClapExtension> {
         None

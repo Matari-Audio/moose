@@ -16,6 +16,9 @@ impl PluginExport for Probe {
         if id == c"test.moose.diagnostics" || id == CLAP_EXT_PARAMS {
             // SAFETY: TABLE uses the test extension ABI and has static storage.
             Some(unsafe { moose_core::export::CustomClapExtension::from_static(&TABLE) })
+        } else if id == CLAP_EXT_REMOTE_CONTROLS {
+            // SAFETY: this immutable table has the declared remote-controls ABI.
+            Some(unsafe { moose_core::export::CustomClapExtension::from_static(&REMOTE_TABLE) })
         } else {
             None
         }
@@ -483,6 +486,20 @@ unsafe extern "C" fn get_resets(plugin: *const clap_plugin) -> usize {
     unsafe { try_with_dsp_state::<Probe, usize, _>(plugin, |state| *state).unwrap_or(usize::MAX) }
 }
 static TABLE: TestExtension = TestExtension { get: get_resets };
+unsafe extern "C" fn remote_count(_: *const clap_plugin) -> u32 {
+    17
+}
+unsafe extern "C" fn remote_get(
+    _: *const clap_plugin,
+    _: u32,
+    _: *mut clap_remote_controls_page,
+) -> bool {
+    false
+}
+static REMOTE_TABLE: clap_plugin_remote_controls = clap_plugin_remote_controls {
+    count: Some(remote_count),
+    get: Some(remote_get),
+};
 
 #[test]
 fn custom_extension_queries_real_instances_and_rejects_busy() {
@@ -493,6 +510,17 @@ fn custom_extension_queries_real_instances_and_rejects_busy() {
             assert!(query(first, c"unknown".as_ptr()).is_null());
             assert!(query(ptr::null(), c"unknown".as_ptr()).is_null());
             let ext = &*query(first, c"test.moose.diagnostics".as_ptr()).cast::<TestExtension>();
+            let remote = query(first, CLAP_EXT_REMOTE_CONTROLS.as_ptr());
+            assert_eq!(
+                remote,
+                query(first, CLAP_EXT_REMOTE_CONTROLS_COMPAT.as_ptr())
+            );
+            assert_eq!(
+                (*remote.cast::<clap_plugin_remote_controls>())
+                    .count
+                    .unwrap()(first),
+                17
+            );
             assert_ne!(
                 query(first, CLAP_EXT_PARAMS.as_ptr()),
                 (&raw const TABLE).cast()
