@@ -290,6 +290,8 @@ struct ClapPluginData<P: PluginExport> {
     /// state). Main-thread-only (`activate` / `deactivate` / `state_load`
     /// are serialized by the host).
     active: AtomicBool,
+    /// True from a successful start_processing until stop_processing returns.
+    processing: AtomicBool,
     /// Current render mode as a [`ProcessMode`] discriminant. The host
     /// sets it through the `clap.render` extension on the main thread;
     /// the audio thread reads it each block. Most hosts deactivate
@@ -959,13 +961,21 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
 }
 
 unsafe extern "C" fn clap_plugin_start_processing<P: PluginExport>(
-    _plugin: *const clap_plugin,
+    plugin: *const clap_plugin,
 ) -> bool {
+    // SAFETY: CLAP supplies a live instance for this factory's plugin type.
+    let data = unsafe { data_from_plugin::<P>(plugin) };
+    if !data.active.load(Ordering::Acquire) {
+        return false;
+    }
+    data.processing.store(true, Ordering::Release);
     true
 }
 
-unsafe extern "C" fn clap_plugin_stop_processing<P: PluginExport>(_plugin: *const clap_plugin) {
-    // Nothing to do.
+unsafe extern "C" fn clap_plugin_stop_processing<P: PluginExport>(plugin: *const clap_plugin) {
+    // SAFETY: CLAP supplies a live instance for this factory's plugin type.
+    let data = unsafe { data_from_plugin::<P>(plugin) };
+    data.processing.store(false, Ordering::Release);
 }
 
 unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plugin) {
@@ -5818,13 +5828,49 @@ pub unsafe fn try_with_dsp_state<P: PluginExport, T: 'static, R>(
     plugin: *const clap_plugin,
     callback: impl FnOnce(&mut T) -> R,
 ) -> Option<R> {
+    // SAFETY: the caller supplies the matching live instance and serialization.
+    unsafe { access_dsp_state::<P, T, R>(plugin, DspAccess::Inactive, callback) }
+}
+
+/// Access concrete DSP state while processing is stopped, without blocking.
+///
+/// Active instances are accepted after `stop_processing`, allowing worker
+/// settlement before a same-activation reset. Running, busy, dynamic-shell,
+/// and mismatched-state instances return `None`. Panics are contained.
+///
+/// # Safety
+/// `plugin` must be null or a live CLAP instance created for `P`. Call on the
+/// CLAP main thread, serialized with every lifecycle callback and destruction.
+/// The host must not restart processing until the callback returns.
+pub unsafe fn try_with_stopped_dsp_state<P: PluginExport, T: 'static, R>(
+    plugin: *const clap_plugin,
+    callback: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
+    // SAFETY: the caller supplies the matching live instance and serialization.
+    unsafe { access_dsp_state::<P, T, R>(plugin, DspAccess::Stopped, callback) }
+}
+
+enum DspAccess {
+    Inactive,
+    Stopped,
+}
+
+unsafe fn access_dsp_state<P: PluginExport, T: 'static, R>(
+    plugin: *const clap_plugin,
+    access: DspAccess,
+    callback: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
     if plugin.is_null() {
         return None;
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: The caller guarantees the pointer and host lifecycle contract.
         let data = unsafe { data_from_plugin::<P>(plugin) };
-        if data.active.load(Ordering::Acquire) {
+        let unavailable = match access {
+            DspAccess::Inactive => data.active.load(Ordering::Acquire),
+            DspAccess::Stopped => data.processing.load(Ordering::Acquire),
+        };
+        if unavailable {
             return None;
         }
         let mut instance = data.plugin.try_enter()?;
@@ -5932,6 +5978,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
             pending_state: Arc::new(StateLoadQueue::new(1)),
             active: AtomicBool::new(false),
+            processing: AtomicBool::new(false),
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
             needs_rescan: Arc::new(AtomicBool::new(false)),
             floating_mode: AtomicBool::new(false),
