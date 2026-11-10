@@ -163,9 +163,9 @@ windows-sys = "0.61"
 wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 
 # All editor backends share MUI's maintained native window implementation.
-baseview = { package = "moose-baseview", git = "https://github.com/Matari-Audio/MUI", rev = "1d7e29cb567289ba73023b04820a6995b7dc853f" }
-mui = { git = "https://github.com/Matari-Audio/MUI", rev = "1d7e29cb567289ba73023b04820a6995b7dc853f", features = ["gpu-effects"] }
-mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "1d7e29cb567289ba73023b04820a6995b7dc853f" }
+baseview = { package = "moose-baseview", git = "https://github.com/Matari-Audio/MUI", rev = "0c8655881158ff5215d5c76e206bc818e72dc61f" }
+mui = { git = "https://github.com/Matari-Audio/MUI", rev = "0c8655881158ff5215d5c76e206bc818e72dc61f", features = ["gpu-effects"] }
+mui-baseview = { git = "https://github.com/Matari-Audio/MUI", rev = "0c8655881158ff5215d5c76e206bc818e72dc61f" }
 
 # Custom profile for shell-mode (hot-reload) builds. `cargo moose
 # install --shell` invokes `cargo build --profile shell --features
