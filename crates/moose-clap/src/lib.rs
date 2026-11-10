@@ -5783,6 +5783,29 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
     }
 }
 
+/// Read an instance's shared parameter store without taking the DSP cell.
+///
+/// This remains available while processing. Panics are contained. The callback
+/// must follow the thread and realtime rules of the operations it performs.
+///
+/// # Safety
+/// `plugin` must be null or a live CLAP instance created for `P`. The host must
+/// not destroy the instance until this call returns.
+pub unsafe fn try_with_params<P: PluginExport, R>(
+    plugin: *const clap_plugin,
+    callback: impl FnOnce(&P::Params) -> R,
+) -> Option<R> {
+    if plugin.is_null() {
+        return None;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees the pointer and its lifetime.
+        let data = unsafe { data_from_plugin::<P>(plugin) };
+        callback(&data.params_arc)
+    }))
+    .ok()
+}
+
 /// Access an inactive instance's concrete DSP state without blocking.
 ///
 /// The callback must run on the CLAP main thread. Active, busy, dynamic-shell,

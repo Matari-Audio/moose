@@ -519,6 +519,17 @@ fn custom_extension_queries_real_instances_and_rejects_busy() {
             assert_eq!((ext.get)(first), 5);
             assert!((*first).activate.unwrap()(first, 48_000.0, 1, 64));
             assert_eq!((ext.get)(first), usize::MAX);
+            assert!((*first).start_processing.unwrap()(first));
+            assert_eq!(
+                try_with_params::<Probe, _>(first, |params| params.param_infos().len()),
+                Some(2)
+            );
+            assert_eq!(
+                try_with_params::<Probe, ()>(first, |_| panic!("test params panic")),
+                None
+            );
+            assert_eq!(try_with_params::<Probe, _>(ptr::null(), |_| 1), None);
+            (*first).stop_processing.unwrap()(first);
             (*first).deactivate.unwrap()(first);
             assert_ne!((ext.get)(first), usize::MAX);
         });
