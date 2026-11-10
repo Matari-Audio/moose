@@ -104,12 +104,8 @@ mod plugin_cell {
         /// comes from the host contract - `process` never overlaps a
         /// lifecycle callback - not from this counter.
         handoff: AtomicU64,
-        /// Whether the cell is currently held. Tracked in every build (not
-        /// just debug) so [`Self::try_enter`] can decline re-entry in
-        /// release rather than hand out a second aliasing `&mut`. `enter`
-        /// still trusts the host contract (it asserts free only in debug);
-        /// `try_enter` is the safe variant for paths where author code may
-        /// re-enter (e.g. `request_resize` called from inside `set_size`).
+        /// Atomic ownership flag. Acquire and release synchronize successive
+        /// owners, and both entry paths reject overlapping mutable access.
         held: AtomicBool,
         /// Token of the thread currently holding the cell, for an accurate
         /// debug overlap message: same-thread re-entry (author code reached
@@ -149,13 +145,10 @@ mod plugin_cell {
             }
         }
 
-        /// Take ownership. Never blocks: the previous owner has already
-        /// released, by the host contract. The `Acquire` observes its
-        /// writes.
-        #[allow(
-            clippy::missing_panics_doc,
-            reason = "the only panic is the debug-only overlap detector, compiled out in release"
-        )]
+        /// Take ownership without blocking.
+        ///
+        /// # Panics
+        /// Panics when another owner holds the cell.
         pub fn enter(&self) -> PluginGuard<'_, T> {
             self.handoff.load(Ordering::Acquire);
             let was_held = self.held.swap(true, Ordering::Acquire);

@@ -521,6 +521,6 @@ fn custom_extension_queries_real_instances_and_rejects_busy() {
             assert_eq!((ext.get)(first), usize::MAX);
             (*first).deactivate.unwrap()(first);
             assert_ne!((ext.get)(first), usize::MAX);
-        })
+        });
     });
 }

@@ -79,6 +79,7 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     type DspState: Send + 'static;
 
     /// Resolve a custom static CLAP extension table.
+    #[must_use]
     fn clap_extension(_id: &std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> {
         None
     }
@@ -257,7 +258,8 @@ macro_rules! plugin_logic_leaf_trait {
             type DspState: ::core::default::Default + Send + 'static;
 
             /// Resolve a custom static CLAP extension table.
-            fn clap_extension(_id: &::std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> { None }
+            #[must_use]
+    fn clap_extension(_id: &::std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> { None }
 
             /// Whether the hot-reload shell carries live DSP state across a
             /// reload. Default `true`: the shell serializes the state

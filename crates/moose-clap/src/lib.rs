@@ -5775,7 +5775,10 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
             "CLAP",
             "custom extension",
             ptr::null(),
-            || P::clap_extension(ext_id).map_or(ptr::null(), |extension| extension.as_ptr()),
+            || {
+                P::clap_extension(ext_id)
+                    .map_or(ptr::null(), moose_core::export::CustomClapExtension::as_ptr)
+            },
         )
     }
 }

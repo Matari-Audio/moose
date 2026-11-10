@@ -45,6 +45,7 @@ pub trait PluginExport: PluginRuntime + Sized {
     type Params: Params;
 
     /// Resolve a custom CLAP extension after built-in extensions.
+    #[must_use]
     fn clap_extension(_id: &std::ffi::CStr) -> Option<CustomClapExtension> {
         None
     }
