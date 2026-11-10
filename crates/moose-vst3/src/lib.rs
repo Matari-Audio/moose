@@ -38,7 +38,7 @@ use moose_core::midi::{
 };
 #[cfg(test)]
 use moose_core::midi::{downconvert_to_midi1, per_note_bend_from_semitones};
-use moose_core::plugin::PluginRuntime;
+use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
 use moose_core::rt::{RtSection, audit};
 use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
@@ -760,22 +760,27 @@ fn vst3_process_mode(mode: i32) -> ProcessMode {
     }
 }
 
-unsafe extern "C" fn cb_reset<P: PluginExport>(
+unsafe extern "C" fn cb_prepare<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     sample_rate: f64,
     max_frames: u32,
     process_mode: i32,
-) {
+) -> i32 {
     // Author `reset` can panic (allocation, DSP prep); firewall it so the
     // panic can't unwind across the C ABI and abort the host.
-    run_extern_callback_with::<P, ()>("vst3", "reset", (), || unsafe {
+    run_extern_callback_with::<P, i32>("vst3", "prepare", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let mut audio = inst.audio.enter();
-        // Clamp host-supplied max_frames up to a sane minimum: hosts that
-        // don't honor their own setupProcessing contract can pass 0 here,
-        // which would size plugin-internal delay lines to zero and blow up
-        // on the first non-zero process() call.
-        let max_frames = (max_frames as usize).max(1024);
+        audio.prepared = false;
+        let max_frames = max_frames as usize;
+        let config = PreparationConfig::new(
+            AudioConfig::new(sample_rate, max_frames)
+                .with_process_mode(vst3_process_mode(process_mode)),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        if config.validate().is_err() {
+            return 0;
+        }
         audio.sample_rate = sample_rate;
         audio.max_block_size = max_frames;
         // Grow per-block scratch to cover the *widest* declared layout and
@@ -790,12 +795,12 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         let (num_in, num_out) = max_layout_channels(&P::bus_layouts());
         audio
             .scratch
-            .ensure_capacity(num_in as usize, num_out as usize, max_frames);
+            .ensure_capacity(num_in as usize, num_out as usize, max_frames.max(1024));
         {
             let mut plugin = enter_plugin(&inst.plugin);
-            let config = AudioConfig::new(sample_rate, max_frames)
-                .with_process_mode(vst3_process_mode(process_mode));
-            plugin.reset(&config);
+            if plugin.prepare(&config).is_err() {
+                return 0;
+            }
             inst.latency_cache
                 .store(plugin.latency(), Ordering::Relaxed);
             inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
@@ -803,6 +808,32 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         audio.output_note_ids.clear();
         audio.pending_output_mutation = PendingOutputMutation::None;
         audio.prepared = true;
+        1
+    })
+}
+
+unsafe extern "C" fn cb_reset<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    sample_rate: f64,
+    max_frames: u32,
+    process_mode: i32,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "reset", (), || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let mut audio = inst.audio.enter();
+        if !audio.prepared {
+            return;
+        }
+        let mut plugin = enter_plugin(&inst.plugin);
+        plugin.reset(
+            &AudioConfig::new(sample_rate, max_frames as usize)
+                .with_process_mode(vst3_process_mode(process_mode)),
+        );
+        inst.latency_cache
+            .store(plugin.latency(), Ordering::Relaxed);
+        inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+        audio.output_note_ids.clear();
+        audio.pending_output_mutation = PendingOutputMutation::None;
     });
 }
 
@@ -1596,7 +1627,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
     // (which `process_block` tolerates).
     unsafe {
         let ctx = cb_create::<P>();
-        cb_reset::<P>(ctx, 48_000.0, FRAMES, 0);
+        assert_eq!(cb_prepare::<P>(ctx, 48_000.0, FRAMES, 0), 1);
 
         // Non-zero input so the sanity check below can confirm the block
         // actually processed (a no-op harness would leave zeros).
@@ -3830,6 +3861,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         create: cb_create::<P>,
         destroy: cb_destroy::<P>,
         reset: cb_reset::<P>,
+        prepare: cb_prepare::<P>,
         process: cb_process::<P>,
         process_f64: cb_process_f64::<P>,
         param_count: cb_param_count::<P>,

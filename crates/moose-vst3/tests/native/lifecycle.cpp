@@ -11,6 +11,10 @@ int main(int argc, char** argv) {
         if (ctx != &token || rate != 44100. || frames != 1024 || mode != 0) std::abort();
         ++resets;
     };
+    callbacks.prepare = [](void* ctx, double rate, uint32_t frames, int32_t mode) -> int32_t {
+        g_cb->reset(ctx, rate, frames, mode);
+        return 1;
+    };
     callbacks.set_active = [](void*, int32_t) {};
     g_cb = &callbacks;
     MooseComponent component;
