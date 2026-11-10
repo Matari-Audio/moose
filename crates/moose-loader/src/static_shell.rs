@@ -216,6 +216,7 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         // No sync needed - plugin reads from the same Arc<Params>.
 
         // Build a ProcessContext with param/meter callbacks for the logic.
+        let latency_change_request = context.deferred_latency_change_request();
         let params = &self.params;
         let meters = &self.meters;
         let param_fn = |id: u32| -> f64 { params.get_plain(id).unwrap_or(0.0) };
@@ -230,6 +231,10 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         .with_bus_routing(context.bus_routing)
         .with_params(&param_fn)
         .with_meters(&meter_fn);
+        let ctx = match latency_change_request {
+            Some(request) => ctx.with_deferred_latency_changes(request),
+            None => ctx,
+        };
         // Stamp the background-task spawner so `ctx.tasks::<T>()` works.
         let mut ctx = match &self.tasks {
             Some(t) => ctx.with_tasks(t),
