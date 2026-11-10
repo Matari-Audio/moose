@@ -12,6 +12,19 @@ struct Probe {
 
 impl PluginExport for Probe {
     type Params = TestParams;
+    fn clap_extension(id: &CStr) -> Option<moose_core::export::CustomClapExtension> {
+        if id == c"test.moose.diagnostics" || id == CLAP_EXT_PARAMS {
+            // SAFETY: TABLE uses the test extension ABI and has static storage.
+            Some(unsafe { moose_core::export::CustomClapExtension::from_static(&TABLE) })
+        } else {
+            None
+        }
+    }
+    fn with_dsp_state(&mut self, callback: &mut dyn FnMut(&mut dyn std::any::Any)) -> bool {
+        callback(&mut self.resets);
+        true
+    }
+
     fn create() -> Self {
         Self {
             inner: TestPlugin::create(),
@@ -459,4 +472,55 @@ fn deactivate_resets_plugin_and_sounding_notes() {
         callbacks.deactivate.unwrap()(plugin);
         callbacks.destroy.unwrap()(plugin);
     }
+}
+
+#[repr(C)]
+struct TestExtension {
+    get: unsafe extern "C" fn(*const clap_plugin) -> usize,
+}
+unsafe extern "C" fn get_resets(plugin: *const clap_plugin) -> usize {
+    // SAFETY: the test passes a live Probe and serializes lifecycle operations.
+    unsafe { try_with_dsp_state::<Probe, usize, _>(plugin, |state| *state).unwrap_or(usize::MAX) }
+}
+static TABLE: TestExtension = TestExtension { get: get_resets };
+
+#[test]
+fn custom_extension_queries_real_instances_and_rejects_busy() {
+    with_probe(|first| {
+        with_probe(|second| unsafe {
+            let query = (*first).get_extension.unwrap();
+            assert!(query(first, ptr::null()).is_null());
+            assert!(query(first, c"unknown".as_ptr()).is_null());
+            assert!(query(ptr::null(), c"unknown".as_ptr()).is_null());
+            let ext = &*query(first, c"test.moose.diagnostics".as_ptr()).cast::<TestExtension>();
+            assert_ne!(
+                query(first, CLAP_EXT_PARAMS.as_ptr()),
+                (&raw const TABLE).cast()
+            );
+            assert_eq!((ext.get)(first), 0);
+            assert_eq!((ext.get)(second), 0);
+            assert_eq!(
+                try_with_dsp_state::<Probe, usize, _>(first, |n| {
+                    *n = 5;
+                    *n
+                }),
+                Some(5)
+            );
+            assert_eq!((ext.get)(first), 5);
+            assert_eq!((ext.get)(second), 0);
+            let guard = data_from_plugin::<Probe>(first).plugin.try_enter().unwrap();
+            assert_eq!((ext.get)(first), usize::MAX);
+            drop(guard);
+            assert_eq!(try_with_dsp_state::<Probe, u8, _>(first, |_| 1), None);
+            assert_eq!(
+                try_with_dsp_state::<Probe, usize, ()>(first, |_| panic!("test panic")),
+                None
+            );
+            assert_eq!((ext.get)(first), 5);
+            assert!((*first).activate.unwrap()(first, 48_000.0, 1, 64));
+            assert_eq!((ext.get)(first), usize::MAX);
+            (*first).deactivate.unwrap()(first);
+            assert_ne!((ext.get)(first), usize::MAX);
+        })
+    });
 }

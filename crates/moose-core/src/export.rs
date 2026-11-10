@@ -3,6 +3,26 @@ use std::sync::Arc;
 use crate::plugin::PluginRuntime;
 use moose_params::{ParamInfo, Params};
 
+/// A CLAP extension vtable whose storage lasts for the life of the process.
+#[derive(Clone, Copy, Debug)]
+pub struct CustomClapExtension(*const std::ffi::c_void);
+
+impl CustomClapExtension {
+    /// Wrap a static vtable.
+    ///
+    /// # Safety
+    /// The table must implement the ABI associated with the advertised extension ID.
+    pub unsafe fn from_static<T: Sync + 'static>(table: &'static T) -> Self {
+        Self(std::ptr::from_ref(table).cast())
+    }
+
+    /// Return the address supplied to the CLAP host.
+    #[must_use]
+    pub fn as_ptr(self) -> *const std::ffi::c_void {
+        self.0
+    }
+}
+
 /// Unified export trait for all plugin formats.
 ///
 /// Implement this once on your plugin type. All format wrappers
@@ -23,6 +43,16 @@ use moose_params::{ParamInfo, Params};
 /// trait usable while the editor holds an `Arc<Params>` reader.
 pub trait PluginExport: PluginRuntime + Sized {
     type Params: Params;
+
+    /// Resolve a custom CLAP extension after built-in extensions.
+    fn clap_extension(_id: &std::ffi::CStr) -> Option<CustomClapExtension> {
+        None
+    }
+
+    /// Visit the concrete DSP state when this export supports typed access.
+    fn with_dsp_state(&mut self, _callback: &mut dyn FnMut(&mut dyn std::any::Any)) -> bool {
+        false
+    }
 
     /// Construct a new instance of the plugin.
     fn create() -> Self;

@@ -158,7 +158,7 @@ mod plugin_cell {
         )]
         pub fn enter(&self) -> PluginGuard<'_, T> {
             self.handoff.load(Ordering::Acquire);
-            let was_held = self.held.swap(true, Ordering::Relaxed);
+            let was_held = self.held.swap(true, Ordering::Acquire);
             #[cfg(debug_assertions)]
             {
                 let me = thread_token();
@@ -179,7 +179,7 @@ mod plugin_cell {
                 );
             }
             #[cfg(not(debug_assertions))]
-            let _ = was_held;
+            assert!(!was_held, "plugin ownership cell is already held");
             PluginGuard {
                 cell: self,
                 _not_send: PhantomData,
@@ -194,22 +194,13 @@ mod plugin_cell {
         /// wrapper called while holding the guard). Callers defer the work
         /// (stash it and apply on the next entry) when they get `None`.
         ///
-        /// # Invariant
-        /// `try_enter` only defends against *same-thread* re-entry. Release
-        /// [`Self::enter`] swaps `held` to `true` unconditionally and ignores
-        /// the prior value (it trusts the host contract), so an `enter` that
-        /// overlapped a `try_enter` on another thread would barge in past a
-        /// live guard with no signal. Every owner of a given cell must
-        /// therefore run on one logical thread of control: today the `audio`
-        /// cell uses only `enter` (audio thread, host-serialized) and the
-        /// `gui` cell uses `enter` + `try_enter` only on the host GUI thread.
-        /// Do not mix `enter` on one thread with `try_enter` on another for
-        /// the same cell.
+        /// All acquisitions arbitrate through the same atomic flag. An
+        /// overlapping `enter` panics rather than creating a mutable alias.
         pub fn try_enter(&self) -> Option<PluginGuard<'_, T>> {
             self.handoff.load(Ordering::Acquire);
             if self
                 .held
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
                 return None;
@@ -253,7 +244,7 @@ mod plugin_cell {
         fn drop(&mut self) {
             #[cfg(debug_assertions)]
             self.cell.owner.store(0, Ordering::Relaxed);
-            self.cell.held.store(false, Ordering::Relaxed);
+            self.cell.held.store(false, Ordering::Release);
             // Release: publish this owner's writes to the next `Acquire`.
             self.cell.handoff.fetch_add(1, Ordering::Release);
         }

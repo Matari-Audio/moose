@@ -526,6 +526,16 @@ macro_rules! export_static {
         impl $crate::__macro_deps::moose_core::export::PluginExport for __HotShellWrapper {
             type Params = $params;
 
+            fn clap_extension(id: &::std::ffi::CStr) -> Option<$crate::__macro_deps::moose_core::export::CustomClapExtension> {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::clap_extension(id)
+            }
+
+            fn with_dsp_state(&mut self, callback: &mut dyn FnMut(&mut dyn ::std::any::Any)) -> bool {
+                callback(self.inner.state_ref_mut());
+                true
+            }
+
+
             fn create() -> Self {
                 let params = std::sync::Arc::new(<$params>::new());
                 // Each `tasks: [..]` type gets its own lane (queue + mode).

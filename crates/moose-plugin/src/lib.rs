@@ -78,6 +78,11 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     /// reinterpreting the old bytes.
     type DspState: Send + 'static;
 
+    /// Resolve a custom static CLAP extension table.
+    fn clap_extension(_id: &std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> {
+        None
+    }
+
     /// Whether the hot-reload shell carries live DSP state across a
     /// reload, via a `save_state` / `load_state` round-trip. Default
     /// `true`. Override to `false` on a state that must always re-init
@@ -250,6 +255,9 @@ macro_rules! plugin_logic_leaf_trait {
             /// carries the state into the new code by a save / load
             /// round-trip, never by reinterpreting the old bytes.
             type DspState: ::core::default::Default + Send + 'static;
+
+            /// Resolve a custom static CLAP extension table.
+            fn clap_extension(_id: &::std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> { None }
 
             /// Whether the hot-reload shell carries live DSP state across a
             /// reload. Default `true`: the shell serializes the state
@@ -883,6 +891,12 @@ macro_rules! plugin_logic_bridge {
         impl<T: $leaf> PluginLogicCore<$sample> for T {
             type Params = <T as $leaf>::Params;
             type DspState = <T as $leaf>::DspState;
+
+            fn clap_extension(
+                id: &std::ffi::CStr,
+            ) -> Option<moose_core::export::CustomClapExtension> {
+                <Self as $leaf>::clap_extension(id)
+            }
 
             const PRESERVE_DSP_STATE: bool = <T as $leaf>::PRESERVE_DSP_STATE;
 

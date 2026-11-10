@@ -5721,7 +5721,7 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
     id: *const c_char,
 ) -> *const c_void {
     unsafe {
-        if id.is_null() {
+        if id.is_null() || plugin.is_null() {
             return ptr::null();
         }
         let ext_id = CStr::from_ptr(id);
@@ -5746,8 +5746,12 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         // Only advertise config switching when there's more than one
         // layout to switch between; a single-layout plugin is fully
         // described by `audio_ports` alone.
-        if ext_id == CLAP_EXT_AUDIO_PORTS_CONFIG && P::bus_layouts().len() > 1 {
-            return (&raw const extensions.audio_ports_config).cast::<c_void>();
+        if ext_id == CLAP_EXT_AUDIO_PORTS_CONFIG {
+            return if P::bus_layouts().len() > 1 {
+                (&raw const extensions.audio_ports_config).cast::<c_void>()
+            } else {
+                ptr::null()
+            };
         }
         if ext_id == CLAP_EXT_SURROUND || ext_id == CLAP_EXT_SURROUND_COMPAT {
             return (&raw const extensions.surround).cast::<c_void>();
@@ -5767,8 +5771,48 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         if ext_id == CLAP_EXT_RENDER {
             return (&raw const extensions.render).cast::<c_void>();
         }
-        ptr::null()
+        run_extern_callback_with::<P, *const c_void>(
+            "CLAP",
+            "custom extension",
+            ptr::null(),
+            || P::clap_extension(ext_id).map_or(ptr::null(), |extension| extension.as_ptr()),
+        )
     }
+}
+
+/// Access an inactive instance's concrete DSP state without blocking.
+///
+/// The callback must run on the CLAP main thread. Active, busy, dynamic-shell,
+/// and mismatched-state instances return `None`. Panics are contained.
+///
+/// # Safety
+/// `plugin` must be null or a live CLAP instance created for `P`. The host must
+/// serialize this call with its main-thread lifecycle callbacks and destruction.
+pub unsafe fn try_with_dsp_state<P: PluginExport, T: 'static, R>(
+    plugin: *const clap_plugin,
+    callback: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
+    if plugin.is_null() {
+        return None;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees the pointer and host lifecycle contract.
+        let data = unsafe { data_from_plugin::<P>(plugin) };
+        if data.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut instance = data.plugin.try_enter()?;
+        let mut callback = Some(callback);
+        let mut result = None;
+        instance.with_dsp_state(&mut |state| {
+            if let (Some(state), Some(callback)) = (state.downcast_mut::<T>(), callback.take()) {
+                result = Some(callback(state));
+            }
+        });
+        result
+    }))
+    .ok()
+    .flatten()
 }
 
 // ---------------------------------------------------------------------------
