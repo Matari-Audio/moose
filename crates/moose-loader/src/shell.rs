@@ -430,6 +430,7 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         // via the shell's params pointer.
 
         // Build a ProcessContext with param/meter callbacks for the logic.
+        let latency_change_request = context.deferred_latency_change_request();
         let params = &self.params;
         let meters = &self.meters;
         let param_fn = |id: u32| -> f64 { params.get_plain(id).unwrap_or(0.0) };
@@ -444,6 +445,9 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         .with_bus_routing(context.bus_routing)
         .with_params(&param_fn)
         .with_meters(&meter_fn);
+        if let Some(request) = latency_change_request {
+            ctx = ctx.with_deferred_latency_changes(request);
+        }
         if let Some(tasks) = loader.task_spawner() {
             ctx = ctx.with_tasks(tasks);
         }

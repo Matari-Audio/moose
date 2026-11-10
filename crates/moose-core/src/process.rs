@@ -75,6 +75,12 @@ impl<'a> ProcessContext<'a> {
         self
     }
 
+    /// Retain the host's reactivation policy when forwarding this context.
+    #[must_use]
+    pub fn deferred_latency_change_request(&self) -> Option<&'a dyn Fn()> {
+        self.latency_change_request
+    }
+
     /// Whether the format requires the active latency contract until reactivation.
     #[must_use]
     pub fn defers_latency_changes(&self) -> bool {
