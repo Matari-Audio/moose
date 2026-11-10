@@ -5,7 +5,9 @@
 //! `cargo-moose` can emit byte-identical blobs (factory preset files)
 //! without inheriting `moose-core`'s runtime dependency chain.
 
-pub use moose_utils::state_stream::{state_stream_size, write_state_stream, write_state_stream_with_persist};
+pub use moose_utils::state_stream::{
+    state_stream_size, write_state_stream, write_state_stream_with_persist,
+};
 
 pub use moose_utils::state::{
     DeserializedState, StateParse, deserialize_state, hash_plugin_id, parse_state,
@@ -175,6 +177,7 @@ pub fn apply_state<P: crate::export::PluginExport>(plugin: &mut P, state: &Deser
 /// `None` means the load failed and the wrapper must report failure
 /// to the host in its own idiom. Runs on the host thread - that's
 /// where `migrate_state` is allowed to do allocator-heavy parsing.
+#[must_use]
 pub fn parse_or_migrate<P: PluginExport>(
     data: &[u8],
     expected_plugin_id: u64,
@@ -469,6 +472,11 @@ pub struct StateLoadQueue {
     owners: std::sync::Mutex<Vec<std::sync::Arc<DeserializedState>>>,
 }
 impl StateLoadQueue {
+    /// Create a single-slot state handoff.
+    ///
+    /// # Panics
+    /// Panics if `capacity` is not one.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         assert_eq!(capacity, 1, "state loads coalesce in one slot");
         Self {

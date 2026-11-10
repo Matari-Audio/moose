@@ -19,9 +19,17 @@ struct ShapesParams {
     skewed: moose_params::FloatParam,
     #[param(name = "Pan", range = "sym_skewed(-1, 1, 2, 0)")]
     pan: moose_params::FloatParam,
-    #[param(name = "Offset log", range = "offset_log(20, 20000, 150)", default = 1700.8)]
+    #[param(
+        name = "Offset log",
+        range = "offset_log(20, 20000, 150)",
+        default = 1700.8
+    )]
     offset_log: moose_params::FloatParam,
-    #[param(name = "Pivoted log", range = "pivoted_log(0.1, 10, 0.707)", default = 0.707)]
+    #[param(
+        name = "Pivoted log",
+        range = "pivoted_log(0.1, 10, 0.707)",
+        default = 0.707
+    )]
     pivoted_log: moose_params::FloatParam,
     #[param(name = "Reversed", range = "reversed(linear(0, 100))")]
     reversed: moose_params::FloatParam,

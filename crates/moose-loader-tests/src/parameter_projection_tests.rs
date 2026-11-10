@@ -124,13 +124,19 @@ fn typed_writes_share_the_canonical_epoch_and_fused_setters_commit_once() {
     let params = Store::default();
     let other = Store::default();
     let plain = params.set_normalized_returning_plain(VIEW, 0.5);
-    assert_eq!(plain, RANGE.denormalize(0.5));
+    assert_eq!(plain.to_bits(), RANGE.denormalize(0.5).to_bits());
     assert_eq!(params.view_writes.load(Ordering::Relaxed), 1);
-    assert_eq!(params.child.value.raw_target(), RANGE.normalize(plain));
+    assert_eq!(
+        params.child.value.raw_target().to_bits(),
+        RANGE.normalize(plain).to_bits()
+    );
     assert_eq!(params.parameter_edit_epoch(), 1);
     assert_eq!(other.parameter_edit_epoch(), 0);
     let normalized = params.set_normalized_returning_normalized(VIEW, 0.9);
-    assert_eq!(normalized, RANGE.normalize(RANGE.denormalize(0.9)));
+    assert_eq!(
+        normalized.to_bits(),
+        RANGE.normalize(RANGE.denormalize(0.9)).to_bits()
+    );
     assert_eq!(params.view_writes.load(Ordering::Relaxed), 2);
     params.set_plain(VIEW, 64.0);
     assert_eq!(params.get_plain(VIEW), Some(64.0));

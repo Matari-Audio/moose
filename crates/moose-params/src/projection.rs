@@ -80,16 +80,16 @@ mod tests {
             }];
             &INFOS
         }
-        fn get_plain(_: &(), _: u32) -> Option<f64> {
+        fn get_plain((): &(), _: u32) -> Option<f64> {
             None
         }
-        fn get_normalized(_: &(), _: u32) -> Option<f64> {
+        fn get_normalized((): &(), _: u32) -> Option<f64> {
             None
         }
-        fn set_plain(_: &(), _: u32, _: f64) -> Option<ProjectedValue> {
+        fn set_plain((): &(), _: u32, _: f64) -> Option<ProjectedValue> {
             None
         }
-        fn set_normalized(_: &(), _: u32, _: f64) -> Option<ProjectedValue> {
+        fn set_normalized((): &(), _: u32, _: f64) -> Option<ProjectedValue> {
             None
         }
     }

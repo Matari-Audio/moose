@@ -78,6 +78,12 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     /// reinterpreting the old bytes.
     type DspState: Send + 'static;
 
+    /// Resolve a custom static CLAP extension table.
+    #[must_use]
+    fn clap_extension(_id: &std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> {
+        None
+    }
+
     /// Whether the hot-reload shell carries live DSP state across a
     /// reload, via a `save_state` / `load_state` round-trip. Default
     /// `true`. Override to `false` on a state that must always re-init
@@ -90,7 +96,10 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     }
 
     /// Maximum serialized host state; size document admission to this bound.
-    fn max_host_state_bytes() -> usize { 32 * 1024 * 1024 }
+    #[must_use]
+    fn max_host_state_bytes() -> usize {
+        32 * 1024 * 1024
+    }
 
     /// Supported audio bus configurations. The host picks one. Default:
     /// the standard audio effect - stereo and mono - so it appears on
@@ -107,15 +116,23 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     /// Worker/fallible-preparation logic must declare this requirement. Legacy
     /// synchronous users retain false. Hot loaders refuse true until executable
     /// worker lifetime and fallible cross-generation preparation are qualified.
-    fn requires_fallible_preparation()->bool{false}
-    fn prepare(state: &mut Self::DspState, params: &Self::Params,
+    #[must_use]
+    fn requires_fallible_preparation() -> bool {
+        false
+    }
+    /// Prepare the runtime before activation.
+    ///
+    /// # Errors
+    /// Returns an error when configuration or preparation fails.
+    fn prepare(
+        state: &mut Self::DspState,
+        params: &Self::Params,
         config: &moose_core::plugin::PreparationConfig,
     ) -> Result<(), moose_core::plugin::PreparationError> {
         config.validate()?;
         Self::reset(state, params, &config.audio);
         Ok(())
     }
-
 
     fn process(
         state: &mut Self::DspState,
@@ -240,6 +257,10 @@ macro_rules! plugin_logic_leaf_trait {
             /// round-trip, never by reinterpreting the old bytes.
             type DspState: ::core::default::Default + Send + 'static;
 
+            /// Resolve a custom static CLAP extension table.
+            #[must_use]
+    fn clap_extension(_id: &::std::ffi::CStr) -> Option<moose_core::export::CustomClapExtension> { None }
+
             /// Whether the hot-reload shell carries live DSP state across a
             /// reload. Default `true`: the shell serializes the state
             /// through the old dylib and restores it into the new one via
@@ -316,6 +337,10 @@ macro_rules! plugin_logic_leaf_trait {
             /// reset exactly once; worker plugins override this and only return
             /// success after their real finite policy/readiness is admitted.
             fn requires_fallible_preparation()->bool{false}
+            /// Prepare the runtime before activation.
+            ///
+            /// # Errors
+            /// Returns an error when configuration or preparation fails.
             fn prepare(state: &mut Self::DspState, params: &Self::Params,
                 config: &$crate::__plugin_logic_deps::PreparationConfig,
             ) -> Result<(), $crate::__plugin_logic_deps::PreparationError> {
@@ -531,9 +556,9 @@ pub mod __plugin_logic_deps {
     pub use moose_core::buffer::AudioBuffer;
     pub use moose_core::bus::BusLayout;
     pub use moose_core::config::AudioConfig;
-    pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::editor::Editor;
     pub use moose_core::events::EventList;
+    pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::process::{ProcessContext, ProcessStatus};
     pub use moose_core::snapshot::SNAPSHOT_PREALLOC;
     pub use moose_core::state::{ForeignState, MigratedState, StateLoadError};
@@ -869,13 +894,21 @@ macro_rules! plugin_logic_bridge {
             type Params = <T as $leaf>::Params;
             type DspState = <T as $leaf>::DspState;
 
+            fn clap_extension(
+                id: &std::ffi::CStr,
+            ) -> Option<moose_core::export::CustomClapExtension> {
+                <Self as $leaf>::clap_extension(id)
+            }
+
             const PRESERVE_DSP_STATE: bool = <T as $leaf>::PRESERVE_DSP_STATE;
 
             fn supports_in_place() -> bool {
                 <Self as $leaf>::supports_in_place()
             }
 
-            fn max_host_state_bytes() -> usize { <Self as $leaf>::max_host_state_bytes() }
+            fn max_host_state_bytes() -> usize {
+                <Self as $leaf>::max_host_state_bytes()
+            }
 
             fn bus_layouts() -> Vec<BusLayout> {
                 <Self as $leaf>::bus_layouts()
@@ -892,8 +925,12 @@ macro_rules! plugin_logic_bridge {
                 <Self as $leaf>::reset(state, params, config);
             }
 
-            fn requires_fallible_preparation()->bool{<Self as $leaf>::requires_fallible_preparation()}
-            fn prepare(state: &mut Self::DspState, params: &Self::Params,
+            fn requires_fallible_preparation() -> bool {
+                <Self as $leaf>::requires_fallible_preparation()
+            }
+            fn prepare(
+                state: &mut Self::DspState,
+                params: &Self::Params,
                 config: &moose_core::plugin::PreparationConfig,
             ) -> Result<(), moose_core::plugin::PreparationError> {
                 <Self as $leaf>::prepare(state, params, config)

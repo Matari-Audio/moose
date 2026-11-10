@@ -1983,8 +1983,11 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // code. Explicit skipped fields (and an empty named store) are useful for
     // lifecycle hooks without exposing a fake host parameter.
     let empty_named = matches!(fields, Fields::Named(named) if named.named.is_empty());
-    if param_fields.is_empty() && nested_fields.is_empty() && meter_fields.is_empty()
-        && skip_fields.is_empty() && !empty_named
+    if param_fields.is_empty()
+        && nested_fields.is_empty()
+        && meter_fields.is_empty()
+        && skip_fields.is_empty()
+        && !empty_named
     {
         return syn::Error::new_spanned(
             &ast,
@@ -2963,13 +2966,17 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #(#nested_fingerprint_stmts)*
         }
     };
-    let persist_signal_fields = persist_fields.iter().map(|(ident, _, _)| quote! {
-        ::moose::core::custom_state::PersistField::set_persist_change_signal(
-            &self.#ident, __signal.clone());
+    let persist_signal_fields = persist_fields.iter().map(|(ident, _, _)| {
+        quote! {
+            ::moose::core::custom_state::PersistField::set_persist_change_signal(
+                &self.#ident, __signal.clone());
+        }
     });
-    let persist_changed_impl = struct_attrs.persist_changed.as_ref().map(|method| quote! {
-        fn wants_persist_notifications(&self) -> bool { true }
-        fn take_persist_change(&self) -> Option<(u32, f64)> { self.#method() }
+    let persist_changed_impl = struct_attrs.persist_changed.as_ref().map(|method| {
+        quote! {
+            fn wants_persist_notifications(&self) -> bool { true }
+            fn take_persist_change(&self) -> Option<(u32, f64)> { self.#method() }
+        }
     });
     let persist_signal_impl = quote! {
         fn set_persist_change_signal(
@@ -3239,8 +3246,8 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
         })
     };
-    let projected_set_plain = projection_write_prefix("set_plain");
-    let projected_set_normalized = projection_write_prefix("set_normalized");
+    let projected_write_plain = projection_write_prefix("set_plain");
+    let projected_write_normalized = projection_write_prefix("set_normalized");
 
     let expanded = quote! {
         #(#attr_errors)*
@@ -3288,7 +3295,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn set_normalized(&self, id: u32, value: f64) {
-                #projected_set_normalized
+                #projected_write_normalized
                 match id {
                     #(#set_normalized_arms)*
                     #set_normalized_fallthrough
@@ -3304,7 +3311,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
 
             fn set_plain(&self, id: u32, value: f64) {
-                #projected_set_plain
+                #projected_write_plain
                 match id {
                     #(#set_plain_arms)*
                     #set_plain_fallthrough

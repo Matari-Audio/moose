@@ -16,7 +16,7 @@ use moose_params::{FloatParamReadF32, Params};
 use std::sync::Arc;
 
 #[derive(Params)]
-struct SmootherParams {
+pub struct SmootherParams {
     #[param(id = 0, name = "Gain", range = "linear(0, 1)", smooth = "exp(50)")]
     gain: moose_params::FloatParam,
 }
@@ -260,5 +260,65 @@ mod hot_shell {
             (g - 0.75).abs() < 1e-3,
             "reset should snap the smoother to its target (0.75); got {g}"
         );
+    }
+}
+
+mod extension_export {
+    use super::*;
+    use moose_core::export::{CustomClapExtension, PluginExport};
+    use moose_gui::PluginLogic;
+    type Sample = f32;
+
+    struct ExtensionLogic;
+    #[derive(Default)]
+    struct ExtensionState(u32);
+    static TABLE: u32 = 42;
+
+    impl PluginLogic for ExtensionLogic {
+        type Params = SmootherParams;
+        type DspState = ExtensionState;
+        fn clap_extension(id: &std::ffi::CStr) -> Option<CustomClapExtension> {
+            (id == c"test.extension").then(|| {
+                // SAFETY: the test uses the static table's u32 ABI.
+                unsafe { CustomClapExtension::from_static(&TABLE) }
+            })
+        }
+        fn process(
+            _: &mut ExtensionState,
+            _: &SmootherParams,
+            _: &mut AudioBuffer,
+            _: &EventList,
+            _: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+        fn editor(_: Arc<SmootherParams>) -> Box<dyn moose::prelude::Editor> {
+            Box::new(NoEditor)
+        }
+    }
+    moose_loader::export_static! {
+        params: SmootherParams,
+        info: unreachable!(),
+        logic: ExtensionLogic,
+    }
+
+    #[test]
+    fn generated_export_forwards_extension_and_state() {
+        let mut instance = __HotShellWrapper::create();
+        assert_eq!(
+            __HotShellWrapper::clap_extension(c"test.extension")
+                .unwrap()
+                .as_ptr(),
+            (&raw const TABLE).cast()
+        );
+        assert!(__HotShellWrapper::clap_extension(c"unknown").is_none());
+        assert!(
+            instance
+                .with_dsp_state(&mut |state| state.downcast_mut::<ExtensionState>().unwrap().0 = 7)
+        );
+        assert!(instance.with_dsp_state(&mut |state| assert_eq!(
+            state.downcast_ref::<ExtensionState>().unwrap().0,
+            7
+        )));
     }
 }

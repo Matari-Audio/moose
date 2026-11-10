@@ -29,6 +29,7 @@ pub struct Bridge<P: ?Sized = dyn Params> {
     /// host echo cannot jitter a drag, and an incremental drag across a
     /// discrete parameter accumulates between the steps it sends.
     open: Vec<(u32, f64, f64)>,
+    held: Vec<u32>,
     /// The ids `bind` saw this build: an open gesture not among them lost
     /// its widget, and nothing else would ever end it.
     bound: Vec<u32>,
@@ -49,6 +50,7 @@ impl<P: Params + ?Sized> Bridge<P> {
             infos,
             meters,
             open: Vec::new(),
+            held: Vec::new(),
             bound: Vec::new(),
             seen,
         }
@@ -82,12 +84,14 @@ impl<P: Params + ?Sized> Bridge<P> {
             }
         }
         self.open.clear();
+        self.held.clear();
     }
 
     /// Drop the host without calling it: for `Drop`, when the host may have
     /// torn its side down already.
     pub fn detach(&mut self) {
         self.open.clear();
+        self.held.clear();
         self.context = None;
     }
 
@@ -99,6 +103,7 @@ impl<P: Params + ?Sized> Bridge<P> {
                 context.end_edit(id);
             }
         }
+        self.held.clear();
     }
 
     fn info(&self, id: u32) -> Option<&ParamInfo> {
@@ -277,6 +282,44 @@ impl<P: Params + ?Sized> Bridge<P> {
         })
     }
 
+    /// Keep a wheel or other pointer-free gesture open while it is rolling.
+    /// Releasing a hold does not end a gesture opened by a pointer control.
+    pub fn hold(&mut self, param: impl Into<u32>, rolling: bool) {
+        let id = param.into();
+        if rolling {
+            if !self.is_open(id)
+                && self
+                    .info(id)
+                    .is_some_and(|info| !info.flags.contains(ParamFlags::READONLY))
+            {
+                self.begin(id);
+                if self.is_open(id) {
+                    self.held.push(id);
+                }
+            }
+        } else if self.held.contains(&id) {
+            self.end(id);
+        }
+    }
+
+    /// Send a canvas or plot drag in the parameter's plain units.
+    /// Call on each build during the drag; an unbound build ends it.
+    pub fn drag_gesture(&mut self, param: impl Into<u32>, plain: f64) {
+        let id = param.into();
+        self.bound.push(id);
+        let Some(range) = self
+            .info(id)
+            .filter(|info| !info.flags.contains(ParamFlags::READONLY))
+            .map(|info| info.range)
+        else {
+            return;
+        };
+        if plain.is_finite() {
+            self.begin(id);
+            self.set(id, range, range.normalize(plain));
+        }
+    }
+
     /// After a build: end the gestures no `bind` in it named. `MuiEditor`
     /// calls it; a host that drives the bridge itself calls it after every
     /// build, or a gesture whose control left the tree never ends.
@@ -318,6 +361,7 @@ impl<P: Params + ?Sized> Bridge<P> {
     }
 
     fn end(&mut self, id: u32) {
+        self.held.retain(|held| *held != id);
         if let (Some(context), Some(i)) = (
             &self.context,
             self.open.iter().position(|(open, ..)| *open == id),

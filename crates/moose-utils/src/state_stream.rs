@@ -140,22 +140,18 @@ pub fn read_state_stream_prepared<T>(
         }
         let mut section = std::io::Read::take(&mut input, len as u64);
         let result = prepare(plugin_id, &mut section, len);
-        let bytes = match result {
-            Some(result) => {
-                let (bytes, commit) = result.ok()?;
-                if section.limit() != 0 {
-                    return None;
-                }
-                prepared = Some(commit);
-                bytes
+        let bytes = if let Some(result) = result {
+            let (bytes, commit) = result.ok()?;
+            if section.limit() != 0 {
+                return None;
             }
-            None => {
-                if section.limit() != len as u64 {
-                    return None;
-                }
-                drop(section);
-                input.bytes(len)?
+            prepared = Some(commit);
+            bytes
+        } else {
+            if section.limit() != len as u64 {
+                return None;
             }
+            input.bytes(len)?
         };
         if input.read(&mut first)? != 0 {
             return None;
@@ -187,14 +183,15 @@ mod tests {
                 let n = dst.len().min(chunk).min(bytes.len() - pos);
                 dst[..n].copy_from_slice(&bytes[pos..pos + n]);
                 pos += n;
-                n as i64
+                i64::try_from(n).unwrap()
             },
             limit,
         )
     }
     #[test]
     fn short_reads_large_lanes_and_legacy_are_lossless() {
-        let persist = vec![173; 33 * 1024 * 1024];
+        let limit = if cfg!(miri) { 1024 } else { 32 * 1024 * 1024 };
+        let persist = vec![173; limit + 1024];
         let blob = crate::state::serialize_state(42, &[7], &[0.25], b"extra", &persist);
         let Some(StreamState::Envelope(StateParse::WrongPlugin { found, state })) =
             parse(&blob, 317, blob.len())
@@ -205,13 +202,13 @@ mod tests {
         assert_eq!(state.params, [(7, 0.25)]);
         assert_eq!(state.extra.as_deref(), Some(b"extra".as_slice()));
         assert_eq!(state.persist, persist);
-        assert!(parse(&blob, 8192, 32 * 1024 * 1024).is_none());
+        assert!(parse(&blob, 8192, limit).is_none());
         assert!(matches!(parse(b"old",1,32),Some(StreamState::Foreign(bytes)) if bytes==b"old"));
     }
     #[test]
     fn malformed_and_overreported_streams_are_rejected() {
         assert!(read_state_stream(|_| -1, 1024).is_none());
-        assert!(read_state_stream(|dst| dst.len() as i64 + 1, 1024).is_none());
+        assert!(read_state_stream(|dst| i64::try_from(dst.len()).unwrap() + 1, 1024).is_none());
         let blob = crate::state::serialize_state(42, &[], &[], b"x", b"y");
         for end in 4..blob.len() {
             // Older envelopes may omit the entire persist lane.
@@ -240,8 +237,14 @@ pub fn write_state_stream(
     write: impl FnMut(&[u8]) -> i64,
 ) -> bool {
     write_state_stream_with_persist(
-        plugin_id, ids, values, extra, persist.len() as u64, limit,
-        |output| output.write_all(persist), write,
+        plugin_id,
+        ids,
+        values,
+        extra,
+        persist.len() as u64,
+        limit,
+        |output| output.write_all(persist),
+        write,
     )
 }
 
@@ -261,9 +264,16 @@ pub fn write_state_stream_with_persist(
     write: impl FnMut(&[u8]) -> i64,
 ) -> bool {
     use std::io::Write;
-    let Some(size) = state_stream_size(ids, values, extra, persist_len, limit) else { return false; };
-    let Ok(count) = u32::try_from(ids.len()) else { return false; };
-    let mut output = Output { write, remaining: size };
+    let Some(size) = state_stream_size(ids, values, extra, persist_len, limit) else {
+        return false;
+    };
+    let Ok(count) = u32::try_from(ids.len()) else {
+        return false;
+    };
+    let mut output = Output {
+        write,
+        remaining: size,
+    };
     let result = (|| {
         output.write_all(b"OAST")?;
         output.write_all(&1_u32.to_le_bytes())?;
@@ -283,11 +293,23 @@ pub fn write_state_stream_with_persist(
 
 /// Validate all lengths before allocating a contiguous host-owned output.
 #[must_use]
-pub fn state_stream_size(ids: &[u32], values: &[f64], extra: &[u8], persist_len: u64, limit: usize) -> Option<usize> {
-    if ids.len() != values.len() || u32::try_from(ids.len()).is_err() { return None; }
+pub fn state_stream_size(
+    ids: &[u32],
+    values: &[f64],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+) -> Option<usize> {
+    if ids.len() != values.len() || u32::try_from(ids.len()).is_err() {
+        return None;
+    }
     let persist_size = usize::try_from(persist_len).ok()?;
-    ids.len().checked_mul(12)?.checked_add(36)?.checked_add(extra.len())?
-        .checked_add(persist_size).filter(|size| *size <= limit)
+    ids.len()
+        .checked_mul(12)?
+        .checked_add(36)?
+        .checked_add(extra.len())?
+        .checked_add(persist_size)
+        .filter(|size| *size <= limit)
 }
 
 struct Output<F> {
@@ -309,7 +331,9 @@ impl<F: FnMut(&[u8]) -> i64> std::io::Write for Output<F> {
         self.remaining -= n;
         Ok(n)
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -332,7 +356,7 @@ mod writer_tests {
             |bytes| {
                 let n = bytes.len().min(317);
                 output.extend_from_slice(&bytes[..n]);
-                n as i64
+                i64::try_from(n).unwrap()
             }
         ));
         assert_eq!(output, expected);
@@ -357,43 +381,80 @@ mod writer_tests {
         let payload = vec![31; 65_537];
         let expected = crate::state::serialize_state(42, &ids, &values, b"extra", &payload);
         let mut output = Vec::new();
-        assert!(write_state_stream_with_persist(42, &ids, &values, b"extra",
-            payload.len() as u64, expected.len(), |writer| {
+        assert!(write_state_stream_with_persist(
+            42,
+            &ids,
+            &values,
+            b"extra",
+            payload.len() as u64,
+            expected.len(),
+            |writer| {
                 // Multiple payload segments, including one larger than the
                 // host callback's bounded request size, need no staging blob.
                 writer.write_all(&payload[..1])?;
                 writer.write_all(&payload[1..])
-            }, |bytes| {
+            },
+            |bytes| {
                 assert!(bytes.len() <= 8192);
                 let len = bytes.len().min(13);
                 output.extend_from_slice(&bytes[..len]);
-                len as i64
-            }));
+                i64::try_from(len).unwrap()
+            }
+        ));
         assert_eq!(output, expected);
     }
 
     #[test]
     fn prepared_lane_bound_and_length_failures_are_honest() {
         for len in [u64::MAX, 1025] {
-            assert!(!write_state_stream_with_persist(42, &[], &[], b"", len, 1024,
+            assert!(!write_state_stream_with_persist(
+                42,
+                &[],
+                &[],
+                b"",
+                len,
+                1024,
                 |_| panic!("oversize prepared its output"),
-                |_| panic!("oversize wrote bytes")));
+                |_| panic!("oversize wrote bytes")
+            ));
         }
         for actual in [0, 2] {
             let mut bytes = Vec::new();
-            assert!(!write_state_stream_with_persist(42, &[], &[], b"", 1, 1024,
+            assert!(!write_state_stream_with_persist(
+                42,
+                &[],
+                &[],
+                b"",
+                1,
+                1024,
                 |writer| writer.write_all(&[9; 2][..actual]),
-                |part| { bytes.extend_from_slice(part); part.len() as i64 }));
+                |part| {
+                    bytes.extend_from_slice(part);
+                    i64::try_from(part.len()).unwrap()
+                }
+            ));
             assert!(bytes.len() <= 37);
         }
-        assert!(!write_state_stream_with_persist(42, &[], &[], b"", 1, 1024,
-            |_| Err(std::io::Error::other("encoding failed")), |part| part.len() as i64));
+        assert!(!write_state_stream_with_persist(
+            42,
+            &[],
+            &[],
+            b"",
+            1,
+            1024,
+            |_| Err(std::io::Error::other("encoding failed")),
+            |part| i64::try_from(part.len()).unwrap()
+        ));
     }
 }
 
 #[cfg(test)]
 mod prepared_tests {
     use super::*;
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the callback contract permits skipping preparation"
+    )]
     fn prepare(
         _id: u64,
         input: &mut dyn std::io::Read,
@@ -426,7 +487,7 @@ mod prepared_tests {
                 let n = dst.len().min(317).min(blob.len() - pos);
                 dst[..n].copy_from_slice(&blob[pos..pos + n]);
                 pos += n;
-                n as i64
+                i64::try_from(n).unwrap()
             },
             blob.len(),
             prepare,
@@ -453,7 +514,7 @@ mod prepared_tests {
                         let n = dst.len().min(blob.len() - pos);
                         dst[..n].copy_from_slice(&blob[pos..pos + n]);
                         pos += n;
-                        n as i64
+                        i64::try_from(n).unwrap()
                     },
                     1024,
                     prepare
@@ -468,7 +529,7 @@ mod prepared_tests {
                     let n = dst.len().min(base.len() - pos);
                     dst[..n].copy_from_slice(&base[pos..pos + n]);
                     pos += n;
-                    n as i64
+                    i64::try_from(n).unwrap()
                 },
                 1024,
                 |_, _, _| Some(Ok((Vec::new(), ())))

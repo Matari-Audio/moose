@@ -508,3 +508,219 @@ fn a_resized_window_fits_the_design_size_unless_the_zoom_is_fixed() {
     let fixed = editor(&params).resizable((200, 150)).fixed_zoom();
     assert_eq!(zoom_at(&fixed, (800, 600), 1.0), 1.0);
 }
+
+#[test]
+fn canvas_drag_brackets_values_and_ends_when_absent() {
+    let params = Arc::new(Synth::default());
+    let (context, log) = context(&params);
+    let mut bridge = Bridge::new(params.clone());
+    bridge.attach(context.with_params(params));
+    bridge.drag_gesture(10u32, 0.7);
+    bridge.end_unbound();
+    bridge.drag_gesture(10u32, 0.8);
+    bridge.end_unbound();
+    bridge.end_unbound();
+    assert_eq!(
+        calls(&log),
+        [
+            Call::Begin(10),
+            Call::Set(10, 0.7),
+            Call::Set(10, 0.8),
+            Call::End(10)
+        ]
+    );
+}
+
+#[test]
+fn wheel_hold_is_one_gesture_and_releases_after_an_earlier_unbind() {
+    let params = Arc::new(Synth::default());
+    let (context, log) = context(&params);
+    let mut bridge = Bridge::new(params.clone());
+    bridge.attach(context.with_params(params));
+    let mut ui = Ui::default();
+    bridge.hold(10u32, true);
+    bridge.bind(&mut ui, 10u32, |ui, id, v| {
+        *v = 0.7;
+        knob(ui, id, "Gain", v, 0.0..=1.0)
+    });
+    bridge.end_unbound();
+    bridge.hold(10u32, true);
+    bridge.bind(&mut ui, 10u32, |ui, id, v| {
+        *v = 0.8;
+        knob(ui, id, "Gain", v, 0.0..=1.0)
+    });
+    bridge.end_unbound();
+    bridge.hold(10u32, false);
+    assert_eq!(
+        calls(&log),
+        [
+            Call::Begin(10),
+            Call::Set(10, 0.7),
+            Call::Set(10, 0.8),
+            Call::End(10)
+        ]
+    );
+    bridge.hold(10u32, true);
+    bridge.end_unbound();
+    bridge.hold(10u32, true);
+    bridge.hold(10u32, false);
+    assert_eq!(
+        calls(&log),
+        [
+            Call::Begin(10),
+            Call::End(10),
+            Call::Begin(10),
+            Call::End(10)
+        ]
+    );
+}
+
+#[test]
+fn user_zoom_multiplies_fit_and_rejects_invalid_factors() {
+    let params = Arc::new(Synth::default());
+    let zoomed = editor(&params).user_zoom(|_| 1.5);
+    assert_eq!(
+        zoom_at(&zoomed, (800, 600), 1.0).to_bits(),
+        3.0_f64.to_bits()
+    );
+    let invalid = editor(&params).user_zoom(|_| f64::NAN);
+    assert_eq!(
+        zoom_at(&invalid, (800, 600), 1.0).to_bits(),
+        2.0_f64.to_bits()
+    );
+}
+
+#[test]
+fn hooks_receive_input_and_diagnostics_after_requests_are_replaced() {
+    use crate::window::baseview::{EventStatus, WindowEvent};
+    let params = Arc::new(Synth::default());
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let files = events.clone();
+    let cancelled = events.clone();
+    let logged = events.clone();
+    let keys = events.clone();
+    let mut editor = editor(&params)
+        .on_files(move |_, _, paths, dropped| {
+            files
+                .lock()
+                .unwrap()
+                .push(format!("{}:{dropped}", paths[0].display()));
+            true
+        })
+        .on_cancel(move |_| cancelled.lock().unwrap().push("cancel".into()))
+        .on_log(move |line| logged.lock().unwrap().push(line.into()))
+        .on_key(move |_, key| {
+            keys.lock().unwrap().push(format!("key:{}", key.down));
+            true
+        });
+    editor.reset_requests();
+    let (editor, mut handler, _) = open_with(&params, editor);
+    let status = handler.on_event_inner(&Event::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: HostKey::Character("a".into()),
+        ..KeyboardEvent::default()
+    }));
+    assert_eq!(status, EventStatus::Captured);
+    let paths = [std::path::PathBuf::from("sample.wav")];
+    assert!(handler.driver.drop_files(
+        &mut lock(&editor.shared),
+        Point::new(1.0, 2.0),
+        mui::input::Mods::default(),
+        &paths,
+        true
+    ));
+    lock(&editor.shared).view.log("renderer message");
+    handler.on_event_inner(&Event::Window(WindowEvent::Unfocused));
+    handler.step();
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["key:true", "sample.wav:true", "renderer message", "cancel"]
+    );
+}
+
+#[test]
+fn close_cancels_app_gestures_and_flushes_persistence() {
+    let params = Arc::new(Synth::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::clone(&events);
+    let closed = Arc::clone(&events);
+    let mut editor = editor(&params)
+        .on_cancel(move |_| cancelled.lock().unwrap().push("cancel"))
+        .on_close(move || closed.lock().unwrap().push("persist"));
+    editor.close();
+    assert_eq!(*events.lock().unwrap(), ["cancel", "persist"]);
+    drop(editor);
+    assert_eq!(*events.lock().unwrap(), ["cancel", "persist", "persist"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an isolated X11 display"]
+fn floating_editor_reopens_with_native_hooks_and_send_controller() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    fn assert_send<T: Send>() {}
+    assert_send::<MuiEditor<Synth>>();
+    assert_send::<Handle>();
+    let params = Arc::new(Synth::default());
+    let (send, receive) = channel();
+    let (pointer_send, pointer_receive) = channel();
+    let mut editor = editor(&params)
+        .on_x11_window(move |id| {
+            send.send(id).unwrap();
+        })
+        .hide_pointer(move |_| {
+            let _ = pointer_send.send(());
+            false
+        })
+        .wheel_policy(window::WheelPolicy::new(3.0, window::WheelAcceleration::Fling).unwrap());
+    for _ in 0..2 {
+        let (context, _) = context(&params);
+        editor.open(RawWindowHandle::X11(0), context);
+        assert!(
+            receive
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .is_some()
+        );
+        pointer_receive
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        editor.close();
+        assert_eq!(receive.recv_timeout(Duration::from_secs(10)).unwrap(), None);
+    }
+}
+
+#[test]
+fn dialog_owner_is_published_and_cleared_without_owning_the_native_handle() {
+    let params = Arc::new(Synth::default());
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&owners);
+    let mut editor = editor(&params).on_win32_parent(move |owner| {
+        observed.lock().unwrap().push(owner);
+    });
+    editor.publish_win32_parent(Some(RawWindowHandle::Win32(
+        std::ptr::without_provenance_mut(7),
+    )));
+    editor.publish_win32_parent(Some(RawWindowHandle::X11(8)));
+    editor.close();
+    assert_eq!(*owners.lock().unwrap(), [Some(7), None]);
+    let parent = ParentWindow::win32(7);
+    assert!(matches!(parent.0, RawWindowHandle::Win32(pointer) if pointer.addr() == 7));
+}
+
+#[test]
+fn dropping_editor_revokes_the_dialog_owner() {
+    let params = Arc::new(Synth::default());
+    let owner = Arc::new(Mutex::new(None));
+    let observed = Arc::clone(&owner);
+    let mut editor = editor(&params).on_win32_parent(move |value| {
+        *observed.lock().unwrap() = value;
+    });
+    editor.publish_win32_parent(Some(RawWindowHandle::Win32(
+        std::ptr::without_provenance_mut(7),
+    )));
+    assert_eq!(*owner.lock().unwrap(), Some(7));
+    drop(editor);
+    assert_eq!(*owner.lock().unwrap(), None);
+}

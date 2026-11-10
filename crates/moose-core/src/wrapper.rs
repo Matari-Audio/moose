@@ -104,12 +104,8 @@ mod plugin_cell {
         /// comes from the host contract - `process` never overlaps a
         /// lifecycle callback - not from this counter.
         handoff: AtomicU64,
-        /// Whether the cell is currently held. Tracked in every build (not
-        /// just debug) so [`Self::try_enter`] can decline re-entry in
-        /// release rather than hand out a second aliasing `&mut`. `enter`
-        /// still trusts the host contract (it asserts free only in debug);
-        /// `try_enter` is the safe variant for paths where author code may
-        /// re-enter (e.g. `request_resize` called from inside `set_size`).
+        /// Atomic ownership flag. Acquire and release synchronize successive
+        /// owners, and both entry paths reject overlapping mutable access.
         held: AtomicBool,
         /// Token of the thread currently holding the cell, for an accurate
         /// debug overlap message: same-thread re-entry (author code reached
@@ -149,16 +145,13 @@ mod plugin_cell {
             }
         }
 
-        /// Take ownership. Never blocks: the previous owner has already
-        /// released, by the host contract. The `Acquire` observes its
-        /// writes.
-        #[allow(
-            clippy::missing_panics_doc,
-            reason = "the only panic is the debug-only overlap detector, compiled out in release"
-        )]
+        /// Take ownership without blocking.
+        ///
+        /// # Panics
+        /// Panics when another owner holds the cell.
         pub fn enter(&self) -> PluginGuard<'_, T> {
             self.handoff.load(Ordering::Acquire);
-            let was_held = self.held.swap(true, Ordering::Relaxed);
+            let was_held = self.held.swap(true, Ordering::Acquire);
             #[cfg(debug_assertions)]
             {
                 let me = thread_token();
@@ -179,7 +172,7 @@ mod plugin_cell {
                 );
             }
             #[cfg(not(debug_assertions))]
-            let _ = was_held;
+            assert!(!was_held, "plugin ownership cell is already held");
             PluginGuard {
                 cell: self,
                 _not_send: PhantomData,
@@ -194,22 +187,13 @@ mod plugin_cell {
         /// wrapper called while holding the guard). Callers defer the work
         /// (stash it and apply on the next entry) when they get `None`.
         ///
-        /// # Invariant
-        /// `try_enter` only defends against *same-thread* re-entry. Release
-        /// [`Self::enter`] swaps `held` to `true` unconditionally and ignores
-        /// the prior value (it trusts the host contract), so an `enter` that
-        /// overlapped a `try_enter` on another thread would barge in past a
-        /// live guard with no signal. Every owner of a given cell must
-        /// therefore run on one logical thread of control: today the `audio`
-        /// cell uses only `enter` (audio thread, host-serialized) and the
-        /// `gui` cell uses `enter` + `try_enter` only on the host GUI thread.
-        /// Do not mix `enter` on one thread with `try_enter` on another for
-        /// the same cell.
+        /// All acquisitions arbitrate through the same atomic flag. An
+        /// overlapping `enter` panics rather than creating a mutable alias.
         pub fn try_enter(&self) -> Option<PluginGuard<'_, T>> {
             self.handoff.load(Ordering::Acquire);
             if self
                 .held
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
                 return None;
@@ -253,7 +237,7 @@ mod plugin_cell {
         fn drop(&mut self) {
             #[cfg(debug_assertions)]
             self.cell.owner.store(0, Ordering::Relaxed);
-            self.cell.held.store(false, Ordering::Relaxed);
+            self.cell.held.store(false, Ordering::Release);
             // Release: publish this owner's writes to the next `Acquire`.
             self.cell.handoff.fetch_add(1, Ordering::Release);
         }

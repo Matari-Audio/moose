@@ -13,6 +13,10 @@ use crate::window::{self, Requests, Shared, View, lock};
 
 type Build<P> = Box<dyn FnMut(&mut Ui, &mut Bridge<P>) -> El + Send>;
 type Changed = Box<dyn FnMut() -> bool + Send>;
+type FileDrop =
+    Box<dyn FnMut(&Ui, mui::prelude::Point, &[std::path::PathBuf], bool) -> bool + Send>;
+type Cancel = Box<dyn FnMut(&Ui) + Send>;
+type Log = Box<dyn FnMut(&str) + Send>;
 
 /// The model half: the app's build closure and the parameters it binds.
 pub(crate) struct Session<P: Params> {
@@ -20,6 +24,11 @@ pub(crate) struct Session<P: Params> {
     build: Build<P>,
     /// [`MuiEditor::changed`]: model state outside the bridge.
     changed: Option<Changed>,
+    file_drop: Option<FileDrop>,
+    cancel: Option<Cancel>,
+    log: Option<Log>,
+    closed: Option<Box<dyn FnMut() + Send>>,
+    user_zoom: Option<Box<dyn Fn(Size) -> f64 + Send>>,
     /// The size `build` was designed at, fitted to the window; `None` is
     /// [`MuiEditor::fixed_zoom`].
     design: Option<Size>,
@@ -28,6 +37,29 @@ pub(crate) struct Session<P: Params> {
 }
 
 impl<P: Params> View for Session<P> {
+    fn log(&mut self, line: &str) {
+        if let Some(log) = &mut self.log {
+            log(line);
+        } else {
+            eprintln!("{line}");
+        }
+    }
+    fn drop_files(
+        &mut self,
+        ui: &Ui,
+        at: mui::prelude::Point,
+        paths: &[std::path::PathBuf],
+        dropped: bool,
+    ) -> bool {
+        self.file_drop
+            .as_mut()
+            .is_some_and(|f| f(ui, at, paths, dropped))
+    }
+    fn cancel(&mut self, ui: &Ui) {
+        if let Some(f) = &mut self.cancel {
+            f(ui);
+        }
+    }
     fn build(&mut self, ui: &mut Ui, _: &Input) -> El {
         let root = (self.build)(ui, &mut self.bridge);
         self.bridge.end_unbound();
@@ -38,9 +70,15 @@ impl<P: Params> View for Session<P> {
         self.bridge.changed() | self.changed.as_mut().is_some_and(|f| f())
     }
     fn zoom(&self, window: Size) -> f64 {
-        self.design.map_or(1.0, |d| {
+        let fit = self.design.map_or(1.0, |d| {
             (window.width / d.width).min(window.height / d.height)
-        })
+        });
+        let user = self.user_zoom.as_ref().map_or(1.0, |f| f(window));
+        fit * if user.is_finite() && user > 0.0 {
+            user
+        } else {
+            1.0
+        }
     }
     fn request_resize(&mut self, width: u32, height: u32) -> bool {
         #[cfg(target_os = "linux")]
@@ -93,6 +131,14 @@ impl<P: Params> View for Session<P> {
 pub struct MuiEditor<P: Params> {
     shared: Arc<Mutex<Shared<Session<P>>>>,
     requests: Arc<Requests>,
+    keys: Option<window::KeyHook>,
+    win32_parent: Option<Box<dyn FnMut(Option<isize>) + Send>>,
+    pointer: Option<window::PointerHook>,
+    wheel: window::WheelPolicy,
+    #[cfg(target_os = "linux")]
+    x11_hook: Option<window::X11WindowHook>,
+    #[cfg(target_os = "linux")]
+    x11_requests: Arc<Mutex<std::sync::Weak<Requests>>>,
     params: Arc<P>,
     size: (u32, u32),
     min: Option<(u32, u32)>,
@@ -115,7 +161,10 @@ fn points(s: Size) -> (u32, u32) {
     )
 }
 
-/// The one field of [`MuiEditor`] that is not auto-`Send`.
+#[cfg(target_os = "linux")]
+struct Handle(window::baseview::ThreadedWindow);
+
+#[cfg(not(target_os = "linux"))]
 struct Handle(window::baseview::Window);
 
 // SAFETY: `baseview::Window` wraps a native window pointer and is not
@@ -123,6 +172,7 @@ struct Handle(window::baseview::Window);
 // from one GUI thread, never concurrently, so the window never leaves the
 // thread that made it; `Send` is only what `Box<dyn Editor>` asks for.
 // moose-gui's own `GpuEditor` makes the same argument.
+#[cfg(not(target_os = "linux"))]
 #[expect(unsafe_code, reason = "vouches Send for the baseview window alone")]
 unsafe impl Send for Handle {}
 
@@ -139,6 +189,11 @@ impl<P: Params> MuiEditor<P> {
             bridge: Bridge::new(Arc::clone(&params)),
             build: Box::new(build),
             changed: None,
+            file_drop: None,
+            cancel: None,
+            log: None,
+            closed: None,
+            user_zoom: None,
             design: Some(size),
             #[cfg(target_os = "linux")]
             native_requests: std::sync::Weak::new(),
@@ -146,6 +201,14 @@ impl<P: Params> MuiEditor<P> {
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
             requests: Arc::default(),
+            keys: None,
+            win32_parent: None,
+            pointer: None,
+            wheel: window::WheelPolicy::default(),
+            #[cfg(target_os = "linux")]
+            x11_hook: None,
+            #[cfg(target_os = "linux")]
+            x11_requests: Arc::default(),
             params,
             size: points(size),
             min: None,
@@ -171,12 +234,150 @@ impl<P: Params> MuiEditor<P> {
         self
     }
 
+    /// Receive window and renderer diagnostics.
+    #[must_use]
+    pub fn on_log(self, f: impl FnMut(&str) + Send + 'static) -> Self {
+        lock(&self.shared).view.log = Some(Box::new(f));
+        self
+    }
+
+    /// Accept file drags and handle their release at a position in scene units.
+    #[must_use]
+    pub fn on_files(
+        self,
+        f: impl FnMut(&Ui, mui::prelude::Point, &[std::path::PathBuf], bool) -> bool + Send + 'static,
+    ) -> Self {
+        lock(&self.shared).view.file_drop = Some(Box::new(f));
+        self
+    }
+
+    /// Release app-owned gestures when the native host cancels input.
+    #[must_use]
+    pub fn on_cancel(self, f: impl FnMut(&Ui) + Send + 'static) -> Self {
+        lock(&self.shared).view.cancel = Some(Box::new(f));
+        self
+    }
+
+    /// Inspect key events before MUI routes them; return true to consume one.
+    #[must_use]
+    pub fn on_key(
+        mut self,
+        f: impl FnMut(&Ui, &window::KeyEvent) -> bool + Send + 'static,
+    ) -> Self {
+        let hook: window::KeyHook = Arc::new(Mutex::new(f));
+        self.requests.on_key(Arc::clone(&hook));
+        self.keys = Some(hook);
+        self
+    }
+
+    /// Hide the pointer while the retained UI requests it during a gesture.
+    #[must_use]
+    pub fn hide_pointer(mut self, f: impl FnMut(&Ui) -> bool + Send + 'static) -> Self {
+        self.pointer = Some(Arc::new(Mutex::new(f)));
+        self
+    }
+
+    /// Observe X11 window creation and cancellation on the native thread.
+    /// The callback must not borrow the model or wait for its worker.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn on_x11_window(mut self, f: impl FnMut(Option<u32>) + Send + 'static) -> Self {
+        self.x11_hook = Some(Arc::new(Mutex::new(f)));
+        self
+    }
+
+    /// Configure notch conversion for baseview windows.
+    #[must_use]
+    pub fn wheel_policy(mut self, policy: window::WheelPolicy) -> Self {
+        self.wheel = policy;
+        self
+    }
+
+    /// Finish app-owned persistence on close and drop.
+    #[must_use]
+    pub fn on_close(self, f: impl FnMut() + Send + 'static) -> Self {
+        lock(&self.shared).view.closed = Some(Box::new(f));
+        self
+    }
+
+    /// Multiply fit zoom by an app-controlled factor based on logical window size.
+    #[must_use]
+    pub fn user_zoom(self, f: impl Fn(Size) -> f64 + Send + 'static) -> Self {
+        lock(&self.shared).view.user_zoom = Some(Box::new(f));
+        self
+    }
+
+    /// Observe the host's Win32 owner while the editor is open.
+    /// Native dialogs can borrow it through [`ParentWindow::win32`].
+    #[must_use]
+    pub fn on_win32_parent(mut self, hook: impl FnMut(Option<isize>) + Send + 'static) -> Self {
+        self.win32_parent = Some(Box::new(hook));
+        self
+    }
+
+    fn publish_win32_parent(&mut self, parent: Option<RawWindowHandle>) {
+        let owner = match parent {
+            Some(RawWindowHandle::Win32(pointer)) if !pointer.is_null() => Some(pointer as isize),
+            Some(_) => return,
+            None => None,
+        };
+        if let Some(hook) = &mut self.win32_parent {
+            hook(owner);
+        }
+    }
+
+    fn reset_requests(&mut self) {
+        self.requests = Arc::default();
+        if let Some(keys) = &self.keys {
+            self.requests.on_key(Arc::clone(keys));
+        }
+        if let Some(pointer) = &self.pointer {
+            self.requests.on_pointer(Arc::clone(pointer));
+        }
+        self.requests.set_wheel_policy(self.wheel);
+        #[cfg(target_os = "linux")]
+        if let Some(hook) = &self.x11_hook {
+            let hook = Arc::clone(hook);
+            let requests = Arc::downgrade(&self.requests);
+            *self
+                .x11_requests
+                .lock()
+                .expect("X11 request generation lock poisoned") = requests.clone();
+            let current = Arc::clone(&self.x11_requests);
+            self.requests.on_x11_window(Arc::new(Mutex::new(move |id| {
+                let mut callback = hook.lock().expect("X11 callback lock poisoned");
+                if std::sync::Weak::ptr_eq(
+                    &requests,
+                    &current
+                        .lock()
+                        .expect("X11 request generation lock poisoned"),
+                ) {
+                    callback(id);
+                }
+            })));
+        }
+    }
+
     /// Keep the zoom at 1.0 when the window resizes: the tree lays out into
     /// the new size instead of scaling to fit its design size.
     #[must_use]
     pub fn fixed_zoom(self) -> Self {
         lock(&self.shared).view.design = None;
         self
+    }
+
+    fn has_window(&self) -> bool {
+        if self.window.is_some() {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.floating.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     fn close_window(&mut self) {
@@ -230,7 +431,7 @@ impl<P: Params> Editor for MuiEditor<P> {
     }
 
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
-        if self.window.is_some() {
+        if self.has_window() {
             self.close();
         }
         lock(&self.shared)
@@ -238,16 +439,67 @@ impl<P: Params> Editor for MuiEditor<P> {
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
         // A request made while closed was for the last window.
-        self.requests = Arc::default();
-        self.window = window::open(
+        self.reset_requests();
+        self.publish_win32_parent(Some(parent));
+        #[cfg(target_os = "linux")]
+        let opened = if matches!(parent, RawWindowHandle::X11(0)) {
+            window::open_floating_threaded(
+                "MUI",
+                self.size,
+                self.scale.policy(),
+                Arc::clone(&self.shared),
+                Arc::clone(&self.requests),
+            )
+        } else {
+            window::open_threaded(
+                &ParentWindow(parent),
+                "MUI",
+                self.size,
+                self.scale.policy(),
+                Arc::clone(&self.shared),
+                Arc::clone(&self.requests),
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let opened = window::open(
             &ParentWindow(parent),
             "MUI",
             self.size,
             self.scale.policy(),
             Arc::clone(&self.shared),
             Arc::clone(&self.requests),
+        );
+        self.window = opened.map(Handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supports_floating_x11(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_floating_x11(
+        &mut self,
+        context: PluginContext,
+        title: &str,
+        closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        self.close();
+        lock(&self.shared)
+            .view
+            .bridge
+            .attach(context.with_params(Arc::clone(&self.params)));
+        self.reset_requests();
+        self.requests.on_close(closed);
+        self.window = window::open_floating_threaded(
+            title,
+            self.size,
+            self.scale.policy(),
+            Arc::clone(&self.shared),
+            Arc::clone(&self.requests),
         )
         .map(Handle);
+        self.window.is_some()
     }
 
     #[cfg(target_os = "linux")]
@@ -267,7 +519,7 @@ impl<P: Params> Editor for MuiEditor<P> {
             .view
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
-        self.requests = Arc::default();
+        self.reset_requests();
         lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
         match window::wayland::open(
             title,
@@ -297,6 +549,7 @@ impl<P: Params> Editor for MuiEditor<P> {
     }
 
     fn close(&mut self) {
+        self.publish_win32_parent(None);
         {
             // Released before the window closes: on macOS and Windows
             // baseview tears the handler down on this thread, inside
@@ -305,6 +558,11 @@ impl<P: Params> Editor for MuiEditor<P> {
             s.view.bridge.close();
             // The bridge ended the host's gestures; these are the same edges.
             s.ui.close();
+            let s = &mut *s;
+            s.view.cancel(&s.ui);
+            if let Some(f) = &mut s.view.closed {
+                f();
+            }
         }
         self.close_window();
     }
@@ -346,8 +604,15 @@ impl<P: Params> Editor for MuiEditor<P> {
 
 impl<P: Params> Drop for MuiEditor<P> {
     fn drop(&mut self) {
+        self.publish_win32_parent(None);
         // The host may have torn its side down already: no callbacks here.
-        lock(&self.shared).view.bridge.detach();
+        {
+            let mut s = lock(&self.shared);
+            s.view.bridge.detach();
+            if let Some(f) = &mut s.view.closed {
+                f();
+            }
+        }
         self.close_window();
     }
 }

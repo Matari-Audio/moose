@@ -182,11 +182,14 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         L::reset(&mut self.state, &self.params, config);
     }
 
-    fn requires_fallible_preparation(&self)->bool{L::requires_fallible_preparation()}
+    fn requires_fallible_preparation(&self) -> bool {
+        L::requires_fallible_preparation()
+    }
 
-    fn prepare(&mut self, config: &moose_core::plugin::PreparationConfig)
-        -> Result<(), moose_core::plugin::PreparationError>
-    {
+    fn prepare(
+        &mut self,
+        config: &moose_core::plugin::PreparationConfig,
+    ) -> Result<(), moose_core::plugin::PreparationError> {
         config.validate()?;
         self.params.set_sample_rate(config.audio.sample_rate);
         self.params.snap_smoothers();
@@ -522,6 +525,16 @@ macro_rules! export_static {
 
         impl $crate::__macro_deps::moose_core::export::PluginExport for __HotShellWrapper {
             type Params = $params;
+
+            fn clap_extension(id: &::std::ffi::CStr) -> Option<$crate::__macro_deps::moose_core::export::CustomClapExtension> {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::clap_extension(id)
+            }
+
+            fn with_dsp_state(&mut self, callback: &mut dyn FnMut(&mut dyn ::std::any::Any)) -> bool {
+                callback(self.inner.state_ref_mut());
+                true
+            }
+
 
             fn create() -> Self {
                 let params = std::sync::Arc::new(<$params>::new());

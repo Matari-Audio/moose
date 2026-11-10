@@ -36,7 +36,7 @@ jobs:
   changes:
     runs-on: ubuntu-24.04
     outputs:
-      # JSON lists of runner labels, e.g. ["macos-14"]
+      # JSON lists of runner labels, e.g. ["macos-15"]
       oses: ${{ steps.pick.outputs.oses }}
       rt_oses: ${{ steps.pick.outputs.rt_oses }}
     steps:
@@ -57,7 +57,7 @@ jobs:
           for o in $picked; do
             case $o in
               linux) oses+=(ubuntu-24.04); rt+=(ubuntu-24.04) ;;
-              macos) oses+=(macos-14) ;;
+              macos) oses+=(macos-15) ;;
               windows) oses+=(windows-latest); rt+=(windows-latest) ;;
             esac
           done
@@ -122,7 +122,7 @@ jobs:
             libwayland-dev \
             libasound2-dev libjack-jackd2-dev \
             libfontconfig1-dev libfreetype-dev \
-            alsa-utils
+            alsa-utils xvfb xauth
           sudo tee /etc/asound.conf >/dev/null <<'EOF'
           pcm.!default { type null }
           ctl.!default { type null }
@@ -148,6 +148,14 @@ jobs:
         # scaffolded cargo builds) in the parallel `cargo-moose tests
         # (windows-latest)` job below; Linux/macOS keep them here.
         run: cargo test --workspace ${{ runner.os == 'Windows' && '--exclude cargo-moose' || '' }}
+      - name: CLAP activation allocation checks
+        run: cargo test --locked -p moose-clap --features rt-paranoid --lib lifecycle_tests
+      - name: X11 hidden host reparenting
+        if: runner.os == 'Linux'
+        run: >-
+          env -u WAYLAND_DISPLAY xvfb-run -a
+          cargo test -p moose-gui --locked --test x11_visibility
+          -- --ignored --test-threads=1
       - name: benches (test mode)
         run: cargo test -p moose-simd --benches
 

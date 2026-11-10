@@ -280,7 +280,7 @@ fn persistence_only_and_empty_stores_have_no_fake_host_parameters() {
     assert_eq!(nested.collect_values(), (vec![], vec![]));
     assert_eq!(nested.get_normalized(100), None);
     nested.set_normalized(100, 0.5);
-    assert_eq!(*nested.flag.lock().unwrap(), false);
+    assert!(!*nested.flag.lock().unwrap());
     let empty = ZeroFields::default();
     assert_eq!(empty.count(), 0);
     assert!(empty.serialize_persist().is_empty());

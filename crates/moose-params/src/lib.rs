@@ -250,7 +250,6 @@ pub trait PersistFingerprintVisitor {
 /// rather than expecting one on the trait - `#[derive(Params)]` emits
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
-
 pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Optional incremental persistence preparation. Return `None` without
     /// reading to keep the ordinary buffered path. `Some(Err)` rejects before
@@ -312,7 +311,6 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     fn param_catalog(&self) -> std::sync::Arc<ParamCatalog> {
         std::sync::Arc::new(ParamCatalog::new(self.param_infos()))
     }
-
 
     /// Append parameter infos onto an existing buffer. Default impl
     /// delegates to [`Self::param_infos`] and `extend`s; the derive
@@ -535,7 +533,10 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
         let mut seen_meters = std::collections::HashSet::new();
         for meter_id in self.meter_ids() {
             if let Some(previous) = catalog.by_id(meter_id) {
-                panic!("meter ID {meter_id} collides with parameter ID for '{}'", previous.name);
+                panic!(
+                    "meter ID {meter_id} collides with parameter ID for '{}'",
+                    previous.name
+                );
             }
             assert!(
                 seen_meters.insert(meter_id),

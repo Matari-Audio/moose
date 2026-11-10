@@ -103,6 +103,21 @@ pub trait Editor: Send {
     /// Create the GUI as a child of the host-provided parent window.
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext);
 
+    /// Whether this editor supports a floating X11 window.
+    fn supports_floating_x11(&self) -> bool {
+        false
+    }
+
+    /// Open a floating X11 window and signal native close through `closed`.
+    fn open_floating_x11(
+        &mut self,
+        _context: PluginContext,
+        _title: &str,
+        _closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        false
+    }
+
     /// Whether this editor implements Linux CLAP floating Wayland windows.
     /// Embedded Wayland surfaces are not part of the CLAP GUI contract.
     fn supports_floating_wayland(&self) -> bool {
@@ -299,6 +314,18 @@ impl Editor for TaskBoundEditor {
             .open(parent, context.with_tasks(self.tasks.clone()));
     }
 
+    fn supports_floating_x11(&self) -> bool {
+        self.editor.supports_floating_x11()
+    }
+    fn open_floating_x11(
+        &mut self,
+        context: PluginContext,
+        title: &str,
+        closed: Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        self.editor
+            .open_floating_x11(context.with_tasks(self.tasks.clone()), title, closed)
+    }
     fn supports_floating_wayland(&self) -> bool {
         self.editor.supports_floating_wayland()
     }

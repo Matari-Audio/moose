@@ -8,6 +8,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "CLAP format wrapper for moose"
 
+[features]
+default = []
+mpe-input = []
+rt-paranoid = ["moose-core/rt-paranoid"]
+
 [dependencies]
 moose-core = { workspace = true }
 moose-params = { workspace = true }

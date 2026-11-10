@@ -10,6 +10,10 @@ pub struct ParamCatalog {
 }
 
 impl ParamCatalog {
+    /// Build an immutable parameter catalog.
+    ///
+    /// # Panics
+    /// Panics if two descriptors have the same parameter ID.
     #[must_use]
     pub fn new(infos: Vec<ParamInfo>) -> Self {
         let mut indices = HashMap::with_capacity(infos.len());
@@ -61,12 +65,12 @@ mod tests {
     }
     #[test]
     fn lookup_preserves_unsorted_declaration_order_and_wide_ids() {
-        let catalog = ParamCatalog::new(vec![info(97), info(0x1000000), info(3)]);
+        let catalog = ParamCatalog::new(vec![info(97), info(0x0100_0000), info(3)]);
         assert_eq!(
             catalog.iter().map(|info| info.id).collect::<Vec<_>>(),
-            [97, 0x1000000, 3]
+            [97, 0x0100_0000, 3]
         );
-        for id in [3, 97, 0x1000000] {
+        for id in [3, 97, 0x0100_0000] {
             assert_eq!(catalog.by_id(id).unwrap().id, id);
         }
         assert!(catalog.by_id(u32::MAX).is_none());

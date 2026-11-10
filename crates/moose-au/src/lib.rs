@@ -76,7 +76,7 @@ use moose_core::wrapper::{
     log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register, save_extra,
     shared_plugin,
 };
-use moose_params::{MidiSource, ParamFlags, ParamInfo, Params};
+use moose_params::{MidiSource, ParamFlags, Params};
 
 use ffi::{
     AU_NATIVE_CARRIER_BYTES, AU_NATIVE_CARRIER_UMP, AU_NATIVE_EVENT_MIDI1, AU_NATIVE_EVENT_SYSEX,
@@ -568,7 +568,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
                 let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
-                (*raw).persist_dispatch = persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
+                (*raw).persist_dispatch =
+                    persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
                 (*raw).param_notify = ParamNotifier::spawn(ctx);
             }
             raw.cast::<std::ffi::c_void>()
@@ -1312,6 +1313,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
+            latency_change_request: None,
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };
@@ -1512,6 +1514,18 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         *out_len = 0;
     }
     run_extern_callback_with::<P, ()>("au", "save_state", (), || unsafe {
+        // Own exactly one contiguous host buffer. RAII frees failed or panicked
+        // partial writes; successful transfer retains the original libc ABI.
+        struct Buffer(*mut u8);
+        impl Drop for Buffer {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        free(self.0.cast());
+                    }
+                }
+            }
+        }
         let inst = &*ctx.cast::<AuInstance<P>>();
         let (ids, values) = inst.params_arc.collect_values();
         // Read the custom state from the lock-free snapshot the audio
@@ -1522,28 +1536,48 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         // the AU shim frees with libc `free`. The Rust global allocator
         // must not appear on either side; mixing allocators is UB.
         let extra = save_extra(&inst.snapshot);
-        let Ok(persist) = inst.params_arc.prepare_persist_write() else { return; };
-        let Some(len) = state::state_stream_size(&ids, &values, &extra, persist.byte_len(), P::max_host_state_bytes()) else { return; };
-        let Ok(host_len) = u32::try_from(len) else { return; };
-        // Own exactly one contiguous host buffer. RAII frees failed or panicked
-        // partial writes; successful transfer retains the original libc ABI.
-        struct Buffer(*mut u8);
-        impl Drop for Buffer {
-            fn drop(&mut self) { if !self.0.is_null() { unsafe { free(self.0.cast()); } } }
-        }
+        let Ok(persist) = inst.params_arc.prepare_persist_write() else {
+            return;
+        };
+        let Some(len) = state::state_stream_size(
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
+        ) else {
+            return;
+        };
+        let Ok(host_len) = u32::try_from(len) else {
+            return;
+        };
         let mut buffer = Buffer(malloc(len).cast::<u8>());
-        if buffer.0.is_null() { return; }
+        if buffer.0.is_null() {
+            return;
+        }
         let mut offset = 0;
-        let ok = state::write_state_stream_with_persist(inst.plugin_id_hash, &ids, &values, &extra,
-            persist.byte_len(), P::max_host_state_bytes(),
+        let ok = state::write_state_stream_with_persist(
+            inst.plugin_id_hash,
+            &ids,
+            &values,
+            &extra,
+            persist.byte_len(),
+            P::max_host_state_bytes(),
             |output| moose_params::write_prepared_persist(persist.as_ref(), output),
             |bytes| {
-                if bytes.len() > len - offset { return -1; }
+                if bytes.len() > len - offset {
+                    return -1;
+                }
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
-                offset += bytes.len(); bytes.len() as i64
-            });
-        if !ok { return; }
-        *out_data = buffer.0; *out_len = host_len;
+                offset += bytes.len();
+                i64::try_from(bytes.len()).unwrap_or(-1)
+            },
+        );
+        if !ok {
+            return;
+        }
+        *out_data = buffer.0;
+        *out_len = host_len;
         buffer.0 = std::ptr::null_mut();
     });
 }
@@ -1566,10 +1600,14 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         // build that stored foreign bytes under moose's key, or a
         // renamed plugin's envelope).
         if let Some(deserialized) = state::read_and_apply_params::<P>(
-            |dst| std::io::Read::read(&mut blob, dst).map_or(-1, |n| n as i64),
+            |dst| {
+                std::io::Read::read(&mut blob, dst).map_or(-1, |n| i64::try_from(n).unwrap_or(-1))
+            },
             inst.plugin_id_hash,
             state::PluginFormat::Au,
-            Some("truce_state"), &*inst.params_arc, len as usize,
+            Some("truce_state"),
+            &*inst.params_arc,
+            len as usize,
         ) {
             // Apply params synchronously on the host thread (atomic-safe)
             // so host queries that read parameter values right after
@@ -1580,12 +1618,14 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             // application. `force_push` overwrites any older pending
             // blob - see the `pending_state` field comment for why
             // newest-wins is the right policy.
-            let _ = inst.pending_state.force_push(deserialized);
+            inst.pending_state.force_push(deserialized);
             if let Some(ref mut editor) = inst.gui.enter().editor {
                 editor.state_changed();
             }
             1
-        } else { 0 }
+        } else {
+            0
+        }
     })
 }
 
@@ -1636,7 +1676,7 @@ unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
         };
         let deserialized: state::DeserializedState = migrated.into();
         state::apply_params(&*inst.params_arc, &deserialized);
-        let _ = inst.pending_state.force_push(deserialized);
+        inst.pending_state.force_push(deserialized);
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.state_changed();
         }
@@ -1802,7 +1842,7 @@ unsafe extern "C" fn cb_factory_preset_load<P: PluginExport>(
         // the host thread, full state through the audio-thread
         // handoff, editor notified.
         state::apply_params(&*inst.params_arc, &deserialized);
-        let _ = inst.pending_state.force_push(deserialized);
+        inst.pending_state.force_push(deserialized);
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.state_changed();
         }
@@ -3099,7 +3139,7 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                             // `process()`'s `&mut plugin`). No params ride
                             // along: the editor mutates params through
                             // `set_param`.
-                            let _ = pending_state_for_set.force_push(state::DeserializedState {
+                            pending_state_for_set.force_push(state::DeserializedState {
                                 params: Vec::new(),
                                 extra: Some(bytes),
                                 persist: Vec::new(),
@@ -3192,9 +3232,10 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
     resolve_name_override(info.au_name, info.name)
 }
 
-/// Construct the same callback table used by AUv2 and AUv3 registration.
+/// Construct the same callback table used by `AUv2` and `AUv3` registration.
 /// Allows qualification of the Rust AU bridge without Apple frameworks;
 /// native property-list marshalling still requires a macOS/iOS host.
+#[must_use]
 pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
     AuCallbacks {
         abi_version: ffi::MOOSE_AU_ABI_VERSION,
@@ -4027,29 +4068,36 @@ use moose_core as core;
 use moose_params as params;
 #[cfg(test)]
 #[path = "../../../test-support/host_value_fixture.rs"]
+#[expect(
+    dead_code,
+    reason = "shared fixture includes completion helpers used by CLAP and VST3 tests"
+)]
 mod host_value_fixture;
 #[cfg(test)]
 #[path = "../../../test-support/large_state_fixture.rs"]
 mod large_state_fixture;
 #[cfg(test)]
 mod large_state_tests {
+    use super::large_state_fixture::{LargePlugin, payload};
     use super::*;
-    use super::large_state_fixture::{LargePlugin,payload};
-    type Large=LargePlugin<{64*1024*1024}>;
+    type Large = LargePlugin<{ 64 * 1024 * 1024 }>;
     #[test]
     fn large_host_state_roundtrips_through_au_callbacks() {
         unsafe {
-            let ctx=cb_create::<Large>(); assert!(!ctx.is_null());
-            let inst=&*ctx.cast::<AuInstance<Large>>();
-            *inst.params_arc.payload.lock().unwrap()=payload();
-            let mut ptr=std::ptr::null_mut(); let mut len=0;
-            cb_state_save::<Large>(ctx,&raw mut ptr,&raw mut len);
-            assert!(len>32*1024*1024);
+            let ctx = cb_create::<Large>();
+            assert!(!ctx.is_null());
+            let inst = &*ctx.cast::<AuInstance<Large>>();
+            *inst.params_arc.payload.lock().unwrap() = payload();
+            let mut ptr = std::ptr::null_mut();
+            let mut len = 0;
+            cb_state_save::<Large>(ctx, &raw mut ptr, &raw mut len);
+            assert!(len > 32 * 1024 * 1024);
             inst.params_arc.payload.lock().unwrap().clear();
-            assert_eq!(cb_state_load::<Large>(ctx,ptr,len),1);
-            assert_eq!(*inst.params_arc.payload.lock().unwrap(),payload());
-            assert_eq!(cb_state_load::<Large>(ctx,ptr,len-1),0);
-            cb_state_free(ptr,len); cb_destroy::<Large>(ctx);
+            assert_eq!(cb_state_load::<Large>(ctx, ptr, len), 1);
+            assert_eq!(*inst.params_arc.payload.lock().unwrap(), payload());
+            assert_eq!(cb_state_load::<Large>(ctx, ptr, len - 1), 0);
+            cb_state_free(ptr, len);
+            cb_destroy::<Large>(ctx);
         }
     }
 }

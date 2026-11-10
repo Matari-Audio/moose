@@ -1083,8 +1083,6 @@ public:
     UINT_PTR restartTimerId = 0;
 #endif
     bool inPerformEdit;       // feedback guard: skip setParamNormalized during performEdit
-    bool stateLoaded;         // true after setState() has run (or on first process if no state chunk)
-    void* deferredParent;     // stashed parent view if editor attached before state loaded
     // Live plug view created by `createView()`. Set there, nulled in
     // `pv_release` when refcount -> 0. `moose_vst3_request_resize`
     // dereferences via this slot rather than holding a `MoosePlugView*`
@@ -1092,11 +1090,12 @@ public:
     // (Cubase theme change, Live dock/undock) would otherwise leave
     // a dangling pointer in the closure.
     MoosePlugView* plugView;
+    // Attachment owns the native editor independently of view creation.
+    MoosePlugView* attachedView;
 
     MooseComponent() : ctx(nullptr), sampleRate(44100), maxFrames(1024),
                        componentHandler(nullptr), inPerformEdit(false),
-                       stateLoaded(false), deferredParent(nullptr),
-                       plugView(nullptr) {
+                       plugView(nullptr), attachedView(nullptr) {
         if (g_desc) {
             inputBusActive.store(
                 default_active_bus_mask(g_desc->num_input_buses, g_desc->input_bus_kinds),
@@ -1354,16 +1353,7 @@ public:
     }
 
     tresult setActive(TBool state) {
-        if (state && g_cb && ctx) {
-            // If we're being activated and no state chunk was received,
-            // this is a fresh instance - allow the editor to open.
-            if (!stateLoaded) {
-                stateLoaded = true;
-                if (deferredParent) {
-                    g_cb->gui_open(ctx, deferredParent);
-                    deferredParent = nullptr;
-                }
-            }
+        if (g_cb && ctx) {
             g_cb->reset(ctx, sampleRate, maxFrames, procMode);
         }
         // Tell Rust the activation state for both directions so a state
@@ -1378,12 +1368,6 @@ public:
         if (!stream || !g_cb || !ctx) return kResultFalse;
         const tresult result = g_cb->state_load_stream(ctx, stream, moose_vst3_read_state_chunk)
             ? kResultOk : kResultFalse;
-        stateLoaded = true;
-        // If the editor was attached before state was loaded, open it now
-        if (deferredParent) {
-            g_cb->gui_open(ctx, deferredParent);
-            deferredParent = nullptr;
-        }
         return result;
     }
 
@@ -1505,7 +1489,10 @@ public:
         return kResultOk;
     }
 
-    tresult setProcessing(TBool) { return kResultOk; }
+    tresult setProcessing(TBool state) {
+        if (!state && g_cb && ctx) g_cb->reset(ctx, sampleRate, maxFrames, procMode);
+        return kResultOk;
+    }
 
     tresult process(ProcessData* data) {
         if (!data || !g_cb || !ctx) return kResultOk;
@@ -2139,7 +2126,7 @@ public:
     }
 #endif
 
-    void* createView(FIDString /*name*/);
+    void* createView(FIDString /*name*/, void* owner);
 };
 
 #if defined(__linux__)
@@ -2239,12 +2226,17 @@ struct IPlugViewContentScaleSupportVtbl {
 // a single COM object. queryInterface returns a pointer to the relevant
 // vtable slot; the functions behind each vtable derive the base with
 // pointer arithmetic, matching the MooseComponent pattern.
+static uint32 comp_release(void* s);
+static tresult pv_setFrame(void* s, void* frame);
+static tresult pv_removed(void* s);
+
 struct MoosePlugView {
     IPlugViewVtbl* vtbl;
     IPlugViewContentScaleSupportVtbl* vtbl_scale;
     int32_t refCount;
     void* ctx;              // Rust plugin context
-    MooseComponent* comp;   // owning component (for state-loaded check)
+    MooseComponent* comp;   // owning component (resize and run-loop lifetime)
+    void* owner;            // retained component interface
     // Stored by `pv_setFrame` (host hands the plug-view its
     // `IPlugFrame*`). Used by `moose_vst3_request_resize` to drive
     // the plugin -> host resize request. Nulled when the view is
@@ -2278,25 +2270,22 @@ static uint32 pv_addRef(void* s) { return ++((MoosePlugView*)s)->refCount; }
 static uint32 pv_release(void* s) {
     auto* pv = (MoosePlugView*)s;
     if (--pv->refCount <= 0) {
+        pv_removed(pv);
+        // Only the current view may unregister the component's run loop.
+        pv_setFrame(pv, nullptr);
         if (pv->comp) {
-            pv->comp->deferredParent = nullptr;
-#if defined(__linux__)
-            // The frame goes away with the view: drop the run-loop
-            // registration so the host doesn't hold a handler tied to a
-            // freed view. A spec-compliant host already called
-            // setFrame(nullptr); this covers those that don't.
-            pv->comp->updateRunLoopRegistration(nullptr);
-#endif
             // Null the component's pointer to this view so
             // `moose_vst3_request_resize` doesn't dereference a
             // freed plug-view between the host releasing the
-            // editor and creating a new one. `pv->comp` is the
-            // component lifetime, longer than the plug view's.
+            // editor and creating a new one. The view retains the component
+            // until its own final release, independently of host references.
             if (pv->comp->plugView == pv) {
                 pv->comp->plugView = nullptr;
             }
         }
+        auto* owner = pv->owner;
         free(pv);
+        if (owner) comp_release(owner);
         return 0;
     }
     return pv->refCount;
@@ -2322,6 +2311,7 @@ static tresult pvcs_setContentScaleFactor(void* s, float factor) {
     return kResultOk;
 }
 static tresult pv_isPlatformTypeSupported(void*, FIDString type) {
+    if (!type) return kResultFalse;
     #ifdef __APPLE__
     if (strcmp(type, kPlatformTypeNSView) == 0) return kResultOk;
     #elif defined(_WIN32)
@@ -2331,20 +2321,23 @@ static tresult pv_isPlatformTypeSupported(void*, FIDString type) {
     #endif
     return kResultFalse;
 }
-static tresult pv_attached(void* s, void* parent, FIDString /*type*/) {
+static tresult pv_attached(void* s, void* parent, FIDString type) {
     auto* pv = (MoosePlugView*)s;
-    if (!g_cb || !pv->ctx) return kResultOk;
-    if (pv->comp && !pv->comp->stateLoaded) {
-        // Editor attached before state was restored - defer gui_open
-        pv->comp->deferredParent = parent;
-    } else {
-        g_cb->gui_open(pv->ctx, parent);
-    }
+    // The type identifies the native pointer representation. Reject it
+    // before Rust interprets a parent as NSView/HWND/X11 or we change ownership.
+    if (!parent || pv_isPlatformTypeSupported(s, type) != kResultOk
+        || !g_cb || !g_cb->gui_open || !pv->ctx) return kResultFalse;
+    // Fresh inactive instances may never receive activation or state restore.
+    if (pv->comp) pv->comp->attachedView = pv;
+    g_cb->gui_open(pv->ctx, parent);
     return kResultOk;
 }
 static tresult pv_removed(void* s) {
     auto* pv = (MoosePlugView*)s;
-    if (pv->comp) pv->comp->deferredParent = nullptr;
+    if (pv->comp) {
+        if (pv->comp->attachedView != pv) return kResultOk;
+        pv->comp->attachedView = nullptr;
+    }
     if (g_cb && pv->ctx) g_cb->gui_close(pv->ctx);
     return kResultOk;
 }
@@ -2387,13 +2380,23 @@ static tresult pv_onSize(void* s, void* rect) {
 // plugin-initiated resize through it.
 static tresult pv_setFrame(void* s, void* frame) {
     auto* pv = (MoosePlugView*)s;
+    if (pv->frame == frame) return kResultOk;
+    if (frame) {
+        auto add_ref = (uint32 (*)(void*))(*(void***)frame)[1];
+        add_ref(frame);
+    }
+    auto* previous = pv->frame;
     pv->frame = frame;
 #if defined(__linux__)
     // Bind (or, on a null frame, unbind) the restart timer to the frame's
     // run loop so a latency change flagged by the audio thread reaches the
     // host UI thread even without param polling.
-    if (pv->comp) pv->comp->updateRunLoopRegistration(frame);
+    if (pv->comp && pv->comp->plugView == pv) pv->comp->updateRunLoopRegistration(frame);
 #endif
+    if (previous) {
+        auto release = (uint32 (*)(void*))(*(void***)previous)[2];
+        release(previous);
+    }
     return kResultOk;
 }
 
@@ -2599,15 +2602,20 @@ struct MooseComponentCOM {
 };
 
 // Deferred: createView
-void* MooseComponent::createView(FIDString /*name*/) {
+void* MooseComponent::createView(FIDString /*name*/, void* owner) {
     if (!g_cb || !ctx) return nullptr;
     if (!g_cb->gui_has_editor(ctx)) return nullptr;
     auto* pv = (MoosePlugView*)calloc(1, sizeof(MoosePlugView));
+    if (!pv) return nullptr;
+    // Editor callbacks keep ctx/comp alive even after the host releases its
+    // controller/component interfaces. Match the SDK EditorView ownership.
+    addRef();
     pv->vtbl = &g_plugview_vtbl;
     pv->vtbl_scale = &g_plugview_scale_vtbl;
     pv->refCount = 1;
     pv->ctx = ctx;
     pv->comp = this;
+    pv->owner = owner;
     pv->frame = nullptr;
     // Track the live plug view on the component so
     // `moose_vst3_request_resize` can find it without holding a
@@ -2616,6 +2624,9 @@ void* MooseComponent::createView(FIDString /*name*/) {
     // time, and the most-recently-created is the one
     // request_resize should target.
     plugView = pv;
+#if defined(__linux__)
+    updateRunLoopRegistration(nullptr);
+#endif
     return pv;
 }
 
@@ -2755,7 +2766,7 @@ static double ctrl_p2n(void* s, uint32 id, double v) { return CTRL(s).plainParam
 static double ctrl_getPN(void* s, uint32 id) { return CTRL(s).getParamNormalized(id); }
 static tresult ctrl_setPN(void* s, uint32 id, double v) { return CTRL(s).setParamNormalized(id, v); }
 static tresult ctrl_setHandler(void* s, void* h) { return CTRL(s).setComponentHandler(h); }
-static void* ctrl_createView(void* s, FIDString n) { return CTRL(s).createView(n); }
+static void* ctrl_createView(void* s, FIDString n) { return CTRL(s).createView(n, com_from_controller(s)); }
 
 // --- HostEditing vtable functions ---
 #define HEDIT(self) (com_from_host_editing(self)->impl)
