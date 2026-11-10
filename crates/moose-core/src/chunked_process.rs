@@ -68,6 +68,8 @@ pub struct ChunkedProcess<'a> {
     pub params_fn: Option<&'a dyn Fn(u32) -> f64>,
     /// Optional meter-write closure plumbed through likewise.
     pub meters_fn: Option<&'a dyn Fn(u32, f32)>,
+    /// Host reactivation request for formats that defer latency changes.
+    pub latency_change_request: Option<&'a dyn Fn()>,
     /// Static param metadata - the chunker keys `is_chunked(id)`
     /// off `ParamFlags::CHUNKED` here. Wrappers cache this once
     /// when the plugin instantiates (via
@@ -169,6 +171,7 @@ where
         output_events,
         params_fn,
         meters_fn,
+        latency_change_request,
         param_infos: _,
         min_subblock_samples,
     } = args;
@@ -247,6 +250,10 @@ where
         }
         if let Some(f) = meters_fn {
             ctx = ctx.with_meters(f);
+        }
+
+        if let Some(request) = latency_change_request {
+            ctx = ctx.with_deferred_latency_changes(request);
         }
 
         last_status = plugin.process(&mut sub_buffer, sub_event_scratch, &mut ctx);

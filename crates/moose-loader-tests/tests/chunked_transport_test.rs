@@ -93,6 +93,7 @@ fn chunked_split_advances_sub_block_playhead() {
         output_events: &mut out_events,
         params_fn: None,
         meters_fn: None,
+        latency_change_request: None,
         param_infos: &param_infos,
         min_subblock_samples: 1,
     };

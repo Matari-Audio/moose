@@ -2231,6 +2231,7 @@ fn audio_callback<P: PluginExport>(
         output_events,
         params_fn: None,
         meters_fn: None,
+        latency_change_request: None,
         param_infos,
         min_subblock_samples,
     };

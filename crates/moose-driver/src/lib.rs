@@ -1202,6 +1202,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 output_events: &mut output_events_block,
                 params_fn: None,
                 meters_fn: None,
+                latency_change_request: None,
                 param_infos: &param_infos,
                 min_subblock_samples,
             };

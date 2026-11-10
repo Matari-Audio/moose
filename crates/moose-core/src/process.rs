@@ -24,6 +24,7 @@ pub struct ProcessContext<'a> {
     pub bus_routing: BusRouting,
     params_fn: Option<&'a dyn Fn(u32) -> f64>,
     meters_fn: Option<&'a dyn Fn(u32, f32)>,
+    latency_change_request: Option<&'a dyn Fn()>,
     /// Type-erased handle to this instance's background-task spawner,
     /// installed by the shell when the plugin wired `tasks:` on
     /// `plugin!`. Recover a typed spawner with [`Self::tasks`].
@@ -46,6 +47,7 @@ impl<'a> ProcessContext<'a> {
             bus_routing: BusRouting::new(),
             params_fn: None,
             meters_fn: None,
+            latency_change_request: None,
             tasks: None,
         }
     }
@@ -63,6 +65,28 @@ impl<'a> ProcessContext<'a> {
     pub fn with_process_mode(mut self, mode: ProcessMode) -> Self {
         self.process_mode = mode;
         self
+    }
+
+    /// Require latency-affecting DSP changes to wait for host reactivation.
+    /// The callback schedules reactivation without changing the active latency.
+    #[must_use]
+    pub fn with_deferred_latency_changes(mut self, request: &'a dyn Fn()) -> Self {
+        self.latency_change_request = Some(request);
+        self
+    }
+
+    /// Whether the format requires the active latency contract until reactivation.
+    #[must_use]
+    pub fn defers_latency_changes(&self) -> bool {
+        self.latency_change_request.is_some()
+    }
+
+    /// Request reactivation after staging new latency-affecting settings.
+    /// Keep processing with the current settings until preparation runs again.
+    pub fn request_latency_change(&self) {
+        if let Some(request) = self.latency_change_request {
+            request();
+        }
     }
 
     /// Set the parameter lookup callback.

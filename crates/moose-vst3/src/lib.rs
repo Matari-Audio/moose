@@ -1527,6 +1527,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
+            latency_change_request: None,
             param_infos: &inst.param_infos,
             min_subblock_samples: inst.min_subblock_samples,
         };

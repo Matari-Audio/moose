@@ -2978,6 +2978,14 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // `plugin.process` exactly once - the splitting machinery is
         // inert. See `chunked_process` for the per-sub-block contract.
         let mut transport_snap = transport;
+        let request_latency_change = || {
+            if !data.latency_dirty.swap(true, Ordering::Relaxed)
+                && !data.host.is_null()
+                && let Some(request) = (*data.host).request_callback
+            {
+                request(data.host);
+            }
+        };
         let chunk_args = ChunkedProcess {
             events: &scr.event_list,
             sub_event_scratch: &mut scr.sub_event_scratch,
@@ -2987,6 +2995,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             output_events: &mut scr.output_events,
             params_fn: None,
             meters_fn: None,
+            latency_change_request: Some(&request_latency_change),
             param_infos: &data.param_infos,
             min_subblock_samples: data.info.automation.min_subblock_samples,
         };
