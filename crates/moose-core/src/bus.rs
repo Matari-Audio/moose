@@ -13,6 +13,8 @@
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct BusLayout {
+    /// Optional host-visible name for this complete configuration.
+    pub name: Option<&'static str>,
     pub inputs: Vec<BusConfig>,
     pub outputs: Vec<BusConfig>,
 }
@@ -63,6 +65,13 @@ impl BusLayout {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Give the complete configuration a stable host-visible name.
+    #[must_use]
+    pub fn with_name(mut self, name: &'static str) -> Self {
+        self.name = Some(name);
+        self
     }
 
     #[must_use]

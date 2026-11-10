@@ -290,7 +290,7 @@ struct ClapPluginData<P: PluginExport> {
     /// state). Main-thread-only (`activate` / `deactivate` / `state_load`
     /// are serialized by the host).
     active: AtomicBool,
-    /// True from a successful start_processing until stop_processing returns.
+    /// True from a successful `start_processing` until `stop_processing` returns.
     processing: AtomicBool,
     /// Current render mode as a [`ProcessMode`] discriminant. The host
     /// sets it through the `clap.render` extension on the main thread;
@@ -4579,7 +4579,7 @@ unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
             layout.total_input_channels(),
             layout.total_output_channels()
         );
-        copy_str_to_buf(&mut out.name, &name);
+        copy_str_to_buf(&mut out.name, layout.name.unwrap_or(&name));
         out.input_port_count = len_u32(layout.inputs.iter().filter(|bus| bus.enabled).count());
         out.output_port_count = len_u32(layout.outputs.iter().filter(|bus| bus.enabled).count());
         // The main port is the first enabled bus, and only if it is Main.
@@ -5859,6 +5859,7 @@ pub unsafe fn try_with_stopped_dsp_state<P: PluginExport, T: 'static, R>(
     unsafe { access_dsp_state::<P, T, R>(plugin, DspAccess::Stopped, callback) }
 }
 
+#[derive(Clone, Copy)]
 enum DspAccess {
     Inactive,
     Stopped,
