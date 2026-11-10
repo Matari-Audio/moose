@@ -161,6 +161,12 @@ pub struct Vst3Callbacks {
         max_frames: u32,
         process_mode: i32,
     ),
+    pub prepare: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        sample_rate: f64,
+        max_frames: u32,
+        process_mode: i32,
+    ) -> i32,
     pub process: unsafe extern "C" fn(
         ctx: *mut c_void,
         inputs: *const *const f32,

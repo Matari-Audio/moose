@@ -460,6 +460,7 @@ struct Vst3Callbacks {
     void* (*create)();
     void (*destroy)(void*);
     void (*reset)(void*, double, uint32_t, int32_t);
+    int32_t (*prepare)(void*, double, uint32_t, int32_t);
     uint32_t (*process)(void*, const float**, float**, uint32_t, uint32_t,
                         const uint32_t*, uint32_t, uint32_t,
                         const uint32_t*, uint32_t, uint32_t, uint32_t,
@@ -1354,7 +1355,11 @@ public:
 
     tresult setActive(TBool state) {
         if (g_cb && ctx) {
-            g_cb->reset(ctx, sampleRate, maxFrames, procMode);
+            if (state) {
+                if (!g_cb->prepare(ctx, sampleRate, maxFrames, procMode)) return kResultFalse;
+            } else {
+                g_cb->reset(ctx, sampleRate, maxFrames, procMode);
+            }
         }
         // Tell Rust the activation state for both directions so a state
         // load while suspended isn't stranded in the audio-thread queue.

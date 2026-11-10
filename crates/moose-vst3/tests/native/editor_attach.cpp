@@ -27,6 +27,10 @@ int main() {
         return 1;
     };
     callbacks.reset = [](void*, double, uint32_t, int32_t) { ++resets; };
+    callbacks.prepare = [](void* ctx, double rate, uint32_t frames, int32_t mode) -> int32_t {
+        g_cb->reset(ctx, rate, frames, mode);
+        return 1;
+    };
     callbacks.set_active = [](void*, int32_t) {};
     g_cb = &callbacks;
     MooseComponent component;

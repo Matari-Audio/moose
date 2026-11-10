@@ -130,7 +130,7 @@ use moose_core::midi::{
     PER_NOTE_VOLUME_MAX_GAIN, decode_short_message, denorm_7bit, downconvert_to_midi1,
     per_note_bend_from_semitones, pitch_bend_to_bytes,
 };
-use moose_core::plugin::PluginRuntime;
+use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
 use moose_core::presets::parse_preset_file;
 use moose_core::process::ProcessStatus;
 use moose_core::rt::{RtSection, audit};
@@ -871,7 +871,13 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
         let mode = ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed));
         {
             let mut instance = enter_plugin(&data.plugin);
-            instance.reset(&AudioConfig::new(sample_rate, max_block).with_process_mode(mode));
+            let config = PreparationConfig::new(
+                AudioConfig::new(sample_rate, max_block).with_process_mode(mode),
+                PreparationFrameBound::NegotiatedHost,
+            );
+            if instance.prepare(&config).is_err() {
+                return false;
+            }
             // Refresh the caches from the freshly-reset instance so the
             // host reads the real latency/tail before the first block -
             // not the placeholder-rate value from create. No dirty flag:
