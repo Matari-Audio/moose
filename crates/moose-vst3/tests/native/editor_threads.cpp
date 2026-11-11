@@ -28,10 +28,14 @@ static tresult h_begin(void* self, uint32) { record(static_cast<Handler*>(self)-
     }
     return kResultOk; }
 static bool flood = false;
-static tresult h_perform(void*, uint32, double v) {
-    record(v == 0.5 ? 'p' : '?');
+static int burst = 0; // a finite flood: this many more submissions
+static tresult h_perform(void* self, uint32, double v) {
+    record(static_cast<Handler*>(self)->replacement ? 'P' : (v == 0.5 ? 'p' : '?'));
     // A worker that submits again for every edit the host takes.
-    if (flood) std::thread([] { moose_vst3_perform_edit(&context_token, 7, 0.5); }).join();
+    if (flood || burst > 0) {
+        if (burst > 0) --burst;
+        std::thread([] { moose_vst3_perform_edit(&context_token, 7, 0.5); }).join();
+    }
     return kResultOk;
 }
 static tresult h_end(void* self, uint32) { record(static_cast<Handler*>(self)->replacement ? 'E' : 'e'); return kResultOk; }
@@ -175,6 +179,25 @@ int main(int argc, char** argv) {
         flood = false;
         pump(loop);
         require(calls == std::string(kDrainPasses + 1, 'p') + operation);
+    }
+
+    // A burst longer than one wake's passes, under way when the handler
+    // changes or the editor detaches: all of it still reaches the old
+    // handler on the UI thread, and nothing is left queued after.
+    if (argc == 1 || std::strcmp(argv[1], "burst") == 0) {
+        Handler next{handler_vtbl, true};
+        calls.clear();
+        burst = 20;
+        off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
+        com->impl.setComponentHandler(&next);
+        require(calls == std::string(21, 'p') && com->impl.pendingEdits.empty());
+        com->impl.setComponentHandler(&handler);
+        calls.clear();
+        burst = 20;
+        off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
+        require(view->vtbl->setFrame(view, nullptr) == kResultOk);
+        require(calls == std::string(21, 'p') && com->impl.pendingEdits.empty());
+        require(view->vtbl->setFrame(view, &frame) == kResultOk);
     }
 
     // Enqueue from a worker while the old handler is draining. Its End

@@ -708,6 +708,18 @@ struct PClassInfo {
 // Component: IComponent + IAudioProcessor + IEditController
 // ---------------------------------------------------------------------------
 
+// A wake's drain makes at most kDrainPasses passes over the queue. Calls
+// submitted while one pass runs (by a worker, or by a host callback
+// reentering) go in the next pass, so a steady submitter cannot hold the
+// UI thread: what is left waits for the next wake, which is asked for.
+static constexpr int kDrainPasses = 8;
+// A detach, handler change or teardown must not leave an accepted call
+// behind -- the old handler would stay mid-gesture, or a call would outlive
+// its wake -- so it drains until the queue is empty. The cap is only a
+// backstop against a submitter that never stops; real editors submit per
+// frame and empty the queue in a pass or two.
+static constexpr int kTransitionPasses = 4096;
+
 // An editor -> host call made off the host UI thread, queued for it. VST3
 // wants IComponentHandler begin/perform/endEdit and IPlugFrame::resizeView
 // on the UI thread, but an editor may build its UI on a worker thread (MUI
@@ -1039,7 +1051,7 @@ public:
         // Keep workers queueing until the UI thread has delivered every
         // pending edit. Clearing the wake and observing an empty queue must
         // be atomic, or a worker could steal the detach batch.
-        drainEditsLocked(lock);
+        drainEditsLocked(lock, kTransitionPasses);
         editRunLoop = nullptr;
         editFd = -1;
         lock.unlock();
@@ -1194,7 +1206,7 @@ public:
     // Defined after MoosePlugView: makes every queued call, on the UI thread.
     void drainEdits();
     bool queueBehindRemainingEdits(EditOp op);
-    void drainEditsLocked(std::unique_lock<std::mutex>& lock);
+    void drainEditsLocked(std::unique_lock<std::mutex>& lock, int passes = kDrainPasses);
     bool inPerformEdit;       // feedback guard: skip setParamNormalized during performEdit
     // Live plug view created by `createView()`. Set there, nulled in
     // `pv_release` when refcount -> 0. `moose_vst3_request_resize`
@@ -1276,7 +1288,7 @@ public:
         // Queued editor calls go out while componentHandler is still held.
         {
             std::unique_lock<std::mutex> lock(editMutex);
-            drainEditsLocked(lock);
+            drainEditsLocked(lock, kTransitionPasses);
             // A worker that kept submitting past the bounded drain: the host
             // is releasing this component, so what is left goes nowhere.
             editsClosed = true;
@@ -2187,7 +2199,7 @@ public:
         // across the empty-queue / handler-swap boundary so concurrent
         // editor calls belong to the handler on the correct side of it.
         std::unique_lock<std::mutex> lock(editMutex);
-        drainEditsLocked(lock);
+        drainEditsLocked(lock, kTransitionPasses);
         void* previous = componentHandler;
         if (handler) {
             auto addRef_fn = (uint32 (*)(void*))(*(void***)handler)[1];
@@ -3374,18 +3386,10 @@ void MooseComponent::drainEdits() {
     drainEditsLocked(lock);
 }
 
-// A drain makes at most this many passes over the queue. Calls submitted
-// while one pass runs (by a worker, or by a host callback reentering) go in
-// the next pass, so a steady submitter cannot hold the UI thread forever:
-// what is left waits for the next wake, which is asked for here. A detach,
-// handler change or teardown accepts the same bound -- one flooding worker
-// may then reach the next handler, or be dropped at teardown.
-static constexpr int kDrainPasses = 8;
-
-void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock) {
+void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, int passes) {
     if (drainingEdits) return;
     drainingEdits = true;
-    for (int pass = 0; pass < kDrainPasses && !pendingEdits.empty(); ++pass) {
+    for (int pass = 0; pass < passes && !pendingEdits.empty(); ++pass) {
         std::vector<EditOp> ops;
         ops.swap(pendingEdits);
         lock.unlock();
