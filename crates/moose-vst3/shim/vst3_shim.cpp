@@ -25,6 +25,7 @@
 #include <cerrno>
 #endif
 #include <algorithm>
+#include <deque>
 #include <mutex>
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -1171,7 +1172,7 @@ public:
     // `editMutex` also guards each platform's wake handle against teardown.
     std::mutex editMutex;
     void unregister();
-    std::vector<EditOp> pendingEdits;
+    std::deque<EditOp> pendingEdits;
     // Gestures begun on componentHandler and not yet ended; editMutex.
     std::vector<uint32> openGestures;
     bool editsClosed = false; // teardown: no more queueing
@@ -2233,7 +2234,7 @@ public:
         componentHandler = handler;
         if (!handler) reopen.clear();
         for (auto id = reopen.rbegin(); id != reopen.rend(); ++id)
-            pendingEdits.insert(pendingEdits.begin(), {EditOp::Begin, *id, 0, 0, 0});
+            pendingEdits.push_front({EditOp::Begin, *id, 0, 0, 0});
         if (!pendingEdits.empty()) wakeEditsLocked();
         lock.unlock();
         if (previous) {
@@ -3465,14 +3466,12 @@ void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, bool t
     drainingEdits = true;
     size_t left = transition ? kTransitionEdits : kDrainEdits;
     while (left > 0 && !pendingEdits.empty() && (transition || mayDeliverLocked())) {
-        std::vector<EditOp> ops;
-        ops.swap(pendingEdits);
-        if (ops.size() > left) {
-            // Over budget: the rest goes back ahead of anything newer.
-            pendingEdits.assign(ops.begin() + left, ops.end());
-            ops.resize(left);
-        }
-        left -= ops.size();
+        // Take at most `left` from the front; the rest keeps its place,
+        // ahead of anything newer, with no work per edit left behind.
+        const size_t take = std::min(left, pendingEdits.size());
+        std::vector<EditOp> ops(pendingEdits.begin(), pendingEdits.begin() + take);
+        pendingEdits.erase(pendingEdits.begin(), pendingEdits.begin() + take);
+        left -= take;
         lock.unlock();
         for (const EditOp& op : ops) {
             switch (op.kind) {

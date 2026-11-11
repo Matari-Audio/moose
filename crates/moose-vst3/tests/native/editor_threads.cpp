@@ -180,6 +180,30 @@ int main(int argc, char** argv) {
         require(calls == std::string(3 * kDrainEdits, 'p') && readable(loop.fd));
         pump(loop);
         require(calls == std::string(3 * kDrainEdits, 'p') + "e" && com->impl.pendingEdits.empty());
+
+        // A backlog far past both budgets with two gestures open: one wake
+        // still delivers kDrainEdits, and a handler change delivers its
+        // budget, ends both gestures on the old handler and reopens them on
+        // the new one, ahead of the rest, in order.
+        calls.clear();
+        static const size_t big = 4 * kTransitionEdits;
+        off_ui([] {
+            moose_vst3_begin_edit(ctx, 7);
+            moose_vst3_begin_edit(ctx, 9);
+            for (size_t i = 0; i < big; ++i) moose_vst3_perform_edit(ctx, 7, 0.5);
+        });
+        pump(loop);
+        require(calls == "bb" + std::string(kDrainEdits - 2, 'p'));
+        Handler next{handler_vtbl, true};
+        com->impl.setComponentHandler(&next);
+        require(calls == "bb" + std::string(kDrainEdits + kTransitionEdits - 2, 'p') + "ee");
+        while (!com->impl.pendingEdits.empty()) pump(loop);
+        moose_vst3_end_edit(ctx, 7);
+        moose_vst3_end_edit(ctx, 9);
+        require(calls == "bb" + std::string(kDrainEdits + kTransitionEdits - 2, 'p') + "eeBB"
+            + std::string(big + 2 - kDrainEdits - kTransitionEdits, 'P') + "EE");
+        require(com->impl.openGestures.empty());
+        com->impl.setComponentHandler(&handler);
     }
 
     // Every UI operation stays behind the remainder of a saturated drain.
