@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <atomic>
+#include <thread>
 #include <new>
 #include <vector>
 #include <string>
@@ -799,8 +800,12 @@ int32_t moose_vst3_write_state_stream(void* stream, const uint8_t* data, uint32_
 
 // Global ctx→component mapping for extern "C" host-notification callbacks
 static constexpr int kMaxInstances = 64;
-static void* g_ctx_map_key[kMaxInstances] = {};
-static MooseComponent* g_ctx_map_comp[kMaxInstances] = {};
+// Entries are atomics so the audio thread's lock-free lookup
+// (moose_vst3_mark_restart) never races a registration. Registration,
+// removal and pinning (PinnedComponent) happen under g_ctx_mutex.
+static std::atomic<void*> g_ctx_map_key[kMaxInstances] = {};
+static std::atomic<MooseComponent*> g_ctx_map_comp[kMaxInstances] = {};
+static std::mutex g_ctx_mutex;
 
 #if __APPLE__
 // Resolves the shim's opaque ctx key to its live component, or null once
@@ -1163,6 +1168,9 @@ public:
     // Editor calls made off the UI thread, oldest first (see EditOp).
     // `editMutex` also guards each platform's wake handle against teardown.
     std::mutex editMutex;
+    // Exported editor calls currently inside this instance (PinnedComponent).
+    std::atomic<int> pinned{0};
+    void unregisterAndQuiesce();
     std::vector<EditOp> pendingEdits;
     bool editsClosed = false; // teardown: no more queueing
     bool drainingEdits = false; // guarded by editMutex; callbacks may reenter
@@ -1234,10 +1242,11 @@ public:
             ctx = g_cb->create();
             if (ctx) {
                 persistWanted = g_cb->wants_persist_notifications(ctx);
+                std::lock_guard<std::mutex> lock(g_ctx_mutex);
                 for (int i = 0; i < kMaxInstances; i++) {
-                    if (!g_ctx_map_key[i]) {
-                        g_ctx_map_key[i] = ctx;
-                        g_ctx_map_comp[i] = this;
+                    if (!g_ctx_map_key[i].load(std::memory_order_relaxed)) {
+                        g_ctx_map_comp[i].store(this, std::memory_order_release);
+                        g_ctx_map_key[i].store(ctx, std::memory_order_release);
                         break;
                     }
                 }
@@ -1283,6 +1292,9 @@ public:
     }
 
     ~MooseComponent() {
+        // No new editor call can find this instance, and the ones already
+        // inside it finish before anything they use is torn down.
+        unregisterAndQuiesce();
         // Wait for any worker wake before unregistering/closing native handles.
         if (persistBound && g_cb && ctx) g_cb->set_persist_waker(ctx, nullptr, nullptr);
         // Queued editor calls go out while componentHandler is still held.
@@ -1311,17 +1323,8 @@ public:
             auto release_fn = (uint32 (*)(void*))(*(void***)componentHandler)[2];
             release_fn(componentHandler);
         }
-        if (ctx) {
-            for (int i = 0; i < kMaxInstances; i++) {
-                if (g_ctx_map_key[i] == ctx) {
-                    g_ctx_map_key[i] = nullptr;
-                    g_ctx_map_comp[i] = nullptr;
-                    break;
-                }
-            }
-        }
 #if __APPLE__
-        // Unregister above happens first, so any in-flight handler
+        // Unregistering happened first (unregisterAndQuiesce), so any in-flight handler
         // resolves null and never touches this freed instance. cancel()
         // stops further invocations; release() is safe mid-handler
         // (libdispatch retains the source across a running handler).
@@ -2342,7 +2345,7 @@ static void th_onTimer(void* self) {
 static void CALLBACK moose_vst3_restart_timer_proc(
         HWND, UINT, UINT_PTR id, DWORD) {
     for (int i = 0; i < kMaxInstances; i++) {
-        MooseComponent* comp = g_ctx_map_comp[i];
+        MooseComponent* comp = g_ctx_map_comp[i].load(std::memory_order_acquire);
         if (comp && comp->restartTimerId == id) {
             comp->flushPendingRestart();
             comp->drainEdits();
@@ -3350,9 +3353,55 @@ void* moose_vst3_get_factory() {
 
 static MooseComponent* ctx_lookup(void* ctx) {
     for (int i = 0; i < kMaxInstances; i++) {
-        if (g_ctx_map_key[i] == ctx) return g_ctx_map_comp[i];
+        if (g_ctx_map_key[i].load(std::memory_order_acquire) == ctx)
+            return g_ctx_map_comp[i].load(std::memory_order_acquire);
     }
     return nullptr;
+}
+
+// Pins on this thread, so a host that releases the component from inside a
+// callback we made (same thread, further up the stack) is not waited on.
+static thread_local MooseComponent* t_pinnedComp = nullptr;
+static thread_local int t_pinnedDepth = 0;
+
+// An exported editor call's hold on its instance: found and counted under
+// g_ctx_mutex, so the destructor -- which unregisters under that mutex and
+// then waits for the count -- cannot free it while the call runs. Editor
+// threads may outlive the host's release (nothing makes `close` join them).
+struct PinnedComponent {
+    MooseComponent* comp = nullptr;
+    explicit PinnedComponent(void* ctx) {
+        std::lock_guard<std::mutex> lock(g_ctx_mutex);
+        comp = ctx_lookup(ctx);
+        if (!comp) return;
+        comp->pinned.fetch_add(1, std::memory_order_acq_rel);
+        if (!t_pinnedComp || t_pinnedComp == comp) {
+            t_pinnedComp = comp;
+            ++t_pinnedDepth;
+        }
+    }
+    ~PinnedComponent() {
+        if (!comp) return;
+        if (t_pinnedComp == comp && --t_pinnedDepth == 0) t_pinnedComp = nullptr;
+        comp->pinned.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    PinnedComponent(const PinnedComponent&) = delete;
+    PinnedComponent& operator=(const PinnedComponent&) = delete;
+};
+
+void MooseComponent::unregisterAndQuiesce() {
+    if (ctx) {
+        std::lock_guard<std::mutex> lock(g_ctx_mutex);
+        for (int i = 0; i < kMaxInstances; i++) {
+            if (g_ctx_map_key[i].load(std::memory_order_relaxed) == ctx) {
+                g_ctx_map_key[i].store(nullptr, std::memory_order_release);
+                g_ctx_map_comp[i].store(nullptr, std::memory_order_release);
+                break;
+            }
+        }
+    }
+    const int own = t_pinnedComp == this ? t_pinnedDepth : 0;
+    while (pinned.load(std::memory_order_acquire) > own) std::this_thread::yield();
 }
 
 static void do_begin_edit(MooseComponent* comp, uint32_t id) {
@@ -3422,7 +3471,8 @@ bool MooseComponent::queueBehindRemainingEdits(EditOp op) {
 // Each call is made now on the host UI thread (after anything queued
 // before it), or queued for that thread when it comes from another one.
 void moose_vst3_begin_edit(void* ctx, uint32_t id) {
-    auto* comp = ctx_lookup(ctx);
+    PinnedComponent pin(ctx);
+    auto* comp = pin.comp;
     if (!comp) return;
     if (comp->tryQueueEdit({EditOp::Begin, id, 0, 0, 0})) return;
     if (comp->queueBehindRemainingEdits({EditOp::Begin, id, 0, 0, 0})) return;
@@ -3430,7 +3480,8 @@ void moose_vst3_begin_edit(void* ctx, uint32_t id) {
 }
 
 void moose_vst3_perform_edit(void* ctx, uint32_t id, double normalized) {
-    auto* comp = ctx_lookup(ctx);
+    PinnedComponent pin(ctx);
+    auto* comp = pin.comp;
     if (!comp) return;
     if (comp->tryQueueEdit({EditOp::Perform, id, normalized, 0, 0})) return;
     if (comp->queueBehindRemainingEdits({EditOp::Perform, id, normalized, 0, 0})) return;
@@ -3438,7 +3489,8 @@ void moose_vst3_perform_edit(void* ctx, uint32_t id, double normalized) {
 }
 
 void moose_vst3_end_edit(void* ctx, uint32_t id) {
-    auto* comp = ctx_lookup(ctx);
+    PinnedComponent pin(ctx);
+    auto* comp = pin.comp;
     if (!comp) return;
     if (comp->tryQueueEdit({EditOp::End, id, 0, 0, 0})) return;
     if (comp->queueBehindRemainingEdits({EditOp::End, id, 0, 0, 0})) return;
@@ -3498,7 +3550,8 @@ static constexpr int32_t kPlugFrameResizeViewIndex = 3;
 // Off the UI thread the request is queued and reported as made: the
 // host's IPlugView::onSize is what commits a size, either way.
 int32_t moose_vst3_request_resize(void* ctx, uint32_t w, uint32_t h) {
-    auto* comp = ctx_lookup(ctx);
+    PinnedComponent pin(ctx);
+    auto* comp = pin.comp;
     if (!comp) return 0;
     if (comp->tryQueueEdit({EditOp::Resize, 0, 0, w, h})) return 1;
     if (comp->queueBehindRemainingEdits({EditOp::Resize, 0, 0, w, h})) return 1;

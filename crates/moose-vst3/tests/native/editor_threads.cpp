@@ -3,6 +3,8 @@
 // in order, woken through the host IRunLoop's event handler.
 #include "../../shim/vst3_shim.cpp"
 #include <thread>
+#include <atomic>
+#include <chrono>
 #include <fcntl.h>
 
 static int context_token;
@@ -253,5 +255,37 @@ int main(int argc, char** argv) {
     require(calls == "b");
     view->vtbl->release(view);
     com->vtbl_component->release(com);
+    // Teardown while an editor thread is inside a call: the release waits
+    // for it, and no call starts once the instance is unregistered.
+    if (argc == 1 || std::strcmp(argv[1], "teardown") == 0) {
+        static std::atomic<int> stage{0}; // 1 inside begin, 2 may return
+        static std::atomic<bool> destroyed{false};
+        callbacks.destroy = [](void*) { destroyed = true; };
+        void* slow_vtbl[] = {(void*)h_query, (void*)h_ref, (void*)h_ref,
+            (void*)+[](void*, uint32) -> tresult {
+                stage = 1;
+                while (stage != 2) std::this_thread::yield();
+                // Still alive: the release is waiting on this call.
+                require(!destroyed);
+                return kResultOk;
+            },
+            (void*)h_perform, (void*)h_end, (void*)h_restart};
+        Handler slow{slow_vtbl};
+        auto* other = create_component();
+        static void* other_ctx; other_ctx = other->impl.rustContext();
+        other->impl.setComponentHandler(&slow);
+        // No editor frame bound, so the worker's call goes straight in.
+        std::thread worker([] { moose_vst3_begin_edit(other_ctx, 3); });
+        while (stage != 1) std::this_thread::yield();
+        std::thread releaser([other] { other->vtbl_component->release(other); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        require(!destroyed);
+        stage = 2;
+        worker.join();
+        releaser.join();
+        require(destroyed);
+        moose_vst3_end_edit(other_ctx, 3); // unregistered: a no-op, not a crash
+    }
+
     std::puts("PASS: off-UI-thread edits and resizes reach the host on its run loop, in order");
 }
