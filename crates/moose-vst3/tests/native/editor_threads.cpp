@@ -27,7 +27,13 @@ static tresult h_begin(void* self, uint32) { record(static_cast<Handler*>(self)-
         std::thread([] { moose_vst3_end_edit(&context_token, 7); }).join();
     }
     return kResultOk; }
-static tresult h_perform(void*, uint32, double v) { record(v == 0.5 ? 'p' : '?'); return kResultOk; }
+static bool flood = false;
+static tresult h_perform(void*, uint32, double v) {
+    record(v == 0.5 ? 'p' : '?');
+    // A worker that submits again for every edit the host takes.
+    if (flood) std::thread([] { moose_vst3_perform_edit(&context_token, 7, 0.5); }).join();
+    return kResultOk;
+}
 static tresult h_end(void* self, uint32) { record(static_cast<Handler*>(self)->replacement ? 'E' : 'e'); return kResultOk; }
 static tresult h_restart(void*, int32) { return kResultOk; }
 
@@ -139,6 +145,19 @@ int main(int argc, char** argv) {
         });
         pump(loop);
         require(calls == "brpebe");
+    }
+
+    // A worker that never stops submitting cannot hold the UI thread: one
+    // wake makes a bounded number of passes, then asks for another wake.
+    if (argc == 1 || std::strcmp(argv[1], "flood") == 0) {
+        calls.clear();
+        flood = true;
+        off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
+        pump(loop);
+        require(calls == std::string(kDrainPasses, 'p') && readable(loop.fd));
+        flood = false;
+        pump(loop);
+        require(calls == std::string(kDrainPasses + 1, 'p'));
     }
 
     // Enqueue from a worker while the old handler is draining. Its End

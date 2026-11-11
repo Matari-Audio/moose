@@ -1156,13 +1156,15 @@ public:
     bool drainingEdits = false; // guarded by editMutex; callbacks may reenter
     // Queue `op` when a UI-thread wake exists and this is not the UI
     // thread; false means call through now (the pre-existing direct path).
+    // Once teardown has closed the queue a call is dropped, never made: the
+    // component is going and its handler with it.
     bool tryQueueEdit(EditOp op) {
         std::lock_guard<std::mutex> lock(editMutex);
+        if (editsClosed) return true;
         if (drainingEdits) {
             pendingEdits.push_back(op);
             return true;
         }
-        if (editsClosed) return false;
 #if defined(__linux__)
         if (!editRunLoop || pthread_equal(pthread_self(), uiThread)) return false;
 #elif __APPLE__
@@ -1173,15 +1175,21 @@ public:
         return false;
 #endif
         pendingEdits.push_back(op);
+        wakeEditsLocked();
+        return true;
+    }
+    // Ask the UI thread for a drain. Windows needs nothing: its UI-thread
+    // timer drains on every tick. Caller holds editMutex.
+    void wakeEditsLocked() {
 #if defined(__linux__)
+        if (editFd < 0) return;
         const uint64_t one = 1;
         ssize_t result;
         do { result = write(editFd, &one, sizeof(one)); }
         while (result < 0 && errno == EINTR);
 #elif __APPLE__
-        dispatch_source_merge_data(restartSource, 1);
+        if (restartSource) dispatch_source_merge_data(restartSource, 1);
 #endif
-        return true;
     }
     // Defined after MoosePlugView: makes every queued call, on the UI thread.
     void drainEdits();
@@ -1268,7 +1276,10 @@ public:
         {
             std::unique_lock<std::mutex> lock(editMutex);
             drainEditsLocked(lock);
+            // A worker that kept submitting past the bounded drain: the host
+            // is releasing this component, so what is left goes nowhere.
             editsClosed = true;
+            pendingEdits.clear();
         }
 #if defined(__linux__)
         unbindEditRunLoop();
@@ -3362,10 +3373,18 @@ void MooseComponent::drainEdits() {
     drainEditsLocked(lock);
 }
 
+// A drain makes at most this many passes over the queue. Calls submitted
+// while one pass runs (by a worker, or by a host callback reentering) go in
+// the next pass, so a steady submitter cannot hold the UI thread forever:
+// what is left waits for the next wake, which is asked for here. A detach,
+// handler change or teardown accepts the same bound -- one flooding worker
+// may then reach the next handler, or be dropped at teardown.
+static constexpr int kDrainPasses = 8;
+
 void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock) {
     if (drainingEdits) return;
     drainingEdits = true;
-    while (!pendingEdits.empty()) {
+    for (int pass = 0; pass < kDrainPasses && !pendingEdits.empty(); ++pass) {
         std::vector<EditOp> ops;
         ops.swap(pendingEdits);
         lock.unlock();
@@ -3380,6 +3399,7 @@ void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock) {
         lock.lock();
     }
     drainingEdits = false;
+    if (!pendingEdits.empty()) wakeEditsLocked();
 }
 
 // Each call is made now on the host UI thread (after anything queued
