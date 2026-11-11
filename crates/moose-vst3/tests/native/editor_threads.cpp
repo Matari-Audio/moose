@@ -160,10 +160,26 @@ int main(int argc, char** argv) {
         flood = true;
         off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
         pump(loop);
-        require(calls == std::string(kDrainPasses, 'p') && readable(loop.fd));
+        require(calls == std::string(kDrainEdits, 'p') && readable(loop.fd));
         flood = false;
         pump(loop);
-        require(calls == std::string(kDrainPasses + 1, 'p'));
+        require(calls == std::string(kDrainEdits + 1, 'p'));
+    }
+
+    // A large backlog is delivered kDrainEdits at a time, in order.
+    if (argc == 1 || std::strcmp(argv[1], "backlog") == 0) {
+        calls.clear();
+        off_ui([] {
+            for (size_t i = 0; i < 3 * kDrainEdits; ++i) moose_vst3_perform_edit(ctx, 7, 0.5);
+            moose_vst3_end_edit(ctx, 7);
+        });
+        pump(loop);
+        require(calls == std::string(kDrainEdits, 'p') && readable(loop.fd));
+        pump(loop);
+        pump(loop);
+        require(calls == std::string(3 * kDrainEdits, 'p') && readable(loop.fd));
+        pump(loop);
+        require(calls == std::string(3 * kDrainEdits, 'p') + "e" && com->impl.pendingEdits.empty());
     }
 
     // Every UI operation stays behind the remainder of a saturated drain.
@@ -177,10 +193,10 @@ int main(int argc, char** argv) {
             case 'e': moose_vst3_end_edit(ctx, 7); break;
             case 'r': require(moose_vst3_request_resize(ctx, 640, 480) == 1); break;
         }
-        require(calls == std::string(kDrainPasses, 'p') && readable(loop.fd));
+        require(calls == std::string(kDrainEdits, 'p') && readable(loop.fd));
         flood = false;
         pump(loop);
-        require(calls == std::string(kDrainPasses + 1, 'p') + operation);
+        require(calls == std::string(kDrainEdits + 1, 'p') + operation);
     }
 
     // A burst longer than one wake's passes, under way when the handler
@@ -218,7 +234,7 @@ int main(int argc, char** argv) {
         pump(loop);
         moose_vst3_end_edit(ctx, 7);
         const size_t e = calls.find('e');
-        require(e == kTransitionPasses + 1); // b and p share the first pass
+        require(e == kTransitionEdits);
         require(calls == "b" + std::string(e - 1, 'p') + "eB" + std::string(calls.size() - e - 3, 'P') + "E");
         require(com->impl.pendingEdits.empty() && com->impl.openGestures.empty());
         com->impl.setComponentHandler(&handler);
@@ -228,19 +244,17 @@ int main(int argc, char** argv) {
         flood = true;
         off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
         require(view->vtbl->setFrame(view, nullptr) == kResultOk);
-        require(calls == std::string(kTransitionPasses, 'p') && !com->impl.pendingEdits.empty());
+        require(calls == std::string(kTransitionEdits, 'p') && !com->impl.pendingEdits.empty());
         flood = false;
         moose_vst3_end_edit(ctx, 7); // no frame now: delivered in place, after the rest
-        require(calls == std::string(kTransitionPasses + 1, 'p') + "e");
+        require(calls == std::string(kTransitionEdits + 1, 'p') + "e");
         require(view->vtbl->setFrame(view, &frame) == kResultOk);
     }
 
     // A worker holds the last reference when the host lets go, with an edit
-    // queued for the bound UI thread. Here the view's release unbinds and
-    // delivers it on the UI thread; teardown then runs on the worker and
-    // makes no host call there (record() requires the UI thread). On macOS
-    // and Windows the wake lives as long as the component, and the
-    // destructor's mayDeliverLocked() gate drops the edit instead.
+    // queued for the still-bound UI thread: teardown runs on the worker,
+    // drops the edit and makes no host call there (record() requires the UI
+    // thread).
     if (argc == 1 || std::strcmp(argv[1], "lastpin") == 0) {
         static std::atomic<int> step{0};
         static std::atomic<bool> destroyed{false};
@@ -254,8 +268,8 @@ int main(int argc, char** argv) {
         other->impl.setComponentHandler(&handler);
         RunLoop loop2{loop_vtbl};
         Frame frame2{frame_vtbl, &loop2};
-        auto* v2 = static_cast<MoosePlugView*>(other->vtbl_controller->createView(&other->vtbl_controller, "editor"));
-        require(v2->vtbl->setFrame(v2, &frame2) == kResultOk && loop2.handler);
+        other->impl.bindEditRunLoop(&frame2); // a bound wake, and no view to unbind it
+        require(loop2.handler);
         calls.clear();
         std::thread worker([] {
             PinnedComponent pin(other_ctx);
@@ -264,12 +278,11 @@ int main(int argc, char** argv) {
             while (step != 2) std::this_thread::yield();
         });
         while (step != 1) std::this_thread::yield();
-        v2->vtbl->release(v2);
         other->vtbl_component->release(other);
         require(!destroyed);
         step = 2;
         worker.join();
-        require(destroyed && calls == "p");
+        require(destroyed && calls.empty() && !loop2.handler);
     }
 
     // Enqueue from a worker while the old handler is draining. Its End
@@ -341,18 +354,20 @@ int main(int argc, char** argv) {
             },
             (void*)h_perform, (void*)h_end, (void*)h_restart};
         Handler slow{slow_vtbl};
+        static int slow_token; // its own ctx, so the worker's call finds this instance
+        callbacks.create = []() -> void* { return &slow_token; };
         auto* other = create_component();
+        callbacks.create = []() -> void* { return &context_token; };
         static void* other_ctx; other_ctx = other->impl.rustContext();
         other->impl.setComponentHandler(&slow);
         // No editor frame bound, so the worker's call goes straight in.
         std::thread worker([] { moose_vst3_begin_edit(other_ctx, 3); });
         while (stage != 1) std::this_thread::yield();
-        std::thread releaser([other] { other->vtbl_component->release(other); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // The release returns at once; the worker's reference keeps it alive.
+        std::thread([other] { other->vtbl_component->release(other); }).join();
         require(!destroyed);
         stage = 2;
         worker.join();
-        releaser.join();
         require(destroyed);
         moose_vst3_end_edit(other_ctx, 3); // unregistered: a no-op, not a crash
     }

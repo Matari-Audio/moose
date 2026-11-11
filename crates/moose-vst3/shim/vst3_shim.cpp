@@ -710,18 +710,18 @@ struct PClassInfo {
 // Component: IComponent + IAudioProcessor + IEditController
 // ---------------------------------------------------------------------------
 
-// A wake's drain makes at most kDrainPasses passes over the queue. Calls
-// submitted while one pass runs (by a worker, or by a host callback
-// reentering) go in the next pass, so a steady submitter cannot hold the
-// UI thread: what is left waits for the next wake, which is asked for.
-static constexpr int kDrainPasses = 8;
+// A wake's drain delivers at most kDrainEdits calls, oldest first, however
+// they were queued (a backlog, a worker, a host callback reentering), so
+// neither a burst nor a steady submitter holds the UI thread: what is left
+// keeps its place and waits for the next wake, which is asked for.
+static constexpr size_t kDrainEdits = 64;
 // A detach, handler change or teardown drains what is queued before it
 // goes on, so a finite burst finishes on the handler that saw it begin.
-// Only a submitter that never stops outlasts kTransitionPasses; then a
+// Only a submitter that never stops outlasts kTransitionEdits; then a
 // handler change cuts over gesture by gesture (closeOpenGesturesLocked) and
 // a detach leaves the rest for the next delivery, never holding the UI
 // thread.
-static constexpr int kTransitionPasses = 4096;
+static constexpr size_t kTransitionEdits = 4096;
 
 // An editor -> host call made off the host UI thread, queued for it. VST3
 // wants IComponentHandler begin/perform/endEdit and IPlugFrame::resizeView
@@ -3463,11 +3463,16 @@ void MooseComponent::drainEdits() {
 void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, bool transition) {
     if (drainingEdits) return;
     drainingEdits = true;
-    const int passes = transition ? kTransitionPasses : kDrainPasses;
-    for (int pass = 0; pass < passes && !pendingEdits.empty()
-         && (transition || mayDeliverLocked()); ++pass) {
+    size_t left = transition ? kTransitionEdits : kDrainEdits;
+    while (left > 0 && !pendingEdits.empty() && (transition || mayDeliverLocked())) {
         std::vector<EditOp> ops;
         ops.swap(pendingEdits);
+        if (ops.size() > left) {
+            // Over budget: the rest goes back ahead of anything newer.
+            pendingEdits.assign(ops.begin() + left, ops.end());
+            ops.resize(left);
+        }
+        left -= ops.size();
         lock.unlock();
         for (const EditOp& op : ops) {
             switch (op.kind) {
