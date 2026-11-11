@@ -24,7 +24,7 @@
 #include <unistd.h>
 #include <cerrno>
 #endif
-#include <limits>
+#include <algorithm>
 #include <mutex>
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -715,13 +715,13 @@ struct PClassInfo {
 // reentering) go in the next pass, so a steady submitter cannot hold the
 // UI thread: what is left waits for the next wake, which is asked for.
 static constexpr int kDrainPasses = 8;
-// A detach, handler change or teardown must not leave an accepted call
-// behind -- the old handler would stay mid-gesture, or a call would outlive
-// its wake -- so it drains until the queue is empty, however long a finite
-// burst runs.
-// ponytail: no cap, so a submitter that never stops holds the transition;
-// add a cancel policy (drop + endEdit for open gestures) if one shows up.
-static constexpr int kTransitionPasses = std::numeric_limits<int>::max();
+// A detach, handler change or teardown drains what is queued before it
+// goes on, so a finite burst finishes on the handler that saw it begin.
+// Only a submitter that never stops outlasts kTransitionPasses; then a
+// handler change cuts over gesture by gesture (closeOpenGesturesLocked) and
+// a detach leaves the rest for the next delivery, never holding the UI
+// thread.
+static constexpr int kTransitionPasses = 4096;
 
 // An editor -> host call made off the host UI thread, queued for it. VST3
 // wants IComponentHandler begin/perform/endEdit and IPlugFrame::resizeView
@@ -1172,6 +1172,8 @@ public:
     std::mutex editMutex;
     void unregister();
     std::vector<EditOp> pendingEdits;
+    // Gestures begun on componentHandler and not yet ended; editMutex.
+    std::vector<uint32> openGestures;
     bool editsClosed = false; // teardown: no more queueing
     bool drainingEdits = false; // guarded by editMutex; callbacks may reenter
     // Queue `op` when a UI-thread wake exists and this is not the UI
@@ -1219,6 +1221,7 @@ public:
     // Defined after MoosePlugView: makes every queued call, on the UI thread.
     void drainEdits();
     bool queueBehindRemainingEdits(EditOp op);
+    std::vector<uint32> closeOpenGesturesLocked(std::unique_lock<std::mutex>& lock);
     void drainEditsLocked(std::unique_lock<std::mutex>& lock, bool transition = false);
     bool inPerformEdit;       // feedback guard: skip setParamNormalized during performEdit
     // Live plug view created by `createView()`. Set there, nulled in
@@ -1302,13 +1305,18 @@ public:
         unregister();
         // Wait for any worker wake before unregistering/closing native handles.
         if (persistBound && g_cb && ctx) g_cb->set_persist_waker(ctx, nullptr, nullptr);
-        // Queued editor calls go out while componentHandler is still held.
+        // Queued editor calls go out while componentHandler is still held,
+        // if this thread may make them: the last reference can be a
+        // worker's pin, and the host is never called from a worker. What
+        // cannot go out is dropped; the host has released this component.
         {
             std::unique_lock<std::mutex> lock(editMutex);
-            drainEditsLocked(lock, true);
-            // The queue is empty and no pinned call is still inside this
-            // component, so closing it drops nothing that was accepted.
+            if (mayDeliverLocked()) {
+                drainEditsLocked(lock, true);
+                if (!pendingEdits.empty()) closeOpenGesturesLocked(lock);
+            }
             editsClosed = true;
+            pendingEdits.clear();
         }
 #if defined(__linux__)
         unbindEditRunLoop();
@@ -2213,12 +2221,20 @@ public:
         // editor calls belong to the handler on the correct side of it.
         std::unique_lock<std::mutex> lock(editMutex);
         drainEditsLocked(lock, true);
+        // A submitter that never stopped: its gestures end on the old
+        // handler and the rest go on in fresh ones on the new handler.
+        std::vector<uint32> reopen;
+        if (!pendingEdits.empty()) reopen = closeOpenGesturesLocked(lock);
         void* previous = componentHandler;
         if (handler) {
             auto addRef_fn = (uint32 (*)(void*))(*(void***)handler)[1];
             addRef_fn(handler);
         }
         componentHandler = handler;
+        if (!handler) reopen.clear();
+        for (auto id = reopen.rbegin(); id != reopen.rend(); ++id)
+            pendingEdits.insert(pendingEdits.begin(), {EditOp::Begin, *id, 0, 0, 0});
+        if (!pendingEdits.empty()) wakeEditsLocked();
         lock.unlock();
         if (previous) {
             auto release_fn = (uint32 (*)(void*))(*(void***)previous)[2];
@@ -3406,6 +3422,8 @@ static void do_begin_edit(MooseComponent* comp, uint32_t id) {
     if (!comp->componentHandler) return;
     auto beginEdit = (tresult (*)(void*, uint32))(*(void***)comp->componentHandler)[3];
     beginEdit(comp->componentHandler, id);
+    std::lock_guard<std::mutex> lock(comp->editMutex);
+    comp->openGestures.push_back(id);
 }
 
 static void do_perform_edit(MooseComponent* comp, uint32_t id, double normalized) {
@@ -3423,6 +3441,12 @@ static void do_end_edit(MooseComponent* comp, uint32_t id) {
     if (!comp->componentHandler) return;
     auto endEdit = (tresult (*)(void*, uint32))(*(void***)comp->componentHandler)[5];
     endEdit(comp->componentHandler, id);
+    {
+        std::lock_guard<std::mutex> lock(comp->editMutex);
+        auto& open = comp->openGestures;
+        auto at = std::find(open.begin(), open.end(), id);
+        if (at != open.end()) open.erase(at);
+    }
     comp->flushPendingRestart();
 }
 
@@ -3457,6 +3481,23 @@ void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, bool t
     }
     drainingEdits = false;
     if (!pendingEdits.empty()) wakeEditsLocked();
+}
+
+// End every gesture still open on componentHandler, on this (delivering)
+// thread, and return their ids. Called with editMutex held and no drain
+// running; the calls are made unlocked, so workers keep queueing.
+std::vector<uint32> MooseComponent::closeOpenGesturesLocked(std::unique_lock<std::mutex>& lock) {
+    std::vector<uint32> open;
+    open.swap(openGestures);
+    void* handler = componentHandler;
+    if (!handler || open.empty()) return open;
+    drainingEdits = true; // late calls queue; no one else delivers meanwhile
+    lock.unlock();
+    auto endEdit = (tresult (*)(void*, uint32))(*(void***)handler)[5];
+    for (uint32 id : open) endEdit(handler, id);
+    lock.lock();
+    drainingEdits = false;
+    return open;
 }
 
 // Preserve FIFO when a bounded synchronous drain leaves work for a later

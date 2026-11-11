@@ -189,17 +189,87 @@ int main(int argc, char** argv) {
     if (argc == 1 || std::strcmp(argv[1], "burst") == 0) {
         Handler next{handler_vtbl, true};
         calls.clear();
-        burst = 5000;
+        burst = 20;
         off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
         com->impl.setComponentHandler(&next);
-        require(calls == std::string(5001, 'p') && com->impl.pendingEdits.empty());
+        require(calls == std::string(21, 'p') && com->impl.pendingEdits.empty());
         com->impl.setComponentHandler(&handler);
         calls.clear();
-        burst = 5000;
+        burst = 20;
         off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
         require(view->vtbl->setFrame(view, nullptr) == kResultOk);
-        require(calls == std::string(5001, 'p') && com->impl.pendingEdits.empty());
+        require(calls == std::string(21, 'p') && com->impl.pendingEdits.empty());
         require(view->vtbl->setFrame(view, &frame) == kResultOk);
+    }
+
+    // A submitter that never stops cannot hold a handler change: past the
+    // transition budget its gesture ends on the old handler and goes on in
+    // a fresh one on the new handler.
+    if (argc == 1 || std::strcmp(argv[1], "cutover") == 0) {
+        Handler next{handler_vtbl, true};
+        calls.clear();
+        flood = true;
+        off_ui([] {
+            moose_vst3_begin_edit(ctx, 7);
+            moose_vst3_perform_edit(ctx, 7, 0.5);
+        });
+        com->impl.setComponentHandler(&next);
+        flood = false;
+        pump(loop);
+        moose_vst3_end_edit(ctx, 7);
+        const size_t e = calls.find('e');
+        require(e == kTransitionPasses + 1); // b and p share the first pass
+        require(calls == "b" + std::string(e - 1, 'p') + "eB" + std::string(calls.size() - e - 3, 'P') + "E");
+        require(com->impl.pendingEdits.empty() && com->impl.openGestures.empty());
+        com->impl.setComponentHandler(&handler);
+
+        // A detach under the same flood leaves the rest for the next call.
+        calls.clear();
+        flood = true;
+        off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
+        require(view->vtbl->setFrame(view, nullptr) == kResultOk);
+        require(calls == std::string(kTransitionPasses, 'p') && !com->impl.pendingEdits.empty());
+        flood = false;
+        moose_vst3_end_edit(ctx, 7); // no frame now: delivered in place, after the rest
+        require(calls == std::string(kTransitionPasses + 1, 'p') + "e");
+        require(view->vtbl->setFrame(view, &frame) == kResultOk);
+    }
+
+    // A worker holds the last reference when the host lets go, with an edit
+    // queued for the bound UI thread. Here the view's release unbinds and
+    // delivers it on the UI thread; teardown then runs on the worker and
+    // makes no host call there (record() requires the UI thread). On macOS
+    // and Windows the wake lives as long as the component, and the
+    // destructor's mayDeliverLocked() gate drops the edit instead.
+    if (argc == 1 || std::strcmp(argv[1], "lastpin") == 0) {
+        static std::atomic<int> step{0};
+        static std::atomic<bool> destroyed{false};
+        callbacks.destroy = [](void*) { destroyed = true; };
+        static int own_token; // its own ctx, so the pin finds this instance
+        callbacks.create = []() -> void* { return &own_token; };
+        auto* other = create_component();
+        callbacks.create = []() -> void* { return &context_token; };
+        static void* other_ctx; other_ctx = other->impl.rustContext();
+        require(other_ctx == &own_token);
+        other->impl.setComponentHandler(&handler);
+        RunLoop loop2{loop_vtbl};
+        Frame frame2{frame_vtbl, &loop2};
+        auto* v2 = static_cast<MoosePlugView*>(other->vtbl_controller->createView(&other->vtbl_controller, "editor"));
+        require(v2->vtbl->setFrame(v2, &frame2) == kResultOk && loop2.handler);
+        calls.clear();
+        std::thread worker([] {
+            PinnedComponent pin(other_ctx);
+            require(pin.comp && pin.comp->tryQueueEdit({EditOp::Perform, 7, 0.5, 0, 0}));
+            step = 1;
+            while (step != 2) std::this_thread::yield();
+        });
+        while (step != 1) std::this_thread::yield();
+        v2->vtbl->release(v2);
+        other->vtbl_component->release(other);
+        require(!destroyed);
+        step = 2;
+        worker.join();
+        require(destroyed && calls == "p");
     }
 
     // Enqueue from a worker while the old handler is draining. Its End
@@ -289,7 +359,7 @@ int main(int argc, char** argv) {
 
     // The host drops its last reference from inside performEdit: the
     // component outlives the callback and goes when the editor call returns.
-    if (argc == 1 || std::strcmp(argv[1], "reentrant") == 0) {
+    if (argc == 1 || std::strcmp(argv[1], "release") == 0) {
         static std::atomic<bool> destroyed{false};
         static MooseComponentCOM* victim;
         destroyed = false;
