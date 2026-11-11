@@ -1301,8 +1301,9 @@ public:
         {
             std::unique_lock<std::mutex> lock(editMutex);
             drainEditsLocked(lock, kTransitionPasses);
-            // A worker that kept submitting past the bounded drain: the host
-            // is releasing this component, so what is left goes nowhere.
+            // Only a submitter that never stopped outlasts kTransitionPasses;
+            // the host is releasing this component, so that remainder goes
+            // nowhere (and no pinned call is still inside it by now).
             editsClosed = true;
             pendingEdits.clear();
         }
