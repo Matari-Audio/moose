@@ -3,6 +3,7 @@
 // in order, woken through the host IRunLoop's event handler.
 #include "../../shim/vst3_shim.cpp"
 #include <thread>
+#include <fcntl.h>
 
 static int context_token;
 static void require_impl(bool ok, const char* condition, int line) {
@@ -14,12 +15,20 @@ static pthread_t ui;
 static std::string calls;
 static void record(char c) { require(pthread_equal(pthread_self(), ui)); calls += c; }
 
-struct Handler { void** vtbl; };
+struct Handler { void** vtbl; bool replacement = false; };
+static bool workerOnBegin = false;
+static bool emitOnResize = false;
+static bool workerOnResize = false;
 static tresult h_query(void*, const TUID, void**) { return kNoInterface; }
 static uint32 h_ref(void*) { return 1; }
-static tresult h_begin(void*, uint32) { record('b'); return kResultOk; }
+static tresult h_begin(void* self, uint32) { record(static_cast<Handler*>(self)->replacement ? 'B' : 'b');
+    if (workerOnBegin) {
+        workerOnBegin = false;
+        std::thread([] { moose_vst3_end_edit(&context_token, 7); }).join();
+    }
+    return kResultOk; }
 static tresult h_perform(void*, uint32, double v) { record(v == 0.5 ? 'p' : '?'); return kResultOk; }
-static tresult h_end(void*, uint32) { record('e'); return kResultOk; }
+static tresult h_end(void* self, uint32) { record(static_cast<Handler*>(self)->replacement ? 'E' : 'e'); return kResultOk; }
 static tresult h_restart(void*, int32) { return kResultOk; }
 
 struct RunLoop {
@@ -52,14 +61,20 @@ static tresult frame_query(void* self, const TUID iid, void** out) {
     if (iid_equal(iid, IRunLoop_iid)) { *out = frame->loop; return kResultOk; }
     *out = nullptr; return kNoInterface;
 }
-static tresult frame_resize(void* self, void*, ViewRect* rect) {
+static tresult frame_resize(void* self, void* view, ViewRect* rect) {
     record('r'); require(rect->right == 640 && rect->bottom == 480);
-    ++static_cast<Frame*>(self)->resizes; return kResultOk;
+    ++static_cast<Frame*>(self)->resizes;
+    if (emitOnResize) {
+        emitOnResize = false;
+        auto* pv = static_cast<MoosePlugView*>(view);
+        require(pv->vtbl->onSize(pv, rect) == kResultOk);
+    }
+    return kResultOk;
 }
 
 static void off_ui(void (*f)()) { std::thread(f).join(); }
 
-int main() {
+int main(int argc, char** argv) {
     ui = pthread_self();
     Vst3Callbacks callbacks{};
     callbacks.wants_persist_notifications = [](void*) -> bool { return false; };
@@ -67,6 +82,14 @@ int main() {
     callbacks.destroy = [](void*) {};
     callbacks.gui_has_editor = [](void*) -> int32_t { return 1; };
     callbacks.gui_close = [](void*) {};
+    callbacks.gui_set_size = [](void* ctx, uint32_t, uint32_t) {
+        if (workerOnResize) {
+            std::thread([ctx] { moose_vst3_end_edit(ctx, 7); }).join();
+        } else {
+            moose_vst3_begin_edit(ctx, 8);
+            moose_vst3_end_edit(ctx, 8);
+        }
+    };
     callbacks.param_presentation_revision = [](void*) -> uint64_t { return 0; };
     g_cb = &callbacks;
 
@@ -102,6 +125,62 @@ int main() {
     off_ui([] { moose_vst3_begin_edit(ctx, 7); });
     moose_vst3_end_edit(ctx, 7);
     require(calls == "be");
+
+    // A synchronous resize -> onSize -> editor callback must not jump
+    // ahead of the rest of the batch already being delivered.
+    if (argc == 1 || std::strcmp(argv[1], "reentrant") == 0) {
+        calls.clear();
+        emitOnResize = true;
+        off_ui([] {
+            moose_vst3_begin_edit(ctx, 7);
+            moose_vst3_request_resize(ctx, 640, 480);
+            moose_vst3_perform_edit(ctx, 7, 0.5);
+            moose_vst3_end_edit(ctx, 7);
+        });
+        pump(loop);
+        require(calls == "brpebe");
+    }
+
+    // Enqueue from a worker while the old handler is draining. Its End
+    // must finish on that handler, before replacement or clearing it.
+    if (argc == 1 || std::strcmp(argv[1], "handler") == 0) {
+        Handler next{handler_vtbl, true};
+        for (void* target : {static_cast<void*>(&next), static_cast<void*>(nullptr)}) {
+            calls.clear();
+            emitOnResize = workerOnResize = true;
+            off_ui([] {
+                moose_vst3_begin_edit(ctx, 7);
+                moose_vst3_request_resize(ctx, 640, 480);
+                moose_vst3_perform_edit(ctx, 7, 0.5);
+            });
+            com->impl.setComponentHandler(target);
+            require(calls == "brpe");
+            if (target) {
+                moose_vst3_begin_edit(ctx, 8);
+                moose_vst3_end_edit(ctx, 8);
+                require(calls == "brpeBE");
+            }
+            com->impl.setComponentHandler(&handler);
+        }
+        workerOnResize = false;
+    }
+
+    // Force a worker enqueue inside the detach drain. The run-loop
+    // ownership marker must remain live until this batch also finishes.
+    if (argc == 1 || std::strcmp(argv[1], "detach") == 0) {
+        calls.clear();
+        workerOnBegin = true;
+        off_ui([] {
+            moose_vst3_begin_edit(ctx, 7);
+            moose_vst3_perform_edit(ctx, 7, 0.5);
+        });
+        int oldFd = loop.fd;
+        require(view->vtbl->setFrame(view, nullptr) == kResultOk);
+        require(calls == "bpe" && !loop.handler && loop.timers == 0);
+        require(fcntl(oldFd, F_GETFD) == -1 && errno == EBADF);
+        workerOnResize = false;
+        require(view->vtbl->setFrame(view, &frame) == kResultOk);
+    }
 
     // Detaching delivers the rest: the host never stays mid-gesture.
     calls.clear();

@@ -1032,20 +1032,17 @@ public:
         release(rl);
     }
     void unbindEditRunLoop() {
-        void* rl;
-        int fd;
-        {
-            // Stop queueing first; later calls go straight through.
-            std::lock_guard<std::mutex> lock(editMutex);
-            rl = editRunLoop;
-            fd = editFd;
-            editRunLoop = nullptr;
-            editFd = -1;
-        }
+        std::unique_lock<std::mutex> lock(editMutex);
+        void* rl = editRunLoop;
+        int fd = editFd;
         if (!rl) return;
-        // Deliver what is queued while the handler and frame are still
-        // valid: an unmatched beginEdit would leave the host mid-gesture.
-        drainEdits();
+        // Keep workers queueing until the UI thread has delivered every
+        // pending edit. Clearing the wake and observing an empty queue must
+        // be atomic, or a worker could steal the detach batch.
+        drainEditsLocked(lock);
+        editRunLoop = nullptr;
+        editFd = -1;
+        lock.unlock();
         auto unreg = (tresult (*)(void*, void*))(*(void***)rl)[4];
         unreg(rl, &editEvent);
         auto release = (uint32 (*)(void*))(*(void***)rl)[2];
@@ -1156,10 +1153,15 @@ public:
     std::mutex editMutex;
     std::vector<EditOp> pendingEdits;
     bool editsClosed = false; // teardown: no more queueing
+    bool drainingEdits = false; // guarded by editMutex; callbacks may reenter
     // Queue `op` when a UI-thread wake exists and this is not the UI
     // thread; false means call through now (the pre-existing direct path).
     bool tryQueueEdit(EditOp op) {
         std::lock_guard<std::mutex> lock(editMutex);
+        if (drainingEdits) {
+            pendingEdits.push_back(op);
+            return true;
+        }
         if (editsClosed) return false;
 #if defined(__linux__)
         if (!editRunLoop || pthread_equal(pthread_self(), uiThread)) return false;
@@ -1183,6 +1185,7 @@ public:
     }
     // Defined after MoosePlugView: makes every queued call, on the UI thread.
     void drainEdits();
+    void drainEditsLocked(std::unique_lock<std::mutex>& lock);
     bool inPerformEdit;       // feedback guard: skip setParamNormalized during performEdit
     // Live plug view created by `createView()`. Set there, nulled in
     // `pv_release` when refcount -> 0. `moose_vst3_request_resize`
@@ -1263,13 +1266,12 @@ public:
         if (persistBound && g_cb && ctx) g_cb->set_persist_waker(ctx, nullptr, nullptr);
         // Queued editor calls go out while componentHandler is still held.
         {
-            std::lock_guard<std::mutex> lock(editMutex);
+            std::unique_lock<std::mutex> lock(editMutex);
+            drainEditsLocked(lock);
             editsClosed = true;
         }
 #if defined(__linux__)
         unbindEditRunLoop();
-#else
-        drainEdits();
 #endif
 #if defined(__linux__)
         if (persistRunLoop) {
@@ -2169,16 +2171,23 @@ public:
     }
 
     tresult setComponentHandler(void* handler) {
-        if (componentHandler) {
-            auto release_fn = (uint32 (*)(void*))(*(void***)componentHandler)[2];
-            release_fn(componentHandler);
+        // Host handler changes run on the UI thread. Hold the queue lock
+        // across the empty-queue / handler-swap boundary so concurrent
+        // editor calls belong to the handler on the correct side of it.
+        std::unique_lock<std::mutex> lock(editMutex);
+        drainEditsLocked(lock);
+        void* previous = componentHandler;
+        if (handler) {
+            auto addRef_fn = (uint32 (*)(void*))(*(void***)handler)[1];
+            addRef_fn(handler);
         }
         componentHandler = handler;
-        if (componentHandler) {
-            auto addRef_fn = (uint32 (*)(void*))(*(void***)componentHandler)[1];
-            addRef_fn(componentHandler);
-            flushPersistChange();
+        lock.unlock();
+        if (previous) {
+            auto release_fn = (uint32 (*)(void*))(*(void***)previous)[2];
+            release_fn(previous);
         }
+        if (handler) flushPersistChange();
         return kResultOk;
     }
 
@@ -3349,19 +3358,28 @@ static void do_end_edit(MooseComponent* comp, uint32_t id) {
 static int32_t do_request_resize(MooseComponent* comp, uint32_t w, uint32_t h);
 
 void MooseComponent::drainEdits() {
-    std::vector<EditOp> ops;
-    {
-        std::lock_guard<std::mutex> lock(editMutex);
+    std::unique_lock<std::mutex> lock(editMutex);
+    drainEditsLocked(lock);
+}
+
+void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock) {
+    if (drainingEdits) return;
+    drainingEdits = true;
+    while (!pendingEdits.empty()) {
+        std::vector<EditOp> ops;
         ops.swap(pendingEdits);
-    }
-    for (const EditOp& op : ops) {
-        switch (op.kind) {
-            case EditOp::Begin: do_begin_edit(this, op.id); break;
-            case EditOp::Perform: do_perform_edit(this, op.id, op.value); break;
-            case EditOp::End: do_end_edit(this, op.id); break;
-            case EditOp::Resize: do_request_resize(this, op.w, op.h); break;
+        lock.unlock();
+        for (const EditOp& op : ops) {
+            switch (op.kind) {
+                case EditOp::Begin: do_begin_edit(this, op.id); break;
+                case EditOp::Perform: do_perform_edit(this, op.id, op.value); break;
+                case EditOp::End: do_end_edit(this, op.id); break;
+                case EditOp::Resize: do_request_resize(this, op.w, op.h); break;
+            }
         }
+        lock.lock();
     }
+    drainingEdits = false;
 }
 
 // Each call is made now on the host UI thread (after anything queued
