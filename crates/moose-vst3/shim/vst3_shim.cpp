@@ -1193,6 +1193,7 @@ public:
     }
     // Defined after MoosePlugView: makes every queued call, on the UI thread.
     void drainEdits();
+    bool queueBehindRemainingEdits(EditOp op);
     void drainEditsLocked(std::unique_lock<std::mutex>& lock);
     bool inPerformEdit;       // feedback guard: skip setParamNormalized during performEdit
     // Live plug view created by `createView()`. Set there, nulled in
@@ -3402,13 +3403,25 @@ void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock) {
     if (!pendingEdits.empty()) wakeEditsLocked();
 }
 
+// Preserve FIFO when a bounded synchronous drain leaves work for a later
+// wake. Check and append under the same lock used by worker submissions.
+bool MooseComponent::queueBehindRemainingEdits(EditOp op) {
+    std::unique_lock<std::mutex> lock(editMutex);
+    drainEditsLocked(lock);
+    if (editsClosed) return true;
+    if (pendingEdits.empty()) return false;
+    pendingEdits.push_back(op);
+    wakeEditsLocked();
+    return true;
+}
+
 // Each call is made now on the host UI thread (after anything queued
 // before it), or queued for that thread when it comes from another one.
 void moose_vst3_begin_edit(void* ctx, uint32_t id) {
     auto* comp = ctx_lookup(ctx);
     if (!comp) return;
     if (comp->tryQueueEdit({EditOp::Begin, id, 0, 0, 0})) return;
-    comp->drainEdits();
+    if (comp->queueBehindRemainingEdits({EditOp::Begin, id, 0, 0, 0})) return;
     do_begin_edit(comp, id);
 }
 
@@ -3416,7 +3429,7 @@ void moose_vst3_perform_edit(void* ctx, uint32_t id, double normalized) {
     auto* comp = ctx_lookup(ctx);
     if (!comp) return;
     if (comp->tryQueueEdit({EditOp::Perform, id, normalized, 0, 0})) return;
-    comp->drainEdits();
+    if (comp->queueBehindRemainingEdits({EditOp::Perform, id, normalized, 0, 0})) return;
     do_perform_edit(comp, id, normalized);
 }
 
@@ -3424,7 +3437,7 @@ void moose_vst3_end_edit(void* ctx, uint32_t id) {
     auto* comp = ctx_lookup(ctx);
     if (!comp) return;
     if (comp->tryQueueEdit({EditOp::End, id, 0, 0, 0})) return;
-    comp->drainEdits();
+    if (comp->queueBehindRemainingEdits({EditOp::End, id, 0, 0, 0})) return;
     do_end_edit(comp, id);
 }
 
@@ -3484,7 +3497,7 @@ int32_t moose_vst3_request_resize(void* ctx, uint32_t w, uint32_t h) {
     auto* comp = ctx_lookup(ctx);
     if (!comp) return 0;
     if (comp->tryQueueEdit({EditOp::Resize, 0, 0, w, h})) return 1;
-    comp->drainEdits();
+    if (comp->queueBehindRemainingEdits({EditOp::Resize, 0, 0, w, h})) return 1;
     return do_request_resize(comp, w, h);
 }
 

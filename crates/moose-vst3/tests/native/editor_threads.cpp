@@ -160,6 +160,23 @@ int main(int argc, char** argv) {
         require(calls == std::string(kDrainPasses + 1, 'p'));
     }
 
+    // Every UI operation stays behind the remainder of a saturated drain.
+    for (char operation : std::string("bper")) {
+        calls.clear();
+        flood = true;
+        off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
+        switch (operation) {
+            case 'b': moose_vst3_begin_edit(ctx, 7); break;
+            case 'p': moose_vst3_perform_edit(ctx, 7, 0.5); break;
+            case 'e': moose_vst3_end_edit(ctx, 7); break;
+            case 'r': require(moose_vst3_request_resize(ctx, 640, 480) == 1); break;
+        }
+        require(calls == std::string(kDrainPasses, 'p') && readable(loop.fd));
+        flood = false;
+        pump(loop);
+        require(calls == std::string(kDrainPasses + 1, 'p') + operation);
+    }
+
     // Enqueue from a worker while the old handler is draining. Its End
     // must finish on that handler, before replacement or clearing it.
     if (argc == 1 || std::strcmp(argv[1], "handler") == 0) {
