@@ -51,6 +51,11 @@ fn editor_ownership() {
 }
 
 #[test]
+fn editor_calls_off_the_ui_thread() {
+    run_fixture("editor_threads", &[]);
+}
+
+#[test]
 fn parameter_units() {
     run_fixture("parameter_units", &[]);
 }

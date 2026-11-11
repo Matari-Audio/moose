@@ -22,6 +22,8 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <cerrno>
+#include <mutex>
+#include <pthread.h>
 #endif
 #if __APPLE__
 // libdispatch: an event-driven bridge that marshals a pending
@@ -811,6 +813,21 @@ struct PersistEventHandler {
     PersistEventVtbl* vtbl;
     MooseComponent* comp;
 };
+// Editor -> host calls made off the host UI thread. VST3 wants
+// IComponentHandler begin/perform/endEdit and IPlugFrame::resizeView on
+// the UI thread, but a Linux editor may run its own X11 thread. Such calls
+// queue here and an eventfd registered with the host's IRunLoop wakes the
+// UI thread to make them, in order.
+static void eh_onFDIsSet(void*, int);
+static PersistEventVtbl g_edit_event_vtbl = {
+    ph_queryInterface, ph_addRef, ph_release, eh_onFDIsSet,
+};
+struct EditOp {
+    enum Kind : uint8_t { Begin, Perform, End, Resize } kind;
+    uint32_t id;
+    double value;
+    uint32_t w, h;
+};
 struct ITimerHandlerVtbl {
     tresult (*queryInterface)(void*, const TUID, void**);
     uint32  (*addRef)(void*);
@@ -987,6 +1004,67 @@ public:
     PersistEventHandler persistEvent{&g_persist_event_vtbl, this};
     int persistFd = -1;
     void* persistRunLoop = nullptr;
+    // Off-UI-thread editor calls (see EditOp). `editMutex` guards the
+    // queue and `editFd`, so a writer never signals a closed fd.
+    PersistEventHandler editEvent{&g_edit_event_vtbl, this};
+    std::mutex editMutex;
+    std::vector<EditOp> pendingEdits;
+    int editFd = -1;
+    void* editRunLoop = nullptr;
+    pthread_t uiThread{};
+    // Queue `op` when a run loop is bound and this is not its thread;
+    // false means call through now (on the UI thread, or no run loop: the
+    // pre-existing direct path).
+    bool tryQueueEdit(EditOp op) {
+        std::lock_guard<std::mutex> lock(editMutex);
+        if (!editRunLoop || pthread_equal(pthread_self(), uiThread)) return false;
+        pendingEdits.push_back(op);
+        const uint64_t one = 1;
+        ssize_t result;
+        do { result = write(editFd, &one, sizeof(one)); }
+        while (result < 0 && errno == EINTR);
+        return true;
+    }
+    void bindEditRunLoop(void* frame) {
+        void* rl = nullptr;
+        auto qi = (tresult (*)(void*, const TUID, void**))(*(void***)frame)[0];
+        if (qi(frame, IRunLoop_iid, &rl) != kResultOk || !rl) return;
+        int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        auto reg = (tresult (*)(void*, void*, int))(*(void***)rl)[3];
+        if (fd >= 0 && reg(rl, &editEvent, fd) == kResultOk) {
+            std::lock_guard<std::mutex> lock(editMutex);
+            uiThread = pthread_self();
+            editFd = fd;
+            editRunLoop = rl;
+            return;
+        }
+        if (fd >= 0) close(fd);
+        auto release = (uint32 (*)(void*))(*(void***)rl)[2];
+        release(rl);
+    }
+    // Defined after MoosePlugView: makes every queued call, on the UI thread.
+    void drainEdits();
+    void unbindEditRunLoop() {
+        void* rl;
+        int fd;
+        {
+            // Stop queueing first; later calls go straight through.
+            std::lock_guard<std::mutex> lock(editMutex);
+            rl = editRunLoop;
+            fd = editFd;
+            editRunLoop = nullptr;
+            editFd = -1;
+        }
+        if (!rl) return;
+        // Deliver what is queued while the handler and frame are still
+        // valid: an unmatched beginEdit would leave the host mid-gesture.
+        drainEdits();
+        auto unreg = (tresult (*)(void*, void*))(*(void***)rl)[4];
+        unreg(rl, &editEvent);
+        auto release = (uint32 (*)(void*))(*(void***)rl)[2];
+        release(rl);
+        close(fd);
+    }
 #endif
     static void wakePersist(void* context) {
         auto* comp = static_cast<MooseComponent*>(context);
@@ -1161,6 +1239,8 @@ public:
         // Wait for any worker wake before unregistering/closing native handles.
         if (persistBound && g_cb && ctx) g_cb->set_persist_waker(ctx, nullptr, nullptr);
 #if defined(__linux__)
+        // Queued editor calls go out while componentHandler is still held.
+        unbindEditRunLoop();
         if (persistRunLoop) {
             auto unreg = (tresult (*)(void*, void*))(*(void***)persistRunLoop)[4];
             unreg(persistRunLoop, &persistEvent);
@@ -2103,6 +2183,8 @@ public:
         // Keep an independent addRef'd event registration until component
         // destruction; closing/detaching this view must not strand completion.
         bindPersistRunLoop(frame);
+        unbindEditRunLoop();
+        if (frame) bindEditRunLoop(frame);
         if (runLoop) {
             auto unreg = (tresult (*)(void*, void*))
                 (*(void***)runLoop)[kRunLoopUnregisterTimerIndex];
@@ -2150,6 +2232,13 @@ static void ph_onFDIsSet(void* self, int fd) {
     do { result = read(fd, &value, sizeof(value)); } while (result < 0 && errno == EINTR);
     if (handler->comp) handler->comp->flushPersistChange();
 }
+static void eh_onFDIsSet(void* self, int fd) {
+    auto* handler = static_cast<PersistEventHandler*>(self);
+    uint64_t value;
+    ssize_t result;
+    do { result = read(fd, &value, sizeof(value)); } while (result < 0 && errno == EINTR);
+    if (handler->comp) handler->comp->drainEdits();
+}
 
 // ITimerHandler method bodies - defined here, now that MooseComponent is
 // complete. The handler is embedded in the component and not
@@ -2170,7 +2259,10 @@ static void th_onTimer(void* self) {
     // editor is open. Cheap when idle: flushPendingRestart exchanges the
     // atomic and returns immediately when no bits are set.
     auto* h = (RestartTimerHandler*)self;
-    if (h->comp) h->comp->flushPendingRestart();
+    if (!h->comp) return;
+    h->comp->flushPendingRestart();
+    // A host that dropped an eventfd wake still gets queued edits here.
+    h->comp->drainEdits();
 }
 #endif
 
@@ -3198,16 +3290,14 @@ static MooseComponent* ctx_lookup(void* ctx) {
     return nullptr;
 }
 
-void moose_vst3_begin_edit(void* ctx, uint32_t id) {
-    auto* comp = ctx_lookup(ctx);
-    if (!comp || !comp->componentHandler) return;
+static void do_begin_edit(MooseComponent* comp, uint32_t id) {
+    if (!comp->componentHandler) return;
     auto beginEdit = (tresult (*)(void*, uint32))(*(void***)comp->componentHandler)[3];
     beginEdit(comp->componentHandler, id);
 }
 
-void moose_vst3_perform_edit(void* ctx, uint32_t id, double normalized) {
-    auto* comp = ctx_lookup(ctx);
-    if (!comp || !comp->componentHandler) return;
+static void do_perform_edit(MooseComponent* comp, uint32_t id, double normalized) {
+    if (!comp->componentHandler) return;
     comp->inPerformEdit = true;
     auto performEdit = (tresult (*)(void*, uint32, double))(*(void***)comp->componentHandler)[4];
     performEdit(comp->componentHandler, id, normalized);
@@ -3217,12 +3307,63 @@ void moose_vst3_perform_edit(void* ctx, uint32_t id, double normalized) {
     comp->flushPendingRestart();
 }
 
-void moose_vst3_end_edit(void* ctx, uint32_t id) {
-    auto* comp = ctx_lookup(ctx);
-    if (!comp || !comp->componentHandler) return;
+static void do_end_edit(MooseComponent* comp, uint32_t id) {
+    if (!comp->componentHandler) return;
     auto endEdit = (tresult (*)(void*, uint32))(*(void***)comp->componentHandler)[5];
     endEdit(comp->componentHandler, id);
     comp->flushPendingRestart();
+}
+
+static int32_t do_request_resize(MooseComponent* comp, uint32_t w, uint32_t h);
+
+#if defined(__linux__)
+void MooseComponent::drainEdits() {
+    std::vector<EditOp> ops;
+    {
+        std::lock_guard<std::mutex> lock(editMutex);
+        ops.swap(pendingEdits);
+    }
+    for (const EditOp& op : ops) {
+        switch (op.kind) {
+            case EditOp::Begin: do_begin_edit(this, op.id); break;
+            case EditOp::Perform: do_perform_edit(this, op.id, op.value); break;
+            case EditOp::End: do_end_edit(this, op.id); break;
+            case EditOp::Resize: do_request_resize(this, op.w, op.h); break;
+        }
+    }
+}
+#endif
+
+// Each call is made now on the host UI thread (after anything queued
+// before it), or queued for that thread when it comes from another one.
+void moose_vst3_begin_edit(void* ctx, uint32_t id) {
+    auto* comp = ctx_lookup(ctx);
+    if (!comp) return;
+#if defined(__linux__)
+    if (comp->tryQueueEdit({EditOp::Begin, id, 0, 0, 0})) return;
+    comp->drainEdits();
+#endif
+    do_begin_edit(comp, id);
+}
+
+void moose_vst3_perform_edit(void* ctx, uint32_t id, double normalized) {
+    auto* comp = ctx_lookup(ctx);
+    if (!comp) return;
+#if defined(__linux__)
+    if (comp->tryQueueEdit({EditOp::Perform, id, normalized, 0, 0})) return;
+    comp->drainEdits();
+#endif
+    do_perform_edit(comp, id, normalized);
+}
+
+void moose_vst3_end_edit(void* ctx, uint32_t id) {
+    auto* comp = ctx_lookup(ctx);
+    if (!comp) return;
+#if defined(__linux__)
+    if (comp->tryQueueEdit({EditOp::End, id, 0, 0, 0})) return;
+    comp->drainEdits();
+#endif
+    do_end_edit(comp, id);
 }
 
 // Plugin -> host restart request. The audio thread calls this to flag a
@@ -3272,9 +3413,20 @@ static void moose_vst3_restart_source_event(void* key) {
 // magic `[3]` hidden in vtable arithmetic.
 static constexpr int32_t kPlugFrameResizeViewIndex = 3;
 
+// Off the UI thread the request is queued and reported as made: the
+// host's IPlugView::onSize is what commits a size, either way.
 int32_t moose_vst3_request_resize(void* ctx, uint32_t w, uint32_t h) {
     auto* comp = ctx_lookup(ctx);
-    if (!comp || !comp->plugView) return 0;
+    if (!comp) return 0;
+#if defined(__linux__)
+    if (comp->tryQueueEdit({EditOp::Resize, 0, 0, w, h})) return 1;
+    comp->drainEdits();
+#endif
+    return do_request_resize(comp, w, h);
+}
+
+static int32_t do_request_resize(MooseComponent* comp, uint32_t w, uint32_t h) {
+    if (!comp->plugView) return 0;
     auto* pv = comp->plugView;
     if (!pv->frame) return 0;
     ViewRect rect;
