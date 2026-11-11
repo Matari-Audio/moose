@@ -1058,7 +1058,7 @@ public:
         // Keep workers queueing until the UI thread has delivered every
         // pending edit. Clearing the wake and observing an empty queue must
         // be atomic, or a worker could steal the detach batch.
-        drainEditsLocked(lock, kTransitionPasses);
+        drainEditsLocked(lock, true);
         editRunLoop = nullptr;
         editFd = -1;
         lock.unlock();
@@ -1170,9 +1170,7 @@ public:
     // Editor calls made off the UI thread, oldest first (see EditOp).
     // `editMutex` also guards each platform's wake handle against teardown.
     std::mutex editMutex;
-    // Exported editor calls currently inside this instance (PinnedComponent).
-    std::atomic<int> pinned{0};
-    void unregisterAndQuiesce();
+    void unregister();
     std::vector<EditOp> pendingEdits;
     bool editsClosed = false; // teardown: no more queueing
     bool drainingEdits = false; // guarded by editMutex; callbacks may reenter
@@ -1187,18 +1185,23 @@ public:
             pendingEdits.push_back(op);
             return true;
         }
-#if defined(__linux__)
-        if (!editRunLoop || pthread_equal(pthread_self(), uiThread)) return false;
-#elif __APPLE__
-        if (!restartSource || pthread_main_np()) return false;
-#elif defined(_WIN32)
-        if (!restartTimerId || GetCurrentThreadId() == uiThreadId) return false;
-#else
-        return false;
-#endif
+        if (mayDeliverLocked()) return false;
         pendingEdits.push_back(op);
         wakeEditsLocked();
         return true;
+    }
+    // This thread may make host calls now: it is the host UI thread, or no
+    // UI-thread wake is bound. Caller holds editMutex; binding takes it too.
+    bool mayDeliverLocked() const {
+#if defined(__linux__)
+        return !editRunLoop || pthread_equal(pthread_self(), uiThread);
+#elif __APPLE__
+        return !restartSource || pthread_main_np();
+#elif defined(_WIN32)
+        return !restartTimerId || GetCurrentThreadId() == uiThreadId;
+#else
+        return true;
+#endif
     }
     // Ask the UI thread for a drain. Windows needs nothing: its UI-thread
     // timer drains on every tick. Caller holds editMutex.
@@ -1216,7 +1219,7 @@ public:
     // Defined after MoosePlugView: makes every queued call, on the UI thread.
     void drainEdits();
     bool queueBehindRemainingEdits(EditOp op);
-    void drainEditsLocked(std::unique_lock<std::mutex>& lock, int passes = kDrainPasses);
+    void drainEditsLocked(std::unique_lock<std::mutex>& lock, bool transition = false);
     bool inPerformEdit;       // feedback guard: skip setParamNormalized during performEdit
     // Live plug view created by `createView()`. Set there, nulled in
     // `pv_release` when refcount -> 0. `moose_vst3_request_resize`
@@ -1294,15 +1297,15 @@ public:
     }
 
     ~MooseComponent() {
-        // No new editor call can find this instance, and the ones already
-        // inside it finish before anything they use is torn down.
-        unregisterAndQuiesce();
+        // No new editor call can find this instance. One already inside
+        // holds a reference (PinnedComponent), so none is running now.
+        unregister();
         // Wait for any worker wake before unregistering/closing native handles.
         if (persistBound && g_cb && ctx) g_cb->set_persist_waker(ctx, nullptr, nullptr);
         // Queued editor calls go out while componentHandler is still held.
         {
             std::unique_lock<std::mutex> lock(editMutex);
-            drainEditsLocked(lock, kTransitionPasses);
+            drainEditsLocked(lock, true);
             // The queue is empty and no pinned call is still inside this
             // component, so closing it drops nothing that was accepted.
             editsClosed = true;
@@ -1325,7 +1328,7 @@ public:
             release_fn(componentHandler);
         }
 #if __APPLE__
-        // Unregistering happened first (unregisterAndQuiesce), so any in-flight handler
+        // Unregistering happened first (unregister), so any in-flight handler
         // resolves null and never touches this freed instance. cancel()
         // stops further invocations; release() is safe mid-handler
         // (libdispatch retains the source across a running handler).
@@ -1368,6 +1371,12 @@ public:
     tresult queryInterface(void* comBase, const TUID iid, void** obj);
 
     uint32 addRef() { return ++refCount; }
+    // A reference unless the count already reached zero (teardown begun).
+    bool tryAddRef() {
+        int32 r = refCount.load(std::memory_order_relaxed);
+        while (r > 0 && !refCount.compare_exchange_weak(r, r + 1)) {}
+        return r > 0;
+    }
     uint32 release() { return --refCount; }
 
     // --- IPluginBase ---
@@ -2203,7 +2212,7 @@ public:
         // across the empty-queue / handler-swap boundary so concurrent
         // editor calls belong to the handler on the correct side of it.
         std::unique_lock<std::mutex> lock(editMutex);
-        drainEditsLocked(lock, kTransitionPasses);
+        drainEditsLocked(lock, true);
         void* previous = componentHandler;
         if (handler) {
             auto addRef_fn = (uint32 (*)(void*))(*(void***)handler)[1];
@@ -3360,49 +3369,37 @@ static MooseComponent* ctx_lookup(void* ctx) {
     return nullptr;
 }
 
-// Pins on this thread, so a host that releases the component from inside a
-// callback we made (same thread, further up the stack) is not waited on.
-static thread_local MooseComponent* t_pinnedComp = nullptr;
-static thread_local int t_pinnedDepth = 0;
-
-// An exported editor call's hold on its instance: found and counted under
-// g_ctx_mutex, so the destructor -- which unregisters under that mutex and
-// then waits for the count -- cannot free it while the call runs. Editor
-// threads may outlive the host's release (nothing makes `close` join them).
+// An exported editor call's reference to its instance, taken under
+// g_ctx_mutex while the instance is still registered. The host may drop its
+// last reference meanwhile -- from another thread, or from inside a callback
+// this call made -- and the instance then goes when the call returns.
+// Editor threads may outlive the host's release (nothing makes `close`
+// join them).
 struct PinnedComponent {
     MooseComponent* comp = nullptr;
     explicit PinnedComponent(void* ctx) {
         std::lock_guard<std::mutex> lock(g_ctx_mutex);
         comp = ctx_lookup(ctx);
-        if (!comp) return;
-        comp->pinned.fetch_add(1, std::memory_order_acq_rel);
-        if (!t_pinnedComp || t_pinnedComp == comp) {
-            t_pinnedComp = comp;
-            ++t_pinnedDepth;
-        }
+        if (comp && !comp->tryAddRef()) comp = nullptr;
     }
     ~PinnedComponent() {
-        if (!comp) return;
-        if (t_pinnedComp == comp && --t_pinnedDepth == 0) t_pinnedComp = nullptr;
-        comp->pinned.fetch_sub(1, std::memory_order_acq_rel);
+        // `impl` follows the eight interface vtable pointers.
+        if (comp) comp_release(reinterpret_cast<char*>(comp) - 8 * sizeof(void*));
     }
     PinnedComponent(const PinnedComponent&) = delete;
     PinnedComponent& operator=(const PinnedComponent&) = delete;
 };
 
-void MooseComponent::unregisterAndQuiesce() {
-    if (ctx) {
-        std::lock_guard<std::mutex> lock(g_ctx_mutex);
-        for (int i = 0; i < kMaxInstances; i++) {
-            if (g_ctx_map_key[i].load(std::memory_order_relaxed) == ctx) {
-                g_ctx_map_key[i].store(nullptr, std::memory_order_release);
-                g_ctx_map_comp[i].store(nullptr, std::memory_order_release);
-                break;
-            }
+void MooseComponent::unregister() {
+    if (!ctx) return;
+    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    for (int i = 0; i < kMaxInstances; i++) {
+        if (g_ctx_map_key[i].load(std::memory_order_relaxed) == ctx) {
+            g_ctx_map_key[i].store(nullptr, std::memory_order_release);
+            g_ctx_map_comp[i].store(nullptr, std::memory_order_release);
+            break;
         }
     }
-    const int own = t_pinnedComp == this ? t_pinnedDepth : 0;
-    while (pinned.load(std::memory_order_acquire) > own) std::this_thread::yield();
 }
 
 static void do_begin_edit(MooseComponent* comp, uint32_t id) {
@@ -3436,10 +3433,15 @@ void MooseComponent::drainEdits() {
     drainEditsLocked(lock);
 }
 
-void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, int passes) {
+// A transition drains wherever it runs, until empty. Any other drain stops
+// once this thread may no longer deliver: a frame bound while a fallback
+// drain had the lock released, and the UI thread now owns what is left.
+void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, bool transition) {
     if (drainingEdits) return;
     drainingEdits = true;
-    for (int pass = 0; pass < passes && !pendingEdits.empty(); ++pass) {
+    const int passes = transition ? kTransitionPasses : kDrainPasses;
+    for (int pass = 0; pass < passes && !pendingEdits.empty()
+         && (transition || mayDeliverLocked()); ++pass) {
         std::vector<EditOp> ops;
         ops.swap(pendingEdits);
         lock.unlock();
@@ -3461,9 +3463,11 @@ void MooseComponent::drainEditsLocked(std::unique_lock<std::mutex>& lock, int pa
 // wake. Check and append under the same lock used by worker submissions.
 bool MooseComponent::queueBehindRemainingEdits(EditOp op) {
     std::unique_lock<std::mutex> lock(editMutex);
-    drainEditsLocked(lock);
     if (editsClosed) return true;
-    if (pendingEdits.empty()) return false;
+    // Re-route under the lock: a frame may have bound since tryQueueEdit.
+    if (mayDeliverLocked()) drainEditsLocked(lock);
+    if (editsClosed) return true;
+    if (pendingEdits.empty() && mayDeliverLocked()) return false;
     pendingEdits.push_back(op);
     wakeEditsLocked();
     return true;

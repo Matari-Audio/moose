@@ -287,5 +287,27 @@ int main(int argc, char** argv) {
         moose_vst3_end_edit(other_ctx, 3); // unregistered: a no-op, not a crash
     }
 
+    // The host drops its last reference from inside performEdit: the
+    // component outlives the callback and goes when the editor call returns.
+    if (argc == 1 || std::strcmp(argv[1], "reentrant") == 0) {
+        static std::atomic<bool> destroyed{false};
+        static MooseComponentCOM* victim;
+        destroyed = false;
+        callbacks.destroy = [](void*) { destroyed = true; };
+        void* drop_vtbl[] = {(void*)h_query, (void*)h_ref, (void*)h_ref, (void*)h_begin,
+            (void*)+[](void*, uint32, double) -> tresult {
+                victim->vtbl_component->release(victim);
+                require(!destroyed); // our call is still inside it
+                return kResultOk;
+            },
+            (void*)h_end, (void*)h_restart};
+        Handler drop{drop_vtbl};
+        victim = create_component();
+        void* victim_ctx = victim->impl.rustContext();
+        victim->impl.setComponentHandler(&drop);
+        moose_vst3_perform_edit(victim_ctx, 3, 0.5); // no frame: called in place
+        require(destroyed);
+    }
+
     std::puts("PASS: off-UI-thread edits and resizes reach the host on its run loop, in order");
 }
