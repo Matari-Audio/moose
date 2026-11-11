@@ -16,6 +16,8 @@ static uint32 loop_add_ref(void* self) { return ++static_cast<RunLoop*>(self)->r
 static uint32 loop_release(void* self) { return --static_cast<RunLoop*>(self)->refs; }
 static tresult loop_register(void* self, void*, uint64_t) { ++static_cast<RunLoop*>(self)->registrations; return kResultOk; }
 static tresult loop_unregister(void* self, void*) { --static_cast<RunLoop*>(self)->registrations; return kResultOk; }
+static tresult loop_add_event(void*, void*, int) { return kResultOk; }
+static tresult loop_remove_event(void*, void*) { return kResultOk; }
 
 struct Frame {
     void** vtbl;
@@ -104,7 +106,8 @@ int main() {
     require(view->vtbl->release(view) == 0 && final_frame.refs == 0 && context_alive);
     require(com->vtbl_component->release(com) == 0 && !context_alive && destroys == 102);
     void* loop_vtbl[] = {nullptr, reinterpret_cast<void*>(loop_add_ref), reinterpret_cast<void*>(loop_release),
-        nullptr, nullptr, reinterpret_cast<void*>(loop_register), reinterpret_cast<void*>(loop_unregister)};
+        reinterpret_cast<void*>(loop_add_event), reinterpret_cast<void*>(loop_remove_event),
+        reinterpret_cast<void*>(loop_register), reinterpret_cast<void*>(loop_unregister)};
     RunLoop old_loop{loop_vtbl}, current_loop{loop_vtbl};
     Frame old_frame{frame_vtbl, 1, 0, &old_loop}, current_frame{frame_vtbl, 1, 0, &current_loop};
     com = create_component();
@@ -115,7 +118,7 @@ int main() {
     require(old_loop.registrations == 0 && old_loop.refs == 1);
     require(old->vtbl->setFrame(old, nullptr) == kResultOk && current_loop.registrations == 1);
     require(old->vtbl->setFrame(old, &old_frame) == kResultOk && current_loop.registrations == 1 && old_loop.registrations == 0);
-    require(old->vtbl->release(old) == 0 && current_loop.registrations == 1 && current_loop.refs == 2);
+    require(old->vtbl->release(old) == 0 && current_loop.registrations == 1 && current_loop.refs == 3);
     require(view->vtbl->release(view) == 0 && current_loop.registrations == 0 && current_loop.refs == 1);
     require(old_frame.refs == 1 && current_frame.refs == 1);
     require(com->vtbl_component->release(com) == 0 && !context_alive && destroys == 103);

@@ -460,7 +460,10 @@ pub trait EditorBridge: Send + Sync {
     /// End the automation gesture started by [`Self::begin_edit`].
     fn end_edit(&self, id: u32);
     /// Ask the host to resize the editor window to `(w, h)` logical
-    /// points. Returns `true` if the host accepted the request.
+    /// points. `true` means the request was made, or queued for the host's
+    /// UI thread when this is not it (VST3); `false` that the host refused
+    /// it or has no window to resize. Either way the size is only settled
+    /// when the host calls the editor's `set_size`.
     fn request_resize(&self, w: u32, h: u32) -> bool;
     /// Read the parameter's current normalized value from the plugin
     /// (host→GUI sync path).
@@ -712,7 +715,9 @@ impl<P: ?Sized> PluginContext<P> {
         self.bridge.end_edit(id);
     }
     /// Ask the host to resize the editor to `(w, h)` logical points.
-    /// Returns `true` if the request was accepted.
+    /// `true` means the request was made, or queued for the host's UI thread
+    /// when called from another thread (VST3); the size is settled only when
+    /// the host calls [`Editor::set_size`].
     ///
     /// **Re-entrancy:** call this from your editor's own event / render loop,
     /// not synchronously from inside an [`Editor`] method the host drives
