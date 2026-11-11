@@ -189,16 +189,16 @@ int main(int argc, char** argv) {
     if (argc == 1 || std::strcmp(argv[1], "burst") == 0) {
         Handler next{handler_vtbl, true};
         calls.clear();
-        burst = 20;
+        burst = 5000;
         off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
         com->impl.setComponentHandler(&next);
-        require(calls == std::string(21, 'p') && com->impl.pendingEdits.empty());
+        require(calls == std::string(5001, 'p') && com->impl.pendingEdits.empty());
         com->impl.setComponentHandler(&handler);
         calls.clear();
-        burst = 20;
+        burst = 5000;
         off_ui([] { moose_vst3_perform_edit(ctx, 7, 0.5); });
         require(view->vtbl->setFrame(view, nullptr) == kResultOk);
-        require(calls == std::string(21, 'p') && com->impl.pendingEdits.empty());
+        require(calls == std::string(5001, 'p') && com->impl.pendingEdits.empty());
         require(view->vtbl->setFrame(view, &frame) == kResultOk);
     }
 

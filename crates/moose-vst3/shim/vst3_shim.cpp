@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <cerrno>
 #endif
+#include <limits>
 #include <mutex>
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -716,10 +717,11 @@ struct PClassInfo {
 static constexpr int kDrainPasses = 8;
 // A detach, handler change or teardown must not leave an accepted call
 // behind -- the old handler would stay mid-gesture, or a call would outlive
-// its wake -- so it drains until the queue is empty. The cap is only a
-// backstop against a submitter that never stops; real editors submit per
-// frame and empty the queue in a pass or two.
-static constexpr int kTransitionPasses = 4096;
+// its wake -- so it drains until the queue is empty, however long a finite
+// burst runs.
+// ponytail: no cap, so a submitter that never stops holds the transition;
+// add a cancel policy (drop + endEdit for open gestures) if one shows up.
+static constexpr int kTransitionPasses = std::numeric_limits<int>::max();
 
 // An editor -> host call made off the host UI thread, queued for it. VST3
 // wants IComponentHandler begin/perform/endEdit and IPlugFrame::resizeView
@@ -1301,11 +1303,9 @@ public:
         {
             std::unique_lock<std::mutex> lock(editMutex);
             drainEditsLocked(lock, kTransitionPasses);
-            // Only a submitter that never stopped outlasts kTransitionPasses;
-            // the host is releasing this component, so that remainder goes
-            // nowhere (and no pinned call is still inside it by now).
+            // The queue is empty and no pinned call is still inside this
+            // component, so closing it drops nothing that was accepted.
             editsClosed = true;
-            pendingEdits.clear();
         }
 #if defined(__linux__)
         unbindEditRunLoop();
