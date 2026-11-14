@@ -30,6 +30,20 @@ Applied to a struct whose fields are `FloatParam`, `IntParam`,
 `BoolParam`, or `EnumParam`. Generates trait impls for parameter
 discovery, indexed access, and state round-tripping.
 
+A field may also be an array of one of those, which is one host
+parameter per element:
+
+```rust
+#[param(id = 100, name = "Macro {n}", short_name = "M{n:02}", range = "linear(0, 1)")]
+macros: [FloatParam; 8],
+```
+
+`{i}` is the element's index from 0, `{n}` its number from 1, and a
+`:0W` suffix pads to width W. The name must contain one of them. With an
+`id`, element `i` takes `id + i`; without one, each element's id comes
+from `field[i]`, so it stays put when the array grows. The `ParamId` enum
+names each element (`Macros0` .. `Macros7`).
+
 ### `#[derive(ParamEnum)]`
 
 Applied to an enum to make it usable as an `EnumParam` value.
