@@ -388,6 +388,10 @@ pub(crate) struct ParamField {
     pub(crate) attrs: ParamAttrs,
     /// For `EnumParam<T>`, the inner type `T`.
     enum_type: Option<syn::Type>,
+    /// For an element of an array field (`[FloatParam; N]`), its index:
+    /// the array expands into one `ParamField` per element, each with
+    /// its own id and name, reached as `self.field[index]`.
+    pub(crate) index: Option<usize>,
 }
 
 impl ParamField {
@@ -400,6 +404,37 @@ impl ParamField {
         self.attrs
             .id
             .expect("ParamField::id called before the auto-assignment block ran")
+    }
+
+    /// The param as a place below `self`: `field`, or `field[i]` for an
+    /// array element.
+    pub(crate) fn access(&self) -> TokenStream2 {
+        let ident = &self.ident;
+        self.index.map_or_else(
+            || quote! { #ident },
+            |i| {
+                let i = proc_macro2::Literal::usize_unsuffixed(i);
+                quote! { #ident[#i] }
+            },
+        )
+    }
+
+    /// The param's path as text (`field`, `field[i]`): its hashed id and
+    /// its entry in the param-index sidecar.
+    pub(crate) fn path(&self) -> String {
+        match self.index {
+            Some(i) => format!("{}[{i}]", self.ident),
+            None => self.ident.to_string(),
+        }
+    }
+
+    /// Its `ParamId` variant: `Field`, or `Field{i}` for an array element.
+    fn variant(&self) -> syn::Ident {
+        let base = snake_to_pascal(&self.ident);
+        match self.index {
+            Some(i) => syn::Ident::new(&format!("{base}{i}"), base.span()),
+            None => base,
+        }
     }
 }
 
@@ -449,7 +484,7 @@ pub(crate) struct DefaultExpr {
 }
 
 /// Parsed `#[param(...)]` attributes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ParamAttrs {
     pub(crate) id: Option<u32>,
     pub(crate) name: Option<String>,
@@ -1145,6 +1180,16 @@ fn collect_fields(fields: &Fields) -> CollectedFields {
             continue;
         }
 
+        if let Type::Array(array) = &f.ty
+            && let Some(kind) = classify_param_type(&array.elem)
+        {
+            let enum_type = (kind == ParamKind::Enum)
+                .then(|| extract_enum_type_arg(&array.elem))
+                .flatten();
+            params.extend(array_elements(f, ident, kind, enum_type, array));
+            continue;
+        }
+
         if let Some(kind) = classify_param_type(&f.ty) {
             let attrs = parse_param_attrs(f);
             let enum_type = if kind == ParamKind::Enum {
@@ -1157,11 +1202,130 @@ fn collect_fields(fields: &Fields) -> CollectedFields {
                 kind,
                 attrs,
                 enum_type,
+                index: None,
             });
         }
     }
 
     (params, nested, meters, skipped)
+}
+
+/// An array field's elements, one [`ParamField`] each. They share the
+/// field's attributes but for three: an explicit `id = N` is element 0's,
+/// element `i` taking `N + i`; `name` and `short_name` are templates in
+/// which `{i}` is the element's index from 0 and `{n}` its number from 1,
+/// either optionally zero-padded (`{n:03}`); and a MIDI binding is refused
+/// (every element would claim the same source). The length must be an
+/// integer literal: the derive emits each element's metadata.
+fn array_elements(
+    f: &syn::Field,
+    ident: syn::Ident,
+    kind: ParamKind,
+    enum_type: Option<syn::Type>,
+    array: &syn::TypeArray,
+) -> Vec<ParamField> {
+    let mut attrs = parse_param_attrs(f);
+    let len = match &array.len {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(n),
+            ..
+        }) => n.base10_parse::<usize>().ok(),
+        _ => None,
+    };
+    let error = |attrs: &mut ParamAttrs, msg: &str| {
+        attrs
+            .errors
+            .push(syn::Error::new_spanned(&f.ty, msg).to_compile_error());
+    };
+    let Some(len) = len.filter(|&n| n > 0) else {
+        error(
+            &mut attrs,
+            "a param array's length must be a positive integer literal",
+        );
+        return vec![ParamField {
+            ident,
+            kind,
+            attrs,
+            enum_type,
+            index: Some(0),
+        }];
+    };
+    if attrs.midi_map.is_some() {
+        error(
+            &mut attrs,
+            "a param array cannot take `midi_cc` / `midi_source`: every element would claim the same source",
+        );
+    }
+    let template = attrs.name.clone().unwrap_or_default();
+    if !has_index_placeholder(&template) {
+        error(
+            &mut attrs,
+            "a param array's `name` needs `{i}` (index from 0) or `{n}` (number from 1), so each element is named apart",
+        );
+    }
+    (0..len)
+        .map(|i| {
+            let mut a = attrs.clone();
+            if i > 0 {
+                // Reported once, on the first element.
+                a.errors.clear();
+            }
+            a.id = attrs
+                .id
+                .map(|base| base.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)));
+            a.name = attrs.name.as_deref().map(|t| fill_index(t, i));
+            a.short_name = attrs.short_name.as_deref().map(|t| fill_index(t, i));
+            ParamField {
+                ident: ident.clone(),
+                kind,
+                attrs: a,
+                enum_type: enum_type.clone(),
+                index: Some(i),
+            }
+        })
+        .collect()
+}
+
+/// Whether `template` names an element: holds `{i}` or `{n}`, padded or not.
+fn has_index_placeholder(template: &str) -> bool {
+    fill_index(template, 0) != fill_index(template, 1)
+}
+
+/// `template` with each `{i}` / `{n}` (or `{i:0W}` / `{n:0W}`) replaced by
+/// element `index`'s index from 0 / number from 1, zero-padded to `W`.
+fn fill_index(template: &str, index: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let spec = &after[..close];
+        let (key, width) = spec.split_once(':').map_or((spec, ""), |(k, w)| (k, w));
+        let value = match key {
+            "i" => Some(index),
+            "n" => Some(index + 1),
+            _ => None,
+        };
+        let width = width
+            .strip_prefix('0')
+            .map_or(Some(0), |w| w.parse::<usize>().ok());
+        if let (Some(v), Some(w)) = (value, width) {
+            let _ = write!(out, "{v:0w$}");
+            rest = &after[close + 1..];
+        } else {
+            // Not a placeholder: keep the brace and read on from the next
+            // character, so `open { {n}` still fills its `{n}`.
+            out.push('{');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse a range string like "linear(-60, 24)" into tokens.
@@ -2029,7 +2193,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             // below; the author resolves by pinning one with `id = N`.
             for f in &mut param_fields {
                 if f.attrs.id.is_none() {
-                    f.attrs.id = Some(name_hash_id(&f.ident.to_string()));
+                    f.attrs.id = Some(name_hash_id(&f.path()));
                 }
             }
         }
@@ -2178,7 +2342,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let own_infos: Vec<_> = param_fields
         .iter()
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             quote! { self.#ident.info() }
         })
         .collect();
@@ -2327,7 +2491,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
 
     // --- get_plain ---
     let get_plain_arms: Vec<_> = param_fields.iter().map(|f| {
-        let ident = &f.ident;
+        let ident = f.access();
         match f.kind {
             ParamKind::Float => quote! { x if x == self.#ident.id() => Some(self.#ident.raw_target()), },
             // `i64 as f64` is precision-lossy by spec (mantissa 53 < 63);
@@ -2365,7 +2529,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let get_normalized_arms: Vec<_> = param_fields
         .iter()
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             let plain_expr = match f.kind {
                 ParamKind::Float => quote! { self.#ident.raw_target() },
                 // i64 → f64 has no `From`; `as` with an explicit
@@ -2398,7 +2562,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
 
     // --- set_plain ---
     let set_plain_arms: Vec<_> = param_fields.iter().map(|f| {
-        let ident = &f.ident;
+        let ident = f.access();
         match f.kind {
             ParamKind::Float => quote! { x if x == self.#ident.id() => self.#ident.set_value(value), },
             ParamKind::Bool => quote! { x if x == self.#ident.id() => self.#ident.set_value(value > 0.5), },
@@ -2425,7 +2589,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let set_normalized_arms: Vec<_> = param_fields
         .iter()
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             let commit = match f.kind {
                 ParamKind::Float => quote! { self.#ident.set_value(plain) },
                 ParamKind::Bool => quote! { self.#ident.set_value(plain > 0.5) },
@@ -2455,9 +2619,9 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let format_value_arms: Vec<_> = param_fields
         .iter()
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             if let Some(ref fmt_fn) = f.attrs.format_fn {
-                let fmt_ident = syn::Ident::new(fmt_fn, ident.span());
+                let fmt_ident = syn::Ident::new(fmt_fn, f.ident.span());
                 quote! { x if x == self.#ident.id() => Some(self.#fmt_ident(value)), }
             } else {
                 match f.kind {
@@ -2505,13 +2669,13 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let parse_value_arms: Vec<_> = param_fields
         .iter()
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             if let Some(parse_fn) = f.attrs.parse_fn.as_ref() {
-                let parse_ident = syn::Ident::new(parse_fn, ident.span());
+                let parse_ident = syn::Ident::new(parse_fn, f.ident.span());
                 return quote! { x if x == self.#ident.id() => self.#parse_ident(text), };
             }
             let (format, lenient) = if let Some(format_fn) = f.attrs.format_fn.as_ref() {
-                let format_ident = syn::Ident::new(format_fn, ident.span());
+                let format_ident = syn::Ident::new(format_fn, f.ident.span());
                 (quote! { |value| self.#format_ident(value) }, false)
             } else {
                 let format = match f.kind {
@@ -2562,7 +2726,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .filter(|f| f.kind == ParamKind::Float)
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             quote! { self.#ident.snap_smoother(); }
         })
         .collect();
@@ -2572,7 +2736,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .filter(|f| f.kind == ParamKind::Float)
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             quote! { self.#ident.set_sample_rate(sample_rate); }
         })
         .collect();
@@ -2581,22 +2745,32 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     let collect_ids: Vec<_> = param_fields
         .iter()
         .map(|f| {
-            let ident = &f.ident;
+            let ident = f.access();
             quote! { self.#ident.id() }
         })
         .collect();
 
     // --- Generate new() ---
     let new_impl = if generate_new {
-        let param_inits: Vec<_> = param_fields
-            .iter()
-            .enumerate()
-            .map(|(slot, f)| {
-                let ident = &f.ident;
+        // An array's elements are consecutive: one `field: [..]` init.
+        let mut param_inits: Vec<TokenStream2> = Vec::new();
+        let mut slot = 0;
+        while let Some(f) = param_fields.get(slot) {
+            let ident = &f.ident;
+            if f.index.is_some() {
+                let elements: Vec<_> = (slot..)
+                    .zip(&param_fields[slot..])
+                    .take_while(|(_, e)| e.ident == *ident && e.index.is_some())
+                    .map(|(s, e)| gen_field_constructor(e, s))
+                    .collect();
+                slot += elements.len();
+                param_inits.push(quote! { #ident: [#(#elements),*] });
+            } else {
                 let constructor = gen_field_constructor(f, slot);
-                quote! { #ident: #constructor }
-            })
-            .collect();
+                param_inits.push(quote! { #ident: #constructor });
+                slot += 1;
+            }
+        }
 
         // One shared metadata table per struct type: every instance
         // (including each `#[nested]` slot reusing the type) borrows its
@@ -2717,7 +2891,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
     // IDs are absolute and stay unchanged through every parent. Meters
     // keep their dedicated id range and aren't shifted. Always emitted
     // so a parent can rebase any nested child, leaf or not.
-    let own_param_idents: Vec<_> = param_fields.iter().map(|f| &f.ident).collect();
+    let own_param_idents: Vec<_> = param_fields.iter().map(ParamField::access).collect();
     let parameter_epoch_expr = if let Some(field) = own_param_idents.first() {
         quote! { self.#field.parameter_edit_epoch() }
     } else {
@@ -2752,7 +2926,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         let param_variants: Vec<_> = param_fields
             .iter()
             .map(|f| {
-                let variant = snake_to_pascal(&f.ident);
+                let variant = f.variant();
                 let id_lit = proc_macro2::Literal::u32_unsuffixed(f.id());
                 quote! { #variant = #id_lit }
             })
@@ -2776,7 +2950,7 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
         let from_u32_arms: Vec<_> = param_fields
             .iter()
             .map(|f| {
-                let variant = snake_to_pascal(&f.ident);
+                let variant = f.variant();
                 let id_lit = proc_macro2::Literal::u32_unsuffixed(f.id());
                 quote! { #id_lit => Some(#enum_name::#variant) }
             })
@@ -3966,5 +4140,29 @@ mod parse_default_tests {
         // Function calls and arithmetic expressions are not const-evaluated.
         assert_eq!(eval("some_fn()"), None);
         assert_eq!(eval("1 + 2"), None);
+    }
+}
+
+#[cfg(test)]
+mod array_name_tests {
+    use super::{fill_index, has_index_placeholder};
+
+    #[test]
+    fn templates_fill_index_number_and_padding() {
+        assert_eq!(fill_index("#{i:03}", 7), "#007");
+        assert_eq!(fill_index("Macro {n}", 0), "Macro 1");
+        assert_eq!(fill_index("{n:02} of {i}", 9), "10 of 9");
+        // Other braces stay as written.
+        assert_eq!(fill_index("{x} {n}", 1), "{x} 2");
+        assert_eq!(fill_index("open { {n}", 0), "open { 1");
+        assert_eq!(fill_index("tail {", 0), "tail {");
+    }
+
+    #[test]
+    fn a_name_without_an_index_is_refused() {
+        assert!(has_index_placeholder("Slot {n}"));
+        assert!(has_index_placeholder("#{i:03}"));
+        assert!(!has_index_placeholder("Slot"));
+        assert!(!has_index_placeholder("{x}"));
     }
 }

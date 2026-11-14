@@ -6,6 +6,10 @@
 //! A practical "instrument that emits MIDI": it both produces audio and
 //! sends notes back to the host, which AU v3, VST3, and LV2 only allow
 //! for a plugin that sets `midi_output = true` in moose.toml.
+//!
+//! Each chord note has its own level, declared once as a param array:
+//! `levels: [FloatParam; 4]` is four host parameters, "Note 1 Level" to
+//! "Note 4 Level".
 
 use moose::prelude::*;
 use moose_gui::IntoLayoutEditor;
@@ -57,7 +61,22 @@ pub struct ChordParams {
         smooth = "exp(5)"
     )]
     pub gain: FloatParam,
+
+    /// One level per chord note, root first. The length is a literal
+    /// because the derive expands one parameter per element; it matches
+    /// `MAX_VOICES`.
+    #[param(
+        name = "Note {n} Level",
+        short_name = "Lvl {n}",
+        range = "linear(0, 1)",
+        default = 1.0,
+        unit = "%",
+        smooth = "exp(5)"
+    )]
+    pub levels: [FloatParam; 4],
 }
+
+const _: () = assert!(MAX_VOICES == 4, "one level per voice");
 
 /// Stateless descriptor - the chord's per-block DSP state is [`ChordDspState`].
 pub struct Chord;
@@ -188,8 +207,9 @@ impl PluginLogic for Chord {
         for i in 0..buffer.num_samples() {
             let mut sample = 0.0f32;
             for voice in 0..MAX_VOICES {
+                let level = params.levels[voice].read();
                 if let Some(note) = state.notes[voice] {
-                    sample += sine_f32(state.phases[voice]);
+                    sample += sine_f32(state.phases[voice]) * level;
                     let inc = note_hz(note) / state.sample_rate;
                     state.phases[voice] = (state.phases[voice] + inc).rem_euclid(1.0);
                 }
@@ -302,6 +322,29 @@ mod tests {
         assert_eq!(notes, vec![60, 64, 67]);
         // ...and the chord is audible.
         assert!(output[0].iter().any(|s| *s != 0.0), "expected audio output");
+    }
+
+    #[test]
+    fn each_chord_note_has_its_own_level() {
+        let params = ChordParams::new();
+        let names: Vec<&str> = params
+            .param_infos()
+            .iter()
+            .map(|p| p.name)
+            .filter(|n| n.starts_with("Note "))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Note 1 Level",
+                "Note 2 Level",
+                "Note 3 Level",
+                "Note 4 Level"
+            ]
+        );
+        params.set_plain(P::Levels2.as_u32(), 0.0);
+        assert!(params.levels[2].value().abs() < 1e-6);
+        assert!((params.levels[1].value() - 1.0).abs() < 1e-6);
     }
 
     #[cfg(target_os = "macos")]

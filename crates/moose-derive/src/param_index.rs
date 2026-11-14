@@ -46,11 +46,11 @@ pub(crate) fn write_struct_sidecar(
         if hash_scheme { "hash" } else { "ordinal" }
     );
     for p in params {
-        let name = p.attrs.name.clone().unwrap_or_else(|| p.ident.to_string());
+        let name = p.attrs.name.clone().unwrap_or_else(|| p.path());
         write_param(
             &mut buf,
             p.id(),
-            &p.ident.to_string(),
+            &p.path(),
             &name,
             p.attrs.unit.as_deref().unwrap_or(""),
         );

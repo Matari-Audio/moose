@@ -4,6 +4,8 @@ Notable changes per release.
 
 ## Unreleased
 
+- `#[derive(Params)]` takes array fields: `#[param(name = "Macro {n}", ...)] macros: [FloatParam; 8]` declares eight host parameters with their own ids (`id + i`, or a stable hash of `macros[i]`), names from the `{i}` / `{n}` / `{n:02}` template, and `ParamId` variants `Macros0..7`. The chord example gives each chord note its own level this way.
+
 - Two parameter range shapes: `offset_log(min, max, offset)` (logarithmic over `[min + offset, max + offset]`, for a frequency axis that is near-linear at the bottom) and `pivoted_log(min, max, mid)` (logarithmic with a power bend that puts `mid` at the knob midpoint, for a Q or width whose default belongs at the centre).
 
 - CLAP GUI drags notify the host through parameter events; rescan values only when the queue or host refuses an edit. Test the real editor bridge together with instance-local edit epochs.

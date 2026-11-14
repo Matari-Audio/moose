@@ -563,15 +563,20 @@ pub fn render_preset_toml_with_persist(
     }
 
     if !params.is_empty() {
-        // Field-identifier keys when the sidecars provide them (and
-        // the name maps back to exactly this id); ids otherwise.
+        // Use field keys only when they are valid TOML bare keys and
+        // resolve uniquely; indexed paths fall back to numeric ids.
         let names = ParamNameMap::from_annotations(annotations);
         out.push_str("\n[params]\n");
         for (id, value) in params {
             let annotation = annotations.get(id);
             let key = annotation
                 .map(|a| a.field.as_str())
-                .filter(|f| !f.is_empty() && names.resolve(f) == Ok(*id))
+                .filter(|f| {
+                    !f.is_empty()
+                        && f.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                        && names.resolve(f) == Ok(*id)
+                })
                 .map_or_else(|| id.to_string(), str::to_string);
             let _ = write!(out, "{key} = {value}");
             if let Some(a) = annotation {
@@ -739,6 +744,44 @@ persist = "cGF0Y2g="
         assert_eq!(p.persist, b"patch");
         let state = moose_utils::state::deserialize_state(&p.state_blob(42), 42).unwrap();
         assert_eq!(state.persist, b"patch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexed_param_keys_round_trip_through_parser() {
+        let dir = temp_lib("render-indexed");
+        let meta = PresetMeta {
+            uuid: "u-indexed".into(),
+            name: "Array preset".into(),
+            ..Default::default()
+        };
+        let annotations = [(100, "slots[0]"), (101, "slots[1]"), (102, "cutoff")]
+            .into_iter()
+            .map(|(id, field)| {
+                (
+                    id,
+                    ParamAnnotation {
+                        field: field.into(),
+                        name: field.into(),
+                        unit: String::new(),
+                    },
+                )
+            })
+            .collect();
+        let names = ParamNameMap::from_annotations(&annotations);
+        assert_eq!(names.resolve("slots[0]"), Ok(100));
+        assert_eq!(names.resolve("slots[1]"), Ok(101));
+        let params = [(100, 0.25), (101, 0.75), (102, 8200.0)];
+        let rendered =
+            render_preset_toml_with_persist(&meta, &params, b"extra", b"persist", &annotations);
+        std::fs::write(dir.join("array.preset"), &rendered).unwrap();
+        let presets = read_presets_dir(&dir, false, Some(&names)).unwrap();
+        assert_eq!(presets[0].params, params);
+        assert_eq!(presets[0].extra, b"extra");
+        assert_eq!(presets[0].persist, b"persist");
+        assert!(rendered.contains("100 = 0.25"), "{rendered}");
+        assert!(rendered.contains("101 = 0.75"), "{rendered}");
+        assert!(rendered.contains("cutoff = 8200"), "{rendered}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
