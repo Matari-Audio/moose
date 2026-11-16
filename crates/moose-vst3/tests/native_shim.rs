@@ -59,3 +59,8 @@ fn editor_calls_off_the_ui_thread() {
 fn parameter_units() {
     run_fixture("parameter_units", &[]);
 }
+
+#[test]
+fn generated_audio_reaches_hosts_that_honor_silence_flags() {
+    run_fixture("output_silence", &[]);
+}
