@@ -1960,6 +1960,14 @@ public:
             return kResultOk;
         }
 
+        // Rust renders samples without reporting channel silence. Clear the
+        // host's previous flags or it may discard newly generated audio.
+        for (uint32_t b = 0; data->outputs && b < g_desc->num_output_buses &&
+                             b < kMaxProcChannels && b < static_cast<uint32_t>(data->numOutputs); ++b) {
+            if (activeOutputs & (uint32_t{1} << b))
+                data->outputs[b].silenceFlags = 0;
+        }
+
         enum OutputEventResult : uint32_t {
             kOutputEnd = 0,
             kOutputEmitted = 1,
