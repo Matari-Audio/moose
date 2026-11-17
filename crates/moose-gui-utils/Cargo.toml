@@ -3,7 +3,6 @@ name = "moose-gui-utils"
 description = "Host-side platform helpers shared by moose GUI backends (macOS NSView anchoring, etc)."
 version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

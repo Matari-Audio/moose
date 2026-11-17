@@ -2,7 +2,6 @@
 name = "moose-derive"
 version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Proc macros for moose plugins, providing plugin_info!() to generate metadata from moose.toml at compile time"

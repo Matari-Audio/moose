@@ -2,7 +2,6 @@
 name = "moose-loader-tests"
 version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Integration tests for moose-loader. Lives in its own crate so the test deps (umbrella `moose` + `moose-derive`) can be normal deps without forming a `moose <-> moose-loader` cycle in cargo metadata."

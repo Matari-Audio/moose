@@ -6,7 +6,6 @@ license.workspace = true
 # MUI needs 1.98.
 rust-version = "1.98"
 repository.workspace = true
-homepage.workspace = true
 description = "MUI editors for moose plugins: MuiEditor and the parameter Bridge"
 keywords = ["audio", "plugin", "gui", "mui"]
 categories = ["multimedia::audio", "gui"]

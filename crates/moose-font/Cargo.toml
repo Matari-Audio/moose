@@ -2,7 +2,6 @@
 name = "moose-font"
 version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 edition.workspace = true
 # Plain Apache 2.0 - this crate is a small font crate (bundled bytes plus
 # an optional glyph rasterizer); no Framework License carve-out

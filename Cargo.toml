@@ -76,7 +76,6 @@ license = "LicenseRef-TruceLicense-1.0"
 rust-version = "1.92"
 description = "Build audio plugins in Rust. One codebase, every format."
 repository = "https://github.com/Matari-Audio/moose"
-homepage = "https://github.com/Matari-Audio/moose"
 categories = ["multimedia::audio", "development-tools::cargo-plugins"]
 keywords = ["audio", "plugin", "vst3", "clap", "daw"]
 readme = "README.md"

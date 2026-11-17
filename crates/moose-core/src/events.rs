@@ -1041,7 +1041,7 @@ impl ExactDeliveryBank {
             return Err(ExactDeliveryError::Capacity);
         }
         let owner = NEXT_EXACT_DELIVERY_BANK
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |owner| {
                 owner.checked_add(1)
             })
             .map_err(|_| ExactDeliveryError::Overflow)?;

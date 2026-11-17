@@ -15,6 +15,8 @@
 // The long signatures are intentional; bundling them into builder
 // structs would obscure call sites without simplifying any single
 // call.
+// wgpu-core's storage types nest past the default limit when proving `Send`.
+#![recursion_limit = "256"]
 #![allow(clippy::too_many_arguments)]
 
 // `blit` (CPU pixmap → wgpu surface upload) is only needed for the

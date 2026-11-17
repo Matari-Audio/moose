@@ -2333,40 +2333,7 @@ dependencies = [
  "x11-dl",
  "x11rb",
  "xkbcommon-dl",
- "zed-xim 0.4.0-zed",
-]
-
-[[package]]
-name = "moose-baseview"
-version = "0.4.1-moose.1"
-source = "git+https://github.com/Matari-Audio/MUI#f6dd9543ee5fc63a7a11bd9d84ca96b3f4fc273f"
-dependencies = [
- "block2 0.6.2",
- "bytemuck",
- "calloop 0.14.4",
- "calloop-wayland-source 0.4.1",
- "dispatch2",
- "dpi",
- "keyboard-types",
- "libc",
- "matari-audio-drag-and-drop",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
- "percent-encoding",
- "raw-window-handle",
- "smithay-client-toolkit 0.21.1",
- "wayland-client",
- "wayland-protocols",
- "windows 0.62.2",
- "windows-core 0.62.2",
- "windows-sys 0.61.2",
- "x11-dl",
- "x11rb",
- "xkbcommon-dl",
- "zed-xim 0.4.0-zed (git+https://github.com/Matari-Audio/MUI)",
+ "zed-xim",
 ]
 
 [[package]]
@@ -2447,7 +2414,7 @@ dependencies = [
  "egui-wgpu",
  "keyboard-types",
  "log",
- "moose-baseview 0.4.1-moose.1 (git+https://github.com/Matari-Audio/MUI)",
+ "moose-baseview",
  "moose-core",
  "moose-gui",
  "moose-params",
@@ -3049,7 +3016,7 @@ dependencies = [
  "bytemuck",
  "log",
  "lyon_tessellation",
- "moose-baseview 0.4.1-moose.1 (git+https://github.com/Matari-Audio/MUI)",
+ "moose-baseview",
  "moose-core",
  "moose-font",
  "moose-gui-types",
@@ -3066,7 +3033,7 @@ version = "7.0.0"
 dependencies = [
  "keyboard-types",
  "log",
- "moose-baseview 0.4.1-moose.1 (git+https://github.com/Matari-Audio/MUI)",
+ "moose-baseview",
  "moose-core",
  "moose-cpu",
  "moose-gpu",
@@ -3184,7 +3151,7 @@ dependencies = [
  "hound",
  "keyboard-types",
  "midir",
- "moose-baseview 0.4.1-moose.1 (git+https://github.com/Matari-Audio/MUI)",
+ "moose-baseview",
  "moose-core",
  "moose-driver",
  "moose-gpu",
@@ -3264,7 +3231,7 @@ dependencies = [
  "arboard",
  "keyboard-types",
  "matari-audio-drag-and-drop",
- "moose-baseview 0.4.1-moose.1",
+ "moose-baseview",
  "mui",
  "mui-access",
  "mui-winit",
@@ -3391,7 +3358,7 @@ version = "0.4.2"
 dependencies = [
  "accesskit_winit",
  "arboard",
- "moose-baseview 0.4.1-moose.1",
+ "moose-baseview",
  "mui",
  "mui-access",
  "wgpu 30.0.1",
@@ -7040,24 +7007,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "xim-ctext"
-version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI#f6dd9543ee5fc63a7a11bd9d84ca96b3f4fc273f"
-dependencies = [
- "encoding_rs",
-]
-
-[[package]]
 name = "xim-parser"
 version = "0.2.1"
-dependencies = [
- "bitflags 2.13.0",
-]
-
-[[package]]
-name = "xim-parser"
-version = "0.2.1"
-source = "git+https://github.com/Matari-Audio/MUI#f6dd9543ee5fc63a7a11bd9d84ca96b3f4fc273f"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -7215,21 +7166,8 @@ dependencies = [
  "hashbrown 0.14.5",
  "log",
  "x11rb",
- "xim-ctext 0.3.0",
- "xim-parser 0.2.1",
-]
-
-[[package]]
-name = "zed-xim"
-version = "0.4.0-zed"
-source = "git+https://github.com/Matari-Audio/MUI#f6dd9543ee5fc63a7a11bd9d84ca96b3f4fc273f"
-dependencies = [
- "ahash",
- "hashbrown 0.14.5",
- "log",
- "x11rb",
- "xim-ctext 0.3.0 (git+https://github.com/Matari-Audio/MUI)",
- "xim-parser 0.2.1 (git+https://github.com/Matari-Audio/MUI)",
+ "xim-ctext",
+ "xim-parser",
 ]
 
 [[package]]

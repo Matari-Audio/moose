@@ -32,7 +32,6 @@ moose-au = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 moose-standalone = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag}" }
 {{ endif -}}
 {{- endif }}
-clap-sys = "0.5"
 
 # Custom profile for `cargo moose install --shell`. The shell-mode
 # build lands at `target/shell/lib<crate>.dylib`, independent of
