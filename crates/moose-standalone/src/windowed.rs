@@ -187,6 +187,41 @@ where
         }
     }
 
+    // No X server (a Wayland-only session): the outer X11 window cannot
+    // exist, so the editor opens as a native Wayland toplevel on its own.
+    // The outer window's extras (QWERTY MIDI, keyboard shortcuts) need it
+    // and are unavailable here.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && editor.supports_floating_wayland()
+    {
+        let ctx = synthesize_editor_context::<P>(
+            &plugin,
+            &transport,
+            Arc::clone(&pending_state),
+            Arc::clone(&pending_resize),
+        );
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        let closed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = closed_tx.send(());
+        });
+        if editor.open_floating_wayland(ctx, P::info().name, closed) {
+            let _ = closed_rx.recv();
+        } else {
+            eprintln!("Error: could not open a Wayland window");
+        }
+        editor.close();
+        #[cfg(feature = "playback")]
+        if let Some(capture) = capture {
+            capture.finalize();
+        }
+        drop((midi_thread, midi_ctrl, input_ctrl, output_ctrl));
+        drop(audio_handles);
+        vlog!("Goodbye!");
+        return;
+    }
+
     // Owned copy for the `move` editor closure - `opts` is a borrow
     // that can't escape into it.
     let presets_dir = opts.presets_dir.clone();

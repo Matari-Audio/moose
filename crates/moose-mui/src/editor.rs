@@ -548,7 +548,7 @@ impl<P: Params> Editor for MuiEditor<P> {
     #[cfg(target_os = "linux")]
     fn set_floating_title(&mut self, title: &str) {
         if let Some(window) = &self.floating {
-            window.title(title.into());
+            window.title(title);
         }
     }
 

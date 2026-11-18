@@ -275,3 +275,35 @@ Also logged in `DECISIONS.md` to bindings.
 - `build-slot cargo check -q --target x86_64-pc-windows-msvc -p moose-clap -p moose-mui -p moose-egui -p moose-gui`: ok.
 - `build-slot cargo check -q --target aarch64-apple-darwin -p moose-clap -p moose-mui -p moose-egui -p moose-gui`: ok.
 - `... --target aarch64-apple-darwin -p moose-au`: fails in the build script (no macOS SDK), as expected.
+
+### Wayland phase 1 (branch `gui/wayland`, after the research doc)
+
+- baseview's native Wayland runtime (previously dock only) gains an xdg
+  toplevel role in `platform/layer/toplevel.rs`:
+  - server decorations, or the toolkit's fallback frame on subsurfaces when the compositor draws none
+  - fractional scale through viewporter
+  - min/max size hints
+  - title changes
+  - `defer_user_close` handling
+- `ThreadedWindow` opens it with `WindowSettings::with_wayland(true)`.
+- CLAP floating Wayland editors use it through `mui_baseview::wayland::open`, in
+  place of mui-winit. Handler, presenters and the request queue are the X11
+  path's. mui-baseview no longer depends on winit.
+- W3: on a session with `WAYLAND_DISPLAY` and no `DISPLAY`, the standalone opens
+  its editor as that native toplevel. QWERTY MIDI and the outer window's keyboard
+  shortcuts are not available on that path.
+- Two pacing bugs found on Hyprland and fixed:
+  1. A frame callback never arrives before the surface's first buffer, so
+     frames are not gated on it until the first callback.
+  2. A commit that paints nothing earns no callback. Explicit redraw and resize
+     requests wait at most 50 ms; continuous animation stays callback-paced.
+- A size the compositor imposes (tiled, maximized) wins over a client resize.
+- Deferred, per the research doc:
+  - The host-loop fd API (`event_fd` / `on_fd`) is deferred to VST3
+    `WaylandSurfaceID`, the case where the host's `wl_display` is shared.
+  - The CLAP nested-compositor draft is deferred behind `clap-draft`.
+- Tested: `native_wayland_multiple_instances_resize_close_and_reopen` on Hyprland
+  (1.5× fractional scale, tiled), plus the baseview and mui-baseview unit tests.
+  The volt standalone was run with `DISPLAY` unset: it opened as a native client
+  (Hyprland reports `xwayland: false`) and exited when the compositor closed it.
+  Not tested: GNOME/KDE (the fallback frame path), any DAW.
