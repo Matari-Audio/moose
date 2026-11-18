@@ -10,6 +10,8 @@ description = "CLAP format wrapper for moose"
 [features]
 default = []
 mpe-input = []
+# Bindings for the CLAP 1.2.10 draft extensions (`moose_clap::draft`).
+clap-draft = []
 rt-paranoid = ["moose-core/rt-paranoid"]
 
 [dependencies]

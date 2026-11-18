@@ -26,7 +26,7 @@ use clap_sys::factory::preset_discovery::{
     clap_preset_discovery_provider, clap_preset_discovery_provider_descriptor,
 };
 use clap_sys::universal_plugin_id::clap_universal_plugin_id;
-use clap_sys::version::CLAP_VERSION;
+use crate::CLAP_VERSION;
 
 use moose_core::export::PluginExport;
 use moose_core::presets::{PresetRef, PresetScope, read_preset_ref, user_preset_root};

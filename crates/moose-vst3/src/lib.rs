@@ -1477,7 +1477,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         // plugin sees consistent params and extra state for the
         // entire block. See `pending_state` field comment for the
         // queue-overflow policy.
-        if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
+        if apply_queued_state(&mut *plugin, &inst.pending_state).is_some_and(|r| r.is_ok()) {
             // An atomic bit-set; the UI thread sends it.
             ffi::moose_vst3_mark_restart(ctx, K_PARAM_VALUES_CHANGED);
         }

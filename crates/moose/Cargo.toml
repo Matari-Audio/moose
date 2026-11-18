@@ -26,6 +26,8 @@ moose-derive = { workspace = true }
 [features]
 default = ["clap"]
 clap = ["dep:moose-clap"]
+# CLAP 1.2.10 draft-extension bindings (`moose_clap::draft`).
+clap-draft = ["clap", "moose-clap/clap-draft"]
 vst3 = ["dep:moose-vst3"]
 # MUI editors (`moose::mui`): `MuiEditor` and the parameter `Bridge`.
 mui = ["dep:moose-mui"]

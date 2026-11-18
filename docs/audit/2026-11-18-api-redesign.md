@@ -205,6 +205,45 @@ state save and load touch.
 Each phase lands with every plugin under `plugins/` migrated and the gate
 (`tools/verify.sh`) green.
 
+## CLAP: clack or our own wrappers (evaluation, 2026-11-18)
+
+Decision for now: **keep moose-clap's own wrappers over `clap-sys`**, report
+CLAP 1.2.10, and generate the 1.2.10 draft extensions with bindgen
+(`moose_clap::draft`, `clap-draft` feature, `crates/moose-clap/tools/gen-draft.sh`).
+Revisit clack when the lifecycle model (order of work, step 2) lands.
+
+What clack (`clack-plugin` + `clack-extensions` 0.2) would give us:
+- Thread-typed plugin parts (`Shared`, `MainThread`, `AudioProcessor`)
+  and host handles that can only be used from the right thread. That is
+  finding A3 and the model step 2 asks for.
+- Extension vtables and the entry/factory boilerplate written once and
+  tested upstream, instead of the hand-built `ClapExtensions` statics.
+- Safe stream, event and port types.
+
+Why not now:
+- **It is the lifecycle rewrite in disguise.** clack fixes the plugin's
+  shape (`Plugin::Shared`, `Plugin::MainThread`, `AudioProcessor`
+  created in `activate`). Mapping moose's `PluginExport` onto that means
+  doing order-of-work step 2 inside the CLAP wrapper only, and the brief
+  rules out changing the plugin trait in this step. Done after step 2,
+  the mapping is close to one to one.
+- **Our extension surface is wider than its typed set.** moose-clap
+  serves remote-controls, preset-load and preset-discovery,
+  audio-ports-config, surround, note-ports, render, state-context and
+  custom extensions from `P::clap_extension`. Each one clack lacks
+  needs a raw escape hatch, which is what we have today.
+- **Version lag is the same problem either way.** clack 0.2 also
+  depends on generated headers; tracking a pinned free-audio tag
+  ourselves (stable ABI unchanged since 1.2.2, drafts via bindgen) keeps
+  the version under our control.
+- **Risk.** moose-clap is 8.7k lines with host-specific workarounds and
+  tests (Bitwig, REAPER, Live). A port now, with no clap-validator in CI,
+  would trade known behaviour for unknown.
+
+What we take from it now: the thread model is the target for step 2.
+Host extension pointers should become thread-typed handles when
+moose-clap is split per extension (G1).
+
 ## Sources
 
 - CLAP changelog: https://github.com/free-audio/clap/blob/main/ChangeLog.md

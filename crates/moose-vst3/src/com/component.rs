@@ -1493,8 +1493,8 @@ impl IAudioProcessorTrait for Component {
                 cfg.sample_rate,
                 cfg.max_frames,
                 cfg.process_mode,
-            )
-        };
+            );
+        }
         kResultOk
     }
 

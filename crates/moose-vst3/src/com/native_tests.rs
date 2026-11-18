@@ -1261,7 +1261,7 @@ mod threads {
         set_handler(hp(&normal));
         // No wake yet: worker edits wait for the next UI-thread operation.
         off_ui(move || begin_edit(ctx_u as *mut c_void, 7));
-        assert!(st.calls().is_empty());
+        assert_eq!(st.calls(), "");
         unsafe { c.getParamNormalized(7) };
         assert_eq!(st.calls(), "b");
         end_edit(ctx, 7);
@@ -1586,7 +1586,7 @@ mod threads {
         assert_eq!(unsafe { com.setComponentHandler(hp(&handler)) }, kResultOk);
         let ctx = com.host.ctx as usize;
         off_ui(move || crate::com::mark_restart(ctx as *mut c_void, 4));
-        assert!(st.calls().is_empty());
+        assert_eq!(st.calls(), "");
         frame.pump();
         assert_eq!(st.calls(), "x");
     }

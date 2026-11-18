@@ -21,6 +21,14 @@ pub mod __macro_deps {
     pub use moose_core;
 }
 
+/// The CLAP version moose implements. clap-sys 0.5 says 1.2.2; the stable
+/// ABI is unchanged through 1.2.10 (only drafts, docs and two surround
+/// constants were added), so the descriptors report the headers we track.
+pub const CLAP_VERSION: clap_sys::version::clap_version =
+    clap_sys::version::clap_version { major: 1, minor: 2, revision: 10 };
+
+#[cfg(feature = "clap-draft")]
+pub mod draft;
 pub mod presets;
 
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -83,6 +91,9 @@ use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, clap_plugin_render, clap_plugin_render_mode,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state, clap_plugin_state};
+use clap_sys::ext::state_context::{
+    CLAP_EXT_STATE_CONTEXT, clap_plugin_state_context, clap_plugin_state_context_type,
+};
 use clap_sys::ext::surround::{
     CLAP_EXT_SURROUND, CLAP_EXT_SURROUND_COMPAT, CLAP_PORT_SURROUND, clap_plugin_surround,
 };
@@ -104,7 +115,6 @@ use clap_sys::process::{
 };
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::string_sizes::{CLAP_NAME_SIZE, CLAP_PATH_SIZE};
-use clap_sys::version::CLAP_VERSION;
 
 use moose_core::TransportSlot;
 use moose_core::buffer::AudioBuffer;
@@ -4322,6 +4332,24 @@ unsafe fn request_value_rescan<P: PluginExport>(data: &ClapPluginData<P>) {
     }
 }
 
+/// `state-context`: every context saves and loads the full state. Moose
+/// state has no project-only or preset-only parts to leave out.
+unsafe extern "C" fn state_context_save<P: PluginExport>(
+    plugin: *const clap_plugin,
+    stream: *const clap_ostream,
+    _context: clap_plugin_state_context_type,
+) -> bool {
+    unsafe { state_save::<P>(plugin, stream) }
+}
+
+unsafe extern "C" fn state_context_load<P: PluginExport>(
+    plugin: *const clap_plugin,
+    stream: *const clap_istream,
+    _context: clap_plugin_state_context_type,
+) -> bool {
+    unsafe { state_load::<P>(plugin, stream) }
+}
+
 fn make_state_extension<P: PluginExport>() -> clap_plugin_state {
     clap_plugin_state {
         save: Some(state_save::<P>),
@@ -5699,6 +5727,7 @@ struct Extensions<P: PluginExport> {
     params: clap_plugin_params,
     remote_controls: clap_plugin_remote_controls,
     state: clap_plugin_state,
+    state_context: clap_plugin_state_context,
     preset_load: clap_plugin_preset_load,
     audio_ports: clap_plugin_audio_ports,
     audio_ports_config: clap_plugin_audio_ports_config,
@@ -5758,6 +5787,10 @@ impl<P: PluginExport> Extensions<P> {
             params: make_params_extension::<P>(),
             remote_controls: make_remote_controls_extension::<P>(),
             state: make_state_extension::<P>(),
+            state_context: clap_plugin_state_context {
+                save: Some(state_context_save::<P>),
+                load: Some(state_context_load::<P>),
+            },
             preset_load: make_preset_load_extension::<P>(),
             audio_ports: make_audio_ports_extension::<P>(),
             audio_ports_config: make_audio_ports_config_extension::<P>(),
@@ -5811,6 +5844,9 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         }
         if ext_id == CLAP_EXT_STATE {
             return (&raw const extensions.state).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_STATE_CONTEXT {
+            return (&raw const extensions.state_context).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_PRESET_LOAD || ext_id == CLAP_EXT_PRESET_LOAD_COMPAT {
             return (&raw const extensions.preset_load).cast::<c_void>();
@@ -6133,7 +6169,7 @@ macro_rules! export_clap {
             };
             use ::clap_sys::host::clap_host;
             use ::clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
-            use ::clap_sys::version::CLAP_VERSION;
+            use ::moose_clap::CLAP_VERSION;
 
             use ::moose_clap::__macro_deps::moose_core::plugin::PluginRuntime;
             use ::moose_clap::DescriptorHolder;
@@ -6801,7 +6837,7 @@ mod host_value_tests {
         // SAFETY: own the plugin, descriptor, host, and all callback buffers.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             host.get_extension = Some(extension);
             let descriptor = DescriptorHolder::new(&TestPlugin::info());
             let plugin = create_plugin_instance::<TestPlugin>(
@@ -6937,7 +6973,7 @@ mod host_value_tests {
         unsafe {
             let calls = Calls::default();
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             host.host_data = (&raw const calls).cast_mut().cast();
             host.get_extension = Some(extension);
             host.request_callback = Some(request);
@@ -7019,7 +7055,7 @@ mod host_value_tests {
         // SAFETY: own the plugin, descriptor, host, and output-event shims.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             host.get_extension = Some(extension);
             let descriptor = DescriptorHolder::new(&TestPlugin::info());
             let plugin = create_plugin_instance::<TestPlugin>(
@@ -7129,7 +7165,7 @@ mod host_value_tests {
         unsafe {
             let calls = Calls::default();
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             host.host_data = (&raw const calls).cast_mut().cast();
             host.get_extension = Some(extension);
             host.request_callback = Some(callback);
@@ -7290,7 +7326,7 @@ mod floating_gui_tests {
         // no native resources and all borrowed test state outlives the instance.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             host.host_data = (&raw const counters).cast_mut().cast();
             host.get_extension = Some(extension);
             host.request_callback = Some(request);
@@ -7416,7 +7452,7 @@ mod inactive_recall_tests {
         // SAFETY: own the plugin, host, descriptor and stream through destruction.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             host.get_extension = Some(no_extension);
             let descriptor = DescriptorHolder::new(&TestPlugin::info());
             let plugin = create_plugin_instance::<TestPlugin>(
@@ -7484,7 +7520,7 @@ mod large_state_tests {
     fn large_host_state_roundtrips_and_default_bound_rejects() {
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             let descriptor = DescriptorHolder::new(&Large::info());
             let plugin =
                 create_plugin_instance::<Large>(&raw const descriptor.descriptor, &raw const host);
@@ -7578,7 +7614,7 @@ mod surround_tests {
     fn host_reads_selected_canonical_surround_maps() {
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
-            host.clap_version = clap_sys::version::CLAP_VERSION;
+            host.clap_version = CLAP_VERSION;
             let descriptor = DescriptorHolder::new(&Surround::info());
             let plugin = create_plugin_instance::<Surround>(
                 &raw const descriptor.descriptor,
