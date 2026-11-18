@@ -5,7 +5,7 @@ repository.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "VST3 format wrapper for moose (C++ shim)"
+description = "VST3 format wrapper for moose, on the official VST3 SDK bindings"
 
 [dependencies]
 moose-core = { workspace = true }
@@ -14,9 +14,10 @@ moose-params = { workspace = true }
 # handoff so the audio thread is the only one that ever holds
 # `&mut Plugin`.
 crossbeam-queue = "0.3"
+vst3 = "0.3.0"
 
-[build-dependencies]
-cc = "1"
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

@@ -679,6 +679,13 @@ fn stage_vst3(
     fs::create_dir_all(&arch_dir)?;
     let inner = arch_dir.join(format!("{}.vst3", p.file_stem()));
     fs::copy(&dll, &inner)?;
+    // Multi-arch bundles share one moduleinfo.json; the host-arch pass
+    // writes it.
+    let host_arch = arch.triple() == moose_build::host_triple();
+    // The metadata reader keeps its library mapped; sign the separate staged copy.
+    if host_arch && let Some(json) = crate::vst3_moduleinfo::generate(&dll, &p.file_stem(), true) {
+        crate::vst3_moduleinfo::write(&bundle, &json)?;
+    }
     Ok(inner)
 }
 

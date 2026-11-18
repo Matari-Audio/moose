@@ -1,9 +1,10 @@
 //! VST3 format wrapper for moose.
 //!
-//! Uses a C++ shim that implements the real VST3 COM interfaces
-//! with correct vtable layout. All plugin logic is delegated to
-//! Rust via C FFI callbacks.
+//! The COM objects (`com/`) are built on the official SDK interfaces from
+//! the `vst3` crate. This file holds the plugin side: a callback table,
+//! generic over the plugin type, that the COM layer calls.
 
+mod com;
 pub mod ffi;
 
 use std::collections::HashSet;
@@ -74,6 +75,11 @@ type StateLoadQueue = state::StateLoadQueue;
 /// next host main-thread callback, so the actual notification lands on
 /// the UI thread - never the render thread or a moose-owned thread.
 const K_LATENCY_CHANGED: i32 = 8;
+
+/// VST3 `RestartFlags::kParamValuesChanged`: values moved without the host
+/// asking (a state load, or a queued state the audio thread applied), so
+/// the host re-reads them.
+const K_PARAM_VALUES_CHANGED: i32 = 4;
 
 struct Vst3Instance<P: PluginExport> {
     persist_signal: std::sync::Mutex<Option<Arc<moose_params::PersistChangeSignal>>>,
@@ -616,6 +622,10 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             let latency_cache = AtomicU32::new(plugin.latency());
             let tail_cache = AtomicU32::new(plugin.tail());
             let midi_proxy_ids = allocate_midi_proxy_ids(&param_infos, midi_proxy_len::<P>());
+            // One point per parameter per block fits next to the note
+            // events; a mapped controller pushes two (event + change).
+            // Points past this are committed as the queue's final value.
+            let event_capacity = EVENT_LIST_PREALLOC + 2 * param_infos.len();
             let midi_proxy_values = (0..midi_proxy_ids.len())
                 .map(|i| {
                     // Bounded by the proxy count.
@@ -649,10 +659,10 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 window_scale: AtomicU64::new(0),
                 pending_resize: AtomicU64::new(0),
                 audio: PluginCell::new(Vst3Scratch {
-                    event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                    event_list: EventList::with_capacity(event_capacity),
                     input_num_frames: 0,
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
-                    sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                    sub_event_scratch: EventList::with_capacity(event_capacity),
                     sample_rate: 44100.0,
                     // 8192 covers the largest block sizes mainstream DAWs /
                     // validators use (Reaper / pluginval <= 4096); a non-zero
@@ -1040,6 +1050,75 @@ unsafe extern "C" fn cb_push_input_event<P: PluginExport>(
     }
 }
 
+/// One host automation point, plain (denormalized) value. Returns 1 when
+/// queued, 0 when the event list is full (the COM layer then commits the
+/// queue's final value directly, so no change is lost).
+unsafe extern "C" fn cb_push_param_change<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: u32,
+    sample_offset: i32,
+    plain: f64,
+) -> i32 {
+    // SAFETY: ctx is a live instance; called on the audio thread inside
+    // process(), like `cb_push_input_event`.
+    let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
+    let mut audio = inst.audio.enter();
+    let Ok(sample_offset) = u32::try_from(sample_offset) else {
+        return 0;
+    };
+    i32::from(push_vst3_param_change::<P>(inst, &mut audio, id, sample_offset, plain))
+}
+
+/// Queue one sample-accurate parameter change. `set_plain` is deferred to
+/// the chunker's per-sub-block apply pass so smoothers see `set_target` at
+/// the event's sample rather than at the head of the audio block.
+fn push_vst3_param_change<P: PluginExport>(
+    inst: &Vst3Instance<P>,
+    audio: &mut Vst3Scratch<P>,
+    id: u32,
+    sample_offset: u32,
+    value: f64,
+) -> bool {
+    let list = &mut audio.event_list;
+    // Unbound MIDI controllers arrive on the hidden proxy ids: decode
+    // straight to the event. No `ParamChange` and no `Params` write - a
+    // proxy is not a plugin parameter. Denormalize is identity for proxy
+    // ids, so `value` is the host's raw `0..=1`. The id carries the event
+    // bus it was mapped for, so multi-port plugins keep controllers per
+    // port.
+    if let Some((port, channel, controller)) = allocated_midi_proxy_decode(&inst.midi_proxy_ids, id) {
+        #[allow(clippy::cast_possible_truncation)]
+        let normalized = value.clamp(0.0, 1.0) as f32;
+        return list
+            .try_push(Event::on_port(sample_offset, port, midi_proxy_event(channel, controller, normalized)))
+            .is_ok();
+    }
+    // MIDI-mapped controllers (pitch bend, CC, pressure, program) arrive
+    // as parameter changes because VST3 has no native input event for
+    // them. Bridge them back into the MIDI event the plugin expects, in
+    // addition to the plain `ParamChange` so the bound parameter still
+    // tracks the controller. The bridged event is port 0: an explicit
+    // `midi_map` binds one plugin parameter across every bus, so the host
+    // delivers a bus-less change with no originating port to recover.
+    let mapped = inst.midi_maps.binary_search_by_key(&id, |(id, _)| *id).ok();
+    if list.len() + 1 + usize::from(mapped.is_some()) > list.capacity() {
+        return false;
+    }
+    if let Some(idx) = mapped {
+        list.push(Event {
+            sample_offset,
+            port: 0,
+            body: midi_event_from_map(&inst.midi_maps[idx].1, value),
+        });
+    }
+    list.push(Event {
+        sample_offset,
+        port: 0,
+        body: EventBody::ParamChange { id, value },
+    });
+    true
+}
+
 fn push_vst3_input_event<P: PluginExport>(
     audio: &mut Vst3Scratch<P>,
     event: &Vst3NativeEvent,
@@ -1261,8 +1340,8 @@ fn faithful_typed_note(
 
 unsafe extern "C" fn cb_process<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
-    inputs: *const *const f32,
-    outputs: *mut *mut f32,
+    inputs: *const *const std::ffi::c_void,
+    outputs: *mut *mut std::ffi::c_void,
     num_input_channels: u32,
     num_output_channels: u32,
     input_bus_channels: *const u32,
@@ -1273,16 +1352,14 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
     output_bus_active: u32,
     num_frames: u32,
     transport_ptr: *const ffi::Vst3Transport,
-    param_changes: *const ffi::Vst3ParamChange,
-    num_param_changes: u32,
     process_mode: i32,
 ) -> u32 {
-    // SAFETY: forwarded - the shim's contract is the same.
+    // SAFETY: forwarded - the COM layer's contract is the same.
     unsafe {
         process_block::<P, f32>(
             ctx,
-            inputs,
-            outputs,
+            inputs.cast(),
+            outputs.cast(),
             num_input_channels,
             num_output_channels,
             input_bus_channels,
@@ -1293,8 +1370,6 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
             output_bus_active,
             num_frames,
             transport_ptr,
-            param_changes,
-            num_param_changes,
             process_mode,
         )
     }
@@ -1306,8 +1381,8 @@ unsafe extern "C" fn cb_process<P: PluginExport>(
 /// directly with no widen/narrow pass.
 unsafe extern "C" fn cb_process_f64<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
-    inputs: *const *const f64,
-    outputs: *mut *mut f64,
+    inputs: *const *const std::ffi::c_void,
+    outputs: *mut *mut std::ffi::c_void,
     num_input_channels: u32,
     num_output_channels: u32,
     input_bus_channels: *const u32,
@@ -1318,16 +1393,14 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
     output_bus_active: u32,
     num_frames: u32,
     transport_ptr: *const ffi::Vst3Transport,
-    param_changes: *const ffi::Vst3ParamChange,
-    num_param_changes: u32,
     process_mode: i32,
 ) -> u32 {
-    // SAFETY: forwarded - the shim's contract is the same.
+    // SAFETY: forwarded - the COM layer's contract is the same.
     unsafe {
         process_block::<P, f64>(
             ctx,
-            inputs,
-            outputs,
+            inputs.cast(),
+            outputs.cast(),
             num_input_channels,
             num_output_channels,
             input_bus_channels,
@@ -1338,8 +1411,6 @@ unsafe extern "C" fn cb_process_f64<P: PluginExport>(
             output_bus_active,
             num_frames,
             transport_ptr,
-            param_changes,
-            num_param_changes,
             process_mode,
         )
     }
@@ -1365,8 +1436,6 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
     output_bus_active: u32,
     num_frames: u32,
     transport_ptr: *const ffi::Vst3Transport,
-    param_changes: *const ffi::Vst3ParamChange,
-    num_param_changes: u32,
     process_mode: i32,
 ) -> u32 {
     let nf = num_frames as usize;
@@ -1408,7 +1477,10 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         // plugin sees consistent params and extra state for the
         // entire block. See `pending_state` field comment for the
         // queue-overflow policy.
-        apply_queued_state(&mut *plugin, &inst.pending_state);
+        if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
+            // An atomic bit-set; the UI thread sends it.
+            ffi::moose_vst3_mark_restart(ctx, K_PARAM_VALUES_CHANGED);
+        }
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the
         // wrapper's per-block glue - event conversion, transport, process,
@@ -1476,66 +1548,6 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             }
         }
 
-        // Queue sample-accurate parameter changes. `set_plain` is
-        // deferred to the chunker's per-sub-block apply pass so
-        // smoothers see `set_target` at the event's sample rather
-        // than at the head of the audio block.
-        // The C++ shim sends plain (denormalized) values.
-        if !param_changes.is_null() && num_param_changes > 0 {
-            let changes = slice::from_raw_parts(param_changes, num_param_changes as usize);
-            for pc in changes {
-                // VST3 delivers sampleOffset as int32; per-block
-                // offsets are non-negative and bounded by block size.
-                #[allow(clippy::cast_sign_loss)]
-                let sample_offset = pc.sample_offset as u32;
-                // Unbound MIDI controllers arrive on the hidden proxy
-                // ids: decode straight to the event. No `ParamChange`
-                // and no `Params` write - a proxy is not a plugin
-                // parameter. The shim's denormalize is identity for
-                // proxy ids, so `pc.value` is the host's raw `0..=1`.
-                // The id carries the event bus it was mapped for, so
-                // multi-port plugins keep controllers per port.
-                if let Some((port, channel, controller)) =
-                    allocated_midi_proxy_decode(&inst.midi_proxy_ids, pc.id)
-                {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let normalized = pc.value.clamp(0.0, 1.0) as f32;
-                    scr.event_list.push(Event::on_port(
-                        sample_offset,
-                        port,
-                        midi_proxy_event(channel, controller, normalized),
-                    ));
-                    continue;
-                }
-                // MIDI-mapped controllers (pitch bend, CC, pressure,
-                // program) arrive here as parameter changes because
-                // VST3 has no native input event for them. Bridge them
-                // back into the MIDI event the plugin expects, in
-                // addition to the plain `ParamChange` so the bound
-                // parameter still tracks the controller.
-                //
-                // The bridged event is port 0: an explicit `midi_map`
-                // binds one plugin parameter across every bus, so the
-                // host delivers a bus-less parameter change with no
-                // originating port to recover - unlike the per-bus
-                // proxy ids decoded above.
-                if let Ok(idx) = inst.midi_maps.binary_search_by_key(&pc.id, |(id, _)| *id) {
-                    scr.event_list.push(Event {
-                        sample_offset,
-                        port: 0,
-                        body: midi_event_from_map(&inst.midi_maps[idx].1, pc.value),
-                    });
-                }
-                scr.event_list.push(Event {
-                    sample_offset,
-                    port: 0,
-                    body: EventBody::ParamChange {
-                        id: pc.id,
-                        value: pc.value,
-                    },
-                });
-            }
-        }
         // Single stable sort across the merged MIDI + param-change
         // streams. Stable sort preserves the within-group order each
         // section already pushed in.
@@ -1685,8 +1697,6 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
                     1,
                     FRAMES,
                     std::ptr::null(),
-                    std::ptr::null(),
-                    0,
                     0,
                 );
             });
@@ -2044,6 +2054,8 @@ unsafe fn apply_host_state<P: PluginExport>(
     {
         editor.state_changed();
     }
+    // Delivered now on the UI thread, else left for the next drain.
+    ffi::moose_vst3_mark_restart(std::ptr::from_ref(inst).cast_mut().cast(), K_PARAM_VALUES_CHANGED);
     1
 }
 
@@ -3448,13 +3460,14 @@ fn apply_physical_resize(editor: &mut dyn Editor, w: u32, h: u32, host_scale: f6
     }
 }
 
+/// `Editor::is_open` after `open`; 0 when there is none or it panicked.
 unsafe extern "C" fn cb_gui_open<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     parent: *mut std::ffi::c_void,
-) {
+) -> i32 {
     // `editor.open` runs author GUI-construction code that can panic;
     // firewall it so the panic can't unwind across the C ABI.
-    run_extern_callback_with::<P, ()>("vst3", "gui_open", (), || unsafe {
+    run_extern_callback_with::<P, i32>("vst3", "gui_open", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let mut gui = inst.gui.enter();
         if let Some(ref mut editor) = gui.editor {
@@ -3568,7 +3581,10 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                 },
                 params_for_ctx,
             )
-            .with_tasks(task_spawner_for_ctx);
+            .with_tasks(task_spawner_for_ctx)
+            .with_mark_dirty(Arc::new(move || {
+                ffi::moose_vst3_mark_dirty(ctx_raw.as_ptr().cast_mut());
+            }));
             #[cfg(target_os = "macos")]
             let handle = RawWindowHandle::AppKit(parent);
             #[cfg(target_os = "windows")]
@@ -3585,8 +3601,11 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
             // AppKit, so `host_scale` stays 1.0 and pinning would force 1x.
             #[cfg(not(target_os = "macos"))]
             editor.set_scale_factor(inst.host_scale());
+            i32::from(editor.is_open())
+        } else {
+            0
         }
-    });
+    })
 }
 
 unsafe extern "C" fn cb_gui_close<P: PluginExport>(ctx: *mut std::ffi::c_void) {
@@ -3610,20 +3629,11 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
     resolve_name_override(info.vst3_name, info.name)
 }
 
-/// Per-direction channel-pointer capacity of the shim's `process()`
-/// arrays (`kMaxProcChannels` in `vst3_shim.cpp`). That path is the
-/// audio callback, so the arrays are fixed rather than heap-sized; a
-/// plugin whose widest declared layout exceeds this can't be rendered
-/// without silently truncating channels. Registration rejects it here
-/// rather than advertise a layout the audio path can't honor. Bus
-/// *counts* have no such limit - `setBusArrangements()` sizes its
-/// per-bus arrays dynamically.
-const VST3_MAX_CHANNELS_PER_DIRECTION: u32 = 32;
-
 /// Largest structural input and output widths across all declared layouts.
 ///
-/// Disabled optional buses still occupy fixed positions in the shim's
-/// process arrays, so their declared channels count toward this bound.
+/// Disabled optional buses still occupy fixed positions in the process
+/// pointer arrays, so their declared channels count toward the width the
+/// COM layer sizes them for.
 fn max_layout_channels(layouts: &[BusLayout]) -> (u32, u32) {
     layouts.iter().fold((0, 0), |(mi, mo), l| {
         let sum = |buses: &[BusConfig]| {
@@ -3632,6 +3642,12 @@ fn max_layout_channels(layouts: &[BusLayout]) -> (u32, u32) {
             })
         };
         (mi.max(sum(&l.inputs)), mo.max(sum(&l.outputs)))
+    })
+}
+
+fn vst3_bus_widths_supported(layouts: &[BusLayout]) -> bool {
+    layouts.iter().all(|layout| {
+        layout.inputs.iter().chain(&layout.outputs).all(|bus| bus.channels.channel_count() <= 64)
     })
 }
 
@@ -3645,20 +3661,14 @@ pub fn register_vst3<P: PluginExport>() {
             return;
         };
         let layouts = P::bus_layouts();
+        if !vst3_bus_widths_supported(&layouts) {
+            eprintln!("[moose VST3] {} declares a bus wider than 64 channels - plugin will not register.", std::any::type_name::<P>());
+            return;
+        }
         if !bus_layouts_fit_routing(&layouts) {
             eprintln!(
                 "[moose VST3] {} declares an audio-bus topology beyond BusRouting's limit of 32 \
                  buses per direction and 65,535 channels per bus - plugin will not register.",
-                std::any::type_name::<P>(),
-            );
-            return;
-        }
-        let (max_in, max_out) = max_layout_channels(&layouts);
-        if max_in > VST3_MAX_CHANNELS_PER_DIRECTION || max_out > VST3_MAX_CHANNELS_PER_DIRECTION {
-            eprintln!(
-                "[moose VST3] {} declares up to {max_in} input / {max_out} output channels, \
-                 exceeding the shim's {VST3_MAX_CHANNELS_PER_DIRECTION}-channel-per-direction \
-                 process limit - plugin will not register.",
                 std::any::type_name::<P>(),
             );
             return;
@@ -3868,6 +3878,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         // Widest output width across all layouts, so the shim's per-channel
         // output discard scratch has a distinct block for every channel of
         // any negotiable layout (see the field's `ffi` doc).
+        max_inputs: max_layout_channels(&P::bus_layouts()).0,
         max_outputs: max_layout_channels(&P::bus_layouts()).1,
     }));
 
@@ -3894,6 +3905,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         get_tail: cb_get_tail::<P>,
         begin_input_events: cb_begin_input_events::<P>,
         push_input_event: cb_push_input_event::<P>,
+        push_param_change: cb_push_param_change::<P>,
         begin_output_events: cb_begin_output_events::<P>,
         next_output_event: cb_next_output_event::<P>,
         commit_output_event: cb_commit_output_event::<P>,
@@ -4113,7 +4125,7 @@ mod midi_proxy_tests {
 
 #[cfg(test)]
 mod channel_limit_tests {
-    use super::{VST3_MAX_CHANNELS_PER_DIRECTION, max_layout_channels, vst3_topology_consistent};
+    use super::{max_layout_channels, vst3_bus_widths_supported, vst3_topology_consistent};
     use moose_core::bus::{BusLayout, ChannelConfig};
 
     /// Layouts differing only in channel *width* (the point of multi-layout)
@@ -4160,33 +4172,29 @@ mod channel_limit_tests {
     }
 
     #[test]
-    fn many_mono_buses_stay_within_limit() {
-        // 17 mono input buses = 17 channels, under the 32-channel cap - so a
-        // high bus count alone never trips the guard, and (with the dynamic
-        // setBusArrangements arrays) such a plugin negotiates all its buses.
-        let mut layout = BusLayout::new()
-            .with_input("Main", ChannelConfig::Mono)
-            .with_output("Main", ChannelConfig::Mono);
-        for _ in 1..17 {
-            layout = layout.with_sidechain_input("Aux", ChannelConfig::Mono);
-        }
-        let (max_in, _) = max_layout_channels(&[layout]);
-        assert_eq!(max_in, 17);
-        assert!(max_in <= VST3_MAX_CHANNELS_PER_DIRECTION);
-    }
-
-    #[test]
-    fn oversized_layout_exceeds_limit() {
-        // 17 stereo buses = 34 channels > 32: registration rejects this.
+    fn wide_layouts_are_measured_not_capped() {
+        // 17 stereo buses = 34 channels: past the old 32-channel shim cap,
+        // now just the width the process pointer arrays are sized for.
         let mut layout = BusLayout::new()
             .with_input("Main", ChannelConfig::Stereo)
             .with_output("Main", ChannelConfig::Stereo);
         for _ in 1..17 {
             layout = layout.with_sidechain_input("Aux", ChannelConfig::Stereo);
         }
-        let (max_in, _) = max_layout_channels(&[layout]);
-        assert_eq!(max_in, 34);
-        assert!(max_in > VST3_MAX_CHANNELS_PER_DIRECTION);
+        assert_eq!(max_layout_channels(&[layout]), (34, 2));
+    }
+
+    #[test]
+    fn each_bus_must_fit_a_speaker_mask() {
+        for (width, allowed) in [(64, true), (65, false)] {
+            let layout = BusLayout::new().with_input("Main", ChannelConfig::Custom(width));
+            assert_eq!(vst3_bus_widths_supported(&[layout]), allowed);
+        }
+        let mut layout = BusLayout::new();
+        for _ in 0..17 {
+            layout = layout.with_input("Bus", ChannelConfig::Stereo);
+        }
+        assert!(vst3_bus_widths_supported(&[layout]));
     }
 }
 
@@ -4205,10 +4213,7 @@ mod tests {
         assert_eq!(parse_midi_proxy_text("loud"), None);
     }
 
-    unsafe extern "C" {
-        fn moose_vst3_read_state_chunk(stream: *mut c_void, dst: *mut u8, len: u32) -> i64;
-        fn moose_vst3_write_state_stream(stream: *mut c_void, data: *const u8, len: u32) -> i32;
-    }
+    use crate::com::{read_state_chunk as moose_vst3_read_state_chunk, write_state_stream as moose_vst3_write_state_stream};
 
     /// A fake `IBStream`: the vtable pointer first, then a script of
     /// `(tresult, byte count)` replies the shim sees per read/write.

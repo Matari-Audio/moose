@@ -549,6 +549,7 @@ fn install_vst3(
         return Err(format!("Missing: {}", dylib.display()).into());
     }
     let bundle = scope.vst3_dir().join(format!("{}.vst3", p.file_stem()));
+    let moduleinfo = crate::vst3_moduleinfo::generate(&dylib, &p.file_stem(), true);
 
     #[cfg(target_os = "macos")]
     {
@@ -593,6 +594,19 @@ fn install_vst3(
             fs_ctx::copy(&dylib, macos_dir.join(&exec_name))?;
             fs_ctx::copy(&plist_tmp, contents.join("Info.plist"))?;
         }
+        // Before signing: the seal covers Contents/Resources.
+        if let Some(json) = &moduleinfo {
+            if scope.needs_sudo() {
+                let tmp = tmp_manifests().join(format!("{}_moduleinfo.json", p.bundle_id));
+                fs_ctx::write(&tmp, json)?;
+                let dst = bundle.join(crate::vst3_moduleinfo::PATH);
+                let dir = dst.parent().unwrap_or(&contents);
+                run_sudo("mkdir", &[OsStr::new("-p"), dir.as_os_str()])?;
+                run_sudo("cp", &[tmp.as_os_str(), dst.as_os_str()])?;
+            } else {
+                crate::vst3_moduleinfo::write(&bundle, json)?;
+            }
+        }
 
         codesign_bundle(
             bundle.to_str().unwrap(),
@@ -609,6 +623,9 @@ fn install_vst3(
         let dst = arch_dir.join(format!("{}.vst3", p.file_stem()));
         fs_ctx::create_dir_all(&arch_dir)?;
         fs_ctx::copy(&dylib, &dst)?;
+        if let Some(json) = &moduleinfo {
+            crate::vst3_moduleinfo::write(&bundle, json)?;
+        }
         crate::log_output(format!("VST3: {}", bundle.display()));
     }
 
@@ -618,6 +635,9 @@ fn install_vst3(
         let dst = arch_dir.join(format!("{}.so", p.file_stem()));
         fs_ctx::create_dir_all(&arch_dir)?;
         fs_ctx::copy(&dylib, &dst)?;
+        if let Some(json) = &moduleinfo {
+            crate::vst3_moduleinfo::write(&bundle, json)?;
+        }
         crate::log_output(format!("VST3: {}", bundle.display()));
     }
 

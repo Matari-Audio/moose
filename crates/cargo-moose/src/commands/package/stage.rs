@@ -259,6 +259,10 @@ fn stage_vst3_macos(root: &Path, p: &PluginDef, config: &Config, bundle: &Path) 
         exec_name = xml_escape(&exec_name),
     );
     fs::write(bundle.join("Contents/Info.plist"), &plist)?;
+    // Before signing: the seal covers Contents/Resources.
+    if let Some(json) = crate::vst3_moduleinfo::generate(&macos_dir.join(&exec_name), &exec_name, true) {
+        crate::vst3_moduleinfo::write(bundle, &json)?;
+    }
     codesign_bundle(
         bundle.to_str().unwrap(),
         &crate::application_identity(),
@@ -289,7 +293,12 @@ fn stage_vst3_shared_lib(
     let arch_dir = bundle.join("Contents").join(vst3_arch_subdir(triple));
     fs::create_dir_all(&arch_dir)?;
     let inner_filename = format!("{}.{}", p.file_stem(), vst3_inner_extension(triple));
-    fs::copy(&dylib, arch_dir.join(inner_filename))?;
+    let inner = arch_dir.join(inner_filename);
+    fs::copy(&dylib, &inner)?;
+    let host_arch = triple == moose_build::host_triple();
+    if let Some(json) = crate::vst3_moduleinfo::generate(&inner, &p.file_stem(), host_arch) {
+        crate::vst3_moduleinfo::write(bundle, &json)?;
+    }
     Ok(())
 }
 

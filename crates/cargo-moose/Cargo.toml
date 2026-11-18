@@ -46,6 +46,10 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 [dependencies.libloading]
 version = "0.9"
 
+# Reads a built VST3 factory for `moduleinfo.json`.
+[dependencies.vst3]
+version = "0.3.0"
+
 # Post-link icon embed for the standalone host .exe lives in
 # `windows_manifest::embed_icon` and calls `BeginUpdateResource` /
 # `UpdateResource` / `EndUpdateResource` directly - same shell-out-free

@@ -15,6 +15,7 @@ pub(crate) mod preset_codec;
 pub mod scaffold;
 mod templates;
 mod util;
+mod vst3_moduleinfo;
 
 pub use error::CargoMooseError;
 

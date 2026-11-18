@@ -1,10 +1,13 @@
-//! C ABI types for the Rust / C++ VST3 shim boundary.
+//! The boundary between the plugin-generic callbacks in `lib.rs` and the
+//! VST3 COM objects in `com/`: what `register_vst3` hands over, and the
+//! host notifications the plugin side sends back.
 
 use std::ffi::c_void;
 use std::mem::{align_of, offset_of, size_of};
 use std::os::raw::c_char;
 
-/// Plugin descriptor passed from Rust to the C++ shim.
+
+/// Plugin descriptor handed to the COM layer at registration.
 #[repr(C)]
 pub struct Vst3PluginDescriptor {
     pub name: *const c_char,
@@ -26,38 +29,39 @@ pub struct Vst3PluginDescriptor {
     /// Number of audio input / output buses (from the first declared
     /// layout). The bus *structure* - how many buses and each one's
     /// `BusKind` - is consistent across a plugin's layouts; only channel
-    /// widths vary. The shim reports one VST3 bus per entry, so a
+    /// widths vary. The COM layer reports one VST3 bus per entry, so a
     /// sidechain input surfaces as its own `kBusType_Aux` bus instead of
     /// being summed into the main bus.
     pub num_input_buses: u32,
     pub num_output_buses: u32,
     /// Per-bus role, one byte per bus (`0` = Main, `1` = Sidechain/Aux),
-    /// arrays of length `num_input_buses` / `num_output_buses`. The shim
+    /// arrays of length `num_input_buses` / `num_output_buses`. The COM layer
     /// maps `1` to `kBusType_Aux` in `getBusInfo`.
     pub input_bus_kinds: *const u8,
     pub output_bus_kinds: *const u8,
     /// Number of MIDI output ports (event output buses). `0` disables
     /// output events entirely - the host never allocates
     /// `ProcessData::outputEvents` and the drain loop after `process()`
-    /// is a no-op. The shim advertises this many `kEvent | kOutput`
+    /// is a no-op. The COM layer advertises this many `kEvent | kOutput`
     /// buses; the plugin routes each event to a bus via `Event::port`.
     pub midi_output_ports: i32,
     /// Number of MIDI input ports (event input buses). `0` means the
     /// plugin takes no MIDI (decoupled from `num_inputs` so an audio
-    /// effect can also take MIDI). The shim advertises this many
+    /// effect can also take MIDI). The COM layer advertises this many
     /// `kEvent | kInput` buses and stamps each event's `Event::port`
     /// from the bus it arrived on.
     pub midi_input_ports: i32,
-    /// Non-zero when the plugin's `Sample` is `f64`. The shim then
+    /// Non-zero when the plugin's `Sample` is `f64`. The COM layer then
     /// answers `canProcessSampleSize(kSample64)` with `kResultOk`,
     /// accepts a 64-bit `setupProcessing`, and routes blocks through
     /// `process_f64` so the plugin reads/writes host memory directly
     /// with no precision conversion.
     pub supports_f64: i32,
-    /// Widest total output-channel count across *all* declared layouts.
-    /// The shim sizes its per-channel output discard scratch to this so a
-    /// negotiated layout wider than the first can't alias two output
-    /// channels onto one discard block (which would be aliased `&mut`s).
+    /// Widest total input / output channel counts across *all* declared
+    /// layouts. Process scratch (channel pointers, the per-channel output
+    /// discard blocks) is sized from these, so any negotiable layout fits
+    /// and no two output channels alias one discard block.
+    pub max_inputs: u32,
     pub max_outputs: u32,
 }
 
@@ -77,7 +81,7 @@ pub struct Vst3ParamDescriptor {
 }
 
 /// Flat, pointer-free except for borrowed `SysEx` bytes, representation of one
-/// VST3 native event. The shim traverses the host's `IEventList` in place and
+/// VST3 native event. The COM layer traverses the host's `IEventList` in place and
 /// hands events to Rust one at a time, avoiding a fixed-size staging array.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
@@ -124,7 +128,7 @@ const _: () = {
     assert!(offset_of!(Vst3NativeEvent, data2) == 69);
 };
 
-/// Transport info passed from the C++ shim to Rust.
+/// Transport info for one block.
 #[repr(C)]
 pub struct Vst3Transport {
     pub playing: i32,
@@ -140,15 +144,25 @@ pub struct Vst3Transport {
     pub cycle_active: i32,
 }
 
-/// Parameter change event with sample offset (for sample-accurate automation).
-#[repr(C)]
-pub struct Vst3ParamChange {
-    pub id: u32,
-    pub sample_offset: i32,
-    pub value: f64, // plain value (already denormalized)
-}
+/// Plugin callbacks the COM layer calls.
+pub type ProcessFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    inputs: *const *const c_void,
+    outputs: *mut *mut c_void,
+    num_input_channels: u32,
+    num_output_channels: u32,
+    input_bus_channels: *const u32,
+    num_input_buses: u32,
+    input_bus_active: u32,
+    output_bus_channels: *const u32,
+    num_output_buses: u32,
+    output_bus_active: u32,
+    num_frames: u32,
+    transport: *const Vst3Transport,
+    // VST3 `ProcessData::processMode` for this block.
+    process_mode: i32,
+) -> u32;
 
-/// Callbacks from the C++ shim into Rust.
 #[repr(C)]
 pub struct Vst3Callbacks {
     pub create: unsafe extern "C" fn() -> *mut c_void,
@@ -167,47 +181,18 @@ pub struct Vst3Callbacks {
         max_frames: u32,
         process_mode: i32,
     ) -> i32,
-    pub process: unsafe extern "C" fn(
-        ctx: *mut c_void,
-        inputs: *const *const f32,
-        outputs: *mut *mut f32,
-        num_input_channels: u32,
-        num_output_channels: u32,
-        input_bus_channels: *const u32,
-        num_input_buses: u32,
-        input_bus_active: u32,
-        output_bus_channels: *const u32,
-        num_output_buses: u32,
-        output_bus_active: u32,
-        num_frames: u32,
-        transport: *const Vst3Transport,
-        param_changes: *const Vst3ParamChange,
-        num_param_changes: u32,
-        // VST3 `ProcessData::processMode` for this block.
-        process_mode: i32,
-    ) -> u32,
-    /// 64-bit twin of `process`. The shim calls exactly one of the
-    /// two per block, chosen by the sample size the host negotiated
-    /// in `setupProcessing` (only offered when
-    /// `Vst3PluginDescriptor::supports_f64` is set).
-    pub process_f64: unsafe extern "C" fn(
-        ctx: *mut c_void,
-        inputs: *const *const f64,
-        outputs: *mut *mut f64,
-        num_input_channels: u32,
-        num_output_channels: u32,
-        input_bus_channels: *const u32,
-        num_input_buses: u32,
-        input_bus_active: u32,
-        output_bus_channels: *const u32,
-        num_output_buses: u32,
-        output_bus_active: u32,
-        num_frames: u32,
-        transport: *const Vst3Transport,
-        param_changes: *const Vst3ParamChange,
-        num_param_changes: u32,
-        process_mode: i32,
-    ) -> u32,
+    /// Render one block. `inputs` / `outputs` are channel pointers of the
+    /// negotiated sample width (`f32`, or `f64` for `process_f64`).
+    /// Parameter points arrived before through `push_param_change`.
+    pub process: ProcessFn,
+    /// 64-bit twin of `process`, used when the host negotiated `kSample64`
+    /// (offered only when `Vst3PluginDescriptor::supports_f64` is set).
+    pub process_f64: ProcessFn,
+    /// Queue one host parameter point (plain value) for the current block.
+    /// Returns 0 when the block's event list is full; the COM layer then
+    /// commits the queue's final value directly.
+    pub push_param_change:
+        unsafe extern "C" fn(ctx: *mut c_void, id: u32, sample_offset: i32, plain: f64) -> i32,
     pub param_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
     pub param_get_value: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> f64,
     pub param_set_value: unsafe extern "C" fn(ctx: *mut c_void, id: u32, value: f64),
@@ -222,7 +207,7 @@ pub struct Vst3Callbacks {
     ) -> u32,
     /// Parse host-entered UTF-8 `text` into a plain param value. Returns
     /// `1` and writes `out_plain` on success, `0` when the text can't be
-    /// parsed (the shim then reports `kResultFalse` to the host).
+    /// parsed (the COM layer then reports `kResultFalse` to the host).
     pub param_parse: unsafe extern "C" fn(
         ctx: *mut c_void,
         id: u32,
@@ -233,9 +218,9 @@ pub struct Vst3Callbacks {
         unsafe extern "C" fn(ctx: *mut c_void, out_data: *mut *mut u8, out_len: *mut u32),
     /// Returns `1` when the blob was accepted (moose envelope, or
     /// `migrate_state` translated it), `0` when the load failed -
-    /// the shim's `setState` forwards that as `kResultFalse`.
+    /// the COM layer's `setState` forwards that as `kResultFalse`.
     pub state_load: unsafe extern "C" fn(ctx: *mut c_void, data: *const u8, len: u32) -> i32,
-    /// Incremental host `IBStream` reader; no C++ staging copy.
+    /// Incremental host `IBStream` reader; no staging copy.
     pub state_load_stream: unsafe extern "C" fn(
         ctx: *mut c_void,
         stream: *mut c_void,
@@ -254,7 +239,7 @@ pub struct Vst3Callbacks {
     /// through `push_input_event` in the host's original `IEventList` order.
     pub begin_input_events: unsafe extern "C" fn(ctx: *mut c_void, num_frames: u32),
     /// Returns 1=emitted, 2=unsupported, 3=invalid, 4=queue full. Queue-full
-    /// tells the shim to stop traversing so the retained prefix stays ordered.
+    /// tells the COM layer to stop traversing so the retained prefix stays ordered.
     pub push_input_event:
         unsafe extern "C" fn(ctx: *mut c_void, event: *const Vst3NativeEvent) -> u32,
     /// Begin one globally ordered output traversal over the lossless event
@@ -269,7 +254,8 @@ pub struct Vst3Callbacks {
     // GUI
     pub gui_has_editor: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
     pub gui_get_size: unsafe extern "C" fn(ctx: *mut c_void, w: *mut u32, h: *mut u32),
-    pub gui_open: unsafe extern "C" fn(ctx: *mut c_void, parent: *mut c_void),
+    /// 1 when the editor opened; 0 fails `IPlugView::attached`.
+    pub gui_open: unsafe extern "C" fn(ctx: *mut c_void, parent: *mut c_void) -> i32,
     pub gui_close: unsafe extern "C" fn(ctx: *mut c_void),
     /// Host-driven DPI notification via `IPlugViewContentScaleSupport::
     /// setContentScaleFactor`. Passed to the Rust side so the instance
@@ -305,7 +291,7 @@ pub struct Vst3Callbacks {
         controller: i16,
         out_param_id: *mut u32,
     ) -> i32,
-    /// Process-emitted parameter output. The shim drains these after
+    /// Process-emitted parameter output. The COM layer drains these after
     /// `process` into the host's `outputParameterChanges` queue, so
     /// hosts see parameter changes the plugin makes during processing.
     /// `value` is normalized `[0,1]`; `sample_offset` is block-relative.
@@ -324,12 +310,12 @@ pub struct Vst3Callbacks {
     pub set_active: unsafe extern "C" fn(ctx: *mut c_void, active: i32),
     /// Return the `bus_layouts()` index whose main-bus channel counts are
     /// `(in_ch, out_ch)`, or `-1`. Static per plugin type (no `ctx`); the
-    /// shim's `setBusArrangements` uses it to accept alternate layouts.
+    /// COM layer's `setBusArrangements` uses it to accept alternate layouts.
     pub match_bus_layout: unsafe extern "C" fn(in_ch: u32, out_ch: u32) -> i32,
     /// Per-bus channel width of a declared layout. `layout_index` indexes
     /// `bus_layouts()`, `is_output != 0` selects the output direction,
     /// `bus_index` the bus within that direction. Returns the channel
-    /// count, or `0` when out of range. The shim reports `getBusInfo` /
+    /// count, or `0` when out of range. The COM layer reports `getBusInfo` /
     /// `getBusArrangement` per bus from this and sizes its process gather.
     pub layout_bus_channels:
         unsafe extern "C" fn(layout_index: u32, is_output: i32, bus_index: u32) -> u32,
@@ -346,7 +332,7 @@ pub struct Vst3Callbacks {
     ) -> i32,
     /// Is a parameter flagged `ParamFlags::CHUNKED` (sample-accurate
     /// automation)? Non-zero when the plugin requests sub-block splitting
-    /// on this id, so the shim defers its per-offset commits to
+    /// on this id, so the COM layer defers its per-offset commits to
     /// `process_chunked` rather than pre-writing the block's end value at
     /// collection time - which would make a mid-block step audible from
     /// sample 0.
@@ -372,42 +358,64 @@ pub struct Vst3Callbacks {
     ),
 }
 
-unsafe extern "C" {
-    /// Register the plugin with the VST3 shim.
-    pub fn moose_vst3_register(
-        descriptor: *const Vst3PluginDescriptor,
-        callbacks: *const Vst3Callbacks,
-        param_descriptors: *const Vst3ParamDescriptor,
-        num_params: u32,
-    );
+/// Register the plugin with the COM layer.
+///
+/// # Safety
+/// Every pointer must reference leaked, immutable registration data.
+pub unsafe fn moose_vst3_register(
+    descriptor: *const Vst3PluginDescriptor,
+    callbacks: *const Vst3Callbacks,
+    param_descriptors: *const Vst3ParamDescriptor,
+    num_params: u32,
+) {
+    let params = if param_descriptors.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(param_descriptors, num_params as usize) }
+    };
+    unsafe { crate::com::register(&*descriptor, &*callbacks, params) };
+}
 
-    /// Get the VST3 factory COM object. Called by `GetPluginFactory`.
-    pub fn moose_vst3_get_factory() -> *mut std::ffi::c_void;
+/// A new reference to the plugin factory. Called by `GetPluginFactory`.
+#[must_use]
+pub fn moose_vst3_get_factory() -> *mut c_void {
+    crate::com::factory()
+}
 
-    /// Notify host: begin editing a parameter (mouse-down).
-    pub fn moose_vst3_begin_edit(ctx: *mut std::ffi::c_void, id: u32);
+/// Host: begin editing a parameter (mouse-down). From any thread; calls off
+/// the host UI thread are queued for it.
+pub fn moose_vst3_begin_edit(ctx: *mut c_void, id: u32) {
+    crate::com::begin_edit(ctx, id);
+}
 
-    /// Notify host: parameter value changed during a gesture.
-    pub fn moose_vst3_perform_edit(ctx: *mut std::ffi::c_void, id: u32, normalized: f64);
+/// Host: parameter value changed during a gesture.
+pub fn moose_vst3_perform_edit(ctx: *mut c_void, id: u32, normalized: f64) {
+    crate::com::perform_edit(ctx, id, normalized);
+}
 
-    /// Notify host: end editing a parameter (mouse-up).
-    pub fn moose_vst3_end_edit(ctx: *mut std::ffi::c_void, id: u32);
+/// Host: end editing a parameter (mouse-up).
+pub fn moose_vst3_end_edit(ctx: *mut c_void, id: u32) {
+    crate::com::end_edit(ctx, id);
+}
 
-    /// Plugin -> host resize request. Looks up the owning
-    /// component via the ctx mapping, walks to the live plug view's
-    /// stored `IPlugFrame*`, and calls `IPlugFrame::resizeView`.
-    /// Returns `1` on success; `0` when no live view / frame is
-    /// available (e.g. editor closed) or when the host refused.
-    /// Routes through the component (not the plug view) so that
-    /// view re-creation between calls (Cubase theme change, Live
-    /// dock/undock) doesn't leave a stale pointer in the closure.
-    pub fn moose_vst3_request_resize(ctx: *mut std::ffi::c_void, w: u32, h: u32) -> i32;
+/// Plugin -> host resize request through the live view's `IPlugFrame`.
+/// Returns 1 when made or queued, 0 when no view or frame is live or the
+/// host refused. Resolved through the instance each time, so a view the
+/// host re-created (theme change, dock/undock) is never stale.
+pub fn moose_vst3_request_resize(ctx: *mut c_void, w: u32, h: u32) -> i32 {
+    crate::com::request_resize(ctx, w, h)
+}
 
-    /// Flag a pending `IComponentHandler::restartComponent`. `flags` is a
-    /// VST3 `RestartFlags` bitmask - `kLatencyChanged` (8) for a latency
-    /// change. Only sets bits on an atomic, so it is safe to call from the
-    /// audio thread; the shim drains them via `restartComponent` on the
-    /// next host main-thread callback (param read / edit gesture), keeping
-    /// the actual host call on the UI thread.
-    pub fn moose_vst3_mark_restart(ctx: *mut std::ffi::c_void, flags: i32);
+/// Flag a `restartComponent` (`RestartFlags` bitmask). Inside `process`
+/// it only sets bits (RT-safe); the UI thread sends them. From the UI
+/// thread it is sent at once.
+pub fn moose_vst3_mark_restart(ctx: *mut c_void, flags: i32) {
+    crate::com::mark_restart(ctx, flags);
+}
+
+/// Tell the host the project changed (`IComponentHandler2::setDirty`), for
+/// custom-state edits it can't see as parameter edits. Any thread; it is
+/// delivered on the UI thread.
+pub fn moose_vst3_mark_dirty(ctx: *mut c_void) {
+    crate::com::mark_dirty(ctx);
 }
