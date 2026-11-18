@@ -83,6 +83,141 @@ pub fn save_extra(snapshot: &crate::snapshot::SnapshotSlot) -> Vec<u8> {
     snapshot.read().unwrap_or_default()
 }
 
+/// How long a host-thread save or load waits for the audio thread to
+/// serve it at the next block boundary before falling back. Long enough
+/// for any real block period; a host that stopped calling `process`
+/// without telling us (a sleeping CLAP plugin) costs this much per call.
+// ponytail: fixed bound, derive from the block period if 50 ms stalls show up.
+pub const AUDIO_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Pop and apply one queued state load on the thread that owns the plugin,
+/// record the result for a waiting host thread, and ask the shell for a
+/// fresh snapshot at the end of the next `process`. `None` when nothing was
+/// queued. Wrappers call this at the top of `process`, outside the
+/// real-time section (`load_state` may allocate).
+pub fn apply_queued_state<P: PluginExport>(
+    plugin: &mut P,
+    queue: &crate::state::StateLoadQueue,
+) -> Option<Result<(), crate::state::StateLoadError>> {
+    let state = queue.pop()?;
+    let result = crate::state::try_apply_state(plugin, &state);
+    queue.mark_applied(&state, result.is_ok());
+    plugin.snapshot_slot().request_fresh();
+    Some(result)
+}
+
+/// Load a host state into the plugin. With `can_own` (the wrapper is not
+/// processing) the host thread takes the plugin and applies it now;
+/// otherwise the state is queued for the audio thread and this waits up to
+/// [`AUDIO_HANDSHAKE_WAIT`] for it to land and for the fresh snapshot, so an
+/// editor notified next reads the new state.
+///
+/// Params and `#[persist]` must already be applied (`read_and_apply_params`
+/// / `apply_params`); `backup` is what they were before. When the plugin's
+/// `load_state` rejects the state, they are restored from it, so the load
+/// fails as a unit and the error is returned for the host. A load still
+/// queued when the wait ends returns `Ok`: its envelope already parsed on
+/// the host thread, and saves until it lands report its custom bytes (see
+/// [`custom_state_view`]).
+///
+/// # Errors
+///
+/// The plugin's `load_state` error, when it ran before this returned.
+pub fn apply_or_queue_state<P: PluginExport>(
+    plugin: &PluginCell<P>,
+    params: &P::Params,
+    slot: &crate::snapshot::SnapshotSlot,
+    queue: &crate::state::StateLoadQueue,
+    state: crate::state::DeserializedState,
+    backup: &crate::state::ParamsBackup,
+    can_own: bool,
+) -> Result<(), crate::state::StateLoadError> {
+    let result = apply_or_queue_inner(plugin, slot, queue, state, can_own);
+    if result.is_err() {
+        backup.restore(params);
+    }
+    result
+}
+
+fn apply_or_queue_inner<P: PluginExport>(
+    plugin: &PluginCell<P>,
+    slot: &crate::snapshot::SnapshotSlot,
+    queue: &crate::state::StateLoadQueue,
+    state: crate::state::DeserializedState,
+    can_own: bool,
+) -> Result<(), crate::state::StateLoadError> {
+    // `try_enter`: a CLAP `reset` may hold the cell on the audio thread
+    // while stopped; then queue instead of panicking on an overlap.
+    if can_own && let Some(mut instance) = plugin.try_enter() {
+        // An older queued load is superseded by this one.
+        if let Some(stale) = queue.pop() {
+            queue.mark_applied(&stale, true);
+        }
+        let result = crate::state::try_apply_state(&mut *instance, &state);
+        instance.republish_snapshot();
+        return result;
+    }
+    let handle = queue.push_tracked(state);
+    match queue.wait_applied(&handle, AUDIO_HANDSHAKE_WAIT) {
+        Some(false) => Err(crate::state::StateLoadError::Other(
+            "plugin load_state rejected the state".into(),
+        )),
+        // Applied: the audio thread requested a fresh snapshot right after
+        // the apply, served at the end of that block. Wait for it so a
+        // `get_state` right after this doesn't read the pre-load snapshot.
+        Some(true) => {
+            let ticket = slot.request_fresh();
+            // A late snapshot only delays freshness; the load itself landed.
+            let _ = slot.wait_served(ticket, AUDIO_HANDSHAKE_WAIT);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Custom state for a host save. With `can_own` the host thread takes the
+/// plugin, applies any queued load, and serializes live state. Otherwise it
+/// asks the audio thread for a fresh snapshot and waits up to
+/// [`AUDIO_HANDSHAKE_WAIT`]; if no block runs in time it falls back to
+/// [`custom_state_view`].
+///
+/// Why a request instead of a lock: the audio thread never waits, and a
+/// running audio thread serves the request within one block, so the host
+/// gets live state without a dropout. Serializing on the audio thread only
+/// happens on request, not every block.
+pub fn custom_state_for_save<P: PluginExport>(
+    plugin: &PluginCell<P>,
+    slot: &crate::snapshot::SnapshotSlot,
+    queue: &crate::state::StateLoadQueue,
+    can_own: bool,
+) -> Vec<u8> {
+    if can_own && let Some(mut instance) = plugin.try_enter() {
+        if apply_queued_state(&mut *instance, queue).is_some() {
+            instance.republish_snapshot();
+        }
+        return crate::export::read_custom_state_offthread(&*instance);
+    }
+    let ticket = slot.request_fresh();
+    if slot.wait_served(ticket, AUDIO_HANDSHAKE_WAIT) && queue.unapplied().is_none() {
+        return save_extra(slot);
+    }
+    custom_state_view(slot, queue)
+}
+
+/// Custom state without touching the plugin: the bytes of a load still
+/// waiting for the audio thread, else the last published snapshot. For
+/// the editor's `get_state` and as the save fallback.
+#[must_use]
+pub fn custom_state_view(
+    slot: &crate::snapshot::SnapshotSlot,
+    queue: &crate::state::StateLoadQueue,
+) -> Vec<u8> {
+    match queue.unapplied() {
+        Some(state) => state.extra.clone().unwrap_or_default(),
+        None => save_extra(slot),
+    }
+}
+
 /// Lock-free plugin ownership cell, uniform across platforms. Holds no
 /// OS mutex: the audio thread owns the plugin while processing, the host
 /// thread while stopped, and a spec-compliant host never overlaps the

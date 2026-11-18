@@ -39,10 +39,10 @@ pub struct StaticShell<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample =
     meters: Arc<MeterStore>,
     /// Lock-free publish slot for `snapshot_into`-based state save.
     snapshots: Arc<SnapshotSlot>,
-    /// Stays `true` until the logic reports (via `snapshot_into`), on a
-    /// block before it ever publishes, that it has no custom snapshot -
-    /// after which per-block publishing is skipped so non-opt-in plugins
-    /// pay nothing. A plugin that has published once stays subscribed.
+    /// Whether the plugin opted into the per-block publish (it overrides
+    /// `snapshot_into` or `snapshot_version`), probed once in `from_parts`
+    /// off the audio thread. `false`: nothing serializes per block; a host
+    /// save asks for a snapshot on demand instead (`serve_snapshot_request`).
     try_snapshot: bool,
     /// Last `snapshot_version` the shell published. A block whose version
     /// matches this skips re-serialization entirely (see
@@ -104,17 +104,25 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         let init_ctx =
             InitContext::new(tasks.clone()).with_snapshot(SnapshotPublisher::new(&snapshots));
         let state = Box::new(L::init(&params, &init_ctx));
-        Self {
+        // Static capability probe, here on the creating thread so it never
+        // allocates on the audio thread.
+        let try_snapshot =
+            L::snapshot_version(&state).is_some() || L::snapshot_into(&state, &mut Vec::new());
+        let mut shell = Self {
             params,
             state,
             meters: MeterStore::new(),
             snapshots,
-            try_snapshot: true,
+            try_snapshot,
             last_snapshot_version: None,
             sample_rate: 44100.0,
             tasks,
             _sample: std::marker::PhantomData,
-        }
+        };
+        // Baseline snapshot, so a save that falls back to the slot before
+        // any block or request still has the initial custom state.
+        shell.republish_snapshot();
+        shell
     }
 
     /// Shared meter storage handle - the GUI-thread-safe channel
@@ -248,6 +256,15 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
             &mut self.try_snapshot,
             &mut self.last_snapshot_version,
         );
+        if let Some(ticket) = self.snapshots.pending_request() {
+            // A host save (or a just-applied load) asked for live state.
+            // Runs once per request, not per block; `save_state` may
+            // allocate, which the request accepts.
+            moose_core::rt::allow_alloc(|| {
+                self.snapshots
+                    .serve(ticket, |buf| live_snapshot::<S, L>(&self.state, buf));
+            });
+        }
         status
     }
 
@@ -260,12 +277,10 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
     }
 
     fn republish_snapshot(&mut self) {
-        publish_snapshot::<S, L>(
-            &self.state,
-            &self.snapshots,
-            &mut self.try_snapshot,
-            &mut self.last_snapshot_version,
-        );
+        // Host thread, plugin owned: serialize live, whatever the opt-in.
+        self.last_snapshot_version = None;
+        self.snapshots
+            .store_inline(|buf| live_snapshot::<S, L>(&self.state, buf));
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<(), StateLoadError> {
@@ -304,6 +319,14 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
     }
 }
 
+/// Live custom state: `snapshot_into`, else the legacy `save_state`.
+fn live_snapshot<S: Sample, L: PluginLogicCore<S>>(state: &L::DspState, buf: &mut Vec<u8>) {
+    if !L::snapshot_into(state, buf) {
+        buf.clear();
+        buf.extend_from_slice(&L::save_state(state));
+    }
+}
+
 /// Publish the plugin's `snapshot_into` bytes into `slot` on the audio
 /// thread. Shared by both shells.
 ///
@@ -327,7 +350,13 @@ pub(crate) fn publish_snapshot<S, L>(
 {
     let version = L::snapshot_version(state);
     publish_snapshot_with(slot, try_snapshot, last_version, version, |buf| {
+        // A versioned plugin that only overrides `save_state` opted in
+        // through `snapshot_version`; serialize it when the token moves.
         L::snapshot_into(state, buf)
+            || (version.is_some() && {
+                buf.extend_from_slice(&L::save_state(state));
+                true
+            })
     });
 }
 

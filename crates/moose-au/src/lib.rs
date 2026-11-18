@@ -72,8 +72,9 @@ use moose_core::ump::{
     encode_ump_channel_voice_1, encode_ump_channel_voice_2, sysex7_packet_count,
 };
 use moose_core::wrapper::{
-    ParamCStrings, PluginCell, SharedPlugin, copy_c_str, default_io_channels, enter_plugin,
-    log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register, save_extra,
+    ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
+    custom_state_for_save, default_io_channels, enter_plugin,
+    log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register,
     shared_plugin,
 };
 use moose_params::{MidiSource, ParamFlags, Params};
@@ -1079,9 +1080,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
         // plugin sees consistent params and extra state for the
         // entire block. See `pending_state` field comment for the
         // queue-overflow policy.
-        if let Some(state) = inst.pending_state.pop() {
-            state::apply_state(&mut *plugin, &state);
-        }
+        apply_queued_state(&mut *plugin, &inst.pending_state);
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the
         // wrapper's per-block glue - event conversion, transport, process,
@@ -1539,14 +1538,14 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
         let (ids, values) = inst.params_arc.collect_values();
-        // Read the custom state from the lock-free snapshot the audio
-        // thread publishes each block. Never touches the plugin, so it
-        // neither stalls a block in flight nor races `process`.
+        // AU gives the wrapper no "render stopped" signal it can trust, so
+        // the save always asks the render thread for a fresh snapshot
+        // (bounded wait), falling back to the last one.
         //
         // Allocator pin: this wrapper allocates with libc `malloc` and
         // the AU shim frees with libc `free`. The Rust global allocator
         // must not appear on either side; mixing allocators is UB.
-        let extra = save_extra(&inst.snapshot);
+        let extra = custom_state_for_save(&inst.plugin, &inst.snapshot, &inst.pending_state, false);
         let Ok(persist) = inst.params_arc.prepare_persist_write() else {
             return;
         };
@@ -1606,6 +1605,7 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             return 0;
         }
         let mut blob = slice::from_raw_parts(data, len as usize);
+        let backup = state::ParamsBackup::capture(&*inst.params_arc);
         // Not this plugin's envelope? Offer the bytes to the plugin's
         // `migrate_state` hook (legacy sessions from a pre-moose
         // build that stored foreign bytes under moose's key, or a
@@ -1629,7 +1629,11 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             // application. `force_push` overwrites any older pending
             // blob - see the `pending_state` field comment for why
             // newest-wins is the right policy.
-            inst.pending_state.force_push(deserialized);
+            // Queue for the render thread and wait (bounded) so the editor
+            // notify below sees the applied state.
+            if !load_custom_state(inst, deserialized, &backup) {
+                return 0;
+            }
             if let Some(ref mut editor) = inst.gui.enter().editor {
                 editor.state_changed();
             }
@@ -1686,13 +1690,41 @@ unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
             return 0;
         };
         let deserialized: state::DeserializedState = migrated.into();
+        let backup = state::ParamsBackup::capture(&*inst.params_arc);
         state::apply_params(&*inst.params_arc, &deserialized);
-        inst.pending_state.force_push(deserialized);
+        if !load_custom_state(inst, deserialized, &backup) {
+            return 0;
+        }
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.state_changed();
         }
         1
     })
+}
+
+/// Custom part of an AU state load, through the render-thread queue (AU has
+/// no trusted stopped signal). `false`: the plugin's `load_state` rejected
+/// it and params and `#[persist]` were put back; report the error.
+fn load_custom_state<P: PluginExport>(
+    inst: &AuInstance<P>,
+    deserialized: state::DeserializedState,
+    backup: &state::ParamsBackup,
+) -> bool {
+    match apply_or_queue_state(
+        &inst.plugin,
+        &*inst.params_arc,
+        &inst.snapshot,
+        &inst.pending_state,
+        deserialized,
+        backup,
+        false,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[moose AU] state load rejected by load_state: {e}");
+            false
+        }
+    }
 }
 
 unsafe extern "C" fn cb_state_free(data: *mut u8, _len: u32) {
@@ -1852,8 +1884,11 @@ unsafe extern "C" fn cb_factory_preset_load<P: PluginExport>(
         // Same apply path as cb_state_load: params synchronously on
         // the host thread, full state through the audio-thread
         // handoff, editor notified.
+        let backup = state::ParamsBackup::capture(&*inst.params_arc);
         state::apply_params(&*inst.params_arc, &deserialized);
-        inst.pending_state.force_push(deserialized);
+        if !load_custom_state(inst, deserialized, &backup) {
+            return 0;
+        }
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.state_changed();
         }
@@ -3022,6 +3057,7 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                 let params = Arc::clone(&inst.params_arc);
                 let meter_store = Arc::clone(&inst.meter_store);
                 let snapshot = Arc::clone(&inst.snapshot);
+                let pending_state_for_get = inst.pending_state.clone();
                 let ctx_raw = SendPtr::new(ctx);
                 let params_for_set = params.clone();
                 let params_for_get = params.clone();
@@ -3134,11 +3170,9 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                         }),
                         get_meter: Box::new(move |id| meter_store.read(id)),
                         get_state: Box::new(move || {
-                            // Editor state read: lock-free, reads the snapshot
-                            // the audio thread publishes each block. Never
-                            // touches the plugin, so an editor read can't
-                            // stall audio.
-                            save_extra(&snapshot)
+                            // Editor state read: never touches the plugin. A
+                            // load still queued for the audio thread wins.
+                            moose_core::wrapper::custom_state_view(&snapshot, &pending_state_for_get)
                         }),
                         set_state: Box::new(move |bytes| {
                             // The editor sends RAW custom-state bytes -

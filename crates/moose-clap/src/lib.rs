@@ -140,8 +140,9 @@ use moose_core::state::PluginFormat;
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
 use moose_core::wrapper::{
-    PluginCell, SharedPlugin, copy_c_str, enter_plugin, run_audio_block_with,
-    run_extern_callback_with, save_extra, shared_plugin,
+    PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
+    custom_state_for_save, custom_state_view, enter_plugin, run_audio_block_with,
+    run_extern_callback_with, shared_plugin,
 };
 use moose_core::{Float, Sample};
 use moose_params::Params;
@@ -953,10 +954,11 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
         // state applied while inactive. Drain it now and apply synchronously
         // (uncontended - no audio thread is processing) so nothing survives
         // deactivate.
-        if let Some(deserialized) = data.pending_state.pop() {
+        {
             let mut instance = enter_plugin(&data.plugin);
-            state::apply_state(&mut *instance, &deserialized);
-            instance.republish_snapshot();
+            if apply_queued_state(&mut *instance, &data.pending_state).is_some() {
+                instance.republish_snapshot();
+            }
         }
         clap_plugin_reset::<P>(plugin);
         if refresh_parameter_list(data)
@@ -2803,10 +2805,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // single-slot queue means a rapid double-recall lands the
         // newest blob and the older one is dropped - preferred to
         // the audio thread chasing stale state across blocks.
-        let state_loaded = data.pending_state.pop().is_some_and(|state| {
-            state::apply_state(&mut *instance, &state);
-            true
-        });
+        let state_loaded = apply_queued_state(&mut *instance, &data.pending_state).is_some();
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the
         // wrapper's per-block glue - event conversion, transport, process,
@@ -4144,26 +4143,16 @@ unsafe extern "C" fn state_save<P: PluginExport>(
     // of aborting the host across this `extern "C"` boundary.
     run_extern_callback_with::<P, bool>("CLAP", "save_state", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        // While inactive the audio thread never runs, so a state edit the
-        // editor queued through `set_state` (or a load) sits undrained in
-        // `pending_state` and would not reach the snapshot below - the save
-        // would serialize the pre-edit state. Drain and apply it here on the
-        // host thread, which owns the plugin while inactive, then republish
-        // so the snapshot read reflects the edit. While active the audio
-        // thread owns the plugin and drains the queue itself, so we must not
-        // touch it here (read the snapshot only).
-        if !data.active.load(Ordering::Relaxed)
-            && let Some(deserialized) = data.pending_state.pop()
-        {
-            let mut instance = enter_plugin(&data.plugin);
-            state::apply_state(&mut *instance, &deserialized);
-            instance.republish_snapshot();
-        }
         let (ids, values) = data.params_arc.collect_values();
-        // Read the custom state from the lock-free snapshot the audio
-        // thread publishes each block. Never touches the plugin, so it
-        // can't stall a block in flight.
-        let extra = save_extra(&data.snapshot);
+        // Live custom state: serialized here when processing is stopped
+        // (the host thread owns the plugin, and drains any queued load
+        // first), otherwise requested from the audio thread's next block.
+        let extra = custom_state_for_save(
+            &data.plugin,
+            &data.snapshot,
+            &data.pending_state,
+            !data.processing.load(Ordering::Acquire),
+        );
         let Ok(persist) = data.params_arc.prepare_persist_write() else {
             return false;
         };
@@ -4223,6 +4212,7 @@ unsafe extern "C" fn state_load<P: PluginExport>(
             return false;
         };
 
+        let backup = state::ParamsBackup::capture(&*data.params_arc);
         let Some(deserialized) = state::read_and_apply_params::<P>(
             |buf| read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64),
             data.plugin_id_hash,
@@ -4240,28 +4230,8 @@ unsafe extern "C" fn state_load<P: PluginExport>(
         // first running a process block - clap-validator reads back
         // immediately after a load round-trip.
 
-        if data.active.load(Ordering::Relaxed) {
-            // Active: the audio thread will drain `pending_state` at the
-            // top of the next block and apply the custom-state blob
-            // under its exclusive `&mut plugin`. `force_push` overwrites
-            // any older pending blob - see the `pending_state` field
-            // comment for why "newest wins" is right.
-            data.pending_state.force_push(deserialized);
-        } else {
-            // A stopped-transport params.flush may have queued a value for
-            // the next block. Recall supersedes it just as active recall
-            // supersedes deferred events in convert_input_events.
-            data.audio.enter().deferred_params.clear();
-            // Inactive: no `process` will run, so the queue would never
-            // drain and the plugin's custom state would stay stale until
-            // the next activate. Apply the full state (params + extra)
-            // synchronously under exclusive plugin ownership - uncontended here
-            // since no audio thread is processing.
-            let mut instance = enter_plugin(&data.plugin);
-            state::apply_state(&mut *instance, &deserialized);
-            // No `process` will publish, so refresh the snapshot slot now
-            // - a save that follows while still inactive reads live state.
-            instance.republish_snapshot();
+        if !load_custom_state(data, deserialized, &backup) {
+            return false;
         }
 
         if let Some(ref mut editor) = data.gui.enter().editor {
@@ -4271,6 +4241,43 @@ unsafe extern "C" fn state_load<P: PluginExport>(
 
         true
     })
+}
+
+/// Apply a recalled state's custom part: synchronously on the host thread
+/// while processing is stopped (inactive, or active between
+/// `stop_processing` and `start_processing`), else through the audio
+/// thread with a bounded wait. Either way the editor's `state_changed`,
+/// which the callers fire next, sees the applied state (or, if no block ran
+/// in time, reads the queued bytes through `custom_state_view`).
+/// `false`: the plugin's `load_state` rejected it and params and
+/// `#[persist]` were put back; the caller reports failure to the host.
+fn load_custom_state<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    deserialized: state::DeserializedState,
+    backup: &state::ParamsBackup,
+) -> bool {
+    let can_own = !data.processing.load(Ordering::Acquire);
+    if can_own && let Some(mut audio) = data.audio.try_enter() {
+        // A stopped-transport params.flush may have queued a value for the
+        // next block. Recall supersedes it just as active recall supersedes
+        // deferred events in convert_input_events.
+        audio.deferred_params.clear();
+    }
+    match apply_or_queue_state(
+        &data.plugin,
+        &*data.params_arc,
+        &data.snapshot,
+        &data.pending_state,
+        deserialized,
+        backup,
+        can_own,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("moose: CLAP state load rejected by load_state: {e}");
+            false
+        }
+    }
 }
 
 /// Metadata work belongs on the host main thread, including when an active
@@ -4368,17 +4375,10 @@ unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
             return false;
         };
 
+        let backup = state::ParamsBackup::capture(&*data.params_arc);
         state::apply_params(&*data.params_arc, &deserialized);
-        // Same active/inactive split as `state_load`: while inactive no
-        // `process` drains `pending_state`, so a synchronous apply is what
-        // keeps offline preset browsing from stranding the custom-state
-        // blob (sample buffers, wavetables) on the queue.
-        if data.active.load(Ordering::Relaxed) {
-            data.pending_state.force_push(deserialized);
-        } else {
-            let mut instance = enter_plugin(&data.plugin);
-            state::apply_state(&mut *instance, &deserialized);
-            instance.republish_snapshot();
+        if !load_custom_state(data, deserialized, &backup) {
+            return false;
         }
         if let Some(ref mut editor) = data.gui.enter().editor {
             editor.state_changed();
@@ -5133,6 +5133,7 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
         let params = Arc::clone(&data.params_arc);
         let meter_store = Arc::clone(&data.meter_store);
         let snapshot = Arc::clone(&data.snapshot);
+        let pending_state_for_get = data.pending_state.clone();
         let gui_changes = data.gui_changes.clone();
         let gui_changes2 = data.gui_changes.clone();
         let gui_changes3 = data.gui_changes.clone();
@@ -5238,10 +5239,9 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
                 }),
                 get_meter: Box::new(move |id| meter_store.read(id)),
                 get_state: Box::new(move || {
-                    // Editor state read: lock-free, reads the snapshot the
-                    // audio thread publishes each block. Never touches the
-                    // plugin, so an editor read can't stall audio.
-                    save_extra(&snapshot)
+                    // Editor state read: never touches the plugin. A load
+                    // still queued for the audio thread wins over the slot.
+                    custom_state_view(&snapshot, &pending_state_for_get)
                 }),
                 set_state: Box::new(move |bytes| {
                     // The editor sends RAW custom-state bytes - exactly

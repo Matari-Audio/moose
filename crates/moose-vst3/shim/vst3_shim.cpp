@@ -550,6 +550,7 @@ struct Vst3Callbacks {
     bool (*wants_persist_notifications)(void*);
     void (*set_persist_waker)(void*, void (*)(void*), void*);
     bool (*take_persist_change)(void*, uint32_t*, double*);
+    void (*set_processing)(void*, int32_t, double, uint32_t, int32_t);
 };
 
 // ---------------------------------------------------------------------------
@@ -1654,7 +1655,7 @@ public:
     }
 
     tresult setProcessing(TBool state) {
-        if (!state && g_cb && ctx) g_cb->reset(ctx, sampleRate, maxFrames, procMode);
+        if (g_cb && ctx) g_cb->set_processing(ctx, state ? 1 : 0, sampleRate, maxFrames, procMode);
         return kResultOk;
     }
 

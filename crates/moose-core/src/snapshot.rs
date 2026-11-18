@@ -18,8 +18,9 @@
 //! audio-thread producer (`publish`) uses `try_lock` and never blocks, so
 //! there is no priority inversion on the audio side.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Capacity the inline publish buffer is pre-warmed to by
 /// [`SnapshotSlot::new`], off the audio thread, so the first per-block
@@ -45,6 +46,11 @@ pub struct SnapshotSlot {
     /// Set once *either* lane publishes for the first time. Until then a
     /// reader falls back to the locked `save_state()` path.
     supported: AtomicBool,
+    /// Fresh-snapshot handshake. A host save that can't own the plugin
+    /// (audio is processing) bumps `requested`; the shell serves it at the
+    /// end of its next `process` and stores the ticket in `served`.
+    requested: AtomicU64,
+    served: AtomicU64,
 }
 
 impl SnapshotSlot {
@@ -66,6 +72,8 @@ impl SnapshotSlot {
             bytes: Mutex::new(Vec::with_capacity(cap)),
             swapped: Mutex::new(None),
             supported: AtomicBool::new(false),
+            requested: AtomicU64::new(0),
+            served: AtomicU64::new(0),
         };
         // Warm both locks off the audio thread: some platforms' std
         // `Mutex` (macOS boxes a `pthread_mutex_t`) lazily allocate the OS
@@ -99,6 +107,61 @@ impl SnapshotSlot {
             true
         } else {
             false
+        }
+    }
+
+    /// Host thread: replace the inline snapshot, waiting for the lock.
+    /// For the host-owned republish (a load applied while the audio thread
+    /// is stopped), where skipping on contention would leave pre-load
+    /// bytes. Never call this from the audio thread.
+    pub fn store_inline(&self, write: impl FnOnce(&mut Vec<u8>)) {
+        let mut guard = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.clear();
+        write(&mut guard);
+        self.supported.store(true, Ordering::Release);
+    }
+
+    /// Host thread: ask the audio thread for a fresh snapshot at the end of
+    /// its next block. Returns the ticket to pass to [`Self::wait_served`].
+    pub fn request_fresh(&self) -> u64 {
+        self.requested.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Audio thread: the newest outstanding request ticket, if any. One
+    /// relaxed-cost atomic pair per block.
+    #[must_use]
+    pub fn pending_request(&self) -> Option<u64> {
+        let requested = self.requested.load(Ordering::Acquire);
+        (requested > self.served.load(Ordering::Relaxed)).then_some(requested)
+    }
+
+    /// Audio thread: serve `ticket` by publishing `write`'s bytes into the
+    /// inline lane. On lock contention the request stays outstanding and
+    /// the next block retries.
+    pub fn serve(&self, ticket: u64, write: impl FnOnce(&mut Vec<u8>)) {
+        if self.publish(|buf| {
+            write(buf);
+            true
+        }) {
+            self.served.fetch_max(ticket, Ordering::AcqRel);
+        }
+    }
+
+    /// Host thread: wait up to `timeout` for the audio thread to serve
+    /// `ticket`. `false` means no block ran in time (host stopped calling
+    /// `process` without telling us, a sleeping CLAP plugin); the caller
+    /// falls back to the last published snapshot.
+    #[must_use]
+    pub fn wait_served(&self, ticket: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.served.load(Ordering::Acquire) >= ticket {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(200));
         }
     }
 
@@ -336,6 +399,27 @@ mod tests {
         slot.store_arc(vec![5, 5, 5]);
         assert!(slot.is_supported());
         assert_eq!(slot.read(), Some(vec![5, 5, 5]));
+    }
+
+    #[test]
+    fn request_is_served_once_and_times_out_without_a_block() {
+        let slot = SnapshotSlot::new();
+        assert!(slot.pending_request().is_none());
+        let ticket = slot.request_fresh();
+        assert!(!slot.wait_served(ticket, std::time::Duration::from_millis(1)));
+        assert_eq!(slot.pending_request(), Some(ticket));
+        slot.serve(ticket, |buf| buf.push(4));
+        assert!(slot.pending_request().is_none());
+        assert!(slot.wait_served(ticket, std::time::Duration::ZERO));
+        assert_eq!(slot.read(), Some(vec![4]));
+    }
+
+    #[test]
+    fn store_inline_replaces_and_marks_supported() {
+        let slot = SnapshotSlot::new();
+        slot.store_inline(|buf| buf.extend_from_slice(&[1, 2]));
+        slot.store_inline(|buf| buf.push(3));
+        assert_eq!(slot.read(), Some(vec![3]));
     }
 
     #[test]

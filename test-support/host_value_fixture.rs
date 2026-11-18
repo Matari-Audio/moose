@@ -148,6 +148,8 @@ pub struct TestPlugin {
     pub params: Arc<TestParams>,
     meters: Arc<MeterStore>,
     snapshot: Arc<SnapshotSlot>,
+    /// Custom state for the state save / load tests.
+    pub custom: Vec<u8>,
 }
 impl PluginExport for TestPlugin {
     type Params = TestParams;
@@ -158,6 +160,7 @@ impl PluginExport for TestPlugin {
             params,
             meters: MeterStore::new(),
             snapshot: SnapshotSlot::new(),
+            custom: Vec::new(),
         }
     }
     fn params(&self) -> &TestParams {
@@ -211,6 +214,16 @@ impl PluginRuntime for TestPlugin {
         }
     }
     fn reset(&mut self, _: &AudioConfig) {}
+    fn save_state(&self) -> Vec<u8> {
+        self.custom.clone()
+    }
+    fn load_state(&mut self, data: &[u8]) -> Result<(), moose_core::state::StateLoadError> {
+        if data == b"bad" {
+            return Err(moose_core::state::StateLoadError::Other("rejected".into()));
+        }
+        self.custom = data.to_vec();
+        Ok(())
+    }
     fn process(
         &mut self,
         _: &mut AudioBuffer,

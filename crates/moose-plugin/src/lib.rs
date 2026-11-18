@@ -363,66 +363,48 @@ macro_rules! plugin_logic_leaf_trait {
             /// Serialize plugin-specific state (DSP state, not params -
             /// those are saved automatically).
             ///
-            /// **Prefer [`Self::snapshot_into`].** That is the
-            /// real-time-safe path and the one CLAP / VST3 / AU actually
-            /// persist from - [`Self::snapshot_into`]'s default delegates
-            /// here, so overriding only `save_state` still round-trips. The
-            /// catch: it then runs on the **audio thread** each changed
-            /// block, so keep it cheap (copy bytes out; no compute or
-            /// compress) and reach for `snapshot_into` (or the off-thread
-            /// `InitContext::snapshot_publisher()` for MB-scale state) for
-            /// anything non-trivial. Default: empty (no extra state).
+            /// Called on demand, never every block: on the host thread
+            /// when the wrapper owns the plugin (inactive or not
+            /// processing), or once on the audio thread at the end of the
+            /// next block when the host saves while audio runs. Allocating
+            /// here is fine. Default: empty (no extra state).
             fn save_state(state: &Self::DspState) -> Vec<u8> {
                 let _ = state;
                 Vec::new()
             }
 
-            /// Opt into lock-free state save. `buf` arrives **cleared**,
-            /// with its capacity retained across calls so a steady state
-            /// is allocation-free; fill it with the same bytes
-            /// [`Self::save_state`] would produce (append freely - it is
-            /// never carried over from the previous block).
+            /// Opt into publishing a snapshot after every changed block.
+            /// `buf` arrives **cleared**, with its capacity retained across
+            /// calls so a steady state is allocation-free; fill it with the
+            /// same bytes [`Self::save_state`] would produce.
             ///
-            /// The return value is a *static capability*, not a
-            /// per-block flag: `true` means "this plugin publishes
-            /// snapshots", `false` means "it never does". Once you return
-            /// `true` you must return `true` for the plugin's whole
-            /// lifetime - if the custom state empties out, return `true`
-            /// with `buf` left empty (an empty blob), don't return `false`.
-            /// The shell latches the opt-in on the first published block; a
-            /// later `false` is a contract violation that would otherwise
-            /// leave the host reading a stale snapshot forever.
+            /// Most plugins don't need this: a host save asks for live
+            /// state on demand (see [`Self::save_state`]). Override it when
+            /// a save must not wait for the next audio block, or when your
+            /// serializer is real-time safe and you want the snapshot kept
+            /// warm. Pair with [`Self::snapshot_version`] so unchanged
+            /// blocks cost O(1).
+            ///
+            /// The return value is a *static capability*: `true` means
+            /// "this plugin publishes snapshots", `false` means "it never
+            /// does". The shell probes it once, off the audio thread, when
+            /// the plugin is created; return `true` (with `buf` empty if
+            /// there is no state) for the plugin's whole lifetime.
             ///
             /// Called on the **audio thread** after each process block
             /// whose [`Self::snapshot_version`] changed, under the same
             /// real-time rules as `process` - bounded, no unbounded
-            /// allocation. The wrapper publishes the result into a
-            /// lock-free slot the host reads without ever taking the
-            /// plugin lock, so saving state while audio runs never stalls
-            /// the audio thread.
+            /// allocation.
             ///
-            /// **Default.** Delegates to [`Self::save_state`], so a plugin
-            /// that overrides only the legacy `save_state` still publishes
-            /// through this slot - at the cost of running `save_state` on
-            /// the audio thread. A plugin overriding neither publishes
-            /// nothing (its empty `save_state`).
+            /// **Default.** `false`: no per-block publish. (7.0 and earlier
+            /// delegated to `save_state` and ran it on the audio thread
+            /// every block.)
             ///
-            /// **Size regime.** This inline lane copies the whole buffer
-            /// on every *changed* block, so it is for **KB-scale** state (a
-            /// file path, a view mode, a small analysis buffer). For
-            /// **MB-scale** state (a sampler's audio, big wavetables) copying
-            /// on the audio thread is itself a hazard - publish that off the
-            /// audio thread instead via
-            /// `InitContext::snapshot_publisher()` (a background-serialized,
-            /// pointer-swapped buffer) and leave this at the default.
+            /// **Size regime.** KB-scale state. For MB-scale state publish
+            /// off the audio thread via `InitContext::snapshot_publisher()`.
             fn snapshot_into(state: &Self::DspState, buf: &mut Vec<u8>) -> bool {
-                let bytes = Self::save_state(state);
-                if bytes.is_empty() {
-                    false
-                } else {
-                    buf.extend_from_slice(&bytes);
-                    true
-                }
+                let _ = (state, buf);
+                false
             }
 
             /// Generation token for the state [`Self::snapshot_into`]
@@ -435,9 +417,11 @@ macro_rules! plugin_logic_leaf_trait {
             ///
             /// Read on the audio thread each block, so keep it trivial
             /// (read a field; no work). `None` (the default) means "no
-            /// version tracking - re-serialize every block", which is fine
-            /// for tiny state but pays the full copy each block for larger
-            /// state. Return `Some(token)` to opt into gating.
+            /// version tracking": an opted-in [`Self::snapshot_into`]
+            /// re-serializes every block. Returning `Some` also opts a
+            /// plugin that only overrides [`Self::save_state`] into the
+            /// per-block publish, gated by this token (its `save_state`
+            /// then runs on the audio thread whenever the token changes).
             fn snapshot_version(state: &Self::DspState) -> Option<u64> {
                 let _ = state;
                 None
@@ -456,9 +440,11 @@ macro_rules! plugin_logic_leaf_trait {
 
             /// Restore plugin-specific state into `state`.
             ///
-            /// Runs on the audio thread between blocks, with the same
-            /// exclusive access `process()` has - writing any field
-            /// is safe.
+            /// Runs with exclusive access to `state`: on the host thread
+            /// when the plugin is not processing, otherwise on the audio
+            /// thread before the next block (outside the real-time check;
+            /// allocating is allowed). The error reaches the host when the
+            /// load is applied synchronously or within the wrapper's wait.
             ///
             /// # Errors
             ///
@@ -474,8 +460,8 @@ macro_rules! plugin_logic_leaf_trait {
                 Ok(())
             }
 
-            /// Called on the audio thread immediately after
-            /// [`Self::load_state`] returns. Invalidate or recompute any
+            /// Called immediately after [`Self::load_state`] returns, on
+            /// the same thread. Invalidate or recompute any
             /// caches in `state` that the next `process()` reads. Default:
             /// no-op.
             fn state_changed(state: &mut Self::DspState, params: &Self::Params) {

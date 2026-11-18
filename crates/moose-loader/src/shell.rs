@@ -81,8 +81,10 @@ pub struct HotShell<P: Params, S: Sample = f32> {
     meters: Arc<moose_core::meters::MeterStore>,
     /// Lock-free publish slot for `snapshot_into`-based state save.
     snapshots: Arc<moose_core::snapshot::SnapshotSlot>,
-    /// Latches off if the loaded logic reports no snapshot before it ever
-    /// publishes one; a logic that has published stays subscribed.
+    /// Whether the loaded logic opted into the per-block publish, probed in
+    /// `new_with_tasks` off the audio thread.
+    // ponytail: probed once; a reload that flips the opt-in keeps the old
+    // answer until the instance is recreated (dev-only shell).
     try_snapshot: bool,
     /// Last `moose_snapshot_version` the shell published; a block whose
     /// version matches skips re-serialization (see `publish_snapshot_with`).
@@ -146,6 +148,9 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
             .map_or((std::ptr::null_mut(), None), |(st, origin)| {
                 (st, Some(origin))
             });
+        let try_snapshot = !state.is_null()
+            && (loader.snapshot_version(state).is_some()
+                || loader.snapshot_into(state, &mut Vec::new()));
         let loader = Arc::new(Mutex::new(loader));
         // Drive reloads off the audio thread. The watcher polls the
         // dylib path and runs `reload()` itself when mtime advances.
@@ -158,7 +163,7 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
             state_origin,
             meters: moose_core::meters::MeterStore::new(),
             snapshots: moose_core::snapshot::SnapshotSlot::new(),
-            try_snapshot: true,
+            try_snapshot,
             last_snapshot_version: None,
             sample_rate: 44100.0,
             max_block_size: 1024,
@@ -461,8 +466,25 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
             &mut self.try_snapshot,
             &mut self.last_snapshot_version,
             version,
-            |buf| loader.snapshot_into(state, buf),
+            |buf| {
+                loader.snapshot_into(state, buf)
+                    || (version.is_some() && {
+                        buf.extend_from_slice(&loader.save_state(state));
+                        true
+                    })
+            },
         );
+        if let Some(ticket) = self.snapshots.pending_request() {
+            // On-demand save request; see `StaticShell::process`.
+            moose_core::rt::allow_alloc(|| {
+                self.snapshots.serve(ticket, |buf| {
+                    if !loader.snapshot_into(state, buf) {
+                        buf.clear();
+                        buf.extend_from_slice(&loader.save_state(state));
+                    }
+                });
+            });
+        }
 
         // Refresh latency / tail caches so host-thread queries don't
         // have to take the loader lock.
@@ -524,15 +546,15 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         if !self.reconcile_state(&loader) {
             return;
         }
+        // Host thread, plugin owned: serialize live, whatever the opt-in.
         let state = self.state.cast_const();
-        let version = loader.snapshot_version(state);
-        crate::static_shell::publish_snapshot_with(
-            &self.snapshots,
-            &mut self.try_snapshot,
-            &mut self.last_snapshot_version,
-            version,
-            |buf| loader.snapshot_into(state, buf),
-        );
+        self.last_snapshot_version = None;
+        self.snapshots.store_inline(|buf| {
+            if !loader.snapshot_into(state, buf) {
+                buf.clear();
+                buf.extend_from_slice(&loader.save_state(state));
+            }
+        });
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<(), moose_core::state::StateLoadError> {

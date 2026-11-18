@@ -16,6 +16,10 @@ int main(int argc, char** argv) {
         return 1;
     };
     callbacks.set_active = [](void*, int32_t) {};
+    // The Rust side resets on setProcessing(false); mirror that here.
+    callbacks.set_processing = [](void* ctx, int32_t on, double rate, uint32_t frames, int32_t mode) {
+        if (!on) g_cb->reset(ctx, rate, frames, mode);
+    };
     g_cb = &callbacks;
     MooseComponent component;
     component.setActive(1);

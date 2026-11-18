@@ -361,6 +361,15 @@ pub struct Vst3Callbacks {
     pub set_persist_waker:
         unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void),
     pub take_persist_change: unsafe extern "C" fn(*mut c_void, *mut u32, *mut f64) -> bool,
+    /// `IAudioProcessor::setProcessing`. `false` also resets the plugin
+    /// (what the shim used to do through `reset`).
+    pub set_processing: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        processing: i32,
+        sample_rate: f64,
+        max_frames: u32,
+        process_mode: i32,
+    ),
 }
 
 unsafe extern "C" {

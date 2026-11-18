@@ -44,9 +44,10 @@ use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::wrapper::{
-    ParamCStrings, PluginCell, SharedPlugin, copy_c_str, default_io_channels, enter_plugin,
+    ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state,
+    copy_c_str, custom_state_for_save, custom_state_view, default_io_channels, enter_plugin,
     find_bus_layout, log_missing_bus_layout, run_audio_block, run_extern_callback_with,
-    run_register, save_extra, shared_plugin,
+    run_register, shared_plugin,
 };
 use moose_params::MidiSource;
 use moose_params::sample::{Float, Sample};
@@ -120,6 +121,11 @@ struct Vst3Instance<P: PluginExport> {
     /// Written only from `cb_set_active` (main thread); unlike
     /// `prepared`, it tracks deactivation too.
     active: AtomicBool,
+    /// `true` between `setProcessing(true)` and `setProcessing(false)` /
+    /// `setActive(false)`, and set by the first `process` for hosts that
+    /// never call `setProcessing`. While `false` the host thread owns the
+    /// plugin, so state save / load run synchronously there.
+    processing: AtomicBool,
     /// Cached `(id, range)` pairs sorted by id. Built once in
     /// `cb_create` from `params().param_infos()`. Hosts call
     /// `cb_param_normalize` / `cb_param_denormalize` extremely often
@@ -630,6 +636,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 min_subblock_samples: info.automation.min_subblock_samples,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 active: AtomicBool::new(false),
+                processing: AtomicBool::new(false),
                 param_ranges,
                 midi_maps,
                 transport_slot: TransportSlot::new(),
@@ -837,6 +844,26 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
     });
 }
 
+/// `IAudioProcessor::setProcessing`. Tracks whether the audio thread owns
+/// the plugin; stopping also resets it, as the shim did before.
+unsafe extern "C" fn cb_set_processing<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    processing: i32,
+    sample_rate: f64,
+    max_frames: u32,
+    process_mode: i32,
+) {
+    unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if processing != 0 {
+            inst.processing.store(true, Ordering::Release);
+        } else {
+            cb_reset::<P>(ctx, sample_rate, max_frames, process_mode);
+            inst.processing.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// `IComponent::setActive`. Tracks activation so `cb_state_load` knows
 /// whether the audio thread will drain the pending-state queue.
 unsafe extern "C" fn cb_set_active<P: PluginExport>(ctx: *mut std::ffi::c_void, active: i32) {
@@ -845,6 +872,7 @@ unsafe extern "C" fn cb_set_active<P: PluginExport>(ctx: *mut std::ffi::c_void, 
     run_extern_callback_with::<P, ()>("vst3", "set_active", (), || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         inst.active.store(active != 0, Ordering::Relaxed);
+        inst.processing.store(false, Ordering::Release);
         if active == 0 {
             // Deactivating: the audio thread stops draining `pending_state`,
             // so a load queued (by the host or the editor) while active would
@@ -852,9 +880,8 @@ unsafe extern "C" fn cb_set_active<P: PluginExport>(ctx: *mut std::ffi::c_void, 
             // state - silently losing the load. Apply it now under the plugin
             // lock (uncontended: the host serializes lifecycle calls with
             // `process`) and refresh the snapshot.
-            if let Some(state) = inst.pending_state.pop() {
-                let mut plugin = enter_plugin(&inst.plugin);
-                state::apply_state(&mut *plugin, &state);
+            let mut plugin = enter_plugin(&inst.plugin);
+            if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
                 plugin.republish_snapshot();
             }
         }
@@ -1372,15 +1399,16 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         // uncontended `Acquire`, never a wait, since the host contract
         // keeps `process` from overlapping a lifecycle callback and host
         // saves read the snapshot instead of the plugin.
+        // A host that never calls `setProcessing(true)` still marks the
+        // audio thread as owner before the first block.
+        inst.processing.store(true, Ordering::Release);
         let mut plugin = enter_plugin(&inst.plugin);
 
         // Apply any pending state-load before per-block work so the
         // plugin sees consistent params and extra state for the
         // entire block. See `pending_state` field comment for the
         // queue-overflow policy.
-        if let Some(state) = inst.pending_state.pop() {
-            state::apply_state(&mut *plugin, &state);
-        }
+        apply_queued_state(&mut *plugin, &inst.pending_state);
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the
         // wrapper's per-block glue - event conversion, transport, process,
@@ -1891,32 +1919,13 @@ unsafe extern "C" fn cb_state_save<P: PluginExport>(
             }
         }
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        // While inactive the audio thread never runs, so a state edit the
-        // editor queued through `set_state` (or a load) sits undrained in
-        // `pending_state` and would not reach the snapshot below - the save
-        // would serialize the pre-edit state. Drain and apply it here on the
-        // host thread, which owns the plugin while inactive, then republish
-        // so the snapshot read reflects the edit. While active the audio
-        // thread owns the plugin and drains the queue itself, so we must not
-        // touch it here (read the snapshot only).
-        if !inst.active.load(Ordering::Relaxed)
-            && let Some(deserialized) = inst.pending_state.pop()
-        {
-            let mut plugin = enter_plugin(&inst.plugin);
-            state::apply_state(&mut *plugin, &deserialized);
-            plugin.republish_snapshot();
-        }
         let (ids, values) = inst.params_arc.collect_values();
-        // Read the custom state from the lock-free snapshot the audio
-        // thread publishes each block. Never touches the plugin, so it
-        // can't stall a block in flight.
-        //
+        let extra = save_custom_state(inst);
         // Allocator pin: this wrapper allocates with `libc_malloc` and
         // the C++ shim frees with `libc::free`. The Rust global
         // allocator must not appear on either side. (VST2 uses the
         // Rust global allocator for both save + free; do not cross
         // wires when refactoring `_save_state` paths together.)
-        let extra = save_extra(&inst.snapshot);
         let Ok(persist) = inst.params_arc.prepare_persist_write() else {
             return;
         };
@@ -1976,6 +1985,7 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
             return 0;
         }
         let blob = slice::from_raw_parts(data, len as usize);
+        let backup = state::ParamsBackup::capture(&*inst.params_arc);
         // Not this plugin's envelope? Offer the bytes to the plugin's
         // `migrate_state` hook (legacy sessions from a pre-moose
         // build); `None` fails the load honestly.
@@ -1987,13 +1997,14 @@ unsafe extern "C" fn cb_state_load<P: PluginExport>(
         ) else {
             return 0;
         };
-        apply_host_state(inst, deserialized, false)
+        apply_host_state(inst, deserialized, &backup, false)
     })
 }
 
 unsafe fn apply_host_state<P: PluginExport>(
     inst: &Vst3Instance<P>,
     deserialized: state::DeserializedState,
+    backup: &state::ParamsBackup,
     params_applied: bool,
 ) -> i32 {
     // Apply params synchronously on the host thread (atomic-safe)
@@ -2004,24 +2015,22 @@ unsafe fn apply_host_state<P: PluginExport>(
     if !params_applied {
         state::apply_params(&*inst.params_arc, &deserialized);
     }
-    if inst.active.load(Ordering::Relaxed) {
-        // Active: the audio thread drains `pending_state` at the top
-        // of the next block and applies the custom-state blob under
-        // its exclusive `&mut plugin`. `force_push` overwrites any
-        // older pending blob - see the `pending_state` field comment
-        // for why newest-wins is right.
-        inst.pending_state.force_push(deserialized);
-    } else {
-        // Inactive: no `cb_process` will run, so apply the full
-        // state (params + extra) synchronously under the plugin
-        // lock - uncontended here since no audio thread is
-        // processing. Otherwise a `getState` before the next
-        // activate would re-serialize stale custom state.
-        let mut plugin = enter_plugin(&inst.plugin);
-        state::apply_state(&mut *plugin, &deserialized);
-        // No `cb_process` will publish, so refresh the snapshot slot
-        // now - a `getState` while still inactive reads live state.
-        plugin.republish_snapshot();
+    // Not processing (inactive, or between setProcessing(false) and
+    // (true)): applied here on the host thread. Processing: queued for the
+    // audio thread with a bounded wait, so the editor notify below sees it.
+    // A rejected `load_state` puts params and `#[persist]` back and fails
+    // the load (kResultFalse), so the host never sees half a state.
+    if let Err(e) = apply_or_queue_state(
+        &inst.plugin,
+        &*inst.params_arc,
+        &inst.snapshot,
+        &inst.pending_state,
+        deserialized,
+        backup,
+        !inst.processing.load(Ordering::Acquire),
+    ) {
+        eprintln!("[moose VST3] state load rejected by load_state: {e}");
+        return 0;
     }
     // `try_enter`, not `enter`: a host can deliver `setState`
     // synchronously from a component-handler callback while an outer
@@ -2038,6 +2047,16 @@ unsafe fn apply_host_state<P: PluginExport>(
     1
 }
 
+/// Live custom state for `getState`; see `wrapper::custom_state_for_save`.
+fn save_custom_state<P: PluginExport>(inst: &Vst3Instance<P>) -> Vec<u8> {
+    custom_state_for_save(
+        &inst.plugin,
+        &inst.snapshot,
+        &inst.pending_state,
+        !inst.processing.load(Ordering::Acquire),
+    )
+}
+
 unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     stream: *mut std::ffi::c_void,
@@ -2045,15 +2064,8 @@ unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
 ) -> i32 {
     run_extern_callback_with::<P, i32>("vst3", "save_state_stream", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        if !inst.active.load(Ordering::Relaxed)
-            && let Some(state) = inst.pending_state.pop()
-        {
-            let mut plugin = enter_plugin(&inst.plugin);
-            state::apply_state(&mut *plugin, &state);
-            plugin.republish_snapshot();
-        }
         let (ids, values) = inst.params_arc.collect_values();
-        let extra = save_extra(&inst.snapshot);
+        let extra = save_custom_state(inst);
         let Ok(persist) = inst.params_arc.prepare_persist_write() else {
             return 0;
         };
@@ -2077,6 +2089,7 @@ unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
 ) -> i32 {
     run_extern_callback_with::<P, i32>("vst3", "load_state_stream", 0, || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let backup = state::ParamsBackup::capture(&*inst.params_arc);
         let Some(deserialized) = state::read_and_apply_params::<P>(
             |buf| u32::try_from(buf.len()).map_or(-1, |len| read(stream, buf.as_mut_ptr(), len)),
             inst.plugin_id_hash,
@@ -2087,7 +2100,7 @@ unsafe extern "C" fn cb_state_load_stream<P: PluginExport>(
         ) else {
             return 0;
         };
-        apply_host_state(inst, deserialized, true)
+        apply_host_state(inst, deserialized, &backup, true)
     })
 }
 
@@ -3465,6 +3478,7 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
             let params = Arc::clone(&inst.params_arc);
             let meter_store = Arc::clone(&inst.meter_store);
             let snapshot = Arc::clone(&inst.snapshot);
+            let pending_state_for_get = inst.pending_state.clone();
             let ctx_raw = SendPtr::new(ctx);
             let params_for_set = params.clone();
             let params_for_get = params.clone();
@@ -3525,7 +3539,7 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                         // the audio thread publishes each block. Never
                         // touches the plugin, so an editor read can't
                         // stall audio.
-                        save_extra(&snapshot)
+                        custom_state_view(&snapshot, &pending_state_for_get)
                     }),
                     set_state: Box::new(move |bytes| {
                         // The editor sends RAW custom-state bytes -
@@ -3905,6 +3919,7 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         wants_persist_notifications: cb_wants_persist_notifications::<P>,
         set_persist_waker: cb_set_persist_waker::<P>,
         take_persist_change: cb_take_persist_change::<P>,
+        set_processing: cb_set_processing::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every
@@ -4633,6 +4648,87 @@ use moose_params as params;
     )
 )]
 mod host_value_fixture;
+
+#[cfg(test)]
+mod state_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+
+    /// Load-then-`getState` in each state where the host thread owns the
+    /// plugin: inactive, active before the first `setProcessing(true)`,
+    /// and after `setProcessing(false)` (audit finding 1). No `process`
+    /// runs in between.
+    #[test]
+    fn load_then_save_while_not_processing_returns_loaded_custom_state() {
+        for phase in ["inactive", "activated", "stopped"] {
+            // SAFETY: serial callback calls on an instance this test owns;
+            // the save buffer is freed with the matching libc allocator.
+            unsafe {
+                let ctx = cb_create::<TestPlugin>();
+                let hash = (&*ctx.cast::<Vst3Instance<TestPlugin>>()).plugin_id_hash;
+                if phase != "inactive" {
+                    assert_eq!(cb_prepare::<TestPlugin>(ctx, 48_000., 512, 0), 1);
+                    cb_set_active::<TestPlugin>(ctx, 1);
+                }
+                if phase == "stopped" {
+                    cb_set_processing::<TestPlugin>(ctx, 1, 48_000., 512, 0);
+                    cb_set_processing::<TestPlugin>(ctx, 0, 48_000., 512, 0);
+                }
+                let blob = state::serialize_state(hash, &[], &[], &[4, 5, 6], &[]);
+                let len = u32::try_from(blob.len()).unwrap();
+                assert_eq!(cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len), 1, "{phase}");
+                let mut data = std::ptr::null_mut();
+                let mut saved_len = 0;
+                cb_state_save::<TestPlugin>(ctx, &raw mut data, &raw mut saved_len);
+                assert!(!data.is_null(), "{phase}");
+                let saved = slice::from_raw_parts(data, saved_len as usize).to_vec();
+                cb_state_free(data, saved_len);
+                let restored = state::deserialize_state(&saved, hash).expect("own envelope");
+                assert_eq!(restored.extra.as_deref(), Some(&[4, 5, 6][..]), "{phase}");
+                cb_destroy::<TestPlugin>(ctx);
+            }
+        }
+    }
+
+    /// A state whose custom part `load_state` rejects fails the load
+    /// (kResultFalse) and leaves params and custom state as they were
+    /// (audit finding 4).
+    #[test]
+    fn rejected_load_fails_and_keeps_the_previous_state() {
+        use moose_params::Params;
+        for phase in ["inactive", "stopped"] {
+            // SAFETY: serial callback calls on an instance this test owns;
+            // the save buffer is freed with the matching libc allocator.
+            unsafe {
+                let ctx = cb_create::<TestPlugin>();
+                let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+                let hash = inst.plugin_id_hash;
+                if phase == "stopped" {
+                    assert_eq!(cb_prepare::<TestPlugin>(ctx, 48_000., 512, 0), 1);
+                    cb_set_active::<TestPlugin>(ctx, 1);
+                    cb_set_processing::<TestPlugin>(ctx, 1, 48_000., 512, 0);
+                    cb_set_processing::<TestPlugin>(ctx, 0, 48_000., 512, 0);
+                }
+                let load = |gain: f64, extra: &[u8]| {
+                    let blob = state::serialize_state(hash, &[0], &[gain], extra, &[]);
+                    let len = u32::try_from(blob.len()).unwrap();
+                    cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len)
+                };
+                assert_eq!(load(-12.0, &[1]), 1, "{phase}");
+                assert_eq!(load(-30.0, b"bad"), 0, "{phase}: rejected load reports failure");
+                assert_eq!(inst.params_arc.get_plain(0), Some(-12.0), "{phase}: params kept");
+                let mut data = std::ptr::null_mut();
+                let mut saved_len = 0;
+                cb_state_save::<TestPlugin>(ctx, &raw mut data, &raw mut saved_len);
+                let saved = slice::from_raw_parts(data, saved_len as usize).to_vec();
+                cb_state_free(data, saved_len);
+                let restored = state::deserialize_state(&saved, hash).expect("own envelope");
+                assert_eq!(restored.extra.as_deref(), Some(&[1][..]), "{phase}: custom kept");
+                cb_destroy::<TestPlugin>(ctx);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod host_value_tests {

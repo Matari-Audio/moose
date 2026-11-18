@@ -8,6 +8,7 @@ struct Probe {
     resets: usize,
     pressed: bool,
     processed_frames: usize,
+    custom: Vec<u8>,
 }
 
 impl PluginExport for Probe {
@@ -34,6 +35,7 @@ impl PluginExport for Probe {
             resets: 0,
             pressed: false,
             processed_frames: 0,
+            custom: Vec::new(),
         }
     }
     fn params(&self) -> &TestParams {
@@ -63,6 +65,16 @@ impl PluginRuntime for Probe {
     fn reset(&mut self, _: &AudioConfig) {
         self.resets += 1;
         self.pressed = false;
+    }
+    fn save_state(&self) -> Vec<u8> {
+        self.custom.clone()
+    }
+    fn load_state(&mut self, data: &[u8]) -> Result<(), moose_core::state::StateLoadError> {
+        if data == b"bad" {
+            return Err(moose_core::state::StateLoadError::Other("rejected".into()));
+        }
+        self.custom = data.to_vec();
+        Ok(())
     }
     fn process(
         &mut self,
@@ -573,4 +585,113 @@ fn custom_extension_queries_real_instances_and_rejects_busy() {
             assert_ne!((ext.get)(first), usize::MAX);
         });
     });
+}
+
+unsafe extern "C" fn read_cursor(stream: *const clap_istream, buffer: *mut c_void, size: u64) -> i64 {
+    // SAFETY: `ctx` is the test's live `(Vec<u8>, usize)` cursor.
+    unsafe {
+        let (bytes, at) = &mut *(*stream).ctx.cast::<(Vec<u8>, usize)>();
+        let n = (bytes.len() - *at).min(usize::try_from(size).unwrap_or(usize::MAX));
+        ptr::copy_nonoverlapping(bytes.as_ptr().add(*at), buffer.cast::<u8>(), n);
+        *at += n;
+        i64::try_from(n).unwrap_or(-1)
+    }
+}
+
+unsafe extern "C" fn write_vec(stream: *const clap_ostream, buffer: *const c_void, size: u64) -> i64 {
+    // SAFETY: `ctx` is the test's live output `Vec<u8>`.
+    unsafe {
+        let out = &mut *(*stream).ctx.cast::<Vec<u8>>();
+        out.extend_from_slice(std::slice::from_raw_parts(buffer.cast::<u8>(), usize::try_from(size).unwrap()));
+        i64::try_from(size).unwrap_or(-1)
+    }
+}
+
+/// Load-then-save in each state where the host thread owns the plugin:
+/// inactive, and active between `stop_processing` and `start_processing`
+/// (audit finding 1). The save must return the loaded custom state, with
+/// no `process` call in between.
+#[test]
+fn load_then_save_while_not_processing_returns_loaded_custom_state() {
+    for phase in ["inactive", "activated", "stopped"] {
+        with_probe(|plugin| {
+            // SAFETY: serial lifecycle calls on a live instance; the streams'
+            // contexts outlive the calls that read them.
+            unsafe {
+                let callbacks = &*plugin;
+                if phase != "inactive" {
+                    assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+                }
+                if phase == "stopped" {
+                    assert!(callbacks.start_processing.unwrap()(plugin));
+                    callbacks.stop_processing.unwrap()(plugin);
+                }
+                let state_ext = make_state_extension::<Probe>();
+                let hash = data_from_plugin::<Probe>(plugin).plugin_id_hash;
+                let blob = state::serialize_state(hash, &[], &[], &[7, 8, 9], &[]);
+                let mut cursor = (blob, 0_usize);
+                let input = clap_istream {
+                    ctx: (&raw mut cursor).cast(),
+                    read: Some(read_cursor),
+                };
+                assert!(state_ext.load.unwrap()(plugin, &raw const input), "{phase}");
+                let mut saved = Vec::new();
+                let output = clap_ostream {
+                    ctx: (&raw mut saved).cast(),
+                    write: Some(write_vec),
+                };
+                assert!(state_ext.save.unwrap()(plugin, &raw const output), "{phase}");
+                let restored = state::deserialize_state(&saved, hash).expect("own envelope");
+                assert_eq!(restored.extra.as_deref(), Some(&[7, 8, 9][..]), "{phase}");
+                if phase != "inactive" {
+                    callbacks.deactivate.unwrap()(plugin);
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn rejected_load_fails_and_keeps_the_previous_state() {
+    use moose_params::Params;
+    for phase in ["inactive", "stopped"] {
+        with_probe(|plugin| {
+            // SAFETY: serial lifecycle calls on a live instance; the streams'
+            // contexts outlive the calls that read them.
+            unsafe {
+                let callbacks = &*plugin;
+                if phase == "stopped" {
+                    assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+                    assert!(callbacks.start_processing.unwrap()(plugin));
+                    callbacks.stop_processing.unwrap()(plugin);
+                }
+                let state_ext = make_state_extension::<Probe>();
+                let data = data_from_plugin::<Probe>(plugin);
+                let hash = data.plugin_id_hash;
+                let load = |gain: f64, extra: &[u8]| {
+                    let blob = state::serialize_state(hash, &[0], &[gain], extra, &[]);
+                    let mut cursor = (blob, 0_usize);
+                    let input = clap_istream {
+                        ctx: (&raw mut cursor).cast(),
+                        read: Some(read_cursor),
+                    };
+                    state_ext.load.unwrap()(plugin, &raw const input)
+                };
+                assert!(load(-12.0, &[1]), "{phase}");
+                assert!(!load(-30.0, b"bad"), "{phase}: rejected load reports failure");
+                assert_eq!(data.params_arc.get_plain(0), Some(-12.0), "{phase}: params kept");
+                let mut saved = Vec::new();
+                let output = clap_ostream {
+                    ctx: (&raw mut saved).cast(),
+                    write: Some(write_vec),
+                };
+                assert!(state_ext.save.unwrap()(plugin, &raw const output), "{phase}");
+                let restored = state::deserialize_state(&saved, hash).expect("own envelope");
+                assert_eq!(restored.extra.as_deref(), Some(&[1][..]), "{phase}: custom kept");
+                if phase != "inactive" {
+                    callbacks.deactivate.unwrap()(plugin);
+                }
+            }
+        });
+    }
 }

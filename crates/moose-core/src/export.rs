@@ -174,17 +174,19 @@ pub trait PluginExport: PluginRuntime + Sized {
     }
 }
 
-/// Serialize a plugin's custom state for a **non-realtime** save path -
-/// LV2, the standalone host, preset export. Prefers the off-thread
-/// publisher lane; otherwise serializes live via `snapshot_into` (the
-/// canonical path, whose default delegates to a legacy `save_state`).
-/// Not for CLAP / VST3 / AU: those read the lock-free snapshot slot
-/// directly so a host save never stalls the audio thread.
+/// Serialize a plugin's custom state live, on a thread that owns the
+/// plugin (never the audio thread). Prefers the off-thread publisher lane,
+/// then `snapshot_into`, then the legacy `save_state`. CLAP / VST3 / AU
+/// reach this through `wrapper::custom_state_for_save` when they can own
+/// the plugin.
 #[must_use]
 pub fn read_custom_state_offthread<P: PluginExport>(plugin: &P) -> Vec<u8> {
     plugin.snapshot_slot().read_offthread().unwrap_or_else(|| {
         let mut buf = Vec::new();
-        plugin.snapshot_into(&mut buf);
-        buf
+        if plugin.snapshot_into(&mut buf) {
+            buf
+        } else {
+            plugin.save_state()
+        }
     })
 }

@@ -141,25 +141,60 @@ impl std::error::Error for StateLoadError {}
 /// load (the standalone host, an inactive-plugin load) calls it alongside
 /// this.
 pub fn apply_state<P: crate::export::PluginExport>(plugin: &mut P, state: &DeserializedState) {
-    use moose_params::Params;
-    plugin.params().restore_values(&state.params);
-    plugin.params().snap_smoothers();
-    if let Some(extra) = &state.extra
-        && let Err(e) = plugin.load_state(extra)
-    {
-        // Debug-only breadcrumb: this can run on the audio thread (the
-        // deferred load pops off the handoff queue at the top of
-        // `process()`), and `eprintln!` locks stderr and allocates - so
-        // it must never fire in a release / shipped build. By the time
-        // this runs the host already got a success return from the
-        // wrapper's setChunk, so there's no user-facing report left,
-        // only a dev diagnostic. Envelope-level failures the host can
-        // act on are logged synchronously in `parse_or_migrate` before
-        // the queue handoff.
+    if let Err(e) = try_apply_state(plugin, state) {
+        // Debug-only breadcrumb: `eprintln!` locks stderr and allocates.
+        // Wrappers that can report the error use `try_apply_state`.
         #[cfg(debug_assertions)]
         eprintln!("moose: load_state failed: {e}");
         #[cfg(not(debug_assertions))]
         let _ = e;
+    }
+}
+
+/// [`apply_state`], returning the plugin's `load_state` error so a
+/// wrapper that applies synchronously can report it to the host.
+///
+/// # Errors
+/// Forwards the plugin's [`crate::plugin::PluginRuntime::load_state`] error.
+pub fn try_apply_state<P: crate::export::PluginExport>(
+    plugin: &mut P,
+    state: &DeserializedState,
+) -> Result<(), StateLoadError> {
+    use moose_params::Params;
+    plugin.params().restore_values(&state.params);
+    plugin.params().snap_smoothers();
+    match &state.extra {
+        Some(extra) => plugin.load_state(extra),
+        None => Ok(()),
+    }
+}
+
+/// Parameter values and `#[persist]` as they were before a load, so a load
+/// whose `load_state` fails is undone as a unit (params, persist and custom
+/// state all stay at the previous state). Captured on the host thread.
+///
+/// ponytail: copies the whole `#[persist]` blob per load; a store with
+/// large persist fields pays that copy. Snapshot by `Arc` if it shows up.
+pub struct ParamsBackup {
+    values: Vec<(u32, f64)>,
+    persist: Vec<u8>,
+}
+
+impl ParamsBackup {
+    /// Capture the store's current values and `#[persist]` blob.
+    #[must_use]
+    pub fn capture<P: moose_params::Params>(params: &P) -> Self {
+        let (ids, values) = params.collect_values();
+        Self {
+            values: ids.into_iter().zip(values).collect(),
+            persist: params.serialize_persist(),
+        }
+    }
+
+    /// Put the captured values and `#[persist]` back.
+    pub fn restore<P: moose_params::Params>(&self, params: &P) {
+        params.restore_state(&self.values, &self.persist);
+        params.snap_smoothers();
     }
 }
 
@@ -470,6 +505,12 @@ mod tests {
 pub struct StateLoadQueue {
     ready: crossbeam_queue::ArrayQueue<std::sync::Arc<DeserializedState>>,
     owners: std::sync::Mutex<Vec<std::sync::Arc<DeserializedState>>>,
+    /// Address of the last state whose apply finished (0 = none), so the
+    /// host can tell whether its own push has landed. The host keeps an
+    /// `Arc` clone while it compares, so the address can't be reused.
+    applied: std::sync::atomic::AtomicUsize,
+    /// Whether that apply's `load_state` succeeded.
+    applied_ok: std::sync::atomic::AtomicBool,
 }
 impl StateLoadQueue {
     /// Create a single-slot state handoff.
@@ -482,10 +523,16 @@ impl StateLoadQueue {
         Self {
             ready: crossbeam_queue::ArrayQueue::new(1),
             owners: std::sync::Mutex::new(Vec::with_capacity(3)),
+            applied: std::sync::atomic::AtomicUsize::new(0),
+            applied_ok: std::sync::atomic::AtomicBool::new(true),
         }
     }
     /// Host thread only. All persist fields must already have been applied.
-    pub fn force_push(&self, mut state: DeserializedState) {
+    pub fn force_push(&self, state: DeserializedState) {
+        drop(self.push_tracked(state));
+    }
+    /// [`Self::force_push`], returning a handle for [`Self::wait_applied`].
+    pub fn push_tracked(&self, mut state: DeserializedState) -> std::sync::Arc<DeserializedState> {
         state.persist = Vec::new();
         let state = std::sync::Arc::new(state);
         let mut owners = self
@@ -493,12 +540,60 @@ impl StateLoadQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         owners.push(std::sync::Arc::clone(&state));
-        drop(self.ready.force_push(state));
-        owners.retain(|state| std::sync::Arc::strong_count(state) > 1);
+        drop(self.ready.force_push(std::sync::Arc::clone(&state)));
+        // `> 2`: the ready slot or audio, plus the handle returned below.
+        owners.retain(|s| std::sync::Arc::strong_count(s) > 1 + usize::from(std::sync::Arc::ptr_eq(s, &state)));
         debug_assert!(owners.len() <= 2, "single audio consumer contract");
+        state
     }
     pub fn pop(&self) -> Option<std::sync::Arc<DeserializedState>> {
         self.ready.pop()
+    }
+    /// Record that `state` (from [`Self::pop`]) has been applied. Two
+    /// atomic stores; safe on the audio thread.
+    pub fn mark_applied(&self, state: &std::sync::Arc<DeserializedState>, ok: bool) {
+        use std::sync::atomic::Ordering;
+        self.applied_ok.store(ok, Ordering::Relaxed);
+        self.applied
+            .store(std::sync::Arc::as_ptr(state) as usize, Ordering::Release);
+    }
+    fn is_applied(&self, state: &std::sync::Arc<DeserializedState>) -> bool {
+        self.applied.load(std::sync::atomic::Ordering::Acquire)
+            == std::sync::Arc::as_ptr(state) as usize
+    }
+    /// Host thread: wait up to `timeout` for the audio thread to apply
+    /// `state`. `Some(ok)` is the `load_state` result; `None` means no
+    /// block ran in time and the state is still queued.
+    #[must_use]
+    pub fn wait_applied(
+        &self,
+        state: &std::sync::Arc<DeserializedState>,
+        timeout: std::time::Duration,
+    ) -> Option<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.is_applied(state) {
+                return Some(self.applied_ok.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+    /// Host thread: the newest pushed state if it has not been applied yet.
+    /// A save taken before the audio thread drains the queue reports this
+    /// state's custom bytes, since they are what the plugin will hold.
+    #[must_use]
+    pub fn unapplied(&self) -> Option<std::sync::Arc<DeserializedState>> {
+        let owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners
+            .last()
+            .filter(|state| !self.is_applied(state))
+            .cloned()
     }
 }
 

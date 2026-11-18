@@ -29,6 +29,9 @@ reload-fixture-common = { path = "fixtures/reload-fixture-common" }
 # in `moose-loader` itself. The dylib-loading tests (`loader_test`,
 # `graceful_degradation`) opt in by enabling this feature.
 shell = ["moose-loader/shell"]
+# Installs the checking allocator in the test binaries that call
+# `moose::enable_rt_paranoid!()`, so the allocation audits count.
+rt-paranoid = ["moose/rt-paranoid"]
 
 [lints]
 workspace = true
