@@ -46,7 +46,7 @@ pub struct SaturateParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor; the SIMD scratch lives in [`SaturateDsp`], sized in `reset`.
+/// Descriptor; the SIMD scratch lives in [`SaturateDsp`], sized in `prepare`.
 pub struct Saturate;
 
 /// Per-instance SIMD scratch, sized to the host's max block in `reset`.
@@ -67,7 +67,13 @@ impl PluginLogic for Saturate {
     type Params = SaturateParams;
     type DspState = SaturateDsp;
 
-    fn reset(state: &mut SaturateDsp, _params: &SaturateParams, config: &AudioConfig) {
+    /// Size the scratch to the host's max block, off the audio thread.
+    fn prepare(
+        state: &mut SaturateDsp,
+        params: &SaturateParams,
+        config: &moose::core::plugin::PreparationConfig,
+    ) -> Result<(), moose::core::plugin::PreparationError> {
+        config.validate()?;
         for buf in [
             &mut state.sx,
             &mut state.sy,
@@ -76,8 +82,23 @@ impl PluginLogic for Saturate {
             &mut state.drive_lin_buf,
             &mut state.output_lin_buf,
         ] {
-            buf.clear();
-            buf.resize(config.max_block_size, 0.0);
+            buf.resize(config.audio.max_block_size, 0.0);
+        }
+        <Self as PluginLogic>::reset(state, params, &config.audio);
+        Ok(())
+    }
+
+    /// Zero the scratch; may run on the audio thread, so no allocation.
+    fn reset(state: &mut SaturateDsp, _params: &SaturateParams, _config: &AudioConfig) {
+        for buf in [
+            &mut state.sx,
+            &mut state.sy,
+            &mut state.drive_db,
+            &mut state.output_db,
+            &mut state.drive_lin_buf,
+            &mut state.output_lin_buf,
+        ] {
+            buf.fill(0.0);
         }
     }
 

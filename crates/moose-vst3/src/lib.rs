@@ -47,7 +47,7 @@ use moose_core::tasks::AnyTaskSpawner;
 use moose_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state,
     copy_c_str, custom_state_for_save, custom_state_view, default_io_channels, enter_plugin,
-    find_bus_layout, log_missing_bus_layout, run_audio_block, run_extern_callback_with,
+    find_bus_layout, log_missing_bus_layout, run_audio_block_latched, run_extern_callback_with,
     run_register, shared_plugin,
 };
 use moose_params::MidiSource;
@@ -157,6 +157,8 @@ struct Vst3Instance<P: PluginExport> {
     /// `cb_set_active` - the editor pushes unconditionally rather than
     /// entering the cell from its own (possibly third) thread.
     pending_state: Arc<StateLoadQueue>,
+    /// Set by a panic in `process`; cleared by the next successful prepare.
+    panic_latch: moose_core::wrapper::PanicLatch,
     /// Atomic snapshots of the plugin's most recent `latency()` /
     /// `tail()` reports. Updated by the audio thread (or `cb_reset`)
     /// so host-thread callbacks (`cb_get_latency`, `cb_get_tail`) read
@@ -651,6 +653,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 midi_maps,
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
+                panic_latch: moose_core::wrapper::PanicLatch::new(),
                 latency_cache,
                 tail_cache,
                 midi_proxy_ids,
@@ -818,6 +821,7 @@ unsafe extern "C" fn cb_prepare<P: PluginExport>(
             if plugin.prepare(&config).is_err() {
                 return 0;
             }
+            inst.panic_latch.clear();
             inst.latency_cache
                 .store(plugin.latency(), Ordering::Relaxed);
             inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
@@ -842,10 +846,15 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
             return;
         }
         let mut plugin = enter_plugin(&inst.plugin);
-        plugin.reset(
-            &AudioConfig::new(sample_rate, max_frames as usize)
-                .with_process_mode(vst3_process_mode(process_mode)),
-        );
+        {
+            // Hosts may call setProcessing(false) on the audio thread: the
+            // author's `reset` must not allocate (rt-paranoid reports it).
+            let _rt = RtSection::enter();
+            plugin.reset(
+                &AudioConfig::new(sample_rate, max_frames as usize)
+                    .with_process_mode(vst3_process_mode(process_mode)),
+            );
+        }
         inst.latency_cache
             .store(plugin.latency(), Ordering::Relaxed);
         inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
@@ -1439,7 +1448,9 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
     process_mode: i32,
 ) -> u32 {
     let nf = num_frames as usize;
-    let ok = run_audio_block::<P>("VST3", || unsafe {
+    // SAFETY: `ctx` is this wrapper's live instance.
+    let latch = unsafe { &(*ctx.cast::<Vst3Instance<P>>()).panic_latch };
+    let ok = run_audio_block_latched::<P, ()>(latch, "VST3", || unsafe {
         // Shared `&Vst3Instance` (never a whole-struct `&mut`) - the audio
         // scratch is reached through its ownership cell, so a concurrent
         // host-thread `&*ctx` (param reads, GUI) can't alias us.
@@ -1450,8 +1461,9 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
         // Host called process() before setActive(true) - the plugin
         // hasn't been told its sample rate / max block size yet, so
         // running DSP would feed garbage out of un-snapped smoothers.
-        // Zero outputs and bail.
-        if !audio.prepared {
+        // Zero outputs and bail. Same after a panic until the next
+        // prepare: the plugin's state is unknown, so it isn't re-entered.
+        if !audio.prepared || inst.panic_latch.is_failed() {
             for ch in 0..num_output_channels as usize {
                 let ptr = *outputs.add(ch);
                 if !ptr.is_null() {
@@ -1632,7 +1644,8 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             ffi::moose_vst3_mark_restart(ctx, K_LATENCY_CHANGED);
         }
         inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
-    });
+    })
+    .is_some();
     if !ok {
         // Panic in plugin.process() - zero outputs so the host
         // doesn't keep playing whatever stale samples were in the

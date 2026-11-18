@@ -143,10 +143,8 @@ impl Smoother {
     }
 
     /// Short-circuit for any advance that can't step normally. `None` means
-    /// proceed. Shared by `next` / `next_after` / `next_into` so every
-    /// advance path is NaN-safe, not just per-sample `next`. Returns
-    /// `Some(v)`:
-    /// - when `target` is non-finite: `v = current()`, and the accumulator
+    /// proceed. Returns `Some(v)`:
+    /// - when `target` is non-finite: `v = current`, and the accumulator
     ///   is left untouched - the `Smoother` is public through the prelude,
     ///   so an author can call `next()` with their own NaN/Inf, and letting
     ///   it reach `current` would latch (or make the self-heal below
@@ -156,57 +154,94 @@ impl Smoother {
     ///   It would otherwise latch forever, since `NaN + coeff * (target -
     ///   NaN)` stays NaN and every arm's comparisons are false against NaN.
     #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    fn advance_guard(&self, target: f64) -> Option<f32> {
+    fn advance_guard(&self, target: f64) -> Option<f64> {
         if !target.is_finite() {
-            return Some(self.current());
+            return Some(self.current.load());
         }
         if !self.current.load().is_finite() {
             self.snap(target);
-            return Some(target as f32);
+            return Some(target);
         }
         None
     }
 
+    /// The one stepping rule every advance path shares, so `next`,
+    /// `next_after` and `next_into` (f32 and f64) agree bit for bit:
+    /// step `n` samples toward `target`, calling `emit(i, value)` for each,
+    /// and land exactly on `target` once the remaining distance is below
+    /// f32 resolution (after every sample, so a per-sample caller and a
+    /// block caller snap on the same sample). One atomic load / store pair
+    /// per call.
+    #[inline]
+    fn advance(&self, target: f64, n: usize, mut emit: impl FnMut(usize, f64)) -> f64 {
+        if let Some(v) = self.advance_guard(target) {
+            (0..n).for_each(|i| emit(i, v));
+            return v;
+        }
+        let mut current = self.current.load();
+        if current.to_bits() == target.to_bits() {
+            (0..n).for_each(|i| emit(i, target));
+            return target;
+        }
+        let coeff = self.coeff.load();
+        // Linear: scale the convergence threshold to the value magnitude
+        // so very-small-range params don't snap prematurely and very
+        // large ones (20 kHz cutoffs) don't step through differences
+        // nobody hears. Floor at 1e-8 for targets near zero.
+        let threshold = (target.abs() * 1e-6).max(1e-8);
+        let step = if matches!(self.style, SmoothingStyle::Linear(_)) {
+            self.arm_linear_ramp(target, current, coeff)
+        } else {
+            0.0
+        };
+        // One-pole ramps otherwise approach forever: once the difference
+        // is below f32 resolution, land on the exact target so later
+        // blocks take the constant path above.
+        let land = (target.abs() * 1e-7).max(1e-12);
+        for i in 0..n {
+            current = match self.style {
+                SmoothingStyle::None => target,
+                SmoothingStyle::Linear(_) => linear_advance(current, target, step, threshold),
+                SmoothingStyle::Exponential(_) => current + coeff * (target - current),
+                // One-pole in the log domain: `current *= (target /
+                // current)^coeff`. Undefined for a non-positive endpoint,
+                // so snap there.
+                SmoothingStyle::Logarithmic(_) => {
+                    if current <= 0.0 || target <= 0.0 {
+                        target
+                    } else {
+                        (current.ln() + coeff * (target.ln() - current.ln())).exp()
+                    }
+                }
+            };
+            if (target - current).abs() <= land {
+                current = target;
+            }
+            emit(i, current);
+            // Landed: every later step returns `target` exactly (the land
+            // rule catches the log path's `exp(ln(target))` rounding).
+            if current.to_bits() == target.to_bits() {
+                (i + 1..n).for_each(|j| emit(j, target));
+                break;
+            }
+        }
+        self.current.store(current);
+        current
+    }
+
     /// Get next smoothed value, advancing one sample.
     // Smoothed param values stay in `[-1e10, 1e10]`; f32 precision
-    // is enough for the per-sample DSP path.
+    // is enough for the per-sample DSP path. `next_f64` keeps f64.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub fn next(&self, target: f64) -> f32 {
-        if let Some(v) = self.advance_guard(target) {
-            return v;
-        }
-        let current = self.current.load();
-        let coeff = self.coeff.load();
+        self.next_f64(target) as f32
+    }
 
-        let new_current = match self.style {
-            SmoothingStyle::None => target,
-            SmoothingStyle::Linear(_) => {
-                // Scale the snap threshold to the value magnitude so
-                // very-small-range params don't snap prematurely and
-                // very-large-range params (e.g. 20 kHz cutoffs) don't
-                // burn cycles on differences they can't perceive.
-                // Floor at 1e-8 for targets near zero.
-                let threshold = (target.abs() * 1e-6).max(1e-8);
-                let step = self.arm_linear_ramp(target, current, coeff);
-                linear_advance(current, target, step, threshold)
-            }
-            SmoothingStyle::Exponential(_) => current + coeff * (target - current),
-            // One-pole exponential in the log domain: equivalent to
-            // `current *= (target / current)^coeff`. Undefined for a
-            // non-positive endpoint, so snap there.
-            SmoothingStyle::Logarithmic(_) => {
-                if current <= 0.0 || target <= 0.0 {
-                    target
-                } else {
-                    (current.ln() + coeff * (target.ln() - current.ln())).exp()
-                }
-            }
-        };
-
-        self.current.store(new_current);
-        new_current as f32
+    /// [`Self::next`] at `f64`, with no `f32` rounding anywhere.
+    #[inline]
+    pub fn next_f64(&self, target: f64) -> f64 {
+        self.advance(target, 1, |_, _| {})
     }
 
     /// Current smoothed value without advancing.
@@ -258,75 +293,38 @@ impl Smoother {
         }
     }
 
+    /// [`Self::current`] at `f64`.
+    #[inline]
+    #[must_use]
+    pub fn current_f64(&self) -> f64 {
+        self.current.load()
+    }
+
     /// Advance the smoother by `n_samples` samples in one call,
     /// returning only the final value. Use for **block-rate**
     /// consumers (hard gates, mode switches, anything that needs a
-    /// single smoothed value per audio block) where the intermediate
-    /// envelope from [`Self::next_block`] is wasted work.
+    /// single smoothed value per audio block).
     ///
-    /// One atomic load and one atomic store regardless of
-    /// `n_samples`. For `Exponential`, uses the closed-form
-    /// `current + (target - current) * (1 - (1 - coeff)^N)` (one
-    /// `powf` per call) instead of looping; for `Linear`, loops
-    /// because the snap-when-close-enough check breaks any clean
-    /// closed form.
-    ///
-    /// Semantics match `next` step-for-step: equivalent to calling
-    /// `next(target)` `n_samples` times and returning the last
-    /// result, but without paying per-sample atomic costs.
+    /// Identical to calling `next(target)` `n_samples` times and
+    /// returning the last result (same stepping and snapping, bit for
+    /// bit), with one atomic load and store instead of one per sample.
+    /// Steps per sample rather than in closed form so it can't drift
+    /// from `next`; the loop stops costing once the ramp lands.
     // Smoother state stays in `[-1e10, 1e10]`; the f32 narrowing
-    // matches `next` / `next_block`.
+    // matches `next`.
     #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::cast_precision_loss)]
     #[inline]
     pub fn next_after(&self, target: f64, n_samples: usize) -> f32 {
+        self.next_after_f64(target, n_samples) as f32
+    }
+
+    /// [`Self::next_after`] at `f64`.
+    #[inline]
+    pub fn next_after_f64(&self, target: f64, n_samples: usize) -> f64 {
         if n_samples == 0 {
-            return self.current.load() as f32;
+            return self.current.load();
         }
-        if let Some(v) = self.advance_guard(target) {
-            return v;
-        }
-
-        let mut current = self.current.load();
-        let coeff = self.coeff.load();
-
-        match self.style {
-            SmoothingStyle::None => {
-                current = target;
-            }
-            SmoothingStyle::Linear(_) => {
-                // Same per-step math as `next_block`: a constant increment
-                // (armed once, since the target is fixed across the call)
-                // added each sample, snapping on the final step. Looped
-                // because the snap check wrecks any closed-form derivation.
-                let threshold = (target.abs() * 1e-6).max(1e-8);
-                let step = self.arm_linear_ramp(target, current, coeff);
-                for _ in 0..n_samples {
-                    current = linear_advance(current, target, step, threshold);
-                }
-            }
-            SmoothingStyle::Exponential(_) => {
-                // Closed form: N iterations of `current += coeff *
-                // (target - current)` converge to
-                // `target + (current - target) * (1 - coeff)^N`.
-                let decay = (1.0 - coeff).powf(n_samples as f64);
-                current = target + (current - target) * decay;
-            }
-            SmoothingStyle::Logarithmic(_) => {
-                if current <= 0.0 || target <= 0.0 {
-                    current = target;
-                } else {
-                    // Closed form of the log-domain one-pole, mirroring
-                    // the `Exponential` arm above in log space.
-                    let decay = (1.0 - coeff).powf(n_samples as f64);
-                    let log_target = target.ln();
-                    current = (log_target + (current.ln() - log_target) * decay).exp();
-                }
-            }
-        }
-
-        self.current.store(current);
-        current as f32
+        self.advance(target, n_samples, |_, _| {})
     }
 
     /// Advance the smoother by `N` samples in one call, returning the
@@ -356,77 +354,19 @@ impl Smoother {
     /// Advance the smoother by `out.len()` samples in one call,
     /// writing each intermediate value to `out`. Slice-based variant
     /// of [`Self::next_block`] - same single-atomic-pair amortization,
-    /// runtime length. Use this when the chunk size depends on
-    /// `process()`'s actual block (the common case for plugins
-    /// chunking the host's buffer into a `MAX_BLOCK` ladder); the
-    /// const-generic `next_block::<N>` always advances by `N` even
-    /// when the caller only consumes a shorter prefix.
+    /// runtime length, and the same values `next` would give, bit for
+    /// bit. Use this when the chunk size depends on `process()`'s
+    /// actual block.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
     pub fn next_into(&self, target: f64, out: &mut [f32]) {
-        if let Some(v) = self.advance_guard(target) {
-            out.fill(v);
-            return;
-        }
-        let mut current = self.current.load();
-        if current.to_bits() == target.to_bits() {
-            out.fill(target as f32);
-            return;
-        }
-        let coeff = self.coeff.load();
+        self.advance(target, out.len(), |i, v| out[i] = v as f32);
+    }
 
-        match self.style {
-            SmoothingStyle::None => {
-                // Snap immediately; every output is `target`.
-                out.fill(target as f32);
-                current = target;
-            }
-            SmoothingStyle::Linear(_) => {
-                // Threshold matches `next()`'s per-step floor. Armed once
-                // (target is fixed across the block), then a constant
-                // increment per sample - a straight line, not the geometric
-                // decay a re-derived `diff * coeff` would trace.
-                let threshold = (target.abs() * 1e-6).max(1e-8);
-                let step = self.arm_linear_ramp(target, current, coeff);
-                for slot in out.iter_mut() {
-                    current = linear_advance(current, target, step, threshold);
-                    *slot = current as f32;
-                }
-            }
-            SmoothingStyle::Exponential(_) => {
-                // Standard one-pole exponential. `current` is a local
-                // (no atomic), so LLVM keeps it in a register and the
-                // body auto-vectorizes for large enough slices.
-                for slot in out.iter_mut() {
-                    current += coeff * (target - current);
-                    *slot = current as f32;
-                }
-            }
-            SmoothingStyle::Logarithmic(_) => {
-                if current <= 0.0 || target <= 0.0 {
-                    out.fill(target as f32);
-                    current = target;
-                } else {
-                    // Step the one-pole in log space, exponentiating each
-                    // sample back to the linear value the DSP consumes.
-                    let log_target = target.ln();
-                    let mut log_current = current.ln();
-                    for slot in out.iter_mut() {
-                        log_current += coeff * (log_target - log_current);
-                        current = log_current.exp();
-                        *slot = current as f32;
-                    }
-                }
-            }
-        }
-
-        // One-pole ramps otherwise approach forever. Once their remaining
-        // difference is below f32 resolution, land on the exact target so
-        // later blocks can use the constant path.
-        if (target - current).abs() <= (target.abs() * 1e-7).max(1e-12) {
-            current = target;
-        }
-        self.current.store(current);
+    /// [`Self::next_into`] at `f64`.
+    #[inline]
+    pub fn next_into_f64(&self, target: f64, out: &mut [f64]) {
+        self.advance(target, out.len(), |i, v| out[i] = v);
     }
 }
 
@@ -799,5 +739,47 @@ mod tests {
 
         assert_eq!(s.next_after(f64::INFINITY, 64), 0.5);
         assert!(s.current().is_finite(), "accumulator stays finite");
+    }
+
+    /// `next`, `next_into` and `next_after` (f32 and f64) step the same
+    /// rule: driven through the same targets in different block shapes,
+    /// they produce identical bits on every sample (finding 7).
+    #[test]
+    fn every_advance_path_matches_next_bit_for_bit() {
+        let styles = [
+            SmoothingStyle::None,
+            SmoothingStyle::Linear(20.0),
+            SmoothingStyle::Exponential(20.0),
+            SmoothingStyle::Logarithmic(20.0),
+        ];
+        let blocks = [1_usize, 7, 64, 3, 512, 1, 128, 1000, 33, 2048];
+        for style in styles {
+            let mk = || {
+                let s = Smoother::new(style);
+                s.set_sample_rate(48_000.0);
+                s.snap(100.0);
+                s
+            };
+            let (per_sample, into, into64, after, after64) = (mk(), mk(), mk(), mk(), mk());
+            for (k, &n) in blocks.iter().enumerate() {
+                let target = [2_000.0, 0.5, 18_000.0, 440.0][k % 4];
+                let expect: Vec<f64> = (0..n).map(|_| per_sample.next_f64(target)).collect();
+                let mut got = vec![0.0_f32; n];
+                into.next_into(target, &mut got);
+                let mut got64 = vec![0.0_f64; n];
+                into64.next_into_f64(target, &mut got64);
+                for i in 0..n {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let e32 = expect[i] as f32;
+                    assert_eq!(got[i].to_bits(), e32.to_bits(), "{style:?} block {k} sample {i}");
+                    assert_eq!(got64[i].to_bits(), expect[i].to_bits(), "{style:?} block {k} sample {i}");
+                }
+                let last = expect[n - 1];
+                #[allow(clippy::cast_possible_truncation)]
+                let last32 = last as f32;
+                assert_eq!(after.next_after(target, n).to_bits(), last32.to_bits(), "{style:?} block {k}");
+                assert_eq!(after64.next_after_f64(target, n).to_bits(), last.to_bits(), "{style:?} block {k}");
+            }
+        }
     }
 }

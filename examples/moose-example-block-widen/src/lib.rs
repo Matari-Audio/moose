@@ -37,7 +37,7 @@ pub struct WidenParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor; the mid/side scratch lives in [`WidenDsp`], sized in `reset`.
+/// Descriptor; the mid/side scratch lives in [`WidenDsp`], sized in `prepare`.
 pub struct Widen;
 
 /// Per-instance mid/side scratch, sized to the host's max block in `reset`.
@@ -51,11 +51,24 @@ impl PluginLogic for Widen {
     type Params = WidenParams;
     type DspState = WidenDsp;
 
-    fn reset(state: &mut WidenDsp, _params: &WidenParams, config: &AudioConfig) {
-        state.mid.clear();
-        state.mid.resize(config.max_block_size, 0.0);
-        state.side.clear();
-        state.side.resize(config.max_block_size, 0.0);
+    /// Size the scratch to the host's max block, off the audio thread.
+    fn prepare(
+        state: &mut WidenDsp,
+        params: &WidenParams,
+        config: &moose::core::plugin::PreparationConfig,
+    ) -> Result<(), moose::core::plugin::PreparationError> {
+        config.validate()?;
+        let n = config.audio.max_block_size;
+        state.mid.resize(n, 0.0);
+        state.side.resize(n, 0.0);
+        <Self as PluginLogic>::reset(state, params, &config.audio);
+        Ok(())
+    }
+
+    /// Zero the scratch; may run on the audio thread, so no allocation.
+    fn reset(state: &mut WidenDsp, _params: &WidenParams, _config: &AudioConfig) {
+        state.mid.fill(0.0);
+        state.side.fill(0.0);
     }
 
     fn process(

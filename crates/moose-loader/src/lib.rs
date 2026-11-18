@@ -217,6 +217,23 @@ macro_rules! export_plugin {
         }
 
         #[unsafe(no_mangle)]
+        pub fn moose_prepare_v1(
+            state: *mut (),
+            params_ptr: *const (),
+            config: &$crate::__macro_deps::moose_core::config::AudioConfig,
+        ) -> bool {
+            let state = unsafe {
+                &mut *state.cast::<<$logic as $crate::PluginLogicCore<Sample>>::DspState>()
+            };
+            let params: &$params = unsafe { &*(params_ptr as *const $params) };
+            let config = $crate::__macro_deps::moose_core::plugin::PreparationConfig::new(
+                *config,
+                $crate::__macro_deps::moose_core::plugin::PreparationFrameBound::NegotiatedHost,
+            );
+            <$logic as $crate::PluginLogicCore<Sample>>::prepare(state, params, &config).is_ok()
+        }
+
+        #[unsafe(no_mangle)]
         pub fn moose_reset(
             state: *mut (),
             params_ptr: *const (),

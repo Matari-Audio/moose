@@ -235,7 +235,9 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
                 }
                 let config = AudioConfig::new(self.sample_rate, self.max_block_size)
                     .with_process_mode(self.process_mode);
-                loader.reset(self.state, &config);
+                // ponytail: a swap seen by `process` prepares (may allocate)
+                // on the audio thread; hot reload is dev-only.
+                let _ = loader.prepare(self.state, &config);
                 // The fresh state is prepared for the current config, so a
                 // reset missed under lock contention is satisfied.
                 self.reset_pending = false;
@@ -326,7 +328,9 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         }
         self.params.set_sample_rate(config.audio.sample_rate);
         self.params.snap_smoothers();
-        loader.reset(self.state, &config.audio);
+        if !loader.prepare(self.state, &config.audio) {
+            return Err(PreparationError::NotReady);
+        }
         self.sample_rate = config.audio.sample_rate;
         self.max_block_size = config.audio.max_block_size;
         self.process_mode = config.audio.process_mode;

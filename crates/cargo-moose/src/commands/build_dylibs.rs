@@ -223,7 +223,18 @@ pub(crate) fn build_logic_dylibs(
             p.crate_name
         );
         let mut cmd = Command::new("cargo");
-        cmd.arg("build").arg("-p").arg(&p.crate_name);
+        // No format feature: the hot-reload exports are compiled only
+        // without one (they stay out of release format builds). Keep the
+        // plugin's non-format defaults so the ABI canary matches the shell.
+        cmd.arg("build")
+            .arg("-p")
+            .arg(&p.crate_name)
+            .arg("--no-default-features")
+            .arg("--lib");
+        let defaults = crate::namespaced_nonformat_defaults(&root, &[p.crate_name.as_str()]);
+        if !defaults.is_empty() {
+            cmd.arg("--features").arg(defaults.join(","));
+        }
         match logic_profile {
             "debug" => {} // cargo default
             "release" => {

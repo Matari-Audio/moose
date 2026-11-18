@@ -314,11 +314,13 @@ macro_rules! plugin_logic_leaf_trait {
                 ::core::default::Default::default()
             }
 
-            /// Reset for a new sample rate / block size / processing
-            /// mode. Clear `state`'s filters / delay lines; read
-            /// `config.process_mode` to size buffers for an offline
-            /// render (allocation belongs here, off the audio thread) -
-            /// see [`AudioConfig`](moose_core::config::AudioConfig).
+            /// Clear `state`'s filters, delay lines and voices back to
+            /// silence. **May run on the audio thread** (CLAP `reset`,
+            /// VST3 `setProcessing(false)`, AU `AudioUnitReset`), so it
+            /// must not allocate, lock or block: size buffers in
+            /// [`prepare`](Self::prepare) and only zero them here. `config`
+            /// is the one the last `prepare` saw. With `rt-paranoid` on,
+            /// an allocation in a wrapper-driven `reset` is reported.
             ///
             /// Params plumbing is NOT your job: the shell calls
             /// `params.set_sample_rate(config.sample_rate)` and
@@ -337,7 +339,13 @@ macro_rules! plugin_logic_leaf_trait {
             /// reset exactly once; worker plugins override this and only return
             /// success after their real finite policy/readiness is admitted.
             fn requires_fallible_preparation()->bool{false}
-            /// Prepare the runtime before activation.
+            /// Prepare for a sample rate, max block size and processing
+            /// mode before activation, on the host's main thread. **May
+            /// allocate**: size buffers and delay lines from `config`
+            /// here (read `config.audio.process_mode` for an offline
+            /// render). Default: [`reset`](Self::reset). An override that
+            /// sizes buffers should also leave them cleared, e.g. by
+            /// calling `reset` at the end.
             ///
             /// # Errors
             /// Returns an error when configuration or preparation fails.

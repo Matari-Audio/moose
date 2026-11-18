@@ -506,6 +506,111 @@ pub fn run_audio_block<P>(format: &str, body: impl FnOnce()) -> bool {
     true
 }
 
+/// Bytes kept of a `process` panic message; the slot never grows.
+const PANIC_MESSAGE_CAP: usize = 256;
+
+/// Per-instance "process panicked" latch (audit finding 5). After the
+/// first caught panic the wrapper stops calling the plugin, outputs
+/// silence and reports the error status once; the next successful
+/// prepare / activate clears it. The message goes into a preallocated
+/// slot on the audio thread and is printed from a host thread
+/// ([`Self::report`], [`Self::clear`], or drop).
+pub struct PanicLatch {
+    failed: std::sync::atomic::AtomicBool,
+    message: std::sync::Mutex<String>,
+}
+
+impl Default for PanicLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PanicLatch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            failed: std::sync::atomic::AtomicBool::new(false),
+            message: std::sync::Mutex::new(String::with_capacity(PANIC_MESSAGE_CAP)),
+        }
+    }
+
+    /// The plugin panicked in `process` since the last prepare.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Audio thread: latch and keep the message without allocating
+    /// (`try_lock`, then truncated to the slot's capacity).
+    fn record(&self, parts: &[&str]) {
+        if let Ok(mut slot) = self.message.try_lock() {
+            slot.clear();
+            for part in parts {
+                let room = slot.capacity() - slot.len();
+                let mut end = part.len().min(room);
+                while !part.is_char_boundary(end) {
+                    end -= 1;
+                }
+                slot.push_str(&part[..end]);
+            }
+        }
+        self.failed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Host thread: print a recorded message, once.
+    pub fn report(&self) {
+        let mut slot = self
+            .message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !slot.is_empty() {
+            eprintln!("{slot}");
+            slot.clear();
+        }
+    }
+
+    /// Host thread, after a successful prepare / activate: report any
+    /// pending message and let `process` call the plugin again.
+    pub fn clear(&self) {
+        self.report();
+        self.failed.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for PanicLatch {
+    fn drop(&mut self) {
+        self.report();
+    }
+}
+
+/// [`run_audio_block_with`] with a [`PanicLatch`]: `None` when `body`
+/// panicked (the latch is now set and holds the message; nothing is
+/// printed on the audio thread). Wrappers check
+/// [`PanicLatch::is_failed`] inside `body` and output silence without
+/// calling the plugin.
+pub fn run_audio_block_latched<P, R>(
+    latch: &PanicLatch,
+    format: &str,
+    body: impl FnOnce() -> R,
+) -> Option<R> {
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(r) => Some(r),
+        Err(payload) => {
+            latch.record(&[
+                "[moose ",
+                format,
+                "] panic in process() for ",
+                type_name::<P>(),
+                ": ",
+                extract_panic_msg(&payload),
+                " (plugin silenced until the next activate)",
+            ]);
+            None
+        }
+    }
+}
+
 /// Like [`run_audio_block`] but for callbacks that return a status
 /// code. Returns `body`'s value on a clean exit, `fallback` if the
 /// body panicked. Used by the CLAP wrapper, whose process callback
@@ -753,5 +858,27 @@ mod copy_c_str_tests {
         let (n, s) = run(text, 32);
         assert_eq!(n, text.len());
         assert_eq!(s, text);
+    }
+}
+
+#[cfg(test)]
+mod panic_latch_tests {
+    use super::*;
+
+    #[test]
+    fn latch_keeps_a_bounded_message_and_clears() {
+        let latch = PanicLatch::new();
+        let long = "é".repeat(400);
+        let out = run_audio_block_latched::<(), ()>(&latch, "TEST", || {
+            std::panic::panic_any(long.clone())
+        });
+        assert!(out.is_none() && latch.is_failed());
+        {
+            let slot = latch.message.lock().unwrap();
+            assert!(slot.len() <= PANIC_MESSAGE_CAP && slot.starts_with("[moose TEST]"));
+            assert_eq!(slot.capacity(), PANIC_MESSAGE_CAP, "the slot never grows");
+        }
+        latch.clear();
+        assert!(!latch.is_failed() && latch.message.lock().unwrap().is_empty());
     }
 }

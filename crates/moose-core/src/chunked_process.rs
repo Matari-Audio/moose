@@ -289,7 +289,7 @@ fn find_next_split(
     from: usize,
     min_offset: usize,
 ) -> Option<(usize, usize)> {
-    for (i, ev) in events.iter().enumerate().skip(from) {
+    for (i, ev) in events_from(events, from) {
         let offset = ev.sample_offset as usize;
         if offset < min_offset {
             continue;
@@ -299,6 +299,14 @@ fn find_next_split(
         }
     }
     None
+}
+
+/// Events from position `from` on, with their positions. Indexed through
+/// `EventList::get` (O(1)), so resuming mid-list costs nothing;
+/// `iter().skip(from)` walks the whole `FilterMap` prefix each time and
+/// made the chunker O(n²) in events per block (audit finding 10).
+fn events_from(events: &EventList, from: usize) -> impl Iterator<Item = (usize, &Event)> {
+    (from..events.len()).filter_map(move |i| Some((i, events.get(i)?)))
 }
 
 fn is_split_event(body: &EventBody, chunked: &impl Fn(u32) -> bool) -> bool {
@@ -370,7 +378,7 @@ fn apply_pending_events(
 ) -> bool {
     let mut i = *event_idx;
     let mut transport_applied = false;
-    for ev in events.iter().skip(i) {
+    for (_, ev) in events_from(events, i) {
         if (ev.sample_offset as usize) >= block_end {
             break;
         }

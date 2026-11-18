@@ -48,7 +48,7 @@ pub struct StereoUtility;
 
 /// Per-instance DSP state: the delay lines and their write heads.
 pub struct StereoUtilityDspState {
-    /// One delay line per channel, sized in `reset()` for `MAX_DELAY_MS`.
+    /// One delay line per channel, sized in `prepare()` for `MAX_DELAY_MS`.
     lines: [Vec<f32>; 2],
     write_pos: [usize; 2],
     line_len: usize,
@@ -89,18 +89,32 @@ impl PluginLogic for StereoUtility {
     type Params = StereoUtilityParams;
     type DspState = StereoUtilityDspState;
 
-    fn reset(
+    /// Size the delay lines for the sample rate, off the audio thread.
+    fn prepare(
         state: &mut StereoUtilityDspState,
-        _params: &StereoUtilityParams,
-        config: &AudioConfig,
-    ) {
-        let sample_rate = config.sample_rate;
+        params: &StereoUtilityParams,
+        config: &moose::core::plugin::PreparationConfig,
+    ) -> Result<(), moose::core::plugin::PreparationError> {
+        config.validate()?;
+        let sample_rate = config.audio.sample_rate;
         state.sample_rate = sample_rate;
         let len = delay_line_len(sample_rate);
         state.line_len = len;
         for line in &mut state.lines {
-            line.clear();
             line.resize(len, 0.0);
+        }
+        <Self as PluginLogic>::reset(state, params, &config.audio);
+        Ok(())
+    }
+
+    /// Clear the delay lines; may run on the audio thread, so no allocation.
+    fn reset(
+        state: &mut StereoUtilityDspState,
+        _params: &StereoUtilityParams,
+        _config: &AudioConfig,
+    ) {
+        for line in &mut state.lines {
+            line.fill(0.0);
         }
         state.write_pos = [0; 2];
     }

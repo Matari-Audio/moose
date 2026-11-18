@@ -161,10 +161,11 @@ pub trait PluginRuntime: Send + 'static {
     /// Called once after construction. Not real-time safe.
     fn init(&mut self) {}
 
-    /// Called when sample rate, max block size, or processing mode
-    /// changes. Reset filters, delay lines, etc., and size any
-    /// mode-dependent buffers off `config.process_mode`. Not real-time
-    /// safe.
+    /// Clear DSP state (filters, delay lines, voices) back to silence.
+    /// May run on the audio thread (CLAP `reset`, VST3
+    /// `setProcessing(false)`, AU `AudioUnitReset`): must not allocate,
+    /// lock or block. Size buffers in [`Self::prepare`]. Wrappers run it
+    /// in an `rt-paranoid` section.
     fn reset(&mut self, config: &AudioConfig);
 
     /// Fallible OFFAUDIO activation. Native adapters call this before marking
@@ -176,7 +177,9 @@ pub trait PluginRuntime: Send + 'static {
         false
     }
 
-    /// Prepare the runtime before activation.
+    /// Prepare for a sample rate, max block size and processing mode
+    /// before activation, on the host's main thread. May allocate: size
+    /// buffers here. Default: validate, then [`Self::reset`].
     ///
     /// # Errors
     /// Returns an error when the configuration or runtime cannot be prepared.
@@ -200,14 +203,10 @@ pub trait PluginRuntime: Send + 'static {
     /// bridge is a passthrough rather than an `Option<Vec<u8>>` to
     /// `Vec<u8>` translation.
     ///
-    /// The legacy custom-state serializer. [`Self::snapshot_into`] (whose
-    /// user-facing default delegates here) is the path every format now
-    /// uses: CLAP / VST3 / AU read the lock-free snapshot slot the shell
-    /// publishes from the audio thread, and LV2 serializes live through
-    /// `snapshot_into` off its non-realtime save thread - so a host save
-    /// never stalls audio. Overriding only the user-facing `save_state`
-    /// still round-trips, it just runs on the audio thread for the RT
-    /// slot, which is why `snapshot_into` is the preferred path.
+    /// Serialized on demand when the host saves: on the host thread while
+    /// the wrapper isn't processing, else once at the end of the next block
+    /// (see `moose_core::wrapper::custom_state_for_save`). Never runs per
+    /// block unless the plugin opts in through [`Self::snapshot_into`].
     fn save_state(&self) -> Vec<u8> {
         Vec::new()
     }

@@ -303,6 +303,42 @@ impl FloatParam {
         }
     }
 
+    /// Internal: f64 twins of the smoothed reads, for
+    /// [`FloatParamReadF64`]: no `f32` rounding end to end.
+    #[doc(hidden)]
+    #[inline]
+    pub fn raw_smoothed_next_f64(&self) -> f64 {
+        let target = self.value.load();
+        self.smoother.as_ref().map_or(target, |s| s.next_f64(target))
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn raw_smoothed_next_into_f64(&self, out: &mut [f64]) {
+        let target = self.value.load();
+        match &self.smoother {
+            Some(smoother) => smoother.next_into_f64(target, out),
+            None => out.fill(target),
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn raw_smoothed_next_after_f64(&self, n_samples: usize) -> f64 {
+        let target = self.value.load();
+        self.smoother
+            .as_ref()
+            .map_or(target, |s| s.next_after_f64(target, n_samples))
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn raw_smoothed_current_f64(&self) -> f64 {
+        self.smoother
+            .as_ref()
+            .map_or_else(|| self.value.load(), |s| s.current_f64())
+    }
+
     /// Internal: advance the smoother by `n_samples` and return only
     /// the final value. Plugin authors reach this through
     /// [`FloatParamReadF32::read_after`] /
@@ -486,36 +522,22 @@ impl FloatParamReadF32 for FloatParam {
 impl FloatParamReadF64 for FloatParam {
     #[inline]
     fn read(&self) -> f64 {
-        f64::from(self.raw_smoothed_next())
+        self.raw_smoothed_next_f64()
     }
 
     #[inline]
     fn read_into(&self, out: &mut [f64]) {
-        // Reuse the f32 fill via a transient stack scratch sized to
-        // the largest chunk a plugin typically passes (cap to 1024 -
-        // beyond that the caller almost certainly wants `read` per
-        // sample), widening each slot to f64.
-        const SCRATCH: usize = 1024;
-        let mut scratch = [0.0_f32; SCRATCH];
-        let mut remaining = out;
-        while !remaining.is_empty() {
-            let take = remaining.len().min(SCRATCH);
-            self.raw_smoothed_next_into(&mut scratch[..take]);
-            for (dst, &src) in remaining[..take].iter_mut().zip(&scratch[..take]) {
-                *dst = f64::from(src);
-            }
-            remaining = &mut remaining[take..];
-        }
+        self.raw_smoothed_next_into_f64(out);
     }
 
     #[inline]
     fn read_after(&self, n_samples: usize) -> f64 {
-        f64::from(self.raw_smoothed_next_after(n_samples))
+        self.raw_smoothed_next_after_f64(n_samples)
     }
 
     #[inline]
     fn current(&self) -> f64 {
-        f64::from(self.raw_smoothed_current())
+        self.raw_smoothed_current_f64()
     }
 
     #[inline]
@@ -916,6 +938,29 @@ mod tests {
         let before = edit_epoch();
         bump_edit_epoch();
         assert!(edit_epoch() > before);
+    }
+
+    /// The f64 prelude reads without an f32 round trip (finding 6).
+    #[test]
+    fn f64_reads_keep_f64_precision() {
+        let p = FloatParam::new(
+            info("precise", ParamRange::Linear { min: 0.0, max: 1.0 }, 0.0),
+            SmoothingStyle::Linear(1.0),
+        );
+        p.set_sample_rate(48_000.0);
+        p.set_value(0.1);
+        let mut out = [0.0_f64; 4096];
+        FloatParamReadF64::read_into(&p, &mut out);
+        assert_eq!(out[4095].to_bits(), 0.1_f64.to_bits());
+        assert_eq!(FloatParamReadF64::read(&p).to_bits(), 0.1_f64.to_bits());
+        assert_eq!(FloatParamReadF64::read_after(&p, 8).to_bits(), 0.1_f64.to_bits());
+        assert_eq!(FloatParamReadF64::current(&p).to_bits(), 0.1_f64.to_bits());
+        // Mid-ramp values aren't f32-quantised either.
+        p.set_value(0.3);
+        let v = FloatParamReadF64::read(&p);
+        #[allow(clippy::cast_possible_truncation)]
+        let narrowed = f64::from(v as f32);
+        assert_ne!(v.to_bits(), narrowed.to_bits());
     }
 
     #[test]

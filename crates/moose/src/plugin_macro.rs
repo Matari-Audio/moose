@@ -96,13 +96,23 @@ macro_rules! __plugin_impl {
         // pipeline reads.
         $crate::__reexport::__moose_param_index_root!($index);
 
-        // Always export the PluginLogic for dylib use (shell-mode or
-        // testing). Static-mode shells ignore these exports.
-        $crate::__reexport::export_plugin!(
-            $logic,
-            $params
-            $(, tasks: [$($task),+])?
-        );
+        // Hot-reload logic exports and `__moose_screenshot` are dev-only
+        // (audit finding 11): compiled only when no plugin format feature
+        // is on. Every release format build enables `clap` / `vst3` /
+        // `au`; the shell-mode logic dylib and `cargo moose screenshot`
+        // build with `--no-default-features` and none of them. Gating on
+        // that needs no extra feature in each plugin's Cargo.toml.
+        #[allow(unexpected_cfgs, unused_imports)]
+        mod __moose_dev_exports {
+            use super::*;
+
+            #[cfg(not(any(feature = "clap", feature = "vst3", feature = "au")))]
+            $crate::__reexport::export_plugin!(
+                $logic,
+                $params
+                $(, tasks: [$($task),+])?
+            );
+        }
 
         // The static / dynamic-shell `__HotShellWrapper` definition
         // lives inside this synthetic module so a single
@@ -155,88 +165,95 @@ macro_rules! __plugin_impl {
         /// Type alias for use in tests and external references.
         pub type Plugin = __HotShellWrapper;
 
-        /// FFI export driven by `cargo moose screenshot`. Renders
-        /// the plugin's editor (optionally after loading a
-        /// `.pluginstate` blob) and writes the PNG to the caller-
-        /// specified path. Returns 0 on success, non-zero on
-        /// failure (error message is printed to stderr).
-        ///
-        /// # FFI contract
-        ///
-        /// **Signature must stay byte-identical to
-        /// `cargo-moose::commands::screenshot::ScreenshotFn`:**
-        /// `unsafe extern "C" fn(*const u8, usize, *const u8, usize, f64) -> u32`.
-        /// The CLI dlopens this plugin's cdylib and casts the
-        /// `__moose_screenshot` symbol to that type - any drift (extra
-        /// arg, reordered args, return-type change) becomes silent UB
-        /// at the call site rather than a link-time error. Update both
-        /// sides together.
-        ///
-        /// `scale` is the render scale factor. `0.0` (or any
-        /// non-finite / `<= 0` value) is the sentinel for "use the
-        /// default": rendering falls back to
-        /// `moose_core::screenshot::DEFAULT_SCREENSHOT_SCALE` (2.0)
-        /// so reference PNGs render at identical physical
-        /// dimensions on every host.
-        ///
-        /// # Safety
-        /// - `state_ptr` may be null when `state_len == 0`.
-        /// - `state_ptr` (if non-null) must point to `state_len`
-        ///   readable bytes (the contents of a `.pluginstate` file).
-        /// - `out_path_ptr` must point to `out_path_len` valid
-        ///   UTF-8 bytes - the absolute path the caller wants the
-        ///   PNG written to.
-        #[doc(hidden)]
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn __moose_screenshot(
-            state_ptr: *const u8,
-            state_len: usize,
-            out_path_ptr: *const u8,
-            out_path_len: usize,
-            scale: f64,
-        ) -> u32 {
-            let state: Option<&[u8]> = if state_len == 0 {
-                None
-            } else {
-                Some(::std::slice::from_raw_parts(state_ptr, state_len))
-            };
-            let path_bytes = ::std::slice::from_raw_parts(out_path_ptr, out_path_len);
-            let path_str = match ::std::str::from_utf8(path_bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    ::std::eprintln!("[moose] __moose_screenshot: invalid UTF-8 in out_path: {e}");
-                    return 1;
+        // `__moose_screenshot` is dev-only too: see `__moose_dev_exports`.
+        #[allow(unexpected_cfgs, unused_imports)]
+        mod __moose_screenshot_export {
+            use super::*;
+
+            #[cfg(not(any(feature = "clap", feature = "vst3", feature = "au")))]
+            /// FFI export driven by `cargo moose screenshot`. Renders
+            /// the plugin's editor (optionally after loading a
+            /// `.pluginstate` blob) and writes the PNG to the caller-
+            /// specified path. Returns 0 on success, non-zero on
+            /// failure (error message is printed to stderr).
+            ///
+            /// # FFI contract
+            ///
+            /// **Signature must stay byte-identical to
+            /// `cargo-moose::commands::screenshot::ScreenshotFn`:**
+            /// `unsafe extern "C" fn(*const u8, usize, *const u8, usize, f64) -> u32`.
+            /// The CLI dlopens this plugin's cdylib and casts the
+            /// `__moose_screenshot` symbol to that type - any drift (extra
+            /// arg, reordered args, return-type change) becomes silent UB
+            /// at the call site rather than a link-time error. Update both
+            /// sides together.
+            ///
+            /// `scale` is the render scale factor. `0.0` (or any
+            /// non-finite / `<= 0` value) is the sentinel for "use the
+            /// default": rendering falls back to
+            /// `moose_core::screenshot::DEFAULT_SCREENSHOT_SCALE` (2.0)
+            /// so reference PNGs render at identical physical
+            /// dimensions on every host.
+            ///
+            /// # Safety
+            /// - `state_ptr` may be null when `state_len == 0`.
+            /// - `state_ptr` (if non-null) must point to `state_len`
+            ///   readable bytes (the contents of a `.pluginstate` file).
+            /// - `out_path_ptr` must point to `out_path_len` valid
+            ///   UTF-8 bytes - the absolute path the caller wants the
+            ///   PNG written to.
+            #[doc(hidden)]
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn __moose_screenshot(
+                state_ptr: *const u8,
+                state_len: usize,
+                out_path_ptr: *const u8,
+                out_path_len: usize,
+                scale: f64,
+            ) -> u32 {
+                let state: Option<&[u8]> = if state_len == 0 {
+                    None
+                } else {
+                    Some(::std::slice::from_raw_parts(state_ptr, state_len))
+                };
+                let path_bytes = ::std::slice::from_raw_parts(out_path_ptr, out_path_len);
+                let path_str = match ::std::str::from_utf8(path_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        ::std::eprintln!("[moose] __moose_screenshot: invalid UTF-8 in out_path: {e}");
+                        return 1;
+                    }
+                };
+                let path = ::std::path::Path::new(path_str);
+                if let Some(parent) = path.parent() {
+                    let _ = ::std::fs::create_dir_all(parent);
                 }
-            };
-            let path = ::std::path::Path::new(path_str);
-            if let Some(parent) = path.parent() {
-                let _ = ::std::fs::create_dir_all(parent);
+                let resolved_scale = if scale.is_finite() && scale > 0.0 {
+                    scale
+                } else {
+                    $crate::core::screenshot::DEFAULT_SCREENSHOT_SCALE
+                };
+                // Panic firewall: `render_with_state_at_scale` panics by
+                // design for editors without screenshot support, and
+                // `save_png` panics on I/O failure. This is an `extern "C"`
+                // boundary the `cargo moose screenshot` process dlopens and
+                // calls, so a bare panic would abort (SIGABRT) it instead of
+                // the documented non-zero return. Catch it and report `2`.
+                $crate::core::wrapper::run_extern_callback_with::<Plugin, u32>(
+                    "screenshot",
+                    "render",
+                    2,
+                    || {
+                        let (pixels, w, h) =
+                            $crate::core::screenshot::render_with_state_at_scale::<Plugin>(
+                                state,
+                                resolved_scale,
+                            );
+                        $crate::core::screenshot::save_png(path, &pixels, w, h);
+                        0
+                    },
+                )
             }
-            let resolved_scale = if scale.is_finite() && scale > 0.0 {
-                scale
-            } else {
-                $crate::core::screenshot::DEFAULT_SCREENSHOT_SCALE
-            };
-            // Panic firewall: `render_with_state_at_scale` panics by
-            // design for editors without screenshot support, and
-            // `save_png` panics on I/O failure. This is an `extern "C"`
-            // boundary the `cargo moose screenshot` process dlopens and
-            // calls, so a bare panic would abort (SIGABRT) it instead of
-            // the documented non-zero return. Catch it and report `2`.
-            $crate::core::wrapper::run_extern_callback_with::<Plugin, u32>(
-                "screenshot",
-                "render",
-                2,
-                || {
-                    let (pixels, w, h) =
-                        $crate::core::screenshot::render_with_state_at_scale::<Plugin>(
-                            state,
-                            resolved_scale,
-                        );
-                    $crate::core::screenshot::save_png(path, &pixels, w, h);
-                    0
-                },
-            )
         }
 
         // Format exports - same wrapper name in both modes.

@@ -53,7 +53,7 @@ pub struct DryWetParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor; the SIMD scratch lives in [`DryWetDsp`], sized in `reset`.
+/// Descriptor; the SIMD scratch lives in [`DryWetDsp`], sized in `prepare`.
 pub struct DryWet;
 
 /// Per-instance SIMD scratch, sized to the host's max block in `reset`.
@@ -69,11 +69,24 @@ impl PluginLogic for DryWet {
     type Params = DryWetParams;
     type DspState = DryWetDsp;
 
-    fn reset(state: &mut DryWetDsp, _params: &DryWetParams, config: &AudioConfig) {
-        state.wet.clear();
-        state.wet.resize(config.max_block_size, 0.0);
-        state.driven.clear();
-        state.driven.resize(config.max_block_size, 0.0);
+    /// Size the scratch to the host's max block, off the audio thread.
+    fn prepare(
+        state: &mut DryWetDsp,
+        params: &DryWetParams,
+        config: &moose::core::plugin::PreparationConfig,
+    ) -> Result<(), moose::core::plugin::PreparationError> {
+        config.validate()?;
+        let n = config.audio.max_block_size;
+        state.wet.resize(n, 0.0);
+        state.driven.resize(n, 0.0);
+        <Self as PluginLogic>::reset(state, params, &config.audio);
+        Ok(())
+    }
+
+    /// Zero the scratch; may run on the audio thread, so no allocation.
+    fn reset(state: &mut DryWetDsp, _params: &DryWetParams, _config: &AudioConfig) {
+        state.wet.fill(0.0);
+        state.driven.fill(0.0);
     }
 
     fn process(

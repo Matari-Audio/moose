@@ -151,7 +151,7 @@ use moose_core::tasks::AnyTaskSpawner;
 use moose_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
 use moose_core::wrapper::{
     PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
-    custom_state_for_save, custom_state_view, enter_plugin, run_audio_block_with,
+    custom_state_for_save, custom_state_view, enter_plugin, run_audio_block_latched,
     run_extern_callback_with, shared_plugin,
 };
 use moose_core::{Float, Sample};
@@ -293,6 +293,8 @@ struct ClapPluginData<P: PluginExport> {
     /// transfer race-free: no GUI-thread `&mut plugin` is ever
     /// constructed.
     pending_state: Arc<StateLoadQueue>,
+    /// Set by a panic in `process`; cleared by the next activate.
+    panic_latch: moose_core::wrapper::PanicLatch,
     /// `true` between `activate` and `deactivate`. `state_load` reads it
     /// to decide whether the audio thread will drain `pending_state`: if
     /// inactive, no `process` runs, so it applies the custom-state blob
@@ -892,6 +894,7 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             if instance.prepare(&config).is_err() {
                 return false;
             }
+            data.panic_latch.clear();
             // Refresh the caches from the freshly-reset instance so the
             // host reads the real latency/tail before the first block -
             // not the placeholder-rate value from create. No dirty flag:
@@ -1008,9 +1011,14 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
         audio.sounding_notes.clear_all();
         let mode = ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed));
         let mut instance = enter_plugin(&data.plugin);
-        instance.reset(
-            &AudioConfig::new(audio.sample_rate, audio.max_block_size).with_process_mode(mode),
-        );
+        {
+            // CLAP `reset` is [audio-thread]: the author's `reset` must not
+            // allocate (rt-paranoid reports it). Sizing belongs in `prepare`.
+            let _rt = RtSection::enter();
+            instance.reset(
+                &AudioConfig::new(audio.sample_rate, audio.max_block_size).with_process_mode(mode),
+            );
+        }
         // Same baseline refresh as `activate` (no dirty flag): keep the
         // caches consistent with the reset instance.
         data.latency_cache
@@ -1022,6 +1030,7 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
 unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const clap_plugin) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
+        data.panic_latch.report();
         if data.persist_pending.swap(false, Ordering::AcqRel)
             && let Some((id, value)) = data.params_arc.take_persist_change()
             && value.is_finite()
@@ -2767,7 +2776,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
     process: *const clap_process,
 ) -> i32 {
     let mut audio_buffers_valid = false;
-    let result = run_audio_block_with::<P, i32>("CLAP", CLAP_PROCESS_ERROR, || unsafe {
+    // SAFETY: the host passes its live plugin instance.
+    let latch = unsafe { &data_from_plugin::<P>(plugin).panic_latch };
+    let result = run_audio_block_latched::<P, i32>(latch, "CLAP", || unsafe {
         if process.is_null() {
             return CLAP_PROCESS_ERROR;
         }
@@ -2799,6 +2810,13 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             }
         }
         audio_buffers_valid = true;
+
+        // Panicked earlier and not re-activated since: don't re-enter a
+        // plugin in an unknown state. Silence; the error was reported once.
+        if data.panic_latch.is_failed() {
+            zero_clap_output_buffers(process);
+            return CLAP_PROCESS_SLEEP;
+        }
 
         // Take ownership of the plugin for the whole block: an
         // uncontended `Acquire`, never a wait, since the host contract
@@ -3445,7 +3463,21 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             ProcessStatus::KeepAlive => CLAP_PROCESS_CONTINUE_IF_NOT_QUIET,
         }
     });
-    // A mid-process panic is caught by `run_audio_block_with`, which returns
+    let result = result.unwrap_or_else(|| {
+        // First panic: print the latched message from the main thread.
+        // SAFETY: the wrapper retains the host for the instance's lifetime;
+        // `request_callback` is thread-safe (CLAP host.h).
+        unsafe {
+            let host = data_from_plugin::<P>(plugin).host;
+            if !host.is_null()
+                && let Some(request) = (*host).request_callback
+            {
+                request(host);
+            }
+        }
+        CLAP_PROCESS_ERROR
+    });
+    // A mid-process panic is caught by `run_audio_block_latched`, which latches and returns
     // the `CLAP_PROCESS_ERROR` fallback - but the plugin may have left the
     // output buffers half-written. Zero them so the host doesn't play stale
     // garbage for a block before it reacts to the error, matching VST3 / VST2
@@ -6079,6 +6111,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             latency_dirty: AtomicBool::new(false),
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
             pending_state: Arc::new(StateLoadQueue::new(1)),
+            panic_latch: moose_core::wrapper::PanicLatch::new(),
             active: AtomicBool::new(false),
             processing: AtomicBool::new(false),
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),

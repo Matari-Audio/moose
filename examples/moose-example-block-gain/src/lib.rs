@@ -64,7 +64,13 @@ impl PluginLogic for Gain {
     type Params = GainParams;
     type DspState = Self;
 
-    fn reset(state: &mut Self, _params: &GainParams, config: &AudioConfig) {
+    /// Size the scratch to the host's max block, off the audio thread.
+    fn prepare(
+        state: &mut Self,
+        params: &GainParams,
+        config: &moose::core::plugin::PreparationConfig,
+    ) -> Result<(), moose::core::plugin::PreparationError> {
+        config.validate()?;
         for buf in [
             &mut state.gain_db,
             &mut state.pan,
@@ -72,8 +78,22 @@ impl PluginLogic for Gain {
             &mut state.g_l,
             &mut state.g_r,
         ] {
-            buf.clear();
-            buf.resize(config.max_block_size, 0.0);
+            buf.resize(config.audio.max_block_size, 0.0);
+        }
+        <Self as PluginLogic>::reset(state, params, &config.audio);
+        Ok(())
+    }
+
+    /// Zero the scratch; may run on the audio thread, so no allocation.
+    fn reset(state: &mut Self, _params: &GainParams, _config: &AudioConfig) {
+        for buf in [
+            &mut state.gain_db,
+            &mut state.pan,
+            &mut state.lin,
+            &mut state.g_l,
+            &mut state.g_r,
+        ] {
+            buf.fill(0.0);
         }
     }
 

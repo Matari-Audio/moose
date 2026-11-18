@@ -59,7 +59,7 @@ use moose_core::midi::{
     decode_short_message, downconvert_to_midi1, event_to_midi1, pitch_bend_to_bytes,
     route_midi_port, upconvert_to_midi2,
 };
-use moose_core::plugin::PluginRuntime;
+use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
 use moose_core::presets::{PresetScope, enumerate_scope, load_preset_file};
 use moose_core::rt::{RtSection, audit};
 use moose_core::snapshot::SnapshotSlot;
@@ -74,7 +74,7 @@ use moose_core::ump::{
 use moose_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
     custom_state_for_save, default_io_channels, enter_plugin,
-    log_missing_bus_layout, run_audio_block, run_extern_callback_with, run_register,
+    log_missing_bus_layout, run_audio_block_latched, run_extern_callback_with, run_register,
     shared_plugin,
 };
 use moose_params::{MidiSource, ParamFlags, Params};
@@ -373,6 +373,8 @@ struct AuInstance<P: PluginExport> {
     /// `cb_process` and calls [`state::apply_state`]
     /// under its exclusive `&mut plugin`.
     pending_state: Arc<StateLoadQueue>,
+    /// Set by a panic in `process`; cleared by the next successful prepare.
+    panic_latch: moose_core::wrapper::PanicLatch,
     /// `SysEx` input queued from the host thread (`MusicDeviceSysEx`, which
     /// AU v2 may call off the render thread) plus the free-list it recycles
     /// through. Kept off the `audio` cell so the host thread never aliases
@@ -394,6 +396,9 @@ struct AuAudio<P: PluginExport> {
     /// Resume point for the appex's sequential `output_ump_at` drain;
     /// reset alongside `output_events` each block.
     ump_drain_cursor: UmpDrainCursor,
+    /// Same for `output_event_at` and `output_sysex_at`.
+    midi_drain_cursor: NthCursor,
+    sysex_drain_cursor: NthCursor,
     native_output_cursor: LosslessEventCursor,
     native_output_carriers: u32,
     native_output_num_frames: u32,
@@ -426,6 +431,8 @@ struct AuAudio<P: PluginExport> {
     /// zeros outputs while false so DSP doesn't run with un-snapped
     /// smoothers / unset sample rate.
     prepared: bool,
+    /// `ProcessMode` discriminant the last `prepare` ran with.
+    prepared_mode: u8,
     /// Reused per-block scratch for `RawBufferScratch::build`. Lives
     /// on the instance so the audio thread doesn't heap-allocate.
     ///
@@ -526,6 +533,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     ump_drain_cursor: UmpDrainCursor::HEAD,
+                    midi_drain_cursor: NthCursor::HEAD,
+                    sysex_drain_cursor: NthCursor::HEAD,
                     native_output_cursor: LosslessEventCursor::default(),
                     native_output_carriers: 0,
                     native_output_num_frames: 0,
@@ -539,12 +548,14 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     sample_rate: 44100.0,
                     max_block_size: 8192,
                     prepared: false,
+                    prepared_mode: 0,
                     scratch: RawBufferScratch::default(),
                 }),
                 gui: PluginCell::new(AuGui { editor: None, view: 0 }),
                 pending_resize: AtomicU64::new(0),
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
+                panic_latch: moose_core::wrapper::PanicLatch::new(),
                 sysex_ready: SysExQueue::new(SYSEX_INPUT_SLOTS),
                 sysex_free: {
                     // Prefill the free-list so the host thread has a buffer to
@@ -625,6 +636,30 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         let mut audio = inst.audio.enter();
         // Clamp host-supplied max_frames to a sane minimum.
         let max_frames = (max_frames as usize).max(1024);
+        let mode_raw = inst.render_mode.load(Ordering::Relaxed);
+        let mode = ProcessMode::from_u8(mode_raw);
+        // The shim calls this from both `AudioUnitInitialize` (main thread)
+        // and `AudioUnitReset`, which hosts may send from the render thread.
+        // Same rate, size and mode as the last prepare: a plain `reset`
+        // (no allocation, checked under rt-paranoid). Otherwise a full
+        // `prepare`, which may allocate.
+        #[allow(clippy::float_cmp, reason = "same host value, not arithmetic")]
+        let same_config = audio.prepared
+            && audio.sample_rate == sample_rate
+            && audio.max_block_size == max_frames
+            && audio.prepared_mode == mode_raw;
+        if same_config {
+            let mut plugin = enter_plugin(&inst.plugin);
+            {
+                let _rt = RtSection::enter();
+                plugin.reset(&AudioConfig::new(sample_rate, max_frames).with_process_mode(mode));
+            }
+            inst.latency_cache
+                .store(plugin.latency(), Ordering::Relaxed);
+            inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+            return;
+        }
+        audio.prepared = false;
         audio.sample_rate = sample_rate;
         audio.max_block_size = max_frames;
         // Match the exact AU flattening: main + first sidechain input and
@@ -639,14 +674,22 @@ unsafe extern "C" fn cb_reset<P: PluginExport>(
         // `isRenderingOffline`), forwarded by the shim before the host
         // (re)initializes. Prepares the plugin for the render mode the
         // host is about to drive.
-        let mode = ProcessMode::from_u8(inst.render_mode.load(Ordering::Relaxed));
         {
             let mut plugin = enter_plugin(&inst.plugin);
-            plugin.reset(&AudioConfig::new(sample_rate, max_frames).with_process_mode(mode));
+            let config = PreparationConfig::new(
+                AudioConfig::new(sample_rate, max_frames).with_process_mode(mode),
+                PreparationFrameBound::NegotiatedHost,
+            );
+            if plugin.prepare(&config).is_err() {
+                // Stays unprepared: `cb_process` outputs silence.
+                return;
+            }
+            inst.panic_latch.clear();
             inst.latency_cache
                 .store(plugin.latency(), Ordering::Relaxed);
             inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
         }
+        audio.prepared_mode = mode_raw;
         audio.prepared = true;
     });
 }
@@ -1027,7 +1070,9 @@ unsafe fn cb_process_impl<P: PluginExport>(
 ) -> u32 {
     let nf = num_frames as usize;
     let mut process_status = AU_PROCESS_OK;
-    let ok = run_audio_block::<P>("AU", || unsafe {
+    // SAFETY: `ctx` is this wrapper's live instance.
+    let latch = unsafe { &(*ctx.cast::<AuInstance<P>>()).panic_latch };
+    let ok = run_audio_block_latched::<P, ()>(latch, "AU", || unsafe {
         // Shared `&AuInstance` (never a whole-struct `&mut`) - the audio
         // scratch is reached through its ownership cell, so a concurrent
         // host-thread `&*ctx` (param reads, GUI) can't alias us.
@@ -1036,8 +1081,9 @@ unsafe fn cb_process_impl<P: PluginExport>(
         let num_frames = nf;
 
         // Host called render before AU initialized us - sample rate
-        // and smoothers haven't been primed. Zero outputs and bail.
-        if !audio.prepared {
+        // and smoothers haven't been primed. Zero outputs and bail. Same
+        // after a panic until the next prepare (plugin state unknown).
+        if !audio.prepared || inst.panic_latch.is_failed() {
             for ch in 0..num_output_channels as usize {
                 let ptr = *outputs.add(ch);
                 if !ptr.is_null() {
@@ -1052,6 +1098,8 @@ unsafe fn cb_process_impl<P: PluginExport>(
             audio.output_events.clear();
             audio.output_events.clear_overflow();
             audio.ump_drain_cursor = UmpDrainCursor::HEAD;
+            audio.midi_drain_cursor = NthCursor::HEAD;
+            audio.sysex_drain_cursor = NthCursor::HEAD;
             // Not prepared: discard any host-queued `SysEx`, recycling the
             // buffers so the queue can't accumulate stale messages.
             while let Some(slot) = inst.sysex_ready.pop() {
@@ -1067,6 +1115,8 @@ unsafe fn cb_process_impl<P: PluginExport>(
         audio.output_events.clear();
         audio.output_events.clear_overflow();
         audio.ump_drain_cursor = UmpDrainCursor::HEAD;
+        audio.midi_drain_cursor = NthCursor::HEAD;
+        audio.sysex_drain_cursor = NthCursor::HEAD;
 
         // Take ownership of the plugin for the whole block: an
         // uncontended `Acquire`, never a wait, since the host contract
@@ -1239,6 +1289,8 @@ unsafe fn cb_process_impl<P: PluginExport>(
             // MIDI/SysEx (duplicated note-ons, stuck notes).
             scr.output_events.clear();
             scr.ump_drain_cursor = UmpDrainCursor::HEAD;
+            scr.midi_drain_cursor = NthCursor::HEAD;
+            scr.sysex_drain_cursor = NthCursor::HEAD;
             return;
         }
         let mut audio_buffer = scr.scratch.build(
@@ -1358,7 +1410,8 @@ unsafe fn cb_process_impl<P: PluginExport>(
         #[cfg(not(target_os = "macos"))]
         let _ = prev_latency;
         inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
-    });
+    })
+    .is_some();
     if !ok {
         process_status = AU_PROCESS_INVALID;
     }
@@ -2003,13 +2056,14 @@ unsafe extern "C" fn cb_output_event_at<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let audio = inst.audio.enter();
-        if let Some(mut packet) = audio
-            .output_events
-            .iter()
-            .filter_map(try_encode_au_midi)
-            .nth(index as usize)
-        {
+        let mut audio = inst.audio.enter();
+        let scr = &mut *audio;
+        if let Some(mut packet) = nth_matching(
+            &scr.output_events,
+            index as usize,
+            &mut scr.midi_drain_cursor,
+            try_encode_au_midi,
+        ) {
             // Route to the plugin's chosen MIDI output cable; an
             // out-of-range port lands on 0. The appex passes `port`
             // straight to `midiOutputEventBlock`.
@@ -2110,6 +2164,56 @@ impl UmpDrainCursor {
     };
 }
 
+/// Resume point for an ascending-index drain over the output events that
+/// `pick` accepts (`output_event_at`, `output_sysex_at`). The appex asks
+/// for indices 0, 1, 2, ... in order, so resuming makes the whole drain
+/// O(n) instead of O(n²). Chosen over encoding a packet list per block:
+/// no second buffer to size, and the same shape as [`UmpDrainCursor`].
+#[derive(Clone, Copy)]
+struct NthCursor {
+    /// Matches before [`Self::event_pos`].
+    matched_before: usize,
+    /// Event position the next lookup resumes from.
+    event_pos: usize,
+}
+
+impl NthCursor {
+    /// Head of the list; also the per-block reset value.
+    const HEAD: Self = Self {
+        matched_before: 0,
+        event_pos: 0,
+    };
+}
+
+/// The `index`-th event `pick` maps to `Some`, resuming from `cursor`
+/// (a backwards query restarts at the head).
+fn nth_matching<'a, T>(
+    list: &'a EventList,
+    index: usize,
+    cursor: &mut NthCursor,
+    mut pick: impl FnMut(&'a Event) -> Option<T>,
+) -> Option<T> {
+    if index < cursor.matched_before {
+        *cursor = NthCursor::HEAD;
+    }
+    let mut seen = cursor.matched_before;
+    for pos in cursor.event_pos..list.len() {
+        let Some(found) = list.get(pos).and_then(&mut pick) else {
+            continue;
+        };
+        if seen == index {
+            // Resume here: a repeat of `index` finds this event again.
+            *cursor = NthCursor {
+                matched_before: seen,
+                event_pos: pos,
+            };
+            return Some(found);
+        }
+        seen += 1;
+    }
+    None
+}
+
 /// The `index`-th packet of the flattened UMP output stream. Resumes
 /// from `cursor` when the query continues forward in the same
 /// protocol (the appex drains indices in ascending order); a
@@ -2127,7 +2231,9 @@ fn au_ump_packet_at(
         };
     }
     let mut remaining = index - cursor.packets_before;
-    for (pos, event) in list.iter().enumerate().skip(cursor.event_pos) {
+    // Indexed from the cursor (`get` is O(1)); `iter().skip()` would walk
+    // from the head on every call.
+    for (pos, event) in (cursor.event_pos..list.len()).filter_map(|p| Some((p, list.get(p)?))) {
         let n = au_ump_packet_count(list, event, protocol);
         if remaining < n {
             cursor.event_pos = pos;
@@ -2267,14 +2373,15 @@ unsafe extern "C" fn cb_output_sysex_at<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let audio = inst.audio.enter();
-        if let Some(event) = audio
-            .output_events
-            .iter()
-            .filter(|e| matches!(e.body, EventBody::SysEx { .. }))
-            .nth(index as usize)
-        {
-            let bytes = audio.output_events.sysex_bytes(&event.body);
+        let mut audio = inst.audio.enter();
+        let scr = &mut *audio;
+        if let Some(event) = nth_matching(
+            &scr.output_events,
+            index as usize,
+            &mut scr.sysex_drain_cursor,
+            |e| matches!(e.body, EventBody::SysEx { .. }).then_some(e),
+        ) {
+            let bytes = scr.output_events.sysex_bytes(&event.body);
             *out_delta_frames = event.sample_offset;
             *out_bytes = bytes.as_ptr();
             *out_len = len_u32(bytes.len());
@@ -4156,5 +4263,29 @@ mod large_state_tests {
             cb_state_free(ptr, len);
             cb_destroy::<Large>(ctx);
         }
+    }
+
+    /// The resuming drain returns what `filter_map(..).nth(i)` does, in
+    /// order, out of order and past the end (finding 10).
+    #[test]
+    fn nth_matching_equals_filter_nth() {
+        let mut list = EventList::with_capacity(64);
+        for i in 0..40_u8 {
+            let body = if i % 3 == 0 {
+                EventBody::ControlChange { group: 0, channel: 0, cc: 1, value: i }
+            } else {
+                EventBody::NoteOn { group: 0, channel: 0, note: i, velocity: 100 }
+            };
+            list.push(Event::new(u32::from(i), body));
+        }
+        let pick = |e: &Event| matches!(e.body, EventBody::ControlChange { .. }).then_some(e.sample_offset);
+        let expect: Vec<u32> = list.iter().filter_map(pick).collect();
+        let mut cur = NthCursor::HEAD;
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(nth_matching(&list, i, &mut cur, pick), Some(*want));
+            assert_eq!(nth_matching(&list, i, &mut cur, pick), Some(*want), "repeat");
+        }
+        assert_eq!(nth_matching(&list, expect.len(), &mut cur, pick), None);
+        assert_eq!(nth_matching(&list, 2, &mut cur, pick), Some(expect[2]), "backwards");
     }
 }

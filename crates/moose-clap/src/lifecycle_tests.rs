@@ -65,6 +65,9 @@ impl PluginRuntime for Probe {
     fn reset(&mut self, _: &AudioConfig) {
         self.resets += 1;
         self.pressed = false;
+        if ALLOC_IN_RESET.get() {
+            std::hint::black_box(vec![0_u8; 64]);
+        }
     }
     fn save_state(&self) -> Vec<u8> {
         self.custom.clone()
@@ -82,6 +85,7 @@ impl PluginRuntime for Probe {
         _: &EventList,
         _: &mut ProcessContext,
     ) -> ProcessStatus {
+        assert!(!PANIC_IN_PROCESS.get(), "probe panic");
         self.processed_frames += audio.num_samples();
         for channel in 0..audio.channels() {
             let (input, output) = audio.io(channel);
@@ -94,6 +98,13 @@ impl PluginRuntime for Probe {
 #[cfg(feature = "rt-paranoid")]
 #[global_allocator]
 static TEST_ALLOC: moose_core::rt::RtCheckAlloc = moose_core::rt::RtCheckAlloc::new();
+
+// Makes `Probe::reset` allocate, for the reset-is-real-time test.
+// Thread-local so concurrent tests' resets never see it.
+thread_local! {
+    static PANIC_IN_PROCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ALLOC_IN_RESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 fn with_probe(test: impl FnOnce(*const clap_plugin)) {
     // SAFETY: host and descriptor outlive the serial vtable calls and destruction.
@@ -694,4 +705,87 @@ fn rejected_load_fails_and_keeps_the_previous_state() {
             }
         });
     }
+}
+
+/// CLAP `reset` is [audio-thread]: the author's `reset` runs in an
+/// rt-paranoid section, so an allocation there is reported (finding 3).
+#[test]
+fn clap_reset_runs_in_the_real_time_section() {
+    with_probe(|plugin| {
+        // SAFETY: serial lifecycle calls on a live instance.
+        unsafe {
+            let callbacks = &*plugin;
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+            let reset = callbacks.reset.unwrap();
+            let ((), clean) = moose_core::rt::audit(|| reset(plugin));
+            assert_eq!(clean, 0);
+            ALLOC_IN_RESET.set(true);
+            let ((), dirty) = moose_core::rt::audit(|| reset(plugin));
+            ALLOC_IN_RESET.set(false);
+            assert_eq!(dirty > 0, moose_core::rt::is_active());
+            callbacks.deactivate.unwrap()(plugin);
+        }
+    });
+}
+
+/// After a panic in `process` the plugin isn't re-entered: one error
+/// status, then silence, until the next activate (finding 5). Not under
+/// rt-paranoid: unwinding allocates inside the real-time section.
+#[test]
+#[cfg(not(feature = "rt-paranoid"))]
+fn process_panic_latches_until_reactivation() {
+    with_probe(|plugin| {
+        // SAFETY: each block owns its sample buffers; lifecycle calls are serial.
+        unsafe {
+            let callbacks = &*plugin;
+            let mut in_l = vec![0.5_f32; 64];
+            let mut in_r = vec![0.5_f32; 64];
+            let mut out_l = vec![0.0_f32; 64];
+            let mut out_r = vec![0.0_f32; 64];
+            let mut ins = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+            let mut outs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            let input = clap_audio_buffer {
+                data32: ins.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let mut output = clap_audio_buffer {
+                data32: outs.as_mut_ptr(),
+                ..input
+            };
+            let process = clap_process {
+                steady_time: 0,
+                frames_count: 64,
+                transport: ptr::null(),
+                audio_inputs: &raw const input,
+                audio_outputs: &raw mut output,
+                audio_inputs_count: 1,
+                audio_outputs_count: 1,
+                in_events: ptr::null(),
+                out_events: ptr::null(),
+            };
+            let run = || callbacks.process.unwrap()(plugin, &raw const process);
+            let frames = || enter_plugin(&data_from_plugin::<Probe>(plugin).plugin).processed_frames;
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+            assert!(callbacks.start_processing.unwrap()(plugin));
+            PANIC_IN_PROCESS.set(true);
+            assert_eq!(run(), CLAP_PROCESS_ERROR, "the panic block reports an error");
+            PANIC_IN_PROCESS.set(false);
+            let before = frames();
+            out_l.fill(1.0);
+            assert_eq!(run(), CLAP_PROCESS_SLEEP, "latched: no second error");
+            assert_eq!(frames(), before, "latched: plugin not re-entered");
+            assert!(out_l.iter().all(|s| *s == 0.0), "latched: silence");
+            callbacks.stop_processing.unwrap()(plugin);
+            callbacks.deactivate.unwrap()(plugin);
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+            assert!(callbacks.start_processing.unwrap()(plugin));
+            assert_eq!(run(), CLAP_PROCESS_CONTINUE, "re-activate clears the latch");
+            assert_eq!(frames(), before + 64);
+            callbacks.stop_processing.unwrap()(plugin);
+            callbacks.deactivate.unwrap()(plugin);
+        }
+    });
 }
