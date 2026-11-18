@@ -217,7 +217,8 @@ pub struct AuCallbacks {
     // GUI
     pub gui_has_editor: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
     pub gui_get_size: unsafe extern "C" fn(ctx: *mut c_void, w: *mut u32, h: *mut u32),
-    pub gui_open: unsafe extern "C" fn(ctx: *mut c_void, parent: *mut c_void),
+    /// `1` when the editor's window opened under `parent`, else `0`.
+    pub gui_open: unsafe extern "C" fn(ctx: *mut c_void, parent: *mut c_void) -> i32,
     pub gui_close: unsafe extern "C" fn(ctx: *mut c_void),
     /// `1` if the editor opted into host-driven resize. The AU v3
     /// Swift shim consults this to decide whether to propagate the

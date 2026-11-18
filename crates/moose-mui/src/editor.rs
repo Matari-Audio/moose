@@ -472,6 +472,10 @@ impl<P: Params> Editor for MuiEditor<P> {
         self.window = opened.map(Handle);
     }
 
+    fn is_open(&self) -> bool {
+        self.has_window()
+    }
+
     #[cfg(target_os = "linux")]
     fn supports_floating_x11(&self) -> bool {
         true

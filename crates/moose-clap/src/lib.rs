@@ -305,6 +305,9 @@ struct ClapPluginData<P: PluginExport> {
     floating_mode: AtomicBool,
     floating_visible: Arc<AtomicBool>,
     floating_closed: Arc<AtomicBool>,
+    /// The editor asked to mark the project dirty (`PluginContext::mark_dirty`,
+    /// any thread); `on_main_thread` calls `host_state.mark_dirty`.
+    dirty_pending: Arc<AtomicBool>,
     /// Last `Params::parameter_presentation_revision` the host saw.
     presentation_revision: AtomicU64,
     /// Coalesces structural changed-ID notifications without a values rescan.
@@ -1026,6 +1029,13 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
             {
                 mark_dirty(data.host);
             }
+        }
+        if data.dirty_pending.swap(false, Ordering::AcqRel)
+            && !data.host.is_null()
+            && !data.host_state.is_null()
+            && let Some(mark_dirty) = (*data.host_state).mark_dirty
+        {
+            mark_dirty(data.host);
         }
         if data.floating_closed.swap(false, Ordering::AcqRel) {
             data.gui.enter().visible = false;
@@ -4939,9 +4949,20 @@ unsafe extern "C" fn gui_set_scale<P: PluginExport>(
         if data.gui.enter().mode != GuiMode::Embedded {
             return false;
         }
+        let changed = data.reported_host_scale() != Some(scale);
         data.set_host_scale(scale);
-        if let Some(ref mut editor) = data.gui.enter().editor {
-            editor.set_scale_factor(scale);
+        let mut gui = data.gui.enter();
+        let Some(editor) = gui.editor.as_mut() else {
+            return true;
+        };
+        editor.set_scale_factor(scale);
+        // An open window's physical size follows the scale; tell the host so
+        // its frame matches (it need not re-query `get_size` on its own).
+        let (lw, lh) = editor.size();
+        let open = editor.is_open() && gui.gui_created;
+        drop(gui);
+        if changed && open && lw > 0 && lh > 0 {
+            request_host_resize(data.host, scale, lw, lh);
         }
         true
     })
@@ -5080,6 +5101,10 @@ unsafe fn gui_set_parent_inner<P: PluginExport>(
         let handle = RawWindowHandle::X11(parent_ptr as u64);
 
         editor.open(handle, context);
+        // `set_parent` "returns true on success": no window, no success.
+        if !editor.is_open() {
+            return false;
+        }
         // baseview attaches its child NSView at the parent's
         // `(0, 0)`. NSView's coordinate system is unflipped, so
         // `(0, 0)` is the parent's bottom-left - which renders the
@@ -5246,6 +5271,21 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
         )
         .with_tasks(task_spawner_for_ctx)
         .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedEdits)
+        .with_mark_dirty({
+            // `state.mark_dirty` is [main-thread]: flag it and ask for
+            // `on_main_thread` (`request_callback` is thread-safe).
+            let dirty = data.dirty_pending.clone();
+            let host = SendPtr::new(data.host);
+            Arc::new(move || {
+                let host = host.as_ptr();
+                if !dirty.swap(true, Ordering::AcqRel)
+                    && !host.is_null()
+                    && let Some(request) = (*host).request_callback
+                {
+                    request(host);
+                }
+            })
+        })
     }
 }
 
@@ -5410,9 +5450,10 @@ unsafe extern "C" fn gui_get_resize_hints<P: PluginExport>(
             return false;
         }
         let (aw, ah) = editor.aspect_ratio().unwrap_or((0, 0));
+        let (min, max) = (editor.min_size(), editor.max_size());
         *hints = clap_gui_resize_hints {
-            can_resize_horizontally: true,
-            can_resize_vertically: true,
+            can_resize_horizontally: min.0 < max.0,
+            can_resize_vertically: min.1 < max.1,
             preserve_aspect_ratio: editor.aspect_ratio().is_some(),
             aspect_ratio_width: aw,
             aspect_ratio_height: ah,
@@ -6009,6 +6050,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             floating_mode: AtomicBool::new(false),
             floating_visible: Arc::new(AtomicBool::new(false)),
             floating_closed: Arc::new(AtomicBool::new(false)),
+            dirty_pending: Arc::new(AtomicBool::new(false)),
             presentation_revision: AtomicU64::new(0),
             presentation_pending: Arc::new(AtomicBool::new(false)),
             remote_pages,

@@ -4,6 +4,11 @@ Notable changes per release.
 
 ## Unreleased
 
+- Editor contract (see `docs/audit/2026-11-18-gui-design.md`): new `Editor::is_open()` (default `true`; MUI, egui and built-in editors report the truth). CLAP `set_parent` returns `false` and the AU v2 view factory returns `nil` when the editor window failed to open. AU `gui_open` callback returns `int32_t`.
+- New `PluginContext::mark_dirty()` (any thread) and `PluginContext::with_mark_dirty` for wrappers. `PluginContext::set_state` marks the project dirty. CLAP delivers it as `state.mark_dirty` on the main thread; AU and standalone have no such API.
+- CLAP: a changed `gui.set_scale` while the editor is open asks the host to resize to the new physical size; resize hints report an axis as fixed when `min_size == max_size` on it.
+- AU v2: the editor closes when its view leaves the window (and reopens if it returns) instead of running until the next open; a view that outlives its AudioUnit no longer calls into it.
+
 - `#[derive(Params)]` takes array fields: `#[param(name = "Macro {n}", ...)] macros: [FloatParam; 8]` declares eight host parameters with their own ids (`id + i`, or a stable hash of `macros[i]`), names from the `{i}` / `{n}` / `{n:02}` template, and `ParamId` variants `Macros0..7`. The chord example gives each chord note its own level this way.
 
 - Two parameter range shapes: `offset_log(min, max, offset)` (logarithmic over `[min + offset, max + offset]`, for a frequency axis that is near-linear at the bottom) and `pivoted_log(min, max, mid)` (logarithmic with a power bend that puts `mid` at the knob midpoint, for a Q or width whose default belongs at the centre).

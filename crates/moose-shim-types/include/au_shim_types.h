@@ -300,7 +300,8 @@ typedef struct {
     /* GUI */
     int32_t (*gui_has_editor)(void *ctx);
     void (*gui_get_size)(void *ctx, uint32_t *w, uint32_t *h);
-    void (*gui_open)(void *ctx, void *parent);
+    /* 1 when the editor's window opened under `parent`, else 0. */
+    int32_t (*gui_open)(void *ctx, void *parent);
     void (*gui_close)(void *ctx);
     /* Whether the editor advertised `can_resize() == true`. The AU
      * v3 Swift shim consults this in `viewDidLayoutSubviews` to

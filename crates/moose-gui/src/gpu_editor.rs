@@ -376,6 +376,10 @@ impl<P: Params + 'static> Editor for GpuEditor<P> {
         self.window = window;
     }
 
+    fn is_open(&self) -> bool {
+        self.window.is_some()
+    }
+
     fn window_scale(&self) -> Option<f64> {
         self.scale.window_scale(self.window.is_some())
     }

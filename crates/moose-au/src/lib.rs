@@ -436,6 +436,10 @@ struct AuAudio<P: PluginExport> {
 /// Main/UI-thread-owned editor state (see [`AuInstance::gui`]).
 struct AuGui {
     editor: Option<Box<dyn Editor>>,
+    /// The host-owned container view the editor last opened in (`0` = none).
+    /// `cb_destroy` detaches it so a view outliving its AudioUnit never
+    /// calls back into the freed instance.
+    view: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +540,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     prepared: false,
                     scratch: RawBufferScratch::default(),
                 }),
-                gui: PluginCell::new(AuGui { editor: None }),
+                gui: PluginCell::new(AuGui { editor: None, view: 0 }),
                 pending_resize: AtomicU64::new(0),
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
@@ -594,6 +598,13 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
             // so catching here keeps a live host alive; the
             // instance is being torn down anyway.
             let raw = ctx.cast::<AuInstance<P>>();
+            #[cfg(target_os = "macos")]
+            {
+                let view = std::mem::take(&mut (*raw).gui.enter().view);
+                if view != 0 {
+                    moose_au_view_detach(view as *mut std::ffi::c_void);
+                }
+            }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 drop(Box::from_raw(raw));
             }));
@@ -2986,10 +2997,10 @@ unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
 unsafe extern "C" fn cb_gui_open<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     parent: *mut std::ffi::c_void,
-) {
+) -> i32 {
     // `editor.open` runs author GUI-construction code that can panic;
     // firewall it so the panic can't unwind across the C ABI.
-    run_extern_callback_with::<P, ()>("au", "gui_open", (), || {
+    run_extern_callback_with::<P, i32>("au", "gui_open", 0, || {
         // AU is macOS+iOS-only at runtime. Linux/Windows builds compile
         // the wrapper crate for completeness (it's part of the workspace
         // build matrix) but the body references AppKit / UIKit /
@@ -3001,6 +3012,7 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
             let _ = ctx;
             let _ = parent;
             let _ = std::marker::PhantomData::<P>;
+            0
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         unsafe {
@@ -3161,9 +3173,13 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                 // logical AppKit points and the editor follows the parent
                 // view's backing scale.
                 editor.open(handle, context);
+                let opened = editor.is_open();
+                gui.view = if opened { parent as usize } else { 0 };
+                return i32::from(opened);
             }
+            0
         }
-    });
+    })
 }
 
 unsafe extern "C" fn cb_gui_close<P: PluginExport>(ctx: *mut std::ffi::c_void) {
@@ -3196,6 +3212,13 @@ unsafe extern "C" fn cb_gui_close<P: PluginExport>(ctx: *mut std::ffi::c_void) {
         // the lightweight Rust struct that survives is reopened
         // in-place by the next `gui_open` call.
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// `au_v2_view.m`: forget the instance so the container stops calling
+    /// `gui_open` / `gui_close` on it.
+    fn moose_au_view_detach(view: *mut std::ffi::c_void);
 }
 
 unsafe extern "C" {

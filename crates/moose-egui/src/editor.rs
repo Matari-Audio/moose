@@ -1597,6 +1597,10 @@ impl<P: Params + 'static> Editor for EguiEditor<P> {
         self.size
     }
 
+    fn is_open(&self) -> bool {
+        self.window.is_some()
+    }
+
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
         self.close_window();
         let lifecycle = EditorLifecycle::new(&context);

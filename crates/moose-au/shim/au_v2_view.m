@@ -52,6 +52,7 @@
 @interface MOOSE_AU_FIXED_CONTAINER_NAME : NSView
 @property(nonatomic, assign) void *rustCtx;
 @property(nonatomic, assign) const AuCallbacks *callbacks;
+@property(nonatomic, assign) BOOL editorOpen;
 @end
 
 @implementation MOOSE_AU_FIXED_CONTAINER_NAME
@@ -69,7 +70,35 @@
     }
     [super setFrameSize:newSize];
 }
+
+/// The host owns this view. The editor lives while the view is in a window:
+/// closed when the host closes or detaches it, reopened if it comes back.
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    if (self.rustCtx == NULL || self.callbacks == NULL) return;
+    if (self.window == nil && self.editorOpen) {
+        self.editorOpen = NO;
+        self.callbacks->gui_close(self.rustCtx);
+    } else if (self.window != nil && !self.editorOpen) {
+        self.editorOpen = self.callbacks->gui_open(self.rustCtx, (__bridge void *)self) != 0;
+    }
+}
+
+/// A host that releases its window without detaching the view first.
+- (void)dealloc {
+    if (self.editorOpen && self.rustCtx != NULL && self.callbacks != NULL) {
+        self.callbacks->gui_close(self.rustCtx);
+    }
+}
 @end
+
+/// Called from the AudioUnit's destroy (main thread): the instance is gone.
+void moose_au_view_detach(void *view) {
+    MOOSE_AU_FIXED_CONTAINER_NAME *container = (__bridge MOOSE_AU_FIXED_CONTAINER_NAME *)view;
+    container.rustCtx = NULL;
+    container.callbacks = NULL;
+    container.editorOpen = NO;
+}
 
 @interface MOOSE_AU_VIEW_FACTORY_NAME : NSObject <AUCocoaUIBase>
 @end
@@ -111,7 +140,8 @@
         [[MOOSE_AU_FIXED_CONTAINER_NAME alloc] initWithFrame:frame];
     container.rustCtx = ctx;
     container.callbacks = cb;
-    cb->gui_open(ctx, (__bridge void *)container);
+    if (!cb->gui_open(ctx, (__bridge void *)container)) return nil;
+    container.editorOpen = YES;
     return container;
 }
 

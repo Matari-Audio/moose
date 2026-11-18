@@ -1441,6 +1441,10 @@ impl<P: Params + 'static> Editor for BuiltinEditor<P> {
         self.set_size(width, height)
     }
 
+    fn is_open(&self) -> bool {
+        self.window.is_some()
+    }
+
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
         // A host that re-attaches by calling open() again without an
         // intervening close() would otherwise overwrite `window` /

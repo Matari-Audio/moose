@@ -103,6 +103,15 @@ pub trait Editor: Send {
     /// Create the GUI as a child of the host-provided parent window.
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext);
 
+    /// Whether the last [`open`](Editor::open) (or floating open) produced a
+    /// window that is still open. Wrappers read it right after `open` and
+    /// report a failure to the host (CLAP `set_parent` `false`, VST3
+    /// `attached` `kResultFalse`, AU view `nil`). Defaults to `true` for
+    /// editors that cannot tell.
+    fn is_open(&self) -> bool {
+        true
+    }
+
     /// Whether this editor supports a floating X11 window.
     fn supports_floating_x11(&self) -> bool {
         false
@@ -312,6 +321,10 @@ impl Editor for TaskBoundEditor {
     fn open(&mut self, parent: RawWindowHandle, context: PluginContext) {
         self.editor
             .open(parent, context.with_tasks(self.tasks.clone()));
+    }
+
+    fn is_open(&self) -> bool {
+        self.editor.is_open()
     }
 
     fn supports_floating_x11(&self) -> bool {
@@ -602,8 +615,15 @@ pub struct PluginContext<P: ?Sized = dyn Params> {
     /// when the plugin wired `tasks:`. Lets the editor schedule work via
     /// [`Self::tasks`]. `None` for a plugin with no background tasks.
     tasks: Option<AnyTaskSpawner>,
+    /// Tells the host the project changed outside the parameter system
+    /// (see [`Self::mark_dirty`]). `None` where the format has no such API.
+    mark_dirty: Option<MarkDirty>,
     params: Arc<P>,
 }
+
+/// The wrapper's "project modified" notifier: callable from any thread, it
+/// delivers the format's call on the host's main/UI thread.
+pub type MarkDirty = Arc<dyn Fn() + Send + Sync>;
 
 impl<P: ?Sized> Clone for PluginContext<P> {
     fn clone(&self) -> Self {
@@ -611,6 +631,7 @@ impl<P: ?Sized> Clone for PluginContext<P> {
             bridge: Arc::clone(&self.bridge),
             notification_delivery: self.notification_delivery,
             tasks: self.tasks.clone(),
+            mark_dirty: self.mark_dirty.clone(),
             params: Arc::clone(&self.params),
         }
     }
@@ -625,7 +646,27 @@ impl<P: ?Sized> PluginContext<P> {
             bridge,
             notification_delivery: EditorNotificationDelivery::HostThread,
             tasks: None,
+            mark_dirty: None,
             params,
+        }
+    }
+
+    /// Install the format's "project modified" notifier (CLAP
+    /// `state.mark_dirty`, VST3 `IComponentHandler2::setDirty`). Format
+    /// wrappers call this; the closure must be safe to call from any thread.
+    #[must_use]
+    pub fn with_mark_dirty(mut self, mark_dirty: MarkDirty) -> Self {
+        self.mark_dirty = Some(mark_dirty);
+        self
+    }
+
+    /// Tell the host the project changed in a way it cannot see through
+    /// parameters (custom state edited in the editor), so it offers to save.
+    /// Parameter edits need no call: the host tracks those itself. A no-op
+    /// on formats without the API (AU, standalone). Any thread.
+    pub fn mark_dirty(&self) {
+        if let Some(f) = &self.mark_dirty {
+            f();
         }
     }
 
@@ -692,6 +733,7 @@ impl<P: ?Sized> PluginContext<P> {
             bridge: Arc::clone(&self.bridge),
             notification_delivery: self.notification_delivery,
             tasks: self.tasks.clone(),
+            mark_dirty: self.mark_dirty.clone(),
             params,
         }
     }
@@ -750,8 +792,11 @@ impl<P: ?Sized> PluginContext<P> {
     pub fn get_state(&self) -> Vec<u8> {
         self.bridge.get_state()
     }
+    /// Hand custom state to the plugin (its `load_state`) and mark the
+    /// project dirty, since the host cannot see this change otherwise.
     pub fn set_state(&self, data: Vec<u8>) {
         self.bridge.set_state(data);
+        self.mark_dirty();
     }
     #[must_use]
     pub fn transport(&self) -> Option<TransportInfo> {
@@ -767,6 +812,7 @@ impl PluginContext<dyn Params> {
             bridge: Arc::new(bridge),
             notification_delivery: EditorNotificationDelivery::HostThread,
             tasks: None,
+            mark_dirty: None,
             params,
         }
     }
@@ -781,6 +827,7 @@ impl<P: Params + 'static> PluginContext<P> {
             bridge: self.bridge,
             notification_delivery: self.notification_delivery,
             tasks: self.tasks,
+            mark_dirty: self.mark_dirty,
             params: self.params as Arc<dyn Params>,
         }
     }
@@ -1246,5 +1293,32 @@ mod notification_delivery_tests {
             1,
             "capabilities add no queue or latency"
         );
+    }
+
+    #[test]
+    fn set_state_marks_dirty_and_survives_adapters() {
+        let dirty = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&dirty);
+        let bridge: Arc<dyn EditorBridge> = Arc::new(ClosureBridge {
+            begin_edit: Box::new(|_| {}),
+            set_param: Box::new(|_, _| {}),
+            end_edit: Box::new(|_| {}),
+            request_resize: Box::new(|_, _| false),
+            get_param: Box::new(|_| 0.0),
+            get_param_plain: Box::new(|_| 0.0),
+            format_param: Box::new(|_| String::new()),
+            get_meter: Box::new(|_| 0.0),
+            get_state: Box::new(Vec::new),
+            set_state: Box::new(|_| {}),
+            transport: Box::new(|| None),
+        });
+        let context = PluginContext::new(bridge, Arc::new(()))
+            .with_mark_dirty(Arc::new(move || {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }))
+            .with_params(Arc::new(()));
+        context.set_state(vec![1]);
+        context.mark_dirty();
+        assert_eq!(dirty.load(Ordering::Relaxed), 2);
     }
 }
