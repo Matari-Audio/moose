@@ -1,0 +1,21 @@
+[package]
+name = "moose-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Realtime-safe DSP primitives shared by moose plugins: time constants, smoothers, followers, biquads, SVFs, windows and FFTs"
+
+[features]
+# Complex FFTs over rustfft. Off by default: most plugins need only the filters.
+fft = ["dep:rustfft"]
+
+[dependencies]
+rustfft = { version = "6.4", optional = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

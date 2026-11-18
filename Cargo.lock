@@ -2405,6 +2405,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "moose-dsp"
+version = "7.0.0"
+dependencies = [
+ "rustfft",
+]
+
+[[package]]
 name = "moose-egui"
 version = "7.0.0"
 dependencies = [
