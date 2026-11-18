@@ -1584,7 +1584,7 @@ mod routing_tests {
             .input(InputSource::Constant(0.5))
             .run();
         let expected: f32 = if KIND == 3 { 0.25 } else { 0.5 };
-        assert_ne!(result.output[0], []);
+        assert!(!result.output[0].is_empty());
         assert!(
             result
                 .output
