@@ -118,6 +118,11 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
     // port.
     if let Some((port, channel, controller)) = allocated_midi_proxy_decode(&inst.midi_proxy_ids, id)
     {
+        // Proxies carry MIDI only, so they share the host input limit.
+        // Letting them use automation headroom can starve real parameters.
+        if input_event_lane_full(list) {
+            return false;
+        }
         #[allow(clippy::cast_possible_truncation)]
         let normalized = value.clamp(0.0, 1.0) as f32;
         return list
@@ -162,7 +167,7 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
     true
 }
 
-/// Host input events (notes, pressure, `SysEx`) may fill the typed event
+/// Host input events (notes, pressure, `SysEx`, MIDI proxies) may fill the typed event
 /// lane only up to `capacity - capacity / VST3_AUTOMATION_RESERVE_DIVISOR`.
 /// The rest is reserved for parameter automation, which the COM layer
 /// interleaves with notes by sample offset. This reserves capacity, not

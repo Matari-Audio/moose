@@ -3110,6 +3110,44 @@ mod input_merge {
     }
 
     #[test]
+    fn midi_proxy_burst_cannot_starve_automation() {
+        let ctx = unsafe { cb_create::<Probe>() };
+        let inst = unsafe { &*ctx.cast::<Vst3Instance<Probe>>() };
+        let proxy_id = inst.midi_proxy_ids[0];
+        let capacity = inst.audio.enter().event_list.capacity();
+        unsafe { cb_begin_input_events::<Probe>(ctx, 512) };
+        let ((), heap) = heap_ops(|| {
+            for offset in 0..capacity * 2 {
+                let accepted =
+                    unsafe { cb_push_param_change::<Probe>(ctx, proxy_id, 0, 0.5, -1, 0.0) };
+                assert_eq!(
+                    accepted,
+                    i32::from(offset < input_event_typed_limit(capacity))
+                );
+            }
+            // A late real parameter retains its sample position after overflow.
+            assert_eq!(
+                unsafe { cb_push_param_change::<Probe>(ctx, 0, 511, 0.75, -1, 0.0) },
+                1
+            );
+        });
+        {
+            let audio = inst.audio.enter();
+            let list = &audio.event_list;
+            assert_eq!(list.len(), input_event_typed_limit(capacity) + 1);
+            assert_eq!(list.overflow(), Some(PushError::EventFull));
+            let point = list.iter().last().unwrap();
+            assert_eq!(point.sample_offset, 511);
+            assert!(matches!(
+                point.body,
+                EventBody::ParamChange { id: 0, value: 0.75 }
+            ));
+        }
+        assert_eq!(heap, 0, "ingestion must not touch the heap");
+        unsafe { cb_destroy::<Probe>(ctx) };
+    }
+
+    #[test]
     fn note_burst_cannot_starve_automation() {
         // One note per sample, far more than the event list holds.
         let notes: Vec<Event> = (0..400).map(|i| note_on(i, (i % 128) as i16)).collect();
