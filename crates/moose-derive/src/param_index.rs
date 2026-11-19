@@ -15,7 +15,7 @@
 //! Cross-crate `#[nested]` types are unsupported: the aggregator only
 //! looks in the plugin crate's own sidecar directory.
 
-use crate::{ParamField, name_hash_id};
+use crate::fields::{ParamField, name_hash_id};
 use moose_params::AUTO_PARAM_ID_MASK;
 use proc_macro::TokenStream;
 use quote::quote;
@@ -101,7 +101,7 @@ pub(crate) fn emit_root_impl(input: TokenStream) -> TokenStream {
     let root_struct = seg.ident.to_string();
 
     // No plugin in moose.toml = nothing to index (helper crate).
-    let Ok((config, pkg_name, moose_toml_path)) = crate::try_resolve_plugin() else {
+    let Ok((config, pkg_name, moose_toml_path)) = crate::info::try_resolve_plugin() else {
         return TokenStream::new();
     };
     let Some(plugin) = config.plugin.iter().find(|p| p.serves(&pkg_name)) else {
