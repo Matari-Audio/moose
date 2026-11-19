@@ -4,6 +4,14 @@ Notable changes per release.
 
 ## Unreleased
 
+- **`Plugin::reactivate`.** A host re-activation the processor still fits
+  now calls `reactivate(processor, shared, config)` on the main thread
+  (default: `reset`), so a plugin can redo what `activate` reads from its
+  params, as the legacy `prepare` did.
+- **`moose::Plugin::requires_fallible_preparation`.** A `moose::Plugin`
+  whose activation can fail or whose processor owns worker threads returns
+  `true` (default `false`), and `Lifecycle` forwards it, so hot loaders still
+  refuse it and the standalone still re-prepares on each device open.
 - **A re-activation the processor still fits keeps it.** `Lifecycle` keeps
   the current `moose::Plugin` processor and calls `reset` when the host
   prepares again at the same sample rate and process mode with a max block

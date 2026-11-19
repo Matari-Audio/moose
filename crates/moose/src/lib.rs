@@ -12,7 +12,7 @@ pub use moose_derive::{ParamEnum, Params, State};
 // from the lightweight `moose-gui-types` so layout / interaction /
 // theme remain available without dragging tiny-skia + baseview + wgpu.
 pub use moose_params as params;
-pub use moose_plugin::{Lifecycle, Plugin};
+pub use moose_plugin::{Lifecycle, Plugin, ProcessorSlot};
 
 #[cfg(feature = "clap")]
 pub use moose_clap as clap_wrapper;

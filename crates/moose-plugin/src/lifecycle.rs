@@ -89,6 +89,16 @@ pub trait Plugin<S: Sample = f32>: 'static {
         BusLayout::stereo_and_mono()
     }
 
+    /// Worker/fallible-preparation logic must declare this requirement:
+    /// return `true` when [`Self::activate`] can fail or the processor owns
+    /// worker threads. Hot loaders refuse `true` until executable worker
+    /// lifetime and fallible cross-generation preparation are qualified.
+    /// Default `false`.
+    #[must_use]
+    fn requires_fallible_preparation() -> bool {
+        false
+    }
+
     /// Build the main-thread part. Called once per instance, on the host
     /// main thread.
     fn main_thread(shared: &Arc<Self::Shared>) -> Self::MainThread;
@@ -98,7 +108,7 @@ pub trait Plugin<S: Sample = f32>: 'static {
     ///
     /// A host re-activation the current processor still fits (same sample
     /// rate and process mode, a max block no larger than the one it was
-    /// built for) keeps it and calls [`Self::reset`] instead. Otherwise the
+    /// built for) keeps it and calls [`Self::reactivate`] instead. Otherwise the
     /// previous processor is deactivated and its custom state carried into
     /// the new one.
     ///
@@ -116,6 +126,16 @@ pub trait Plugin<S: Sample = f32>: 'static {
         config: &AudioConfig,
         cx: &InitContext,
     ) -> Result<Self::Processor, PreparationError>;
+
+    /// A host re-activation the processor still fits (see
+    /// [`Self::activate`]), on the host main thread: may allocate and block.
+    /// Redo what `activate` reads from `shared` at activation time (a mode
+    /// that latency depends on, for instance), then clear to silence.
+    /// Default: [`Self::reset`].
+    fn reactivate(processor: &mut Self::Processor, shared: &Self::Shared, config: &AudioConfig) {
+        let _ = config;
+        Self::reset(processor, shared);
+    }
 
     /// Clear the processor back to silence. Runs on the audio thread (CLAP
     /// `reset`, VST3 `setProcessing(false)`): no allocation, locks or
@@ -310,7 +330,7 @@ fn activate<S: Sample, P: Plugin<S>>(
     } = &mut slot.slot
         && fits(built, &config.audio)
     {
-        P::reset(processor, shared);
+        P::reactivate(processor, shared, &config.audio);
         return Ok(());
     }
     let carried = match std::mem::take(&mut slot.slot) {
@@ -430,6 +450,10 @@ macro_rules! lifecycle_leaf {
 
             fn bus_layouts() -> Vec<BusLayout> {
                 P::bus_layouts()
+            }
+
+            fn requires_fallible_preparation() -> bool {
+                P::requires_fallible_preparation()
             }
 
             fn init(_params: &P::Shared, cx: &InitContext) -> Self::DspState {

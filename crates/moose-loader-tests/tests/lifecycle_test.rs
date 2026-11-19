@@ -320,3 +320,46 @@ fn reactivation_the_processor_fits_keeps_it() {
     let processor = plugin.state_ref().processor().expect("active");
     assert_eq!((processor.blocks, processor.resets), (0, 0), "rebuilt");
 }
+
+/// Declares fallible preparation; nothing else.
+struct Fallible;
+
+impl Plugin for Fallible {
+    type Shared = LcParams;
+    type MainThread = ();
+    type Processor = ();
+
+    fn requires_fallible_preparation() -> bool {
+        true
+    }
+
+    fn main_thread(_shared: &Arc<LcParams>) {}
+
+    fn activate(
+        _shared: &LcParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<(), PreparationError> {
+        Ok(())
+    }
+
+    fn process(
+        _processor: &mut (),
+        _shared: &LcParams,
+        _buffer: &mut AudioBuffer,
+        _events: &EventList,
+        _context: &mut ProcessContext,
+    ) -> ProcessStatus {
+        ProcessStatus::Normal
+    }
+
+    fn editor(_shared: Arc<LcParams>) -> Box<dyn Editor> {
+        Box::new(NoEditor)
+    }
+}
+
+#[test]
+fn requires_fallible_preparation_is_forwarded() {
+    assert!(!<Lifecycle<Lc> as PluginLogicCore<f32>>::requires_fallible_preparation());
+    assert!(<Lifecycle<Fallible> as PluginLogicCore<f32>>::requires_fallible_preparation());
+}
