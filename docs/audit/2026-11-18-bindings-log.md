@@ -264,4 +264,47 @@ Stacked on the runtime-catalog core (`moose/runtime-catalog`).
   hooks over a `DynamicParams<4>` plugin.
 - Commands: `build-slot cargo clippy -p moose-clap --all-targets -- -D
   warnings` (clean), `build-slot cargo test -p moose-clap` (57 passed).
-||||||| parent of dec727d29e (moose-vst3: runtime catalog, dynamic list modes, host features)
+## Step 6: lifecycle trait (branch `moose/lifecycle-trait`)
+
+- Redesign B2/B3, additive. `moose_plugin::Plugin<S: Sample = f32>`
+  (`crates/moose-plugin/src/lifecycle.rs`), re-exported as `moose::Plugin`
+  and from every prelude. Three associated types: `Shared: Params`,
+  `MainThread: MainThreadHooks`, `Processor: Send + 'static`.
+- Precision is the trait parameter, not a GAT: `impl Plugin for X` is f32,
+  `impl Plugin<f64>` (or `Plugin<Sample>` under `prelude64`) is f64. A GAT
+  `Processor<S>` would make every author write DSP generic over `S` while
+  the prelude still picks one precision at compile time.
+- `activate` takes `&Shared`, not `&Arc<Shared>`: the leaf `prepare` hook
+  it runs from only has `&Params`, and `process` receives `&Shared` every
+  block, so a processor never needs to hold the `Arc`.
+- `Lifecycle<P>` is a marker type implementing `PluginLogic` for
+  `P: Plugin<f32>` and `PluginLogic64` for `P: Plugin<f64>`; no overlap
+  with the `PurePluginLogic` blanket because no crate can implement
+  `PurePluginLogic` for `Lifecycle<_>`. Its `DspState` is
+  `ProcessorSlot<P::Processor>` (inactive with an optional pending state
+  load, or active). `prepare` deactivates the old processor, carries its
+  `save_state` bytes (or a load that arrived while inactive) into the new
+  one, and leaves the slot inactive on error. `process` while inactive
+  writes silence and returns `Normal`; `reset` while inactive is a no-op;
+  `load_state` while inactive runs `validate_state` and keeps the bytes.
+- `moose::plugin!` still declares `pub type Plugin` in the caller module,
+  which shadows the prelude trait there, so the example writes
+  `impl moose::Plugin for Bitcrusher`.
+- Not carried (stay on `PluginLogic` for these): `InitContext` /
+  background tasks, `snapshot_into` / `snapshot_version`,
+  `supports_in_place`, `clap_extension`, `state_changed`.
+- Example: `moose-example-dasp-bitcrusher` migrated.
+- Tests: `crates/moose-loader-tests/tests/lifecycle_test.rs` (5 tests:
+  silence before activate, activate error is a preparation failure,
+  reset/process reach the processor, state loaded before activation and
+  across re-activation, main-thread hooks returned).
+
+## Validators (2026-11-19, main 542bd8c1f6)
+
+Fresh `cargo moose build -p moose-example-synth --vst3 --clap`:
+- clap-validator 0.4.1: 44 run, 41 passed, 0 failed, 3 skipped (no input
+  ports, no audio-ports-activation, no configurable-audio-ports).
+- VST3 SDK validator 3.8.0: 47 passed, 0 failed.
+- pluginval (official Linux release, Dec 2024), VST3,
+  `--validate-in-process --skip-gui-tests`: SUCCESS at strictness 5 and 10.
+

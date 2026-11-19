@@ -1,0 +1,230 @@
+//! `moose::Plugin` through the `Lifecycle` adapter and the static shell:
+//! the processor exists only after a successful activation.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use moose::prelude::{Editor, PluginContext, PreparationError};
+use moose::{Lifecycle, Plugin};
+use moose_core::AudioConfig;
+use moose_core::buffer::AudioBuffer;
+use moose_core::editor::RawWindowHandle;
+use moose_core::events::{EventList, TransportInfo};
+use moose_core::main_thread::{MainThreadHooks, TrackInfo};
+use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
+use moose_core::process::{ProcessContext, ProcessStatus};
+use moose_core::state::StateLoadError;
+use moose_core::thread::MainThread;
+use moose_derive::Params;
+use moose_gui::PluginLogicCore;
+use moose_loader::static_shell::StaticShell;
+use moose_params::{FloatParam, FloatParamReadF32 as _};
+
+#[derive(Params)]
+struct LcParams {
+    #[param(id = 0, name = "Level", range = "linear(0, 1)", default = 0.5)]
+    level: FloatParam,
+    /// Main-thread hooks write here so the test can see they ran.
+    #[skip]
+    track_seen: AtomicBool,
+    /// `activate` fails while this is set.
+    #[skip]
+    refuse: AtomicBool,
+}
+
+/// Counts what reached it; `value` is its custom state.
+struct Counter {
+    blocks: u32,
+    resets: u32,
+    value: u32,
+}
+
+struct Hooks(Arc<LcParams>);
+impl MainThreadHooks for Hooks {
+    fn track_info_changed(&mut self, _cx: &MainThread, _info: &TrackInfo) {
+        self.0.track_seen.store(true, Ordering::Relaxed);
+    }
+}
+
+static ACTIVATIONS: AtomicU32 = AtomicU32::new(0);
+
+struct Lc;
+
+impl Plugin for Lc {
+    type Shared = LcParams;
+    type MainThread = Hooks;
+    type Processor = Counter;
+
+    fn main_thread(shared: &Arc<LcParams>) -> Hooks {
+        Hooks(Arc::clone(shared))
+    }
+
+    fn activate(shared: &LcParams, _config: &AudioConfig) -> Result<Counter, PreparationError> {
+        if shared.refuse.load(Ordering::Relaxed) {
+            return Err(PreparationError::ResourceBudget);
+        }
+        ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+        Ok(Counter {
+            blocks: 0,
+            resets: 0,
+            value: 0,
+        })
+    }
+
+    fn reset(processor: &mut Counter, _shared: &LcParams) {
+        processor.resets += 1;
+    }
+
+    fn process(
+        processor: &mut Counter,
+        shared: &LcParams,
+        buffer: &mut AudioBuffer,
+        _events: &EventList,
+        _context: &mut ProcessContext,
+    ) -> ProcessStatus {
+        processor.blocks += 1;
+        let level = shared.level.value();
+        buffer.output(0).fill(level);
+        ProcessStatus::KeepAlive
+    }
+
+    fn save_state(processor: &Counter) -> Vec<u8> {
+        processor.value.to_le_bytes().to_vec()
+    }
+
+    fn load_state(processor: &mut Counter, data: &[u8]) -> Result<(), StateLoadError> {
+        Self::validate_state(data)?;
+        let bytes: [u8; 4] = data.try_into().expect("validated length");
+        processor.value = u32::from_le_bytes(bytes);
+        Ok(())
+    }
+
+    fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
+        if data.len() == 4 {
+            Ok(())
+        } else {
+            Err(StateLoadError::Malformed("Counter expects 4 bytes"))
+        }
+    }
+
+    fn editor(_shared: Arc<LcParams>) -> Box<dyn Editor> {
+        Box::new(NoEditor)
+    }
+}
+
+struct NoEditor;
+impl Editor for NoEditor {
+    fn size(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn open(&mut self, _: RawWindowHandle, _: PluginContext) {}
+    fn close(&mut self) {}
+}
+
+type Shell = StaticShell<LcParams, Lifecycle<Lc>>;
+
+fn shell() -> (Shell, Arc<LcParams>) {
+    let params = Arc::new(LcParams::new());
+    (Shell::from_parts(Arc::clone(&params), None), params)
+}
+
+fn config() -> PreparationConfig {
+    PreparationConfig::new(
+        AudioConfig::new(48_000.0, 64),
+        PreparationFrameBound::NegotiatedHost,
+    )
+}
+
+/// One 64-frame mono block; returns the status and the first output sample.
+fn block(shell: &mut Shell) -> (ProcessStatus, f32) {
+    let input = [0.0f32; 64];
+    let mut output = [1.0f32; 64];
+    let inputs: [&[f32]; 1] = [&input];
+    let transport = TransportInfo::default();
+    let mut output_events = EventList::default();
+    let status = {
+        let mut outputs: [&mut [f32]; 1] = [&mut output];
+        // SAFETY: one 64-frame channel each way, both live for the call.
+        let mut buffer = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
+        let mut ctx = ProcessContext::new(&transport, 48_000.0, 64, &mut output_events);
+        shell.process(&mut buffer, &EventList::default(), &mut ctx)
+    };
+    (status, output[0])
+}
+
+#[test]
+fn processor_is_absent_and_output_silent_before_activate() {
+    let (mut plugin, _params) = shell();
+    assert!(plugin.state_ref().processor().is_none());
+    // `reset` with no processor is a no-op, not a panic.
+    plugin.reset(&AudioConfig::new(48_000.0, 64));
+    let (status, first) = block(&mut plugin);
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(first, 0.0, "silence before activation");
+    assert!(plugin.state_ref().processor().is_none());
+}
+
+#[test]
+fn activate_error_is_a_preparation_failure() {
+    let (mut plugin, params) = shell();
+    params.refuse.store(true, Ordering::Relaxed);
+    assert_eq!(
+        plugin.prepare(&config()),
+        Err(PreparationError::ResourceBudget)
+    );
+    assert!(plugin.state_ref().processor().is_none());
+    assert_eq!(block(&mut plugin).1, 0.0, "still silent");
+
+    params.refuse.store(false, Ordering::Relaxed);
+    assert_eq!(plugin.prepare(&config()), Ok(()));
+    assert!(plugin.state_ref().processor().is_some());
+}
+
+#[test]
+fn reset_and_process_reach_the_processor() {
+    let (mut plugin, _params) = shell();
+    plugin.prepare(&config()).expect("activates");
+    let (status, first) = block(&mut plugin);
+    assert_eq!(status, ProcessStatus::KeepAlive);
+    assert_eq!(first, 0.5, "processor wrote the level param");
+    block(&mut plugin);
+    plugin.reset(&AudioConfig::new(48_000.0, 64));
+    let processor = plugin.state_ref().processor().expect("active");
+    assert_eq!((processor.blocks, processor.resets), (2, 1));
+}
+
+#[test]
+fn state_loaded_before_activate_reaches_the_processor() {
+    let (mut plugin, _params) = shell();
+    assert!(
+        plugin.load_state(&[1, 2]).is_err(),
+        "validated while inactive"
+    );
+    plugin
+        .load_state(&7u32.to_le_bytes())
+        .expect("valid state queues");
+    assert_eq!(
+        plugin.save_state(),
+        7u32.to_le_bytes(),
+        "pending state saves"
+    );
+    plugin.prepare(&config()).expect("activates");
+    assert_eq!(plugin.state_ref().processor().map(|p| p.value), Some(7));
+
+    // Re-activation (new sample rate) carries the state to the new processor.
+    let before = ACTIVATIONS.load(Ordering::Relaxed);
+    plugin.prepare(&config()).expect("re-activates");
+    assert!(ACTIVATIONS.load(Ordering::Relaxed) > before);
+    assert_eq!(plugin.state_ref().processor().map(|p| p.value), Some(7));
+}
+
+#[test]
+fn main_thread_hooks_object_is_returned() {
+    let params = Arc::new(LcParams::new());
+    let mut hooks = <Lifecycle<Lc> as PluginLogicCore<f32>>::main_thread(&params);
+    // SAFETY: the test thread is the only thread that uses main-thread
+    // tokens in this test.
+    let cx = unsafe { MainThread::assume() };
+    hooks.track_info_changed(&cx, &TrackInfo::new());
+    assert!(params.track_seen.load(Ordering::Relaxed));
+}

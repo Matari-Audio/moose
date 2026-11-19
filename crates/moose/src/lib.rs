@@ -12,6 +12,7 @@ pub use moose_derive::{ParamEnum, Params, State};
 // from the lightweight `moose-gui-types` so layout / interaction /
 // theme remain available without dragging tiny-skia + baseview + wgpu.
 pub use moose_params as params;
+pub use moose_plugin::{Lifecycle, Plugin};
 
 #[cfg(feature = "clap")]
 pub use moose_clap as clap_wrapper;
@@ -95,6 +96,7 @@ macro_rules! enable_rt_paranoid {
 // type alias.
 mod prelude_impl {
     pub use moose_core::custom_state::{AtomicCell, State as StateTrait, StateBinding, StateField};
+    pub use moose_core::plugin::PreparationError;
     pub use moose_core::sample::{Float, Sample as SampleTrait};
     pub use moose_core::state::{ForeignState, MigratedState, PluginFormat, StateLoadError};
     pub use std::f64::consts::TAU;
@@ -106,7 +108,7 @@ mod prelude_impl {
     pub use moose_core::snapshot::SnapshotPublisher;
     pub use moose_core::tasks::{InitContext, TaskSpawner};
     pub use moose_core::util::{db_to_linear, linear_to_db, meter_display, midi_note_to_freq};
-    pub use moose_plugin::BackgroundTask;
+    pub use moose_plugin::{BackgroundTask, Lifecycle, Plugin};
     // `AudioBuffer` is *not* re-exported from `moose_core` here -
     // each prelude module declares its own per-precision
     // `pub type AudioBuffer<'a> = moose_core::buffer::AudioBuffer<'a, $sample>;`

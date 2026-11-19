@@ -23,13 +23,13 @@ pub struct BitcrusherParams {
     pub mix: FloatParam,
 }
 
-/// Stateless descriptor - DSP state lives in [`BitcrusherDspState`].
+/// Descriptor for the [`moose::Plugin`] impl; the audio side lives in
+/// [`BitcrusherProcessor`].
 pub struct Bitcrusher;
 
-/// Per-instance DSP state: the sample-and-hold buffer and its
-/// frame counter.
-#[derive(Default)]
-pub struct BitcrusherDspState {
+/// The audio processor: the sample-and-hold buffer and its frame counter.
+/// Built by `activate`, so it never exists before the host activates.
+pub struct BitcrusherProcessor {
     /// Sample-and-hold buffer per channel (max 2 channels supported).
     held: [f32; 2],
     /// Frame counter for the hold ratio.
@@ -52,17 +52,32 @@ fn quantize(s: f32, bits: u8) -> f32 {
     }
 }
 
-impl PluginLogic for Bitcrusher {
-    type Params = BitcrusherParams;
-    type DspState = BitcrusherDspState;
+// `moose::plugin!` declares a `Plugin` alias in this module, so the trait
+// is named by path.
+impl moose::Plugin for Bitcrusher {
+    type Shared = BitcrusherParams;
+    type MainThread = ();
+    type Processor = BitcrusherProcessor;
 
-    fn reset(state: &mut BitcrusherDspState, _params: &BitcrusherParams, _config: &AudioConfig) {
+    fn main_thread(_shared: &Arc<BitcrusherParams>) {}
+
+    fn activate(
+        _shared: &BitcrusherParams,
+        _config: &AudioConfig,
+    ) -> Result<BitcrusherProcessor, PreparationError> {
+        Ok(BitcrusherProcessor {
+            held: [0.0; 2],
+            hold_counter: 0,
+        })
+    }
+
+    fn reset(state: &mut BitcrusherProcessor, _params: &BitcrusherParams) {
         state.held = [0.0; 2];
         state.hold_counter = 0;
     }
 
     fn process(
-        state: &mut BitcrusherDspState,
+        state: &mut BitcrusherProcessor,
         params: &BitcrusherParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -77,13 +92,13 @@ impl PluginLogic for Bitcrusher {
         let channels = buffer.channels().min(2);
         for i in 0..buffer.num_samples() {
             let refresh = state.hold_counter.is_multiple_of(hold);
-            for ch in 0..channels {
+            for (ch, held) in state.held.iter_mut().enumerate().take(channels) {
                 let (inp, out) = buffer.io(ch);
                 let dry = inp[i];
                 if refresh {
-                    state.held[ch] = dry;
+                    *held = dry;
                 }
-                let crushed = quantize(state.held[ch], bits);
+                let crushed = quantize(*held, bits);
                 out[i] = dry * (1.0 - mix) + crushed * mix;
             }
             state.hold_counter = state.hold_counter.wrapping_add(1);
@@ -104,7 +119,7 @@ impl PluginLogic for Bitcrusher {
 }
 
 moose::plugin! {
-    logic: Bitcrusher,
+    logic: moose::Lifecycle<Bitcrusher>,
     params: BitcrusherParams,
 }
 

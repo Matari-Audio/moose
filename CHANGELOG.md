@@ -4,6 +4,17 @@ Notable changes per release.
 
 ## Unreleased
 
+- **`Plugin` trait (lifecycle split).** `moose::Plugin<S = f32>` has three
+  parts: `type Shared: Params` (any thread), `type MainThread:
+  MainThreadHooks` and `type Processor`. `activate(&Shared, &AudioConfig)
+  -> Result<Processor, PreparationError>` runs on the main thread and is
+  the only way to get a processor; `reset` (audio thread), `process`,
+  `deactivate`, `latency` / `tail` / `save_state` / `load_state` take the
+  processor. Export it with `moose::plugin! { logic:
+  moose::Lifecycle<MyPlugin>, params: MyParams }`; before activation the
+  plugin outputs silence, and a state load is kept until a processor
+  exists. `PreparationError` is in the prelude. `PluginLogic` and
+  friends are unchanged. The bitcrusher example uses the new trait.
 - **Runtime parameters.** `DynamicParams<N>` (a `#[nested]` field) is a pool
   of `N` host slots with stable ids. `edit(|tx| ..)` binds, renames and frees
   slots (`SlotDef`: name, group, `SlotRange` of linear / log / int / toggle /

@@ -13,6 +13,10 @@
 //! tree but not the built-in editor's tiny-skia + baseview +
 //! moose-font stack.
 //!
+//! New code implements [`Plugin`] (shared, main-thread and processor
+//! parts as three types) and exports it through [`Lifecycle`]; the
+//! traits below stay as the compatibility layer.
+//!
 //! ## Three traits, one source of truth
 //!
 //! - [`PluginLogic`]   - what plugin authors implement for `f32`-buffer plugins.
@@ -52,6 +56,9 @@ use moose_core::state::{ForeignState, MigratedState, StateLoadError};
 use moose_gui_types::interaction::WidgetRegion;
 use moose_gui_types::widgets::WidgetType;
 use moose_params::sample::Sample;
+
+mod lifecycle;
+pub use lifecycle::{Lifecycle, Plugin, ProcessorSlot};
 
 // ---------------------------------------------------------------------------
 // PluginLogicCore - generic trait, what format wrappers consume
