@@ -362,8 +362,7 @@ pub fn parse_state(data: &[u8], expected_plugin_id: u64) -> StateParse {
     };
     offset += extra_len;
 
-    // `#[persist]` block: trailing and optional. Absent (older envelope,
-    // or no persist fields) when no bytes remain - then it's empty.
+    // Only legacy v1 envelopes may omit the trailing persist length.
     let persist = if offset + 8 <= data.len() {
         let Ok(len_bytes) = data[offset..offset + 8].try_into() else {
             return StateParse::Corrupt;
@@ -380,7 +379,7 @@ pub fn parse_state(data: &[u8], expected_plugin_id: u64) -> StateParse {
             }
             _ => return StateParse::Corrupt,
         }
-    } else if version == STATE_VERSION_V2 && offset != data.len() {
+    } else if version == STATE_VERSION_V2 {
         return StateParse::Corrupt;
     } else {
         Vec::new()

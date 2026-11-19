@@ -164,11 +164,10 @@ pub(crate) unsafe extern "C" fn cb_factory_preset_load<P: PluginExport>(
         else {
             return 0;
         };
-        // Same apply path as cb_state_load: params synchronously on
-        // the host thread, full state through the audio-thread
-        // handoff, editor notified.
+        // Apply sound parameters on the host thread and custom state through
+        // the audio handoff, preserving session-only fields.
         let backup = state::ParamsBackup::capture(&*inst.params_arc);
-        state::apply_params(&*inst.params_arc, &deserialized);
+        state::apply_preset_params(&*inst.params_arc, &deserialized);
         if !load_custom_state(inst, deserialized, &backup) {
             return 0;
         }

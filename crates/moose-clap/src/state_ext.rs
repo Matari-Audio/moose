@@ -304,9 +304,12 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         let Some((_, blob)) = parse_preset_file(&bytes) else {
             return false;
         };
-        let Some(mut deserialized) =
-            state::parse_or_migrate::<P>(&blob, data.plugin_id_hash, PluginFormat::Clap, None)
-        else {
+        let Some(mut deserialized) = state::parse_preset_or_migrate::<P>(
+            &blob,
+            data.plugin_id_hash,
+            PluginFormat::Clap,
+            None,
+        ) else {
             return false;
         };
         if !deserialized.named_params.is_empty() {
@@ -314,7 +317,7 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         }
 
         let backup = state::ParamsBackup::capture(&*data.params_arc);
-        state::apply_params(&*data.params_arc, &deserialized);
+        state::apply_preset_params(&*data.params_arc, &deserialized);
         if !load_custom_state(data, deserialized, &backup) {
             return false;
         }

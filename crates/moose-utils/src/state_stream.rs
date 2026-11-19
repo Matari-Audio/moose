@@ -167,6 +167,9 @@ pub fn read_state_stream_prepared<T>(
     let mut first = [0];
     let mut prepared = None;
     let persist = if input.read(&mut first)? == 0 {
+        if version == STATE_VERSION_V2 {
+            return None;
+        }
         Vec::new()
     } else {
         let mut word = [0; 8];
@@ -245,6 +248,31 @@ mod tests {
         assert!(parse(&blob, 8192, limit).is_none());
         assert!(matches!(parse(b"old",1,32),Some(StreamState::Foreign(bytes)) if bytes==b"old"));
     }
+    #[test]
+    fn v2_requires_persist_length_even_for_empty_payload() {
+        let blob = crate::state::serialize_state_v2(42, 1, &[], b"custom", &[]);
+        assert!(parse(&blob, 3, 1024).is_some());
+        assert!(matches!(
+            crate::state::parse_state(&blob, 42),
+            StateParse::Ok(_)
+        ));
+        for missing in 1..=8 {
+            let truncated = &blob[..blob.len() - missing];
+            assert!(parse(truncated, 3, 1024).is_none());
+            assert!(matches!(
+                crate::state::parse_state(truncated, 42),
+                StateParse::Corrupt
+            ));
+        }
+        let legacy = crate::state::serialize_state(42, &[], &[], b"custom", &[]);
+        let legacy = &legacy[..legacy.len() - 8];
+        assert!(parse(legacy, 3, 1024).is_some());
+        assert!(matches!(
+            crate::state::parse_state(legacy, 42),
+            StateParse::Ok(_)
+        ));
+    }
+
     #[test]
     fn malformed_and_overreported_streams_are_rejected() {
         assert!(read_state_stream(|_| -1, 1024).is_none());

@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use moose_core::export::{PluginExport, read_custom_state_offthread};
 use moose_core::presets::{PresetScope, PresetStore, mint_uuid, user_preset_root};
 use moose_core::state::{
-    apply_params, apply_state, hash_plugin_id, load_preset, save_user_preset, serialize_preset,
+    apply_preset_params, apply_state, hash_plugin_id, load_preset, save_user_preset,
+    serialize_preset,
 };
 use moose_utils::preset::write_preset_file;
 use moose_utils::safe_filename;
@@ -84,10 +85,9 @@ pub fn apply_selected<P: PluginExport>(store: &PresetStore, plugin: &mut P, sel:
     // v2 string IDs before anything touches the live params.
     match load_preset::<P>(store, plugin.params(), &preset.uri) {
         Ok(state) => {
-            // `apply_state` no longer touches `#[persist]` fields (they
-            // lock, so they're kept off the audio thread); apply them here
-            // on the calling thread. Harmless double-write of params.
-            apply_params(plugin.params(), &state);
+            // Preset recall restores sound parameters and custom state;
+            // session-only fields remain as they were before recall.
+            apply_preset_params(plugin.params(), &state);
             apply_state(plugin, &state);
             vlog!(
                 "loaded preset \"{}\" ({})",

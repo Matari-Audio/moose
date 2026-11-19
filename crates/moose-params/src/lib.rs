@@ -326,6 +326,10 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// [`DynamicParams`]) wakes it after every committed change.
     fn set_catalog_signal(&self, _signal: std::sync::Weak<CatalogSignal>) {}
 
+    /// Defer count-changing value-list edits until the wrapper is inactive.
+    /// Called on the main thread; clearing the flag commits staged edits.
+    fn defer_catalog_structure(&self, _defer: bool) {}
+
     /// Main thread, after a catalog wake: what changed since the last call.
     /// Taking clears it.
     fn take_catalog_changes(&self) -> CatalogChanges {

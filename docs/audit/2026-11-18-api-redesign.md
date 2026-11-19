@@ -276,8 +276,16 @@ What string IDs do instead:
   `migrate_to_current`; preset writes go through `serialize_preset` /
   `save_user_preset` (`serialize_state_for_schema` underneath), preset reads
   through `load_preset` / `load_preset_file` (`prepare_preset`).
-- **VST3 `IRemapParamID`** remaps a host's stale numeric ID through the same
-  catalog when a project names an ID this build no longer has.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:635368f27f7260ecd56b72676021a8df941a1e3bdfb4bceeebd857e7fe18f2d0 -->
+
+- **VST3 `IRemapParamID`** forwards the old plugin class ID and parameter ID
+  to `MainThreadHooks::remap_param_id`. Its default returns `None`; plugins
+  that need stale-ID remapping must implement this hook to return the
+  corresponding current parameter ID.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 Collisions never panic a host:
 

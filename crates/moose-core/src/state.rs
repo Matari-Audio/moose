@@ -366,6 +366,33 @@ fn finish_parse_or_migrate<P: PluginExport>(
     format: PluginFormat,
     source_key: Option<&str>,
 ) -> Option<DeserializedState> {
+    finish_parse_or_migrate_context::<P>(parsed, data, format, source_key, false)
+}
+
+/// Parse and migrate a preset without validating or restoring session-only fields.
+#[must_use]
+pub fn parse_preset_or_migrate<P: PluginExport>(
+    data: &[u8],
+    expected_plugin_id: u64,
+    format: PluginFormat,
+    source_key: Option<&str>,
+) -> Option<DeserializedState> {
+    finish_parse_or_migrate_context::<P>(
+        parse_state(data, expected_plugin_id),
+        data,
+        format,
+        source_key,
+        true,
+    )
+}
+
+fn finish_parse_or_migrate_context<P: PluginExport>(
+    parsed: StateParse,
+    data: &[u8],
+    format: PluginFormat,
+    source_key: Option<&str>,
+    preset: bool,
+) -> Option<DeserializedState> {
     let mut state = match parsed {
         StateParse::Ok(state) => Some(state),
         StateParse::NotAnEnvelope => P::migrate_state(&ForeignState::Raw {
@@ -397,7 +424,12 @@ fn finish_parse_or_migrate<P: PluginExport>(
             None
         }
     }?;
-    if let Err(err) = migrate_to_current::<P>(&mut state) {
+    let result = if preset {
+        migrate_preset::<P>(&mut state)
+    } else {
+        migrate_to_current::<P>(&mut state)
+    };
+    if let Err(err) = result {
         eprintln!("moose: {err} - load failed");
         return None;
     }
@@ -768,10 +800,10 @@ pub fn save_user_preset<P: PluginExport>(
 }
 
 /// Bring a decoded preset up to the current plugin: run
-/// [`migrate_to_current`] (schema migrations + `#[persist]` validation),
+/// schema migrations while discarding session-only `#[persist]` fields,
 /// then resolve v2 string-keyed entries against `params`' catalog so a
 /// renumbered parameter still receives its saved value. The returned state
-/// carries resolved numeric IDs only, ready for [`apply_params`] /
+/// carries resolved numeric IDs only, ready for [`apply_preset_params`] /
 /// [`apply_state`].
 ///
 /// # Errors
@@ -780,12 +812,35 @@ pub fn prepare_preset<P: PluginExport>(
     params: &P::Params,
     mut state: DeserializedState,
 ) -> Result<DeserializedState, StateLoadError> {
-    migrate_to_current::<P>(&mut state)?;
+    migrate_preset::<P>(&mut state)?;
     if !state.named_params.is_empty() {
         resolve_named_params(&mut state, &params.param_catalog());
         state.named_params.clear();
     }
     Ok(state)
+}
+
+fn migrate_preset<P: PluginExport>(state: &mut DeserializedState) -> Result<(), StateLoadError> {
+    let chain = P::state_migrations();
+    if state.schema_version != chain.target_version() {
+        chain.run(state)?;
+    }
+    // Presets contain sound settings only, including after a migration supplies
+    // defaults for session fields that were absent from the original preset.
+    state.persist.clear();
+    Ok(())
+}
+
+/// Apply preset parameters without validating or restoring session-only fields.
+pub fn apply_preset_params<P: moose_params::Params>(params: &P, state: &DeserializedState) {
+    if state.named_params.is_empty() {
+        params.restore_values(&state.params);
+    } else {
+        let mut resolved = state.clone();
+        resolve_named_params(&mut resolved, &params.param_catalog());
+        params.restore_values(&resolved.params);
+    }
+    params.snap_smoothers();
 }
 
 /// Read a preset file for this plugin and [`prepare_preset`] it. `None` for

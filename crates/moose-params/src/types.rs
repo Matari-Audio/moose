@@ -1095,9 +1095,10 @@ pub struct ValueListParam {
     info: &'static ParamInfo,
     id: u32,
     edit_epoch: Arc<AtomicU64>,
-    value: AtomicU32,
-    count: AtomicU32,
+    // High word: count; low word: selection. Setters retry on list changes.
+    selection: AtomicU64,
     labels: RwLock<Vec<String>>,
+    deferred: Mutex<(bool, Option<Vec<String>>)>,
     catalog_signal: Mutex<Weak<CatalogSignal>>,
     pending_changes: AtomicU8,
 }
@@ -1145,9 +1146,9 @@ impl ValueListParam {
             info,
             id: info.id,
             edit_epoch: own_edit_epoch(),
-            value: AtomicU32::new(default),
-            count: AtomicU32::new(count_u32),
+            selection: AtomicU64::new((u64::from(count_u32) << 32) | u64::from(default)),
             labels: RwLock::new(items),
+            deferred: Mutex::new((false, None)),
             catalog_signal: Mutex::new(Weak::new()),
             pending_changes: AtomicU8::new(0),
         }
@@ -1165,33 +1166,40 @@ impl ValueListParam {
             return false;
         }
         let new_count = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let mut deferred = self.deferred.lock().unwrap_or_else(PoisonError::into_inner);
+        if deferred.0 && items.len() != self.len() {
+            deferred.1 = Some(items);
+            drop(deferred);
+            self.pending_changes
+                .fetch_or(CatalogChange::STRUCTURE.bits(), Ordering::Release);
+            if let Some(signal) = self
+                .catalog_signal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .upgrade()
+            {
+                signal.notify();
+            }
+            return true;
+        }
+        deferred.1 = None;
+        drop(deferred);
         let mut guard = self.labels.write().unwrap_or_else(PoisonError::into_inner);
         if *guard == items {
             return true;
         }
-        let old_count = self.count.swap(new_count, Ordering::Release);
         *guard = items;
         drop(guard);
-
+        let old = self.update_selection(|old| {
+            let index = (old & u64::from(u32::MAX)).min(u64::from(new_count - 1));
+            (u64::from(new_count) << 32) | index
+        });
         let mut flags = CatalogChange::INFO;
-        if old_count != new_count {
+        if old >> 32 != u64::from(new_count) {
             flags |= CatalogChange::STRUCTURE;
-            let max_idx = new_count.saturating_sub(1);
-            let mut cur = self.value.load(Ordering::Relaxed);
-            while cur > max_idx {
-                match self.value.compare_exchange_weak(
-                    cur,
-                    max_idx,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        self.note_edit(true);
-                        flags |= CatalogChange::VALUES;
-                        break;
-                    }
-                    Err(observed) => cur = observed,
-                }
+            if old & u64::from(u32::MAX) > u64::from(new_count - 1) {
+                self.note_edit(true);
+                flags |= CatalogChange::VALUES;
             }
         }
         self.pending_changes
@@ -1207,27 +1215,58 @@ impl ValueListParam {
         true
     }
 
+    fn update_selection(&self, mut update: impl FnMut(u64) -> u64) -> u64 {
+        let mut old = self.selection.load(Ordering::Acquire);
+        loop {
+            match self.selection.compare_exchange_weak(
+                old,
+                update(old),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return old,
+                Err(current) => old = current,
+            }
+        }
+    }
+
+    /// Main-thread wrapper policy: commit pending structural edits on deactivation.
+    pub fn defer_catalog_structure(&self, defer: bool) {
+        let pending = {
+            let mut state = self.deferred.lock().unwrap_or_else(PoisonError::into_inner);
+            state.0 = defer;
+            if defer { None } else { state.1.take() }
+        };
+        if let Some(labels) = pending {
+            self.set_labels(labels);
+        }
+    }
+
     /// Current selected 0-based index. Lock-free on any thread.
     #[inline]
     #[must_use]
     pub fn index(&self) -> u32 {
-        let max = self.count.load(Ordering::Acquire).saturating_sub(1);
-        self.value.load(Ordering::Relaxed).min(max)
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.selection.load(Ordering::Acquire) as u32
+        }
     }
 
     /// Select a 0-based index, clamping to the current list length. Lock-free.
     #[inline]
     pub fn set_index(&self, idx: u32) {
-        let max = self.count.load(Ordering::Acquire).saturating_sub(1);
-        let clamped = idx.min(max);
-        self.note_edit(self.value.swap(clamped, Ordering::Relaxed) != clamped);
+        let old = self.update_selection(|old| {
+            let count = old >> 32;
+            (count << 32) | u64::from(idx).min(count - 1)
+        });
+        self.note_edit((old & u64::from(u32::MAX)) != u64::from(idx).min((old >> 32) - 1));
     }
 
     /// Number of entries currently in the list (always >= 1). Lock-free.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        self.count.load(Ordering::Acquire) as usize
+        (self.selection.load(Ordering::Acquire) >> 32) as usize
     }
 
     /// Always `false` since a `ValueListParam` holds at least one entry.
@@ -1277,6 +1316,9 @@ impl ValueListParam {
     pub fn current_info(&self) -> ParamInfo {
         let mut info = self.info();
         info.range = self.current_range();
+        info.default_plain = info
+            .range
+            .denormalize(info.range.normalize(info.default_plain));
         info
     }
 
@@ -1294,13 +1336,11 @@ impl ValueListParam {
         if !value.is_finite() {
             return;
         }
-        let max = self.count.load(Ordering::Acquire).saturating_sub(1);
-        let idx = if value <= 0.0 {
+        self.set_index(if value <= 0.0 {
             0
         } else {
-            (value.round() as u32).min(max)
-        };
-        self.note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
+            value.round() as u32
+        });
     }
 
     /// Current normalized value in `0.0..=1.0`. Lock-free.
@@ -1808,6 +1848,60 @@ mod tests {
             p.take_catalog_changes().flags,
             CatalogChange::STRUCTURE | CatalogChange::INFO | CatalogChange::VALUES
         );
+    }
+
+    #[test]
+    fn value_list_stages_structure_until_inactive() {
+        let p =
+            ValueListParam::with_labels(info("List", ParamRange::Enum { count: 1 }, 0.0), ["A"]);
+        p.defer_catalog_structure(true);
+        p.set_labels(["A", "B", "C"]);
+        p.set_index(2);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.index(), 0);
+        assert_eq!(p.labels(), ["A"]);
+        assert!(
+            p.take_catalog_changes()
+                .flags
+                .contains(CatalogChange::STRUCTURE)
+        );
+        p.defer_catalog_structure(false);
+        assert_eq!(p.len(), 3);
+        p.defer_catalog_structure(true);
+        p.set_labels(["X", "Y", "Z"]);
+        assert_eq!(p.labels(), ["X", "Y", "Z"]);
+        p.set_index(2);
+        p.set_labels(["Only"]);
+        assert_eq!(p.index(), 2);
+        p.defer_catalog_structure(false);
+        assert_eq!(p.index(), 0);
+    }
+
+    #[test]
+    fn value_list_shrink_does_not_resurrect_selection_or_expose_invalid_default() {
+        let p = ValueListParam::with_labels(
+            info("List", ParamRange::Enum { count: 3 }, 2.0),
+            ["A", "B", "C"],
+        );
+        p.set_index(0);
+        let stale = p.selection.load(Ordering::Acquire);
+        p.set_labels(["A"]);
+        assert!(
+            p.selection
+                .compare_exchange(
+                    stale,
+                    (3_u64 << 32) | 2,
+                    Ordering::AcqRel,
+                    Ordering::Acquire
+                )
+                .is_err()
+        );
+        p.set_index(2);
+        p.set_plain(2.0);
+        assert_eq!(p.current_info().default_plain, 0.0);
+        p.set_labels(["A", "B", "C"]);
+        assert_eq!(p.index(), 0);
+        assert_eq!(p.current_info().default_plain, 2.0);
     }
 
     #[test]

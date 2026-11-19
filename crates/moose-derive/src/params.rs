@@ -798,10 +798,8 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                         #(
                             let __n = self.#nested_idents.count();
                             if __rel < __n {
-                                if let Some(__v) =
-                                    self.#nested_idents.parse_value_by_index(__rel, id, text)
-                                {
-                                    return Some(__v);
+                                if self.#nested_idents.get_plain(id).is_some() {
+                                    return self.#nested_idents.parse_value_by_index(__rel, id, text);
                                 }
                                 break 'nested;
                             }
@@ -1458,6 +1456,11 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             #(::moose::params::Params::set_catalog_signal(&self.#nested_idents, __signal.clone());)*
             let _ = __signal;
         }
+        fn defer_catalog_structure(&self, __defer: bool) {
+            #(self.#value_list_idents.defer_catalog_structure(__defer);)*
+            #(::moose::params::Params::defer_catalog_structure(&self.#nested_idents, __defer);)*
+        }
+
         fn take_catalog_changes(&self) -> ::moose::params::CatalogChanges {
             #[allow(unused_mut)]
             let mut __changes = ::moose::params::CatalogChanges::default();

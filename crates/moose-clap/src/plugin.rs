@@ -267,6 +267,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
         }
         drop(audio);
 
+        data.params_arc.defer_catalog_structure(true);
         data.active.store(true, Ordering::Relaxed);
         true
     })
@@ -280,6 +281,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
     run_extern_callback_with::<P, ()>("CLAP", "deactivate", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.active.store(false, Ordering::Relaxed);
+        data.params_arc.defer_catalog_structure(false);
         // A `state_load` while active queues its blob for the audio thread
         // to drain at the top of the next block. If the host deactivates
         // before that block runs (sample-rate / buffer change, offline
