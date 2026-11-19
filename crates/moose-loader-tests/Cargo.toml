@@ -18,6 +18,14 @@ moose-derive = { workspace = true }
 moose-gui = { workspace = true }
 moose-loader = { workspace = true }
 moose-params = { workspace = true }
+# Format wrappers driven in-process by `tests/cross_format_contract.rs`
+# through their real C ABIs. `clap-sys` / `vst3` pin the exact versions the
+# wrappers already lock, so no new crate enters Cargo.lock.
+moose-au = { workspace = true }
+moose-clap = { workspace = true }
+moose-vst3 = { workspace = true }
+clap-sys = "0.5"
+vst3 = "0.3.0"
 # Shared params / state / logic for the reload-transition fixtures. A
 # dev-dep (not a build-graph edge to the cdylibs, which expose no rlib)
 # so the test can build `FxParams` for the shared params pointer.
