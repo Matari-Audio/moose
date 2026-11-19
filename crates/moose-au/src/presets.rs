@@ -34,7 +34,9 @@ pub(crate) static FACTORY_PRESETS: OnceLock<Vec<FactoryPresetEntry>> = OnceLock:
 
 pub(crate) fn factory_presets<P: PluginExport>() -> &'static [FactoryPresetEntry] {
     FACTORY_PRESETS.get_or_init(|| {
-        let Some(root) = component_presets_root::<P>() else {
+        let Some(root) =
+            component_presets_root(cb_factory_preset_count::<P> as *const std::ffi::c_void)
+        else {
             return Vec::new();
         };
         let info = P::info();
@@ -71,6 +73,7 @@ pub(crate) fn factory_presets<P: PluginExport>() -> &'static [FactoryPresetEntry
 /// the `malloc` / `free` externs above to keep the crate free of a
 /// libc dependency. Field names keep dlfcn's `dli_` prefix so they
 /// line up with the C declaration they shadow.
+#[cfg(unix)]
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct DlInfo {
@@ -80,6 +83,7 @@ pub(crate) struct DlInfo {
     pub(crate) dli_saddr: *mut std::ffi::c_void,
 }
 
+#[cfg(unix)]
 unsafe extern "C" {
     pub(crate) fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
 }
@@ -94,14 +98,14 @@ unsafe extern "C" {
 /// - AU v3 framework (iOS): `<F>.framework/<F>` - a shallow bundle, so
 ///   presets live in a flat `<F>.framework/Presets/` (one level up; a
 ///   `Resources/` subdir would make iOS installd reject the framework).
-pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::PathBuf> {
+#[cfg(unix)]
+pub(crate) fn component_presets_root(probe: *const std::ffi::c_void) -> Option<std::path::PathBuf> {
     let mut info = DlInfo {
         dli_fname: std::ptr::null(),
         dli_fbase: std::ptr::null_mut(),
         dli_sname: std::ptr::null(),
         dli_saddr: std::ptr::null_mut(),
     };
-    let probe = cb_factory_preset_count::<P> as *const std::ffi::c_void;
     // SAFETY: `probe` is a function in this image; `dladdr` only
     // writes into the out-struct on success.
     if unsafe { dladdr(probe, &raw mut info) } == 0 || info.dli_fname.is_null() {
@@ -122,6 +126,14 @@ pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::Pat
     .into_iter()
     .flatten()
     .find(|root| root.is_dir())
+}
+
+// Non-Unix callback-table tests have no AU bundle to discover.
+#[cfg(not(unix))]
+pub(crate) fn component_presets_root(
+    _probe: *const std::ffi::c_void,
+) -> Option<std::path::PathBuf> {
+    None
 }
 
 pub(crate) unsafe extern "C" fn cb_factory_preset_count<P: PluginExport>(
