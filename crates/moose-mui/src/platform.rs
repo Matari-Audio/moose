@@ -36,6 +36,8 @@ impl rwh::HasWindowHandle for ParentWindow {
                     .ok_or_else(null)?;
                 rwh::RawWindowHandle::Xcb(rwh::XcbWindowHandle::new(id))
             }
+            // A host's Wayland surface is embedded by the editor, not parented.
+            _ => return Err(rwh::HandleError::NotSupported),
         };
         // SAFETY: the host keeps the parent alive while the editor is open;
         // this only re-types its handle.

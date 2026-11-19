@@ -11,6 +11,9 @@ use crate::Bridge;
 use crate::platform::{HostScale, ParentWindow};
 use crate::window::{self, Requests, Shared, View, lock};
 
+#[cfg(target_os = "linux")]
+mod embedded;
+
 type Build<P> = Box<dyn FnMut(&mut Ui, &mut Bridge<P>) -> El + Send>;
 type Changed = Box<dyn FnMut() -> bool + Send>;
 type FileDrop =
@@ -146,6 +149,8 @@ pub struct MuiEditor<P: Params> {
     window: Option<Handle>,
     #[cfg(target_os = "linux")]
     floating: Option<window::wayland::FloatingWindow>,
+    #[cfg(target_os = "linux")]
+    embedded: Option<embedded::Embedded>,
 }
 
 /// Whole logical points, as the host's window API takes them.
@@ -216,6 +221,8 @@ impl<P: Params> MuiEditor<P> {
             window: None,
             #[cfg(target_os = "linux")]
             floating: None,
+            #[cfg(target_os = "linux")]
+            embedded: None,
         }
     }
 
@@ -372,7 +379,7 @@ impl<P: Params> MuiEditor<P> {
         }
         #[cfg(target_os = "linux")]
         {
-            self.floating.is_some()
+            self.floating.is_some() || self.embedded.is_some()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -380,13 +387,66 @@ impl<P: Params> MuiEditor<P> {
         }
     }
 
+    /// Physical size and scale of a native Wayland window, floating or embedded.
+    #[cfg(target_os = "linux")]
+    fn native_wayland_size(&self) -> Option<((u32, u32), f64)> {
+        if let Some(window) = &self.floating {
+            return Some(window.size());
+        }
+        self.embedded.as_ref()?.with(|window| window.size())
+    }
+
+    /// `open` with a host's Wayland surface: a subsurface the host's loop pumps.
+    #[cfg(target_os = "linux")]
+    fn embed(&mut self, display: *mut std::ffi::c_void, surface: *mut std::ffi::c_void) {
+        let (Some(display), Some(surface)) = (
+            std::ptr::NonNull::new(display),
+            std::ptr::NonNull::new(surface),
+        ) else {
+            lock(&self.shared)
+                .view
+                .log("Wayland: the host gave a null display or surface");
+            return;
+        };
+        lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
+        // SAFETY: `RawWindowHandle::WaylandSurface`'s contract: both stay live
+        // on this, the host's UI thread, until `close`, which drops the window.
+        #[expect(unsafe_code, reason = "the host vouches for its Wayland objects")]
+        let opened = unsafe {
+            window::wayland::embed(
+                display,
+                surface,
+                self.size,
+                Arc::clone(&self.shared),
+                Arc::clone(&self.requests),
+            )
+        };
+        match opened {
+            Ok(window) => self.embedded = Some(embedded::Embedded::adopt(window)),
+            Err(error) => lock(&self.shared).view.log(&format!("Wayland: {error}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pump_embedded(&mut self) {
+        let Some(result) = self.embedded.as_ref().and_then(|e| e.with(window::wayland::EmbeddedWindow::dispatch)) else {
+            return;
+        };
+        if let Err(error) = result {
+            // A Wayland error is fatal to the window; the next timer would only repeat it.
+            self.embedded = None;
+            lock(&self.shared).view.log(&format!("Wayland: {error}"));
+        }
+    }
+
     fn close_window(&mut self) {
         #[cfg(target_os = "linux")]
         {
-            if self.floating.is_some() {
+            if self.floating.is_some() || self.embedded.is_some() {
                 self.size = self.size();
             }
             drop(self.floating.take());
+            drop(self.embedded.take());
         }
         if let Some(Handle(window)) = self.window.take() {
             #[cfg(target_os = "linux")]
@@ -402,8 +462,7 @@ impl<P: Params> MuiEditor<P> {
 impl<P: Params> Editor for MuiEditor<P> {
     fn size(&self) -> (u32, u32) {
         #[cfg(target_os = "linux")]
-        if let Some(window) = &self.floating {
-            let ((w, h), scale) = window.size();
+        if let Some(((w, h), scale)) = self.native_wayland_size() {
             return points(Size::new(f64::from(w) / scale, f64::from(h) / scale));
         }
         // The open window, not the last `set_size`: on X11 the window follows
@@ -441,6 +500,11 @@ impl<P: Params> Editor for MuiEditor<P> {
         // A request made while closed was for the last window.
         self.reset_requests();
         self.publish_win32_parent(Some(parent));
+        #[cfg(target_os = "linux")]
+        if let RawWindowHandle::WaylandSurface { display, surface } = parent {
+            self.embed(display, surface);
+            return;
+        }
         #[cfg(target_os = "linux")]
         let opened = if matches!(parent, RawWindowHandle::X11(0)) {
             window::open_floating_threaded(
@@ -546,6 +610,26 @@ impl<P: Params> Editor for MuiEditor<P> {
     }
 
     #[cfg(target_os = "linux")]
+    fn supports_wayland_embedding(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn event_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.embedded.as_ref().map(embedded::Embedded::fd)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn on_fd(&mut self) {
+        self.pump_embedded();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn on_timer(&mut self) {
+        self.pump_embedded();
+    }
+
+    #[cfg(target_os = "linux")]
     fn set_floating_title(&mut self, title: &str) {
         if let Some(window) = &self.floating {
             window.title(title);
@@ -589,8 +673,8 @@ impl<P: Params> Editor for MuiEditor<P> {
 
     fn window_scale(&self) -> Option<f64> {
         #[cfg(target_os = "linux")]
-        if let Some(window) = &self.floating {
-            return Some(window.size().1);
+        if let Some((_, scale)) = self.native_wayland_size() {
+            return Some(scale);
         }
         let open = self.window.as_ref().filter(|w| w.0.is_open())?;
         (!cfg!(target_os = "macos")).then(|| open.0.size().scale_factor)

@@ -91,11 +91,22 @@ unsafe impl<T> Sync for SendPtr<T> {}
 
 /// Raw platform window handle for GUI parenting.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum RawWindowHandle {
     AppKit(*mut std::ffi::c_void), // macOS NSView*
     UiKit(*mut std::ffi::c_void),  // iOS / iPadOS UIView*
     Win32(*mut std::ffi::c_void),  // HWND
     X11(u64),                      // X11 Window ID
+    /// A host's Wayland surface (VST3 `WaylandSurfaceID`): the editor maps a
+    /// subsurface of `surface` on the host's connection. Both pointers stay
+    /// valid on the host UI thread from `open` until `close` returns. Only
+    /// editors whose [`Editor::supports_wayland_embedding`] is true get one.
+    WaylandSurface {
+        /// The host's `wl_display*`.
+        display: *mut std::ffi::c_void,
+        /// The parent `wl_surface*`, a proxy on `display`.
+        surface: *mut std::ffi::c_void,
+    },
 }
 
 /// Plugin GUI editor.
@@ -153,6 +164,30 @@ pub trait Editor: Send {
 
     /// Update the native floating title, when supported.
     fn set_floating_title(&mut self, _title: &str) {}
+
+    /// Whether `open` accepts [`RawWindowHandle::WaylandSurface`]. Such an
+    /// editor runs no thread of its own: the host drives it through
+    /// [`Self::event_fd`], [`Self::on_fd`] and [`Self::on_timer`].
+    fn supports_wayland_embedding(&self) -> bool {
+        false
+    }
+
+    /// While an embedded Wayland editor is open: the fd the host watches on its
+    /// UI thread (VST3 `IRunLoop::registerEventHandler`). Readable means call
+    /// [`Self::on_fd`]. The fd stays the same until `close`.
+    #[cfg(unix)]
+    fn event_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    /// [`Self::event_fd`] became readable. Host UI thread.
+    fn on_fd(&mut self) {}
+
+    /// The host's ~16 ms UI timer (VST3 `IRunLoop::registerTimer`), while an
+    /// embedded Wayland editor is open. The host may read the shared display
+    /// and queue the editor's events without the fd waking, and frame
+    /// deadlines need a clock; this catches both. Host UI thread.
+    fn on_timer(&mut self) {}
 
     /// Destroy the GUI.
     fn close(&mut self);
@@ -359,6 +394,19 @@ impl Editor for TaskBoundEditor {
     }
     fn set_floating_title(&mut self, title: &str) {
         self.editor.set_floating_title(title);
+    }
+    fn supports_wayland_embedding(&self) -> bool {
+        self.editor.supports_wayland_embedding()
+    }
+    #[cfg(unix)]
+    fn event_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.editor.event_fd()
+    }
+    fn on_fd(&mut self) {
+        self.editor.on_fd();
+    }
+    fn on_timer(&mut self) {
+        self.editor.on_timer();
     }
 
     fn close(&mut self) {
