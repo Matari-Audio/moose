@@ -10,6 +10,9 @@
 //! `moose_gui::default_editor(...)` from their `PluginLogic::editor`
 //! impl, which pulls `WgpuBackend` transitively.
 
+// wgpu's auto-trait (`Send`) evaluation needs more depth than the default 128.
+#![recursion_limit = "256"]
+
 mod backend;
 pub mod platform;
 #[cfg(not(target_os = "ios"))]

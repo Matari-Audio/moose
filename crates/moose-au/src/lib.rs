@@ -445,8 +445,12 @@ struct AuAudio<P: PluginExport> {
 struct AuGui {
     editor: Option<Box<dyn Editor>>,
     /// The host-owned container view the editor last opened in (`0` = none).
-    /// `cb_destroy` detaches it so a view outliving its AudioUnit never
+    /// `cb_destroy` detaches it so a view outliving its `AudioUnit` never
     /// calls back into the freed instance.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only read by the macOS view detach in cb_destroy")
+    )]
     view: usize,
 }
 
