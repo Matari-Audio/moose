@@ -54,8 +54,8 @@ with reason), N/A.
 | VST3 macOS | `ViewRect` is in points; `IPlugViewContentScaleSupport` is not used on macOS | Logical sizes; scale ignored on macOS (shim still returns `kResultOk`) | OK, but bindings should return `kResultFalse` on macOS (4) |
 | VST3 Win/Linux | `ViewRect` physical; `setContentScaleFactor` may arrive before or after `attached`, and again on monitor change | Stored on the instance, replayed into new editors and re-synced around `open`, `resizeView` sent on change | OK |
 | Windows per-monitor DPI v2 | Child HWNDs of a PMv2 host receive `WM_DPICHANGED_AFTERPARENT` (not `WM_DPICHANGED`) when the top level crosses monitors | baseview handles `WM_DPICHANGED_AFTERPARENT`: re-reads DPI, keeps the logical size, resizes the child physically unless the host pinned a scale | OK |
-| Windows mixed-DPI, host without a scale API | The host frame must be resized to the child's new physical size | Child resizes itself; the host frame is not told. Hosts that call `set_scale` / `setContentScaleFactor` on a monitor move (Cubase, Live, Bitwig, REAPER for VST3) are fine | GAP H1 (narrow; deferred, see 5) |
-| Linux X11 | No standard per-window scale; `Xft.dpi` is the convention | `Xft.dpi` via baseview when no host scale | OK |
+| Windows mixed-DPI, host without a scale API | The host frame must be resized to the child's new physical size | The child keeps its logical size at the new DPI, then `View::rescaled` → `PluginContext::window_rescaled` + `request_resize`; CLAP converts at the new scale (`host_gui.request_resize`) | OK (H1 fixed; VST3 needs the same listener, see 7) |
+| Linux X11 | No standard per-window scale; `Xft.dpi` is the convention | `Xft.dpi` via baseview when no host scale, re-read when the root's `RESOURCE_MANAGER` changes (keeps the logical size, same host path as Windows) | OK |
 | AU | AppKit points; backing scale is the OS's | Logical, no pinning | OK |
 
 ### 1.3 Resize negotiation
@@ -69,7 +69,8 @@ with reason), N/A.
 | VST3 `checkSizeConstraint` | Clamp the rect in place, `kResultTrue` | Fit inside the request; fixed editors snap to current size | OK |
 | VST3 `onSize` | Host committed; must not call `resizeView` from inside | Clamp only, no re-request | OK |
 | VST3 plugin-initiated | `IPlugFrame::resizeView` on the UI thread; host calls `onSize` back | Queued to the UI thread when called off it (shim) | OK (bindings must keep the queue, 4) |
-| AU v2 | No host resize protocol | Fixed container at the editor's size | OK (documented limitation) |
+| AU v2 | No host resize protocol | Fixed container at the editor's size; a plugin `request_resize` re-pins it (`moose_au_view_fit`) | OK |
+| AU v3 | `preferredContentSize` announces the view's size | Set at open; a plugin `request_resize` sets it again (`moose_au_view_fit`) | OK (untested, see 7) |
 
 ### 1.4 Show / hide / destroy ordering
 
@@ -118,8 +119,9 @@ enforced.
 | Platform | Spec / convention | MOOSE (baseview) | Verdict |
 |---|---|---|---|
 | macOS | Unhandled `keyDown:` goes up the responder chain (`[super keyDown:]`) so host shortcuts work | Done (`view.rs`) | OK |
-| Windows | Keys the plugin does not use must reach the host's accelerators | A `WH_GETMESSAGE` hook on the host GUI thread claims only keys the editor captures; ignored keys stay in the host's message stream | OK |
-| X11 | A child on its own connection must re-send unhandled keys to the parent (`XSendEvent`) and give focus back | `forward_key_event` re-sends ignored keys; `focus_handoff` returns focus | OK |
+| Windows | Keys the plugin does not use must reach the host's accelerators | A `WH_GETMESSAGE` hook on the host GUI thread claims only keys the editor captures; ignored keys stay in the host's message stream. Dropping capture (a text field ends) gives focus back to the parent. No `WM_GETDLGCODE`: the hook claims captured keys before the host's `IsDialogMessage` sees them | OK |
+| X11 | A child on its own connection must re-send unhandled keys to the parent (`XSendEvent`) | `forward_key_event` re-sends ignored keys. A click takes the focus (`SetInputFocus`); it stays until the host takes it back. `focus_handoff` is not used on X11, and `set_keyboard_capture` is a no-op there | OK |
+| X11 XEmbed hosts | The embedder keeps the X focus, forwards keys, and sends `_XEMBED` `FOCUS_IN`/`FOCUS_OUT`; the client sets `_XEMBED_INFO` and asks with `REQUEST_FOCUS` | `_XEMBED_INFO` on embedded windows; `EMBEDDED_NOTIFY`, `FOCUS_IN`/`OUT` drive focus; a click sends `REQUEST_FOCUS` to an XEmbed embedder | OK (untested in an XEmbed host, see 7) |
 | VST3 `onKeyDown`/`onKeyUp`/`onWheel` | Return `kResultTrue` only if handled | `kResultFalse` (keys arrive natively) | OK |
 | CLAP | No key API; native events | Native | OK |
 
@@ -221,10 +223,7 @@ Also logged in `DECISIONS.md` to bindings.
   baseview X11 window. A no-XWayland session could reuse the editor's
   floating-Wayland path; deferred because every desktop that ships a DAW
   ships XWayland.
-- **H1, mixed-DPI move on Windows with a host that sends no scale.** The
-  child keeps its logical size but the host frame is not resized. Fixing it
-  needs the editor to report its new scale to the wrapper before the resize
-  request; deferred until a host that needs it is identified.
+- **H1** is fixed (gui/platform-polish, section 7).
 - **C1, host context menus.** Belongs with the CLAP binding layer
   (`context-menu` ext) and the VST3 rewrite (`IComponentHandler3`).
 
@@ -308,3 +307,40 @@ Also logged in `DECISIONS.md` to bindings.
   The volt standalone was run with `DISPLAY` unset: it opened as a native client
   (Hyprland reports `xwayland: false`) and exited when the compositor closed it.
   Not tested: GNOME/KDE (the fallback frame path), any DAW.
+
+## 7. Platform round (branch `gui/platform-polish`)
+
+- **Windows.** Per-monitor v2 awareness, `WM_DPICHANGED` (top level) and
+  `WM_DPICHANGED_AFTERPARENT` (child) were already there.
+  `WM_DPICHANGED_BEFOREPARENT` needs nothing: AFTERPARENT does the work.
+  - H1 is fixed: the child keeps its logical size at the new DPI, and mui
+    reports `View::rescaled`. moose-mui calls `PluginContext::window_rescaled`,
+    then `request_resize` at the same logical size, and CLAP converts at the
+    new scale.
+  - VST3 (bindings) should install `with_window_rescaled` too, so its
+    `resizeView` converts at the new scale.
+- **macOS.**
+  - Already in place: backing-scale changes (`viewDidChangeBackingProperties`),
+    display-link pacing with a run-loop timer fallback, and retina through
+    `contentsScale`.
+  - New: a plugin `request_resize` re-pins the AU v2 fixed container, and on
+    AU v3 sets the controller's `preferredContentSize` (`moose_au_view_fit` in
+    `au_v2_view.m`).
+- **X11.**
+  - XEmbed client: `_XEMBED_INFO`, focus from `_XEMBED`, and `REQUEST_FOCUS`
+    on click. Pure parsing is in `x11/xembed.rs`, with tests.
+  - `Xft.dpi` is re-read on a root `RESOURCE_MANAGER` change, emits
+    `ScaleFactorChanged`, keeps the logical size, and reaches the host through
+    H1's path. A host or override scale still wins.
+- **Needs a manual test** (not possible here):
+  - Windows: drag a CLAP editor between monitors of different DPI, in a host
+    that sends no `set_scale`. The host frame should follow.
+  - macOS:
+    - `moose-au` and `au_v2_view.m` were not compiled (no macOS SDK).
+    - AU v2 in REAPER/Logic: plugin-initiated resize grows the container.
+    - AU v3 in Logic: same through `preferredContentSize`.
+  - X11:
+    - An XEmbed host (Qt `QX11EmbedContainer`, Carla's X11 bridge): click
+      into the editor, type, click back into the host.
+    - `xrdb -merge <<< 'Xft.dpi: 144'` with a CLAP editor open in a host
+      that sends no scale: the editor and its host frame grow 1.5×.

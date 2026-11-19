@@ -100,6 +100,21 @@ void moose_au_view_detach(void *view) {
     container.editorOpen = NO;
 }
 
+/// The editor resized itself (`request_resize`, main thread). AU v2: the
+/// fixed container re-pins to the editor's new natural size. AU v3: `view` is
+/// the Swift shim's container inside the AUViewController's view; resize it
+/// and announce the size, and the host's next layout re-syncs the shim.
+void moose_au_view_fit(void *view, uint32_t w, uint32_t h) {
+    NSView *v = (__bridge NSView *)view;
+    NSSize size = NSMakeSize((CGFloat)w, (CGFloat)h);
+    [v setFrameSize:size];
+    if ([v isKindOfClass:[MOOSE_AU_FIXED_CONTAINER_NAME class]]) return;
+    NSResponder *owner = v.superview.nextResponder;
+    if ([owner isKindOfClass:[NSViewController class]]) {
+        ((NSViewController *)owner).preferredContentSize = size;
+    }
+}
+
 @interface MOOSE_AU_VIEW_FACTORY_NAME : NSObject <AUCocoaUIBase>
 @end
 

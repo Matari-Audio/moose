@@ -95,6 +95,14 @@ impl<P: Params> View for Session<P> {
             .context()
             .is_some_and(|c| c.request_resize(width, height))
     }
+    fn rescaled(&mut self, scale: f64, (width, height): (u32, u32)) {
+        if let Some(context) = self.bridge.context() {
+            context.window_rescaled(scale);
+            // A host that refuses keeps the old pixels; the view still lays
+            // out at the new scale, so there's nothing to undo.
+            let _ = context.request_resize(width, height);
+        }
+    }
 }
 
 /// A MUI editor for any moose plugin: `build` makes the tree every frame
@@ -374,17 +382,11 @@ impl<P: Params> MuiEditor<P> {
     }
 
     fn has_window(&self) -> bool {
-        if self.window.is_some() {
-            return true;
-        }
         #[cfg(target_os = "linux")]
-        {
-            self.floating.is_some() || self.embedded.is_some()
-        }
+        let native = self.floating.is_some() || self.embedded.is_some();
         #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
+        let native = false;
+        self.window.is_some() || native
     }
 
     /// Physical size and scale of a native Wayland window, floating or embedded.

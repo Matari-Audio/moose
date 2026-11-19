@@ -449,7 +449,7 @@ struct AuGui {
     /// calls back into the freed instance.
     #[cfg_attr(
         not(target_os = "macos"),
-        expect(dead_code, reason = "only read by the macOS view detach in cb_destroy")
+        expect(dead_code, reason = "only read by the macOS view detach and fit")
     )]
     view: usize,
 }
@@ -3260,7 +3260,18 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                             // and otherwise stashes it for `cb_gui_get_size` to
                             // apply on the next size query.
                             if let Some(mut gui) = inst.gui.try_enter() {
-                                gui.editor.as_mut().is_some_and(|e| e.set_size(w, h))
+                                let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
+                                // The host sees the container, not the editor's
+                                // own view: size it (AU v2) or announce it
+                                // (AU v3 `preferredContentSize`) to match.
+                                #[cfg(target_os = "macos")]
+                                if resized
+                                    && gui.view != 0
+                                    && let Some((w, h)) = gui.editor.as_ref().map(|e| e.size())
+                                {
+                                    moose_au_view_fit(gui.view as *mut std::ffi::c_void, w, h);
+                                }
+                                resized
                             } else {
                                 inst.pending_resize
                                     .store((u64::from(w) << 32) | u64::from(h), Ordering::Relaxed);
@@ -3364,6 +3375,9 @@ unsafe extern "C" {
     /// `au_v2_view.m`: forget the instance so the container stops calling
     /// `gui_open` / `gui_close` on it.
     fn moose_au_view_detach(view: *mut std::ffi::c_void);
+    /// `au_v2_view.m`: the editor resized itself to `w`x`h` points; the
+    /// view the host holds follows. Main thread.
+    fn moose_au_view_fit(view: *mut std::ffi::c_void, w: u32, h: u32);
 }
 
 unsafe extern "C" {

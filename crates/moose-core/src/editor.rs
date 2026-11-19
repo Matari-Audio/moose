@@ -693,12 +693,18 @@ pub struct PluginContext<P: ?Sized = dyn Params> {
     /// Tells the host note names or voice info changed (see
     /// [`Self::notify_host`]). `None` until a wrapper installs one.
     host_notifier: Option<HostNotifier>,
+    /// Tells the wrapper the window's OS scale changed (see
+    /// [`Self::window_rescaled`]). `None` where nothing listens.
+    window_rescaled: Option<WindowRescaled>,
     params: Arc<P>,
 }
 
 /// The wrapper's "project modified" notifier: callable from any thread, it
 /// delivers the format's call on the host's main/UI thread.
 pub type MarkDirty = Arc<dyn Fn() + Send + Sync>;
+
+/// The wrapper's OS-scale listener: callable from any thread.
+pub type WindowRescaled = Arc<dyn Fn(f64) + Send + Sync>;
 
 /// One edge of a group of parameter edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -720,6 +726,7 @@ impl<P: ?Sized> Clone for PluginContext<P> {
             mark_dirty: self.mark_dirty.clone(),
             group_edits: self.group_edits.clone(),
             host_notifier: self.host_notifier.clone(),
+            window_rescaled: self.window_rescaled.clone(),
             params: Arc::clone(&self.params),
         }
     }
@@ -737,6 +744,7 @@ impl<P: ?Sized> PluginContext<P> {
             mark_dirty: None,
             group_edits: None,
             host_notifier: None,
+            window_rescaled: None,
             params,
         }
     }
@@ -757,6 +765,25 @@ impl<P: ?Sized> PluginContext<P> {
     pub fn mark_dirty(&self) {
         if let Some(f) = &self.mark_dirty {
             f();
+        }
+    }
+
+    /// Install the wrapper's OS-scale listener, so a host that sizes the
+    /// view in physical pixels and sends no scale of its own can be told the
+    /// new size. The closure must be safe to call from any thread.
+    #[must_use]
+    pub fn with_window_rescaled(mut self, rescaled: WindowRescaled) -> Self {
+        self.window_rescaled = Some(rescaled);
+        self
+    }
+
+    /// The open window moved to another OS scale (Windows monitor DPI, X11
+    /// `Xft.dpi`) and kept its logical size. Call it before asking the host
+    /// for that size with [`Self::request_resize`], which then converts at
+    /// the new scale. Not for host-set scales. Any thread.
+    pub fn window_rescaled(&self, scale: f64) {
+        if let Some(f) = &self.window_rescaled {
+            f(scale);
         }
     }
 
@@ -869,6 +896,7 @@ impl<P: ?Sized> PluginContext<P> {
             mark_dirty: self.mark_dirty.clone(),
             group_edits: self.group_edits.clone(),
             host_notifier: self.host_notifier.clone(),
+            window_rescaled: self.window_rescaled.clone(),
             params,
         }
     }
@@ -950,6 +978,7 @@ impl PluginContext<dyn Params> {
             mark_dirty: None,
             group_edits: None,
             host_notifier: None,
+            window_rescaled: None,
             params,
         }
     }
@@ -967,6 +996,7 @@ impl<P: Params + 'static> PluginContext<P> {
             mark_dirty: self.mark_dirty,
             group_edits: self.group_edits,
             host_notifier: self.host_notifier,
+            window_rescaled: self.window_rescaled,
             params: self.params as Arc<dyn Params>,
         }
     }

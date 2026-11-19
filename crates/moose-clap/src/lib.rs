@@ -5357,6 +5357,17 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
         .with_tasks(task_spawner_for_ctx)
         .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedEdits)
         .with_host_notifier(data.host_notifier.clone())
+        .with_window_rescaled({
+            // The next `request_resize` converts at the window's new scale
+            // while the host has sent none of its own (`host_scale`).
+            let plugin = SendPtr::new(plugin);
+            Arc::new(move |scale| {
+                if scale.is_finite() && scale > 0.0 {
+                    let data = data_from_plugin::<P>(plugin.as_ptr());
+                    data.window_scale.store(scale.to_bits(), Ordering::Relaxed);
+                }
+            })
+        })
         .with_mark_dirty({
             // `state.mark_dirty` is [main-thread]: flag it and ask for
             // `on_main_thread` (`request_callback` is thread-safe).
