@@ -296,6 +296,20 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         <L as PluginLogicCore<S>>::migrate_state(foreign)
     }
 
+    fn state_schema_version() -> u32
+    where
+        Self: Sized,
+    {
+        <L as PluginLogicCore<S>>::state_schema_version()
+    }
+
+    fn state_migrations() -> moose_core::state::StateMigrationChain
+    where
+        Self: Sized,
+    {
+        <L as PluginLogicCore<S>>::state_migrations()
+    }
+
     fn validate_state(data: &[u8]) -> Result<(), StateLoadError>
     where
         Self: Sized,
@@ -540,6 +554,20 @@ macro_rules! export_static {
                 Self: Sized,
             {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::migrate_state(foreign)
+            }
+
+            fn state_schema_version() -> u32
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::state_schema_version()
+            }
+
+            fn state_migrations() -> $crate::__macro_deps::moose_core::state::StateMigrationChain
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::state_migrations()
             }
 
             fn validate_state(

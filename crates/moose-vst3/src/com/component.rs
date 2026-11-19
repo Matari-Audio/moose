@@ -1574,6 +1574,7 @@ impl Class for Component {
         IUnitInfo,
         INoteExpressionController,
         IParameterFunctionName,
+        IRemapParamID,
         IInfoListener,
         IMidiLearn,
         IMidiLearn2,
@@ -2269,6 +2270,36 @@ impl IParameterFunctionNameTrait for Component {
         if found.is_some() {
             kResultTrue
         } else {
+            kResultFalse
+        }
+    }
+}
+
+impl IRemapParamIDTrait for Component {
+    unsafe fn getCompatibleParamID(
+        &self,
+        plugin_to_replace_uid: *const TUID,
+        old_param_id: ParamID,
+        new_param_id: *mut ParamID,
+    ) -> tresult {
+        if plugin_to_replace_uid.is_null() || new_param_id.is_null() {
+            return kInvalidArgument;
+        }
+        let h = &self.host;
+        let mut out_id: u32 = kNoParamId;
+        let ok = unsafe {
+            (h.reg.cb.remap_param_id)(
+                h.ctx,
+                plugin_to_replace_uid.cast::<u8>(),
+                old_param_id,
+                &raw mut out_id,
+            )
+        };
+        if ok != 0 {
+            unsafe { *new_param_id = out_id };
+            kResultOk
+        } else {
+            unsafe { *new_param_id = kNoParamId };
             kResultFalse
         }
     }

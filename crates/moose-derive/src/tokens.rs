@@ -609,7 +609,9 @@ pub(crate) fn gen_param_info_literal(f: &ParamField) -> Option<proc_macro2::Toke
         let invalid = match f.kind {
             ParamKind::Bool => d != 0.0 && d != 1.0,
             ParamKind::Int => !d.is_finite() || (d as i64 as f64) != d,
-            ParamKind::Enum => !d.is_finite() || d < 0.0 || f64::from(d as u32) != d,
+            ParamKind::Enum | ParamKind::ValueList => {
+                !d.is_finite() || d < 0.0 || f64::from(d as u32) != d
+            }
             ParamKind::Float => !d.is_finite(),
         };
         if invalid {
@@ -633,6 +635,7 @@ pub(crate) fn gen_param_info_literal(f: &ParamField) -> Option<proc_macro2::Toke
                     quote! { ::moose::params::ParamRange::Enum { count: 2 } }
                 }
             }
+            ParamKind::ValueList => quote! { ::moose::params::ParamRange::Enum { count: 1 } },
             _ => quote! { ::moose::params::ParamRange::Linear { min: 0.0, max: 1.0 } },
         },
     };
@@ -665,6 +668,7 @@ pub(crate) fn gen_param_info_literal(f: &ParamField) -> Option<proc_macro2::Toke
         ParamKind::Int => quote! { ::moose::params::ParamValueKind::Int },
         ParamKind::Bool => quote! { ::moose::params::ParamValueKind::Bool },
         ParamKind::Enum => quote! { ::moose::params::ParamValueKind::Enum },
+        ParamKind::ValueList => quote! { ::moose::params::ParamValueKind::ValueList },
     };
 
     let midi_map = a.midi_map.map_or_else(
@@ -736,9 +740,11 @@ pub(crate) fn gen_field_constructor(f: &ParamField, slot: usize) -> proc_macro2:
             ParamKind::Int if !d.is_finite() || (d as i64 as f64) != d => Some(format!(
                 "IntParam '{name}' default must be an integer literal; got {d}"
             )),
-            ParamKind::Enum if !d.is_finite() || d < 0.0 || f64::from(d as u32) != d => {
+            ParamKind::Enum | ParamKind::ValueList
+                if !d.is_finite() || d < 0.0 || f64::from(d as u32) != d =>
+            {
                 Some(format!(
-                    "EnumParam '{name}' default must be a non-negative integer (variant index); got {d}"
+                    "EnumParam/ValueListParam '{name}' default must be a non-negative integer (variant index); got {d}"
                 ))
             }
             ParamKind::Float if !d.is_finite() => Some(format!(
@@ -781,6 +787,7 @@ pub(crate) fn gen_field_constructor(f: &ParamField, slot: usize) -> proc_macro2:
         ParamKind::Bool => quote! { ::moose::params::BoolParam::new(#info) },
         ParamKind::Int => quote! { ::moose::params::IntParam::new(#info) },
         ParamKind::Enum => quote! { ::moose::params::EnumParam::new(#info) },
+        ParamKind::ValueList => quote! { ::moose::params::ValueListParam::new(#info) },
     }
 }
 

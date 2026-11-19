@@ -330,9 +330,8 @@ mod tests {
         let source = params_with_label("guitar bus");
         source.edit_count.store(7);
         let ds = DeserializedState {
-            params: Vec::new(),
-            extra: None,
             persist: source.serialize_persist(),
+            ..DeserializedState::default()
         };
 
         // Host-thread path: restores the persisted fields.
@@ -400,8 +399,8 @@ mod tests {
         let gain_id = source.gain.id();
         let bad = DeserializedState {
             params: vec![(gain_id, 0.9)],
-            extra: None,
             persist: source.serialize_persist(),
+            ..DeserializedState::default()
         };
         let target = Guarded::new();
         state::apply_params(&target, &bad);

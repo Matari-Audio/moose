@@ -17,13 +17,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::preset::{PresetMeta, write_preset_file};
 use crate::safe_filename;
 use crate::state::{
-    DeserializedState, StateParse, deserialize_state, parse_state, serialize_state,
+    DeserializedState, StateParse, deserialize_state, parse_state, serialize_state_for_schema,
 };
 
-pub use crate::preset::{PRESET_FILE_EXT, parse_preset_file};
+pub use crate::preset::{PRESET_FILE_EXT, PresetMeta, parse_preset_file, write_preset_file};
 
 /// Where a preset lives. `Factory` presets sit inside the plugin
 /// bundle, written at install time; `User` presets live in the
@@ -631,8 +630,30 @@ impl PresetStore {
     /// sanitizes to nothing, [`PresetError::Io`] on write failure.
     pub fn save(
         &self,
-        mut meta: PresetMeta,
+        meta: PresetMeta,
         params: &[(u32, f64)],
+        extra: &[u8],
+    ) -> Result<PresetRef, PresetError> {
+        let entries: Vec<(&str, u32, f64)> =
+            params.iter().map(|&(id, value)| ("", id, value)).collect();
+        self.save_for_schema(meta, 0, &entries, extra)
+    }
+
+    /// [`Self::save`] writing the envelope `schema_version` calls for (see
+    /// [`serialize_state_for_schema`]): OAST v1 for `0`, OAST v2 carrying the
+    /// schema version and each entry's `(string_id, numeric_id, value)`
+    /// otherwise. Plugin-aware callers go through
+    /// `moose_core::state::save_user_preset`, which fills these in from the
+    /// plugin's schema and parameter catalog.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::save`].
+    pub fn save_for_schema(
+        &self,
+        mut meta: PresetMeta,
+        schema_version: u32,
+        entries: &[(&str, u32, f64)],
         extra: &[u8],
     ) -> Result<PresetRef, PresetError> {
         let user_root = self
@@ -669,9 +690,10 @@ impl PresetStore {
             dir.join(format!("{file_stem}.{}", self.extension))
         };
 
-        let ids: Vec<u32> = params.iter().map(|(id, _)| *id).collect();
-        let values: Vec<f64> = params.iter().map(|(_, v)| *v).collect();
-        let blob = serialize_state(self.plugin_id_hash, &ids, &values, extra, &[]);
+        // Presets carry params + custom state only; `#[persist]` (window
+        // size, file paths) belongs to the session, not the sound.
+        let blob =
+            serialize_state_for_schema(self.plugin_id_hash, schema_version, entries, extra, &[]);
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -780,6 +802,7 @@ fn scope_rank(scope: PresetScope) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{STATE_VERSION_V1, STATE_VERSION_V2, serialize_state};
 
     /// Hash every test fixture's payload is written under.
     const TEST_HASH: u64 = 42;
@@ -1075,6 +1098,50 @@ mod tests {
             store.delete("u1"),
             Err(PresetError::ReadOnlyScope)
         ));
+
+        let _ = std::fs::remove_dir_all(&user);
+        let _ = std::fs::remove_dir_all(&factory);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "real file I/O; Miri isolation rejects it")]
+    fn save_writes_v1_for_schema_zero_and_v2_otherwise() {
+        let (store, user, factory) = store("schema");
+        let envelope_version = |preset: &PresetRef| {
+            let (_, blob) = parse_preset_file(&std::fs::read(&preset.path).unwrap()).unwrap();
+            u32::from_le_bytes(blob[4..8].try_into().unwrap())
+        };
+
+        // Legacy `save` and schema 0 both write v1, byte for byte.
+        let legacy = store
+            .save(meta("", "Legacy", ""), &[(0, 0.5)], b"x")
+            .unwrap();
+        assert_eq!(envelope_version(&legacy), STATE_VERSION_V1);
+        let (_, legacy_blob) = parse_preset_file(&std::fs::read(&legacy.path).unwrap()).unwrap();
+        assert_eq!(legacy_blob, serialize_state(42, &[0], &[0.5], b"x", &[]));
+        let zero = store
+            .save_for_schema(meta("", "Zero", ""), 0, &[("gain", 0, 0.5)], b"x")
+            .unwrap();
+        assert_eq!(envelope_version(&zero), STATE_VERSION_V1);
+        assert_eq!(store.load(&zero.uri).unwrap().named_params, Vec::new());
+
+        // Schema >= 1 writes v2 with string IDs and the schema version.
+        let v2 = store
+            .save_for_schema(meta("", "Versioned", ""), 3, &[("gain", 0, 0.25)], b"y")
+            .unwrap();
+        assert_eq!(envelope_version(&v2), STATE_VERSION_V2);
+        let state = store.load(&v2.uri).unwrap();
+        assert_eq!(state.schema_version, 3);
+        assert_eq!(
+            state.named_params,
+            vec![crate::state::NamedParam {
+                key: "gain".to_owned(),
+                fallback_id: Some(0),
+                value: 0.25,
+            }]
+        );
+        assert_eq!(state.params, Vec::new());
+        assert_eq!(state.extra.as_deref(), Some(&b"y"[..]));
 
         let _ = std::fs::remove_dir_all(&user);
         let _ = std::fs::remove_dir_all(&factory);

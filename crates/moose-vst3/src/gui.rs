@@ -496,9 +496,8 @@ pub(crate) unsafe fn gui_open_with<P: PluginExport>(
                         // / `cb_set_active`, so an edit made in that window is
                         // neither lost nor stranded.
                         pending_state_for_set.force_push(state::DeserializedState {
-                            params: Vec::new(),
                             extra: Some(bytes),
-                            persist: Vec::new(),
+                            ..state::DeserializedState::default()
                         });
                     }),
                     transport: Box::new(move || transport_slot.read()),

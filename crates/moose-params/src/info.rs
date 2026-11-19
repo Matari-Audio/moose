@@ -114,6 +114,8 @@ pub enum ParamValueKind {
     Int,
     Bool,
     Enum,
+    /// Runtime-populated discrete labelled list (`ValueListParam`).
+    ValueList,
 }
 
 /// The role a parameter plays, for hosts that drive well-known controls

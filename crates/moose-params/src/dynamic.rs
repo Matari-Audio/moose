@@ -293,7 +293,7 @@ pub struct DynamicParams<const N: usize> {
     revision: AtomicU64,
     pending: AtomicU8,
     signal: Mutex<Weak<CatalogSignal>>,
-    edit_epoch: Option<Arc<AtomicU64>>,
+    edit_epoch: Arc<AtomicU64>,
 }
 
 impl<const N: usize> Default for DynamicParams<N> {
@@ -335,7 +335,7 @@ impl<const N: usize> DynamicParams<N> {
             revision: AtomicU64::new(0),
             pending: AtomicU8::new(0),
             signal: Mutex::new(Weak::new()),
-            edit_epoch: None,
+            edit_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -356,6 +356,52 @@ impl<const N: usize> DynamicParams<N> {
         let first = self.slots.first()?.id;
         let index = usize::try_from(id.wrapping_sub(first) & crate::AUTO_PARAM_ID_MASK).ok()?;
         (self.slots.get(index)?.id == id).then_some(Slot(index))
+    }
+
+    /// The slot at dense `index`, verified against `id`.
+    #[must_use]
+    fn slot_at_index(&self, index: usize, id: u32) -> Option<Slot> {
+        let cell = self.slots.get(index)?;
+        (cell.id == id).then_some(Slot(index))
+    }
+
+    fn format_slot(&self, slot: Slot, value: f64) -> Option<String> {
+        let def = self.def(slot);
+        if let Some(SlotDef {
+            range: SlotRange::Choice(labels),
+            ..
+        }) = &def
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded, clamped index"
+            )]
+            let index = (value.round().max(0.0) as usize).min(labels.len().saturating_sub(1));
+            return labels.get(index).cloned();
+        }
+        let shape = self.slots[slot.0].shape.load();
+        Some(crate::format_param_value(
+            &self.info_at(slot.0, shape, def.as_ref()),
+            value,
+        ))
+    }
+
+    fn parse_slot(&self, slot: Slot, text: &str) -> Option<f64> {
+        let text = text.trim();
+        if let Some(SlotDef {
+            range: SlotRange::Choice(labels),
+            ..
+        }) = self.def(slot)
+        {
+            #[allow(clippy::cast_precision_loss, reason = "label counts are tiny")]
+            return labels
+                .iter()
+                .position(|l| l.eq_ignore_ascii_case(text))
+                .map(|i| i as f64);
+        }
+        let value: f64 = text.split_whitespace().next()?.parse().ok()?;
+        value.is_finite().then_some(value)
     }
 
     /// The host parameter id of `slot`.
@@ -479,9 +525,7 @@ impl<const N: usize> DynamicParams<N> {
     }
 
     fn note_edit(&self) {
-        if let Some(epoch) = &self.edit_epoch {
-            epoch.fetch_add(1, Ordering::Release);
-        }
+        self.edit_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Store a plain value: clamped into a bound slot's range, kept as is
@@ -534,7 +578,7 @@ impl<const N: usize> DynamicParams<N> {
     /// Bind a containing tree's edit counter (derive support).
     #[doc(hidden)]
     pub fn set_edit_epoch(&mut self, epoch: Arc<AtomicU64>) {
-        self.edit_epoch = Some(epoch);
+        self.edit_epoch = epoch;
     }
 }
 
@@ -599,6 +643,22 @@ impl<const N: usize> Params for DynamicParams<N> {
         self.def(self.slot_for_id(id)?)?.function
     }
 
+    fn param_string_ids(&self) -> Vec<(u32, String)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| (slot.id, format!("slot[{i}]")))
+            .collect()
+    }
+
+    fn value_list_labels(&self, id: u32) -> Option<Vec<String>> {
+        let slot = self.slot_for_id(id)?;
+        match self.def(slot)?.range {
+            SlotRange::Choice(labels) => Some(labels),
+            _ => None,
+        }
+    }
+
     fn set_catalog_signal(&self, signal: Weak<CatalogSignal>) {
         *self.signal.lock().unwrap_or_else(PoisonError::into_inner) = signal;
     }
@@ -614,9 +674,7 @@ impl<const N: usize> Params for DynamicParams<N> {
     }
 
     fn parameter_edit_epoch(&self) -> u64 {
-        self.edit_epoch
-            .as_ref()
-            .map_or_else(crate::edit_epoch, |e| e.load(Ordering::Acquire))
+        self.edit_epoch.load(Ordering::Acquire)
     }
 
     fn set_edit_epoch(&mut self, epoch: Arc<AtomicU64>) {
@@ -658,51 +716,48 @@ impl<const N: usize> Params for DynamicParams<N> {
         Some(self.plain(self.slot_for_id(id)?))
     }
 
+    fn get_plain_by_index(&self, index: usize, id: u32) -> Option<f64> {
+        let slot = self
+            .slot_at_index(index, id)
+            .or_else(|| self.slot_for_id(id))?;
+        Some(self.plain(slot))
+    }
+
     fn set_plain(&self, id: u32, value: f64) {
         if let Some(slot) = self.slot_for_id(id) {
             self.store_plain(slot, value);
         }
     }
 
-    fn format_value(&self, id: u32, value: f64) -> Option<String> {
-        let slot = self.slot_for_id(id)?;
-        let def = self.def(slot);
-        if let Some(SlotDef {
-            range: SlotRange::Choice(labels),
-            ..
-        }) = &def
+    fn set_plain_by_index(&self, index: usize, id: u32, value: f64) {
+        if let Some(slot) = self
+            .slot_at_index(index, id)
+            .or_else(|| self.slot_for_id(id))
         {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "rounded, clamped index"
-            )]
-            let index = (value.round().max(0.0) as usize).min(labels.len().saturating_sub(1));
-            return labels.get(index).cloned();
+            self.store_plain(slot, value);
         }
-        let shape = self.slots[slot.0].shape.load();
-        Some(crate::format_param_value(
-            &self.info_at(slot.0, shape, def.as_ref()),
-            value,
-        ))
+    }
+
+    fn format_value(&self, id: u32, value: f64) -> Option<String> {
+        self.format_slot(self.slot_for_id(id)?, value)
+    }
+
+    fn format_value_by_index(&self, index: usize, id: u32, value: f64) -> Option<String> {
+        let slot = self
+            .slot_at_index(index, id)
+            .or_else(|| self.slot_for_id(id))?;
+        self.format_slot(slot, value)
     }
 
     fn parse_value(&self, id: u32, text: &str) -> Option<f64> {
-        let slot = self.slot_for_id(id)?;
-        let text = text.trim();
-        if let Some(SlotDef {
-            range: SlotRange::Choice(labels),
-            ..
-        }) = self.def(slot)
-        {
-            #[allow(clippy::cast_precision_loss, reason = "label counts are tiny")]
-            return labels
-                .iter()
-                .position(|l| l.eq_ignore_ascii_case(text))
-                .map(|i| i as f64);
-        }
-        let value: f64 = text.split_whitespace().next()?.parse().ok()?;
-        value.is_finite().then_some(value)
+        self.parse_slot(self.slot_for_id(id)?, text)
+    }
+
+    fn parse_value_by_index(&self, index: usize, id: u32, text: &str) -> Option<f64> {
+        let slot = self
+            .slot_at_index(index, id)
+            .or_else(|| self.slot_for_id(id))?;
+        self.parse_slot(slot, text)
     }
 
     fn snap_smoothers(&self) {}

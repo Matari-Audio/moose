@@ -14,6 +14,7 @@ pub(crate) enum ParamKind {
     Bool,
     Int,
     Enum,
+    ValueList,
 }
 
 /// A parsed parameter field from the input struct.
@@ -71,6 +72,17 @@ impl ParamField {
             None => base,
         }
     }
+
+    /// Stable string ID for OAST v2 state and [`ParamCatalog::by_string_id`].
+    /// Uses explicit `#[param(key = "...")]` when provided, otherwise the
+    /// field's path (`field` or `field[i]`).
+    pub(crate) fn string_key(&self) -> String {
+        match (&self.attrs.key, self.index) {
+            (Some(key), Some(i)) => format!("{key}[{i}]"),
+            (Some(key), None) => key.clone(),
+            (None, _) => self.path(),
+        }
+    }
 }
 
 /// A nested Params field (delegates to inner struct).
@@ -115,6 +127,8 @@ pub(crate) struct DefaultExpr {
 #[derive(Clone, Default)]
 pub(crate) struct ParamAttrs {
     pub(crate) id: Option<u32>,
+    /// Optional explicit stable string ID (`#[param(key = "osc1.cutoff")]`).
+    pub(crate) key: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) short_name: Option<String>,
     pub(crate) group: Option<String>,
@@ -205,6 +219,7 @@ pub(crate) fn classify_param_type(ty: &Type) -> Option<ParamKind> {
         "BoolParam" => Some(ParamKind::Bool),
         "IntParam" => Some(ParamKind::Int),
         "EnumParam" => Some(ParamKind::Enum),
+        "ValueListParam" => Some(ParamKind::ValueList),
         _ => None,
     }
 }
@@ -396,11 +411,26 @@ pub(crate) fn parse_param_attrs(field: &syn::Field) -> ParamAttrs {
                 "midi_cc" | "midi_source" | "midi_channel" => {
                     parse_midi_attr(key.as_str(), &meta, &mut attrs)?;
                 }
+                "key" => {
+                    let value: Lit = meta.value()?.parse()?;
+                    match value {
+                        Lit::Str(lit) if !lit.value().is_empty() => {
+                            attrs.key = Some(lit.value());
+                        }
+                        other => push_err(
+                            &mut attrs,
+                            syn::Error::new_spanned(
+                                other,
+                                "`#[param(key = ...)]` expects a non-empty string literal (e.g. `key = \"osc1.cutoff\"`)",
+                            ),
+                        ),
+                    }
+                }
                 other => {
                     push_err(
                         &mut attrs,
                         meta.error(format!(
-                            "unknown `#[param]` key `{other}` (expected one of: id, name, \
+                            "unknown `#[param]` key `{other}` (expected one of: id, key, name, \
                              short_name, group, range, default, unit, flags, smooth, format, \
                              parse, chunk, midi_cc, midi_source, midi_channel)",
                         )),

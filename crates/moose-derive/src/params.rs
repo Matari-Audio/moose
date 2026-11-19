@@ -259,6 +259,18 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         }
     }
 
+    // Stable string IDs (D9) key OAST v2 state and `ParamCatalog`'s side
+    // map. A duplicate would make the runtime catalog drop one of them, so
+    // reject it here; keys from nested structs are checked by their own
+    // derive and namespaced by the field name.
+    {
+        let keys: Vec<String> = param_fields.iter().map(ParamField::string_key).collect();
+        let nested: Vec<String> = nested_fields.iter().map(|n| n.ident.to_string()).collect();
+        if let Some(msg) = string_key_conflict(&keys, &nested) {
+            return syn::Error::new_spanned(&ast, msg).to_compile_error().into();
+        }
+    }
+
     // --- Compile-time param-index sidecar ---
     //
     // Each Params struct writes `<target>/param-index/<crate>/<struct>
@@ -301,7 +313,11 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.access();
-            quote! { self.#ident.info() }
+            if f.kind == ParamKind::ValueList {
+                quote! { self.#ident.current_info() }
+            } else {
+                quote! { self.#ident.info() }
+            }
         })
         .collect();
 
@@ -448,23 +464,31 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
     };
 
     // --- get_plain ---
-    let get_plain_arms: Vec<_> = param_fields.iter().map(|f| {
-        let ident = f.access();
-        match f.kind {
-            ParamKind::Float => quote! { x if x == self.#ident.id() => Some(self.#ident.raw_target()), },
-            // `i64 as f64` is precision-lossy by spec (mantissa 53 < 63);
-            // no `From<i64> for f64` exists, so the cast is the idiom.
-            ParamKind::Int => quote! { x if x == self.#ident.id() => {
-                #[allow(clippy::cast_precision_loss)]
-                let v = self.#ident.value() as f64;
-                Some(v)
-            }, },
-            ParamKind::Bool => quote! { x if x == self.#ident.id() => Some(if self.#ident.value() { 1.0 } else { 0.0 }), },
-            // `u32 → f64` is lossless (u32::MAX < 2^53); use `From` for
-            // consistency with the rest of the derive output.
-            ParamKind::Enum => quote! { x if x == self.#ident.id() => Some(f64::from(self.#ident.index())), },
-        }
-    }).collect();
+    // One body per field feeds both the per-id arms and the D6 per-index
+    // arms, so the two lookups can never disagree.
+    let get_plain_bodies: Vec<_> = param_fields
+        .iter()
+        .map(|f| {
+            let ident = f.access();
+            let body = match f.kind {
+                ParamKind::Float => quote! { Some(self.#ident.raw_target()) },
+                // `i64 as f64` is precision-lossy by spec (mantissa 53 < 63);
+                // no `From<i64> for f64` exists, so the cast is the idiom.
+                ParamKind::Int => quote! {{
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = self.#ident.value() as f64;
+                    Some(v)
+                }},
+                ParamKind::Bool => quote! { Some(if self.#ident.value() { 1.0 } else { 0.0 }) },
+                // `u32 → f64` is lossless (u32::MAX < 2^53).
+                ParamKind::Enum => quote! { Some(f64::from(self.#ident.index())) },
+                ParamKind::ValueList => quote! { Some(self.#ident.get_plain()) },
+            };
+            (ident, body)
+        })
+        .collect();
+    let get_plain_arms = id_arms(&get_plain_bodies);
+    let get_plain_by_index_arms = index_arms(&get_plain_bodies);
 
     let get_plain_fallthrough = if nested_fields.is_empty() {
         quote! { _ => None, }
@@ -473,6 +497,30 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             _ => {
                 #(if let Some(v) = self.#nested_idents.get_plain(id) { return Some(v); })*
                 None
+            }
+        }
+    };
+
+    let get_plain_by_index_fallthrough = if nested_fields.is_empty() {
+        quote! { _ => <Self as ::moose::params::Params>::get_plain(self, id), }
+    } else {
+        quote! {
+            _ => {
+                if let Some(mut __rel) = index.checked_sub(#own_count) {
+                    'nested: {
+                        #(
+                            let __n = self.#nested_idents.count();
+                            if __rel < __n {
+                                if let Some(__v) = self.#nested_idents.get_plain_by_index(__rel, id) {
+                                    return Some(__v);
+                                }
+                                break 'nested;
+                            }
+                            __rel -= __n;
+                        )*
+                    }
+                }
+                <Self as ::moose::params::Params>::get_plain(self, id)
             }
         }
     };
@@ -488,6 +536,11 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.access();
+            if f.kind == ParamKind::ValueList {
+                return quote! {
+                    x if x == self.#ident.id() => Some(self.#ident.get_normalized()),
+                };
+            }
             let plain_expr = match f.kind {
                 ParamKind::Float => quote! { self.#ident.raw_target() },
                 // i64 → f64 has no `From`; `as` with an explicit
@@ -500,6 +553,7 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                 ParamKind::Bool => quote! { if self.#ident.value() { 1.0 } else { 0.0 } },
                 // u32 → f64 is lossless: use `From`.
                 ParamKind::Enum => quote! { f64::from(self.#ident.index()) },
+                ParamKind::ValueList => unreachable!(),
             };
             quote! {
                 x if x == self.#ident.id() => Some(self.#ident.range().normalize(#plain_expr)),
@@ -519,15 +573,22 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
     };
 
     // --- set_plain ---
-    let set_plain_arms: Vec<_> = param_fields.iter().map(|f| {
-        let ident = f.access();
-        match f.kind {
-            ParamKind::Float => quote! { x if x == self.#ident.id() => self.#ident.set_value(value), },
-            ParamKind::Bool => quote! { x if x == self.#ident.id() => self.#ident.set_value(value > 0.5), },
-            ParamKind::Int => quote! { x if x == self.#ident.id() => self.#ident.set_value(value.round() as i64), },
-            ParamKind::Enum => quote! { x if x == self.#ident.id() => self.#ident.set_index(value.round() as u32), },
-        }
-    }).collect();
+    let set_plain_bodies: Vec<_> = param_fields
+        .iter()
+        .map(|f| {
+            let ident = f.access();
+            let body = match f.kind {
+                ParamKind::Float => quote! { self.#ident.set_value(value) },
+                ParamKind::Bool => quote! { self.#ident.set_value(value > 0.5) },
+                ParamKind::Int => quote! { self.#ident.set_value(value.round() as i64) },
+                ParamKind::Enum => quote! { self.#ident.set_index(value.round() as u32) },
+                ParamKind::ValueList => quote! { self.#ident.set_plain(value) },
+            };
+            (ident, body)
+        })
+        .collect();
+    let set_plain_arms = id_arms(&set_plain_bodies);
+    let set_plain_by_index_arms = index_arms(&set_plain_bodies);
 
     let set_plain_fallthrough = if nested_fields.is_empty() {
         quote! { _ => {} }
@@ -535,6 +596,31 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         quote! {
             _ => {
                 #(self.#nested_idents.set_plain(id, value);)*
+            }
+        }
+    };
+
+    let set_plain_by_index_fallthrough = if nested_fields.is_empty() {
+        quote! { _ => <Self as ::moose::params::Params>::set_plain(self, id, value), }
+    } else {
+        quote! {
+            _ => {
+                if let Some(mut __rel) = index.checked_sub(#own_count) {
+                    'nested: {
+                        #(
+                            let __n = self.#nested_idents.count();
+                            if __rel < __n {
+                                if self.#nested_idents.get_plain_by_index(__rel, id).is_some() {
+                                    self.#nested_idents.set_plain_by_index(__rel, id, value);
+                                    return;
+                                }
+                                break 'nested;
+                            }
+                            __rel -= __n;
+                        )*
+                    }
+                }
+                <Self as ::moose::params::Params>::set_plain(self, id, value);
             }
         }
     };
@@ -548,11 +634,17 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.access();
+            if f.kind == ParamKind::ValueList {
+                return quote! {
+                    x if x == self.#ident.id() => self.#ident.set_normalized(value),
+                };
+            }
             let commit = match f.kind {
                 ParamKind::Float => quote! { self.#ident.set_value(plain) },
                 ParamKind::Bool => quote! { self.#ident.set_value(plain > 0.5) },
                 ParamKind::Int => quote! { self.#ident.set_value(plain.round() as i64) },
                 ParamKind::Enum => quote! { self.#ident.set_index(plain.round() as u32) },
+                ParamKind::ValueList => unreachable!(),
             };
             quote! {
                 x if x == self.#ident.id() => {
@@ -574,40 +666,36 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
     };
 
     // --- format_value ---
-    let format_value_arms: Vec<_> = param_fields
+    let format_value_bodies: Vec<_> = param_fields
         .iter()
         .map(|f| {
             let ident = f.access();
-            if let Some(ref fmt_fn) = f.attrs.format_fn {
+            let body = if let Some(ref fmt_fn) = f.attrs.format_fn {
                 let fmt_ident = syn::Ident::new(fmt_fn, f.ident.span());
-                quote! { x if x == self.#ident.id() => Some(self.#fmt_ident(value)), }
+                quote! { Some(self.#fmt_ident(value)) }
             } else {
                 match f.kind {
                     ParamKind::Bool => quote! {
-                        x if x == self.#ident.id() => {
-                            Some(if value > 0.5 { "On".to_string() } else { "Off".to_string() })
-                        }
+                        Some(if value > 0.5 { "On".to_string() } else { "Off".to_string() })
                     },
                     ParamKind::Enum => {
                         let enum_ty = f
                             .enum_type
                             .as_ref()
                             .expect("ParamKind::Enum field must have enum_type populated");
-                        quote! {
-                            x if x == self.#ident.id() => {
-                                Some(::moose::params::EnumParam::<#enum_ty>::format_by_index(value))
-                            }
-                        }
+                        quote! { Some(::moose::params::EnumParam::<#enum_ty>::format_by_index(value)) }
                     }
+                    ParamKind::ValueList => quote! { Some(self.#ident.format_value(value)) },
                     _ => quote! {
-                        x if x == self.#ident.id() => {
-                            Some(::moose::params::format_param_value(self.#ident.static_info(), value))
-                        }
+                        Some(::moose::params::format_param_value(self.#ident.static_info(), value))
                     },
                 }
-            }
+            };
+            (ident, body)
         })
         .collect();
+    let format_value_arms = id_arms(&format_value_bodies);
+    let format_value_by_index_arms = index_arms(&format_value_bodies);
 
     let format_fallthrough = if nested_fields.is_empty() {
         quote! { _ => None, }
@@ -620,17 +708,47 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         }
     };
 
+    let format_by_index_fallthrough = if nested_fields.is_empty() {
+        quote! { _ => <Self as ::moose::params::Params>::format_value(self, id, value), }
+    } else {
+        quote! {
+            _ => {
+                if let Some(mut __rel) = index.checked_sub(#own_count) {
+                    'nested: {
+                        #(
+                            let __n = self.#nested_idents.count();
+                            if __rel < __n {
+                                if let Some(__s) =
+                                    self.#nested_idents.format_value_by_index(__rel, id, value)
+                                {
+                                    return Some(__s);
+                                }
+                                break 'nested;
+                            }
+                            __rel -= __n;
+                        )*
+                    }
+                }
+                <Self as ::moose::params::Params>::format_value(self, id, value)
+            }
+        }
+    };
+
     // --- parse_value ---
     // A `parse_fn` wins; every other param round-trips its display text
     // through `parse_formatted_value` with the same formatter
     // `format_value` uses, so host text entry works for the whole set.
-    let parse_value_arms: Vec<_> = param_fields
+    let parse_value_bodies: Vec<_> = param_fields
         .iter()
         .map(|f| {
             let ident = f.access();
             if let Some(parse_fn) = f.attrs.parse_fn.as_ref() {
                 let parse_ident = syn::Ident::new(parse_fn, f.ident.span());
-                return quote! { x if x == self.#ident.id() => self.#parse_ident(text), };
+                return (ident, quote! { self.#parse_ident(text) });
+            }
+            if f.kind == ParamKind::ValueList && f.attrs.format_fn.is_none() {
+                let body = quote! { self.#ident.parse_value(text) };
+                return (ident, body);
             }
             let (format, lenient) = if let Some(format_fn) = f.attrs.format_fn.as_ref() {
                 let format_ident = syn::Ident::new(format_fn, f.ident.span());
@@ -651,16 +769,50 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                 };
                 (format, true)
             };
-            quote! {
-                x if x == self.#ident.id() => ::moose::params::parse_formatted_value(
-                    self.#ident.static_info(),
+            let info = if f.kind == ParamKind::ValueList {
+                quote! { &self.#ident.current_info() }
+            } else {
+                quote! { self.#ident.static_info() }
+            };
+            let body = quote! {
+                ::moose::params::parse_formatted_value(
+                    #info,
                     text,
                     #format,
                     #lenient,
-                ),
-            }
+                )
+            };
+            (ident, body)
         })
         .collect();
+    let parse_value_arms = id_arms(&parse_value_bodies);
+    let parse_value_by_index_arms = index_arms(&parse_value_bodies);
+
+    let parse_by_index_fallthrough = if nested_fields.is_empty() {
+        quote! { _ => <Self as ::moose::params::Params>::parse_value(self, id, text), }
+    } else {
+        quote! {
+            _ => {
+                if let Some(mut __rel) = index.checked_sub(#own_count) {
+                    'nested: {
+                        #(
+                            let __n = self.#nested_idents.count();
+                            if __rel < __n {
+                                if let Some(__v) =
+                                    self.#nested_idents.parse_value_by_index(__rel, id, text)
+                                {
+                                    return Some(__v);
+                                }
+                                break 'nested;
+                            }
+                            __rel -= __n;
+                        )*
+                    }
+                }
+                <Self as ::moose::params::Params>::parse_value(self, id, text)
+            }
+        }
+    };
 
     let nested_parse = if nested_fields.is_empty() {
         quote! { _ => None, }
@@ -1225,14 +1377,91 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             }
         }
     };
+    let value_list_idents: Vec<_> = param_fields
+        .iter()
+        .filter(|f| f.kind == ParamKind::ValueList)
+        .map(ParamField::access)
+        .collect();
+    let value_list_label_arms: Vec<_> = param_fields
+        .iter()
+        .filter_map(|f| {
+            let ident = f.access();
+            match f.kind {
+                ParamKind::ValueList => Some(quote! {
+                    x if x == self.#ident.id() => Some(self.#ident.labels()),
+                }),
+                ParamKind::Enum => {
+                    let enum_ty = f
+                        .enum_type
+                        .as_ref()
+                        .expect("ParamKind::Enum field must have enum_type populated");
+                    Some(quote! {
+                        x if x == self.#ident.id() => Some(
+                            <#enum_ty as ::moose::params::ParamEnum>::variant_names()
+                                .iter()
+                                .map(|s| (*s).to_owned())
+                                .collect(),
+                        ),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let value_list_labels_impl = if value_list_label_arms.is_empty() && nested_idents.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn value_list_labels(&self, id: u32) -> Option<Vec<String>> {
+                match id {
+                    #(#value_list_label_arms)*
+                    _ => {
+                        #(if let Some(labels) = ::moose::params::Params::value_list_labels(&self.#nested_idents, id) { return Some(labels); })*
+                        None
+                    }
+                }
+            }
+        }
+    };
+    let own_string_id_pushes: Vec<_> = param_fields
+        .iter()
+        .map(|f| {
+            let ident = f.access();
+            let key = f.string_key();
+            quote! { __out.push((self.#ident.id(), #key.to_owned())); }
+        })
+        .collect();
+    let nested_string_id_pushes: Vec<_> = nested_fields
+        .iter()
+        .map(|n| {
+            let ident = &n.ident;
+            let prefix = n.ident.to_string();
+            quote! {
+                for (__id, __sub) in ::moose::params::Params::param_string_ids(&self.#ident) {
+                    __out.push((__id, format!("{}.{}", #prefix, __sub)));
+                }
+            }
+        })
+        .collect();
+    let param_string_ids_impl = quote! {
+        fn param_string_ids(&self) -> Vec<(u32, String)> {
+            #[allow(unused_mut)]
+            let mut __out = Vec::new();
+            #(#own_string_id_pushes)*
+            #(#nested_string_id_pushes)*
+            __out
+        }
+    };
     let catalog_impl = quote! {
         fn set_catalog_signal(&self, __signal: ::std::sync::Weak<::moose::params::CatalogSignal>) {
+            #(self.#value_list_idents.set_catalog_signal(__signal.clone());)*
             #(::moose::params::Params::set_catalog_signal(&self.#nested_idents, __signal.clone());)*
             let _ = __signal;
         }
         fn take_catalog_changes(&self) -> ::moose::params::CatalogChanges {
             #[allow(unused_mut)]
             let mut __changes = ::moose::params::CatalogChanges::default();
+            #(__changes.merge(self.#value_list_idents.take_catalog_changes());)*
             #(__changes.merge(::moose::params::Params::take_catalog_changes(&self.#nested_idents));)*
             __changes
         }
@@ -1456,6 +1685,8 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             #presentation_revision_impl
             #presentation_change_impl
             #function_impl
+            #param_string_ids_impl
+            #value_list_labels_impl
             #catalog_impl
             #validate_impl
             #restore_impl
@@ -1493,11 +1724,27 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                 }
             }
 
+            fn get_plain_by_index(&self, index: usize, id: u32) -> Option<f64> {
+                #projected_get_plain
+                match index {
+                    #(#get_plain_by_index_arms)*
+                    #get_plain_by_index_fallthrough
+                }
+            }
+
             fn set_plain(&self, id: u32, value: f64) {
                 #projected_write_plain
                 match id {
                     #(#set_plain_arms)*
                     #set_plain_fallthrough
+                }
+            }
+
+            fn set_plain_by_index(&self, index: usize, id: u32, value: f64) {
+                #projected_write_plain
+                match index {
+                    #(#set_plain_by_index_arms)*
+                    #set_plain_by_index_fallthrough
                 }
             }
 
@@ -1509,9 +1756,25 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                 }
             }
 
+            fn format_value_by_index(&self, index: usize, id: u32, value: f64) -> Option<String> {
+                #value_format_override
+                match index {
+                    #(#format_value_by_index_arms)*
+                    #format_by_index_fallthrough
+                }
+            }
+
             fn parse_value(&self, id: u32, text: &str) -> Option<f64> {
                 #value_parse_override
                 #parse_value_impl
+            }
+
+            fn parse_value_by_index(&self, index: usize, id: u32, text: &str) -> Option<f64> {
+                #value_parse_override
+                match index {
+                    #(#parse_value_by_index_arms)*
+                    #parse_by_index_fallthrough
+                }
             }
 
             fn snap_smoothers(&self) {
@@ -1604,6 +1867,60 @@ pub(crate) fn snake_to_pascal(ident: &syn::Ident) -> syn::Ident {
     syn::Ident::new(&pascal, ident.span())
 }
 
+/// The first clash among a struct's own stable string IDs, or between an
+/// own ID and a `#[nested]` field's `prefix.` namespace.
+fn string_key_conflict(keys: &[String], nested: &[String]) -> Option<String> {
+    let mut seen = HashSet::new();
+    for key in keys {
+        if !seen.insert(key.as_str()) {
+            return Some(format!(
+                "duplicate parameter string ID `{key}`: give one field a distinct \
+                 `#[param(key = \"...\")]`"
+            ));
+        }
+        if let Some(prefix) = nested.iter().find(|prefix| {
+            key.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        }) {
+            return Some(format!(
+                "parameter string ID `{key}` is inside the `{prefix}.` namespace of the \
+                 `#[nested]` field `{prefix}`"
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod string_key_tests {
+    use super::string_key_conflict;
+
+    fn own(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn string_key_conflicts_are_compile_errors() {
+        assert_eq!(
+            string_key_conflict(&own(&["gain", "mix"]), &own(&["osc1"])),
+            None
+        );
+        assert!(
+            string_key_conflict(&own(&["gain", "gain"]), &[])
+                .is_some_and(|m| m.contains("duplicate parameter string ID `gain`"))
+        );
+        assert!(
+            string_key_conflict(&own(&["osc1.cutoff"]), &own(&["osc1"]))
+                .is_some_and(|m| m.contains("`osc1.` namespace"))
+        );
+        assert_eq!(
+            string_key_conflict(&own(&["osc10.cutoff", "osc1"]), &own(&["osc1"])),
+            None,
+            "only a `prefix.` match is inside the namespace"
+        );
+    }
+}
+
 #[cfg(test)]
 mod snake_to_pascal_tests {
     use super::*;
@@ -1655,4 +1972,23 @@ mod snake_to_pascal_tests {
         assert_eq!(convert("___"), "___");
         assert_eq!(convert("__"), "__");
     }
+}
+
+/// Per-id match arms (`x if x == self.field.id() => body,`).
+fn id_arms(bodies: &[(TokenStream2, TokenStream2)]) -> Vec<TokenStream2> {
+    bodies
+        .iter()
+        .map(|(ident, body)| quote! { x if x == self.#ident.id() => #body, })
+        .collect()
+}
+
+/// D6 dense-index match arms (`N if self.field.id() == id => body,`). The
+/// id guard rejects a stale or foreign index, so the caller's fallthrough
+/// resolves it by id instead of touching the wrong field.
+fn index_arms(bodies: &[(TokenStream2, TokenStream2)]) -> Vec<TokenStream2> {
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(idx, (ident, body))| quote! { #idx if self.#ident.id() == id => #body, })
+        .collect()
 }
