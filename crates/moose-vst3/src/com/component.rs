@@ -1011,18 +1011,30 @@ impl Host {
             let id = unsafe { queue.getParameterId() };
             let mut pushed_all = will_process;
             let mut last = None;
+            // A queue's first segment ramps from the value at block start.
+            let prev = unsafe { (cb.param_get_value)(self.ctx, id) };
+            let mut from = (0, prev);
             for j in 0..unsafe { queue.getPointCount() } {
                 let (mut offset, mut value) = (0, 0.0);
                 if unsafe { queue.getPoint(j, &raw mut offset, &raw mut value) } != kResultOk {
                     continue;
                 }
                 let plain = unsafe { (cb.param_denormalize)(self.ctx, id, value) };
+                // The first point ramps from an implicit point at sample
+                // -1 holding the last value (VST3 SDK), so sample 0 is
+                // already one step along.
+                if last.is_none() {
+                    from.1 = prev + (plain - prev) / (f64::from(offset) + 1.0);
+                }
                 last = Some(plain);
-                if pushed_all && unsafe { (cb.push_param_change)(self.ctx, id, offset, plain) } == 0
+                if pushed_all
+                    && unsafe { (cb.push_param_change)(self.ctx, id, offset, plain, from.0, from.1) }
+                        == 0
                 {
                     pushed_all = false;
                     dropped = true;
                 }
+                from = (offset, plain);
             }
             if let Some(plain) = last
                 && !(pushed_all && unsafe { (cb.param_is_chunked)(self.ctx, id) } != 0)

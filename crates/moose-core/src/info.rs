@@ -140,13 +140,11 @@ pub struct PluginInfo {
     #[doc(hidden)]
     pub mute_preview_output: bool,
 
-    /// Sample-accurate automation chunking tunables. Read by the
+    /// How parameter automation reaches `process`. Read by the
     /// `chunked_process::process_chunked` helper that every format
-    /// wrapper routes `process()` through. Populated by
-    /// `moose::plugin_info!()` from `moose.toml`'s `[automation]`
-    /// table; defaults to [`AutomationConfig::DEFAULT`] when the
-    /// table is absent.
-    pub automation: AutomationConfig,
+    /// wrapper routes `process()` through. Populated from `moose.toml`'s
+    /// `[automation]` table; [`Automation::DEFAULT`] when it is absent.
+    pub automation: Automation,
 
     /// AU `ClassInfo` dictionary keys a pre-moose build stored its
     /// state under. Probed by `moose-au` when moose's own data key is
@@ -156,28 +154,31 @@ pub struct PluginInfo {
     pub legacy_au_keys: &'static [&'static str],
 }
 
-/// Sample-accurate chunking tunables baked into [`PluginInfo`] at
-/// compile time. Mirrors `moose_build::AutomationConfig` (the
-/// derive-time view of the same TOML key) but lives in `moose-core`
-/// so wrappers can read it without a `moose-build` dep.
+/// How a plugin receives parameter automation, baked into [`PluginInfo`]
+/// from `moose.toml`'s `[automation]` table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AutomationConfig {
-    /// Smallest sub-block size in samples. The chunker only splits
-    /// the audio block at split-eligible events whose `sample_offset`
-    /// is at least `block_start + min_subblock_samples` past the
-    /// current sub-block start; closer events are coalesced. Default
-    /// 32 (set via [`AutomationConfig::DEFAULT`]).
-    pub min_subblock_samples: u32,
+pub enum Automation {
+    /// Split the audio block at automation points on `CHUNKED` params, so
+    /// each sub-block runs with the parameter store already at the point's
+    /// value. Points closer than `min` samples to the sub-block start are
+    /// coalesced into it.
+    BlockSplit {
+        /// Smallest sub-block in samples; 0 and 1 both split at every point.
+        min: u32,
+    },
+    /// Never split: `process` gets the whole block plus the points
+    /// (`ParamChange`, and `ParamRamp` for VST3 queue segments) and ramps
+    /// itself. The parameter store holds each param's last value in the
+    /// block.
+    PerSample,
 }
 
-impl AutomationConfig {
-    /// Default used when `moose.toml` omits the `[automation]` table.
-    pub const DEFAULT: Self = Self {
-        min_subblock_samples: 32,
-    };
+impl Automation {
+    /// Used when `moose.toml` omits the `[automation]` table.
+    pub const DEFAULT: Self = Self::BlockSplit { min: 32 };
 }
 
-impl Default for AutomationConfig {
+impl Default for Automation {
     fn default() -> Self {
         Self::DEFAULT
     }

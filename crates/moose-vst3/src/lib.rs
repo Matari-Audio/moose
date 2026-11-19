@@ -34,7 +34,7 @@ use moose_core::events::{
 use moose_core::export::PluginExport;
 use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
 use moose_core::main_thread::{
-    HostColor, HostNotifier, LearnSource, MainThreadHooks, Midi2Controller, Midi2ControllerKind,
+    HostColor, HostNotice, HostNotifier, LearnSource, MainThreadHooks, Midi2Controller, Midi2ControllerKind,
     TrackInfo,
 };
 use moose_core::meters::MeterStore;
@@ -62,7 +62,7 @@ use moose_params::{
 
 use ffi::{Vst3Callbacks, Vst3NativeEvent, Vst3ParamDescriptor, Vst3PluginDescriptor};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Instance wrapper
@@ -86,6 +86,8 @@ const K_LATENCY_CHANGED: i32 = 8;
 /// asking (a state load, or a queued state the audio thread applied), so
 /// the host re-reads them.
 const K_PARAM_VALUES_CHANGED: i32 = 4;
+/// VST3 `RestartFlags::kIoChanged`: the buses changed.
+const K_IO_CHANGED: i32 = 2;
 
 struct Vst3Instance<P: PluginExport> {
     persist_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
@@ -124,10 +126,10 @@ struct Vst3Instance<P: PluginExport> {
     /// lookup. Built once at `cb_create`; static for the life of
     /// the instance.
     param_infos: Arc<moose_params::ParamCatalog>,
-    /// `min_subblock_samples` from `moose.toml`'s `[automation]`
+    /// The automation mode from `moose.toml`'s `[automation]`
     /// table. Read at instance construction and passed to
     /// `chunked_process::process_chunked` every block.
-    min_subblock_samples: u32,
+    automation: moose_core::Automation,
     plugin_id_hash: u64,
     /// `true` between `setActive(true)` and `setActive(false)`.
     /// `cb_state_load` and `cb_state_save` read it to decide whether the
@@ -222,6 +224,8 @@ struct Vst3Instance<P: PluginExport> {
     /// editor-notify - all run on the host main thread; `cb_process` never
     /// touches it, so it can't overlap the audio thread.
     gui: PluginCell<Vst3Gui>,
+    /// The hooks' notifier; see `host_notice_woke`.
+    host_notifier: HostNotifier,
 }
 
 impl<P: PluginExport> Vst3Instance<P> {
@@ -629,9 +633,17 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
             midi_maps.sort_by_key(|(id, _)| *id);
             let params_arc = plugin.params_arc();
             let mut hooks = plugin.main_thread();
-            // VST3 has no note-name / voice-info changed call, so notices
-            // wake nothing; the hooks still get a notifier to keep.
-            hooks.connect(HostNotifier::new(|| {}));
+            // VST3 has no note-name / voice-info changed call; a port
+            // change becomes `kIoChanged`. The wake learns the instance
+            // once it is boxed; `cb_destroy` closes it before the free.
+            let notice_ctx = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+            let host_notifier = HostNotifier::new({
+                let notice_ctx = Arc::clone(&notice_ctx);
+                // SAFETY: the pointer is the live instance until
+                // `cb_destroy` closes this wake.
+                move || unsafe { host_notice_woke::<P>(notice_ctx.load(Ordering::Acquire)) }
+            });
+            hooks.connect(host_notifier.clone());
             let main_thread = MainThreadCell::new(hooks);
             let meter_store = plugin.meter_store();
             let snapshot = plugin.snapshot_slot();
@@ -663,7 +675,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 task_spawner,
                 editor_builder,
                 param_infos,
-                min_subblock_samples: info.automation.min_subblock_samples,
+                automation: info.automation,
                 plugin_id_hash: state::shared_plugin_state_hash(&info),
                 active: AtomicBool::new(false),
                 processing: AtomicBool::new(false),
@@ -698,11 +710,27 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     pending_output_mutation: PendingOutputMutation::None,
                 }),
                 gui: PluginCell::new(Vst3Gui { editor: None }),
+                host_notifier,
             });
             let raw = Box::into_raw(instance);
+            notice_ctx.store(raw.cast(), Ordering::Release);
             raw.cast::<std::ffi::c_void>()
         },
     )
+}
+
+/// A [`HostNotice`] arrived: flag `kIoChanged` for a port change.
+///
+/// # Safety
+/// `ctx` is null or a live `Vst3Instance<P>`.
+unsafe fn host_notice_woke<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    // SAFETY: caller contract.
+    let Some(instance) = (unsafe { ctx.cast::<Vst3Instance<P>>().as_ref() }) else {
+        return;
+    };
+    if instance.host_notifier.take().contains(HostNotice::AUDIO_PORTS) {
+        ffi::moose_vst3_mark_restart(ctx, K_IO_CHANGED);
+    }
 }
 
 unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
@@ -715,6 +743,7 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
             let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
+            instance.host_notifier.close();
             rebind_signal(&instance.persist_signal, None, std::ptr::null_mut());
             rebind_signal(&instance.catalog_signal, None, std::ptr::null_mut());
             drop(instance);
@@ -1251,6 +1280,8 @@ unsafe extern "C" fn cb_push_param_change<P: PluginExport>(
     id: u32,
     sample_offset: i32,
     plain: f64,
+    from_offset: i32,
+    from_plain: f64,
 ) -> i32 {
     // SAFETY: ctx is a live instance; called on the audio thread inside
     // process(), like `cb_push_input_event`.
@@ -1259,12 +1290,29 @@ unsafe extern "C" fn cb_push_param_change<P: PluginExport>(
     let Ok(sample_offset) = u32::try_from(sample_offset) else {
         return 0;
     };
+    // A segment that starts after its end (a host sending points out of
+    // order) degrades to a step at the point. So does a non-linear range:
+    // the host's segment is linear in normalized space, and a plain-value
+    // ramp would leave its curve.
+    // ponytail: steps for non-linear ranges; carry normalized ramps if a
+    // PerSample plugin with log params needs the curve.
+    let linear = matches!(
+        inst.param_ranges
+            .binary_search_by_key(&id, |(i, _)| *i)
+            .map(|at| inst.param_ranges[at].1),
+        Ok(ParamRange::Linear { .. })
+    );
+    let ramp_from = u32::try_from(from_offset)
+        .ok()
+        .filter(|from| linear && *from <= sample_offset)
+        .map(|from| (from, from_plain));
     i32::from(push_vst3_param_change::<P>(
         inst,
         &mut audio,
         id,
         sample_offset,
         plain,
+        ramp_from,
     ))
 }
 
@@ -1277,6 +1325,7 @@ fn push_vst3_param_change<P: PluginExport>(
     id: u32,
     sample_offset: u32,
     value: f64,
+    ramp_from: Option<(u32, f64)>,
 ) -> bool {
     let list = &mut audio.event_list;
     // Unbound MIDI controllers arrive on the hidden proxy ids: decode
@@ -1315,12 +1364,38 @@ fn push_vst3_param_change<P: PluginExport>(
             body: midi_event_from_map(&inst.midi_maps[idx].1, value),
         });
     }
-    list.push(Event {
-        sample_offset,
-        port: 0,
-        body: EventBody::ParamChange { id, value },
-    });
+    list.push(param_point_event(inst.automation, id, sample_offset, value, ramp_from));
     true
+}
+
+/// The event for one host queue point. `PerSample` plugins ramp
+/// themselves, so they get the segment from the previous point as a linear
+/// `ParamRamp`; `BlockSplit` plugins get the point, and the chunker splits
+/// there.
+fn param_point_event(
+    automation: moose_core::Automation,
+    id: u32,
+    sample_offset: u32,
+    value: f64,
+    ramp_from: Option<(u32, f64)>,
+) -> Event {
+    match (automation, ramp_from) {
+        (moose_core::Automation::PerSample, Some((from, start))) => Event {
+            sample_offset: from,
+            port: 0,
+            body: EventBody::ParamRamp {
+                id,
+                start,
+                end: value,
+                len: sample_offset - from,
+            },
+        },
+        _ => Event {
+            sample_offset,
+            port: 0,
+            body: EventBody::ParamChange { id, value },
+        },
+    }
 }
 
 fn push_vst3_input_event<P: PluginExport>(
@@ -1807,7 +1882,7 @@ unsafe fn process_block<P: PluginExport, H: Sample>(
             meters_fn: None,
             latency_change_request: None,
             param_infos: &inst.param_infos,
-            min_subblock_samples: inst.min_subblock_samples,
+            automation: inst.automation,
         };
         process_chunked_with_bus_routing_and_catalog(
             &mut *plugin,
@@ -5267,3 +5342,44 @@ mod persist_notify_tests;
 
 #[cfg(test)]
 mod native_note_tests;
+
+#[cfg(test)]
+mod param_point_tests {
+    use super::param_point_event;
+    use moose_core::Automation;
+    use moose_core::events::EventBody;
+
+    #[test]
+    fn per_sample_gets_the_segment_as_a_linear_ramp() {
+        let event = param_point_event(Automation::PerSample, 7, 300, 0.75, Some((100, 0.25)));
+        assert_eq!(event.sample_offset, 100, "the ramp starts at the previous point");
+        assert_eq!(
+            event.body,
+            EventBody::ParamRamp {
+                id: 7,
+                start: 0.25,
+                end: 0.75,
+                len: 200
+            }
+        );
+    }
+
+    #[test]
+    fn block_split_gets_the_point() {
+        let event = param_point_event(
+            Automation::BlockSplit { min: 32 },
+            7,
+            300,
+            0.75,
+            Some((100, 0.25)),
+        );
+        assert_eq!(event.sample_offset, 300);
+        assert_eq!(event.body, EventBody::ParamChange { id: 7, value: 0.75 });
+    }
+
+    #[test]
+    fn out_of_order_point_degrades_to_a_step() {
+        let event = param_point_event(Automation::PerSample, 7, 300, 0.75, None);
+        assert_eq!(event.body, EventBody::ParamChange { id: 7, value: 0.75 });
+    }
+}

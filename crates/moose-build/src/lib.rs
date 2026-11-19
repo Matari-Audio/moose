@@ -235,12 +235,26 @@ pub struct AutomationConfig {
     /// split point and falls back to one `process()` call per block,
     /// equivalent to the pre-chunking behavior).
     pub min_subblock_samples: u32,
+    /// `"block-split"` (default): split the block at automation points.
+    /// `"per-sample"`: never split; the plugin gets every point (and VST3
+    /// ramp segments) as events and ramps itself.
+    pub mode: AutomationMode,
+}
+
+/// `[automation] mode`. See `moose_core::info::Automation`.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomationMode {
+    #[default]
+    BlockSplit,
+    PerSample,
 }
 
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             min_subblock_samples: 32,
+            mode: AutomationMode::BlockSplit,
         }
     }
 }

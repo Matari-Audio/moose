@@ -95,7 +95,7 @@ fn chunked_split_advances_sub_block_playhead() {
         meters_fn: None,
         latency_change_request: None,
         param_infos: &param_infos,
-        min_subblock_samples: 1,
+        automation: moose_core::Automation::BlockSplit { min: 1 },
     };
     process_chunked(&mut plugin, &params as &dyn Params, &mut buffer, args);
 
@@ -105,4 +105,68 @@ fn chunked_split_advances_sub_block_playhead() {
         vec![(1_000, 400), (1_400, 112)],
         "second sub-block must see the playhead advanced by 400 samples",
     );
+}
+
+/// `Automation::PerSample` never splits: one `process()` call sees the
+/// whole block with every point and ramp, and the parameter store already
+/// holds each param's last value (a ramp's `end`).
+#[test]
+#[allow(clippy::float_cmp)]
+fn per_sample_delivers_points_and_ramps_without_splitting() {
+    let params = GainParams::new();
+    let param_infos = params.param_infos();
+    let mut plugin = RecordPlugin { seen: Vec::new() };
+
+    let input = vec![0.0f32; 512];
+    let mut output = vec![0.0f32; 512];
+    let inputs: [&[f32]; 1] = [&input];
+    let mut outputs: [&mut [f32]; 1] = [&mut output];
+    let mut buffer = AudioBuffer::<f32>::from_slices_checked(&inputs, &mut outputs, 512);
+
+    let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
+    events.push(Event::new(
+        100,
+        EventBody::ParamChange { id: 0, value: 0.25 },
+    ));
+    events.push(Event::new(
+        200,
+        EventBody::ParamRamp {
+            id: 0,
+            start: 0.25,
+            end: 0.75,
+            len: 200,
+        },
+    ));
+    // A mid-block transport update reaches the plugin as an event; the
+    // context still reports the block start.
+    events.push(Event::new(
+        256,
+        EventBody::Transport(TransportInfo {
+            position_samples: 9_999,
+            ..TransportInfo::default()
+        }),
+    ));
+
+    let mut scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
+    let mut out_events = EventList::with_capacity(EVENT_LIST_PREALLOC);
+    let mut transport = TransportInfo::default();
+    let args = ChunkedProcess {
+        events: &events,
+        sub_event_scratch: &mut scratch,
+        transport: &mut transport,
+        sample_rate: 48_000.0,
+        process_mode: ProcessMode::Realtime,
+        output_events: &mut out_events,
+        params_fn: None,
+        meters_fn: None,
+        latency_change_request: None,
+        param_infos: &param_infos,
+        automation: moose_core::Automation::PerSample,
+    };
+    process_chunked(&mut plugin, &params as &dyn Params, &mut buffer, args);
+
+    assert_eq!(plugin.seen, vec![(0, 512)], "one call, no split");
+    assert_eq!(scratch.len(), 3, "the plugin saw the point, ramp and transport");
+    assert_eq!(params.get_plain(0), Some(0.75), "store holds the ramp's end");
+    assert_eq!(transport.position_samples, 9_999, "the cached transport moved on");
 }

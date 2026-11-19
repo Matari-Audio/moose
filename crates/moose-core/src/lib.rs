@@ -43,7 +43,7 @@ pub use events::{
     RawUmp, SYSEX_POOL_PREALLOC, TransportInfo, Vst3EventMetadata,
 };
 pub use export::PluginExport;
-pub use info::{AutomationConfig, MidiDialect, PluginCategory, PluginInfo};
+pub use info::{Automation, MidiDialect, PluginCategory, PluginInfo};
 pub use meters::MeterStore;
 pub use plugin::PluginRuntime;
 pub use process::{ProcessContext, ProcessStatus};

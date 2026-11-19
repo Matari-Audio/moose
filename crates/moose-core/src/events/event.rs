@@ -288,6 +288,17 @@ pub enum EventBody {
         id: u32,
         value: f64,
     },
+    /// A linear parameter ramp in plain units: the value moves from
+    /// `start` at this event's offset to `end` at `offset + len`, and holds
+    /// `end` after. Delivered only to plugins that chose
+    /// [`crate::info::Automation::PerSample`] (VST3 queue segments); the
+    /// parameter store already holds `end` when the block runs.
+    ParamRamp {
+        id: u32,
+        start: f64,
+        end: f64,
+        len: u32,
+    },
     /// Parameter modulation offset (CLAP-specific, zero on other
     /// formats). Effective value is `base + value`. The base value
     /// is unchanged.

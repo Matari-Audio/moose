@@ -339,8 +339,8 @@ struct AuInstance<P: PluginExport> {
     param_notify: Option<ParamNotifier>,
     /// Cached param-info table for the chunker's split predicate.
     param_infos: Arc<moose_params::ParamCatalog>,
-    /// `min_subblock_samples` from `moose.toml`'s `[automation]`.
-    min_subblock_samples: u32,
+    /// The automation mode from `moose.toml`'s `[automation]`.
+    automation: moose_core::Automation,
     input_bus_count: usize,
     output_bus_count: usize,
     /// AU exposes one main input plus one sidechain element.
@@ -528,7 +528,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 #[cfg(target_os = "macos")]
                 param_notify: None,
                 param_infos,
-                min_subblock_samples: info.automation.min_subblock_samples,
+                automation: info.automation,
                 input_bus_count,
                 output_bus_count,
                 sidechain_channels,
@@ -1381,7 +1381,7 @@ unsafe fn cb_process_impl<P: PluginExport>(
             meters_fn: None,
             latency_change_request: None,
             param_infos: &inst.param_infos,
-            min_subblock_samples: inst.min_subblock_samples,
+            automation: inst.automation,
         };
         process_chunked_with_bus_routing_and_catalog(
             &mut *plugin,

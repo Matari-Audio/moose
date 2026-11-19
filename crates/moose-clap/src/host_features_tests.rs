@@ -168,6 +168,7 @@ struct HostLog {
     clears: Mutex<Vec<(u32, u32)>>,
     note_names_changed: AtomicU32,
     voice_info_changed: AtomicU32,
+    port_rescans: Mutex<Vec<u32>>,
 }
 
 impl HostLog {
@@ -226,6 +227,12 @@ unsafe extern "C" fn voice_info_changed(host: *const clap_host) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, flags: u32) {
+    // SAFETY: called by the plugin with the test host.
+    let log = unsafe { log(host) };
+    log.port_rescans.lock().expect("port rescans").push(flags);
+}
+
 unsafe extern "C" fn track_get(_: *const clap_host, info: *mut clap_track_info) -> bool {
     // SAFETY: the plugin passes a writable info.
     let info = unsafe { &mut *info };
@@ -259,6 +266,10 @@ unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *
     static VOICE_INFO: clap_host_voice_info = clap_host_voice_info {
         changed: Some(voice_info_changed),
     };
+    static AUDIO_PORTS: clap_host_audio_ports = clap_host_audio_ports {
+        is_rescan_flag_supported: None,
+        rescan: Some(audio_ports_rescan),
+    };
     // SAFETY: the plugin passes a NUL-terminated id.
     let id = unsafe { CStr::from_ptr(id) };
     if id == CLAP_EXT_PARAMS {
@@ -269,6 +280,8 @@ unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *
         (&raw const NOTE_NAME).cast()
     } else if id == CLAP_EXT_VOICE_INFO {
         (&raw const VOICE_INFO).cast()
+    } else if id == CLAP_EXT_AUDIO_PORTS {
+        (&raw const AUDIO_PORTS).cast()
     } else {
         ptr::null()
     }
@@ -481,6 +494,28 @@ fn host_notices_reach_the_host_on_the_main_thread() {
         (*plugin).on_main_thread.unwrap()(plugin);
         assert_eq!(log.note_names_changed.load(Ordering::Relaxed), 1);
         assert_eq!(log.voice_info_changed.load(Ordering::Relaxed), 2);
+    });
+}
+
+#[test]
+fn port_notice_restarts_an_active_plugin_and_rescans_once_inactive() {
+    with_modular(|plugin, log, _| unsafe {
+        let notifier = NOTIFIER
+            .with(|n| n.borrow().clone())
+            .expect("connected at init");
+        let rescans = || log.port_rescans.lock().expect("port rescans").clone();
+        notifier.notify(HostNotice::AUDIO_PORTS);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(rescans(), [CLAP_AUDIO_PORTS_RESCAN_LIST], "inactive: rescan now");
+
+        assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
+        let restarts = log.restarts.load(Ordering::Relaxed);
+        notifier.notify(HostNotice::AUDIO_PORTS);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.restarts.load(Ordering::Relaxed), restarts + 1);
+        assert_eq!(rescans().len(), 1, "no list rescan while active");
+        (*plugin).deactivate.unwrap()(plugin);
+        assert_eq!(rescans().len(), 2, "rescanned at deactivate");
     });
 }
 

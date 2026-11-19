@@ -4,7 +4,7 @@ use moose_core::{
     config::AudioConfig,
     events::EventList,
     export::PluginExport,
-    info::{AutomationConfig, MidiDialect, PluginCategory, PluginInfo},
+    info::{Automation, MidiDialect, PluginCategory, PluginInfo},
     meters::MeterStore,
     plugin::PluginRuntime,
     process::{ProcessContext, ProcessStatus},
@@ -215,7 +215,7 @@ impl PluginRuntime for TestPlugin {
             au_name: None,
             au3_name: None,
             mute_preview_output: false,
-            automation: AutomationConfig::DEFAULT,
+            automation: Automation::DEFAULT,
             legacy_au_keys: &[],
         }
     }

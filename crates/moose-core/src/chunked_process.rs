@@ -19,6 +19,7 @@ use moose_params::{ParamFlags, ParamInfo, Params};
 use crate::buffer::AudioBuffer;
 use crate::bus_routing::BusRouting;
 use crate::config::ProcessMode;
+use crate::info::Automation;
 use crate::events::{
     Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventCursor, LosslessEventRef,
     TransportInfo,
@@ -77,13 +78,10 @@ pub struct ChunkedProcess<'a> {
     /// [`Params::param_infos_static`]) and pass the same slice on
     /// every block.
     pub param_infos: &'a [ParamInfo],
-    /// Minimum sub-block size in samples. From
-    /// [`crate::info::AutomationConfig::min_subblock_samples`].
-    /// Events whose `sample_offset` falls within
-    /// `min_subblock_samples` of the current sub-block start are
-    /// coalesced into that sub-block's leading `apply_pending_events`
-    /// batch instead of triggering a split.
-    pub min_subblock_samples: u32,
+    /// The plugin's automation mode, from [`crate::info::PluginInfo`].
+    /// `BlockSplit { min }` coalesces points within `min` samples of the
+    /// sub-block start; `PerSample` never splits.
+    pub automation: Automation,
 }
 
 /// Walk the audio block in sub-block chunks, calling
@@ -174,7 +172,7 @@ where
         meters_fn,
         latency_change_request,
         param_infos: _,
-        min_subblock_samples,
+        automation,
     } = args;
 
     let total = buffer.num_samples();
@@ -195,7 +193,11 @@ where
     // offset 0, which every wrapper pushes) yields `block_end ==
     // block_start`, a zero-length sub-block, and a `while block_start
     // < total` loop that never advances - hanging the audio thread.
-    let min_sub = (min_subblock_samples as usize).max(1);
+    // `None` for PerSample: the whole block is one sub-block.
+    let min_sub = match automation {
+        Automation::BlockSplit { min } => Some((min as usize).max(1)),
+        Automation::PerSample => None,
+    };
 
     // Paranoid allocation check (the `rt-paranoid` feature): one section
     // spanning the whole per-host-block run, so it covers not just the
@@ -210,8 +212,10 @@ where
         // Find the next split-eligible event at or past
         // `block_start + min_sub`. Anything before that coalesces
         // into this sub-block's leading apply batch.
-        let coalesce_until = block_start.saturating_add(min_sub).min(total);
-        let next_split = find_next_split(events, &chunked, event_idx, coalesce_until);
+        let next_split = min_sub.and_then(|min_sub| {
+            let coalesce_until = block_start.saturating_add(min_sub).min(total);
+            find_next_split(events, &chunked, event_idx, coalesce_until)
+        });
         let block_end = next_split.map_or(total, |(s, _)| s.min(total));
 
         // Apply every event with sample_offset < block_end that's
@@ -219,6 +223,15 @@ where
         // wrappers used to make eagerly at block start, plus
         // transport-snapshot updates for `EventBody::Transport`.
         // Advances `event_idx` past everything consumed.
+        // Unsplit (PerSample), the context keeps the transport at the
+        // block start; later updates reach the plugin as events and only
+        // the cached snapshot moves on.
+        let start_transport = min_sub.is_none().then(|| {
+            if apply_pending_events(events, params, transport, &mut event_idx, block_start + 1) {
+                transport_anchor = block_start;
+            }
+            advance_transport(transport, block_start - transport_anchor, sample_rate)
+        });
         if apply_pending_events(events, params, transport, &mut event_idx, block_end) {
             // A transport event refreshed the snapshot at this boundary,
             // so its position already reflects `block_start`.
@@ -245,8 +258,9 @@ where
 
         // Advance the playhead to this sub-block's start so a plugin that
         // re-derives phase from the transport sees the right position.
-        let sub_transport =
-            advance_transport(transport, block_start - transport_anchor, sample_rate);
+        let sub_transport = start_transport.unwrap_or_else(|| {
+            advance_transport(transport, block_start - transport_anchor, sample_rate)
+        });
         let mut ctx = ProcessContext::new(
             &sub_transport,
             sample_rate,
@@ -385,7 +399,7 @@ fn apply_pending_events(
             break;
         }
         match ev.body {
-            EventBody::ParamChange { id, value } => {
+            EventBody::ParamChange { id, value } | EventBody::ParamRamp { id, end: value, .. } => {
                 params.set_plain(id, value);
             }
             EventBody::Transport(t) => {
@@ -724,7 +738,7 @@ mod tests {
 
     #[test]
     fn offset_zero_split_needs_min_offset_at_least_one() {
-        // The `min_subblock_samples.max(1)` clamp in `process_chunked`
+        // The `BlockSplit { min }.max(1)` clamp in `process_chunked`
         // rests on this: with `min_offset == 0`, an event sitting
         // exactly on `block_start` (offset 0 - a Transport every
         // wrapper pushes) is returned as a split point, so `block_end

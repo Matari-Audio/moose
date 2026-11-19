@@ -30,6 +30,11 @@ bitflags::bitflags! {
         /// [`MainThreadHooks::voice_info`] changed (CLAP
         /// `voice_info.changed`).
         const VOICE_INFO = 0b10;
+        /// The audio ports changed: which layouts are declared, their
+        /// names or channel counts (CLAP `audio_ports.rescan`, VST3
+        /// `kIoChanged`). An active plugin is restarted first; the host
+        /// re-reads the ports while it is inactive.
+        const AUDIO_PORTS = 0b100;
     }
 }
 
@@ -322,7 +327,7 @@ mod tests {
         clone.notify(HostNotice::VOICE_INFO);
         clone.notify(HostNotice::NOTE_NAMES);
         assert_eq!(wakes.load(Ordering::Relaxed), 3);
-        assert_eq!(notifier.take(), HostNotice::all());
+        assert_eq!(notifier.take(), HostNotice::NOTE_NAMES | HostNotice::VOICE_INFO);
         assert_eq!(notifier.take(), HostNotice::empty());
 
         notifier.close();

@@ -1393,7 +1393,7 @@ fn open_output_stream<P: PluginExport>(
             .expect("plugin mutex poisoned at audio setup");
         (p.params().param_infos(), p.params_arc())
     };
-    let min_subblock_samples = P::info().automation.min_subblock_samples;
+    let automation = P::info().automation;
     // Raw-pointer arrays + `RawBufferScratch` reused across callbacks.
     // The pointer arrays mirror `input_bufs` / `channel_bufs` each
     // block; the scratch wraps the raw->slice conversion plus the
@@ -1473,7 +1473,7 @@ fn open_output_stream<P: PluginExport>(
                         &mut sub_event_scratch,
                         &param_infos,
                         &params_arc,
-                        min_subblock_samples,
+                        automation,
                         &mut ptr_scratch,
                         &mut scratch,
                         #[cfg(feature = "playback")]
@@ -2037,7 +2037,7 @@ fn audio_callback<P: PluginExport>(
     sub_event_scratch: &mut EventList,
     param_infos: &[ParamInfo],
     params_arc: &Arc<P::Params>,
-    min_subblock_samples: u32,
+    automation: moose_core::Automation,
     ptr_scratch: &mut CallbackPtrScratch,
     scratch: &mut RawBufferScratch<<P as moose_core::plugin::PluginRuntime>::Sample>,
     #[cfg(feature = "playback")] playback: Option<&Arc<crate::playback::PlaybackSource>>,
@@ -2233,7 +2233,7 @@ fn audio_callback<P: PluginExport>(
         meters_fn: None,
         latency_change_request: None,
         param_infos,
-        min_subblock_samples,
+        automation,
     };
     process_chunked_with_bus_routing(
         &mut *plugin,

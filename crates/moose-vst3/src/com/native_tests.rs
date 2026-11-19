@@ -51,7 +51,7 @@ unsafe extern "C" fn ok_process(
 ) -> u32 {
     1
 }
-unsafe extern "C" fn push_param(_: *mut c_void, _: u32, _: i32, _: f64) -> i32 {
+unsafe extern "C" fn push_param(_: *mut c_void, _: u32, _: i32, _: f64, _: i32, _: f64) -> i32 {
     1
 }
 unsafe extern "C" fn zero_u32(_: *mut c_void) -> u32 {

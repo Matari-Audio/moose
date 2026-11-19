@@ -4,6 +4,24 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Breaking: `Automation` replaces `AutomationConfig`.** `PluginInfo::automation`
+  is `Automation::BlockSplit { min }` (the old behaviour, `min` was
+  `min_subblock_samples`) or `Automation::PerSample`, chosen in `moose.toml`
+  with `[automation] mode = "per-sample"`. A `PerSample` plugin is never
+  split: `process` gets the whole block with every automation point, and the
+  parameter store holds each param's last value. `ChunkedProcess` takes
+  `automation` in place of `min_subblock_samples`.
+- **`EventBody::ParamRamp { id, start, end, len }`.** VST3 parameter queues
+  reach `PerSample` plugins as linear segments instead of steps. CLAP has no
+  ramp events, and AU ramps still land as a step at their end value.
+- **CLAP `configurable-audio-ports` and `audio-ports-activation`.** A host's
+  proposed port configuration selects the matching declared bus layout, and
+  ports the host switches off reach `BusRouting` as `BusActivation::Inactive`.
+- **`HostNotice::AUDIO_PORTS`.** Tell the host the ports changed: CLAP
+  restarts an active plugin and calls `audio_ports.rescan` once inactive;
+  VST3 sends `kIoChanged`. AU drops it for now.
+- **CLAP latency is fixed at `activate`.** A change while active requests a
+  restart and is reported after reactivation.
 - **Deprecated: `PluginLogic`, `PluginLogic64`, `PurePluginLogic(64)` and
   `moose::plugin! { logic: .. }`** (since 7.1.0, removal planned for 8.0).
   Implement `moose::Plugin` and export with `plugin: X`; tests and runners

@@ -263,7 +263,15 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
         return quote! { compile_error!(#msg); }.into();
     }
     let mute_preview_output = plugin.mute_preview_output;
-    let min_subblock_samples = config.automation.min_subblock_samples;
+    let automation = match config.automation.mode {
+        moose_build::AutomationMode::PerSample => {
+            quote! { ::moose::core::info::Automation::PerSample }
+        }
+        moose_build::AutomationMode::BlockSplit => {
+            let min = config.automation.min_subblock_samples;
+            quote! { ::moose::core::info::Automation::BlockSplit { min: #min } }
+        }
+    };
 
     // `[plugin.legacy_state]` AU probe keys, baked as a static slice.
     let legacy_au_keys = plugin
@@ -324,9 +332,7 @@ pub fn plugin_info(_input: TokenStream) -> TokenStream {
                 au_name: #au_name,
                 au3_name: #au3_name,
                 mute_preview_output: #mute_preview_output,
-                automation: ::moose::core::info::AutomationConfig {
-                    min_subblock_samples: #min_subblock_samples,
-                },
+                automation: #automation,
                 legacy_au_keys: #legacy_au_keys,
             }
         }

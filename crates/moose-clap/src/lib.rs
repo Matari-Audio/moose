@@ -68,11 +68,19 @@ use clap_sys::events::{
 };
 use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_AUDIO_PORT_PREFERS_64BITS, CLAP_AUDIO_PORT_SUPPORTS_64BITS,
-    CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info,
-    clap_plugin_audio_ports,
+    CLAP_AUDIO_PORTS_RESCAN_LIST, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO,
+    clap_audio_port_info, clap_host_audio_ports, clap_plugin_audio_ports,
+};
+use clap_sys::ext::audio_ports_activation::{
+    CLAP_EXT_AUDIO_PORTS_ACTIVATION, CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT,
+    clap_plugin_audio_ports_activation,
 };
 use clap_sys::ext::audio_ports_config::{
     CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config,
+};
+use clap_sys::ext::configurable_audio_ports::{
+    CLAP_EXT_CONFIGURABLE_AUDIO_PORTS, CLAP_EXT_CONFIGURABLE_AUDIO_PORTS_COMPAT,
+    clap_audio_port_configuration_request, clap_plugin_configurable_audio_ports,
 };
 use clap_sys::ext::context_menu::{
     CLAP_EXT_CONTEXT_MENU, CLAP_EXT_CONTEXT_MENU_COMPAT, clap_plugin_context_menu,
@@ -141,7 +149,7 @@ use clap_sys::string_sizes::{CLAP_NAME_SIZE, CLAP_PATH_SIZE};
 
 use moose_core::TransportSlot;
 use moose_core::buffer::AudioBuffer;
-use moose_core::bus::{BusConfig, BusKind, ChannelConfig};
+use moose_core::bus::{BusConfig, BusKind, BusLayout, ChannelConfig};
 use moose_core::bus_routing::{BusActivation, BusRoute, BusRouting, bus_layouts_fit_routing};
 use moose_core::cast::{len_u32, size_of_u32};
 use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
@@ -255,12 +263,15 @@ struct ClapPluginData<P: PluginExport> {
     /// through this never touches the plugin (`--shell` builds rebuild
     /// from the reloaded dylib, so GUI edits hot-reload).
     editor_builder: EditorBuilder<P::Params>,
-    /// Atomic snapshots of the plugin's most recent `latency()` /
-    /// `tail()`. Refreshed at `activate` / `reset` (from the real,
-    /// resolved sample rate) and after every process block, so
-    /// `latency_get` / `tail_get` read the value without touching
-    /// `data.plugin`.
+    /// The latency reported to the host: set at `activate` only,
+    /// because CLAP forbids a latency change while active. `latency_get`
+    /// reads it without touching `data.plugin`.
     latency_cache: AtomicU32,
+    /// The plugin's `latency()` after its last block. When it moves off
+    /// `latency_cache`, the main thread asks the host to restart, and the
+    /// new value is reported from the next `activate`.
+    latency_live: AtomicU32,
+    /// The plugin's most recent `tail()`, refreshed every block.
     tail_cache: AtomicU32,
     /// Index into `P::bus_layouts()` of the port config the host last
     /// selected through `clap.audio-ports-config` (0 = the default first
@@ -269,6 +280,13 @@ struct ClapPluginData<P: PluginExport> {
     /// the plugin is deactivated; the audio scratch is pre-sized to the
     /// widest layout, so a wider selection never allocates in `process`.
     selected_config: AtomicU32,
+    /// Which enabled audio ports the host switched off through
+    /// `clap.audio-ports-activation` (bit = port index; inputs, outputs).
+    /// Applied to the bus routing at `activate`; until the host uses the
+    /// extension every bus reports `BusActivation::Unknown`.
+    ports_inactive: [AtomicU32; 2],
+    /// The host has used `clap.audio-ports-activation`.
+    ports_activation_used: AtomicBool,
     /// Audio + lifecycle-owned per-block scratch. Behind a `PluginCell` so
     /// every callback reaches it through a shared `&ClapPluginData` - never a
     /// whole-struct `&mut`, which would alias a concurrent host-thread `&`
@@ -299,7 +317,7 @@ struct ClapPluginData<P: PluginExport> {
     /// Whether the hooks reported voice info at init (`voice_info`).
     voice_info_supported: AtomicBool,
     /// Cached plugin info. Read by the chunker each block for
-    /// `automation.min_subblock_samples` and otherwise unused; the
+    /// `automation` and otherwise unused; the
     /// rest of the wrapper consumes `PluginInfo` from the C ABI
     /// surface we build at registration.
     info: PluginInfo,
@@ -325,6 +343,9 @@ struct ClapPluginData<P: PluginExport> {
     /// main thread, which notifies the host. Coalesces a burst of
     /// changes into one host notification per main-thread callback.
     latency_dirty: AtomicBool,
+    /// A `HostNotice::AUDIO_PORTS` waits for the plugin to be inactive,
+    /// where the host may rescan the port list.
+    ports_rescan: AtomicBool,
     /// Queue of GUI-initiated parameter changes to emit as output events.
     gui_changes: Arc<GuiChangeQueue>,
     /// Bounded SPSC handoff for state loads. Host (`state_load`) and
@@ -964,6 +985,7 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
                     return false;
                 }
             }
+            apply_port_activation(&mut audio.bus_routing, data, layout);
         }
         let mode = ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed));
         {
@@ -982,6 +1004,8 @@ unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             // this is the baseline the host reads at activate, not a
             // mid-session change needing changed() / request_restart.
             data.latency_cache
+                .store(instance.latency(), Ordering::Relaxed);
+            data.latency_live
                 .store(instance.latency(), Ordering::Relaxed);
             data.tail_cache.store(instance.tail(), Ordering::Relaxed);
         }
@@ -1058,6 +1082,9 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
         // SAFETY: `clap_plugin.deactivate` is [main-thread & active] (plugin.h).
         let main = MainThread::assume();
         catalog_sync::sync_parameters(data, &main);
+        if data.ports_rescan.swap(false, Ordering::Relaxed) {
+            host_rescan_audio_ports(data.host);
+        }
     });
 }
 
@@ -1096,10 +1123,8 @@ unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plug
                 &AudioConfig::new(audio.sample_rate, audio.max_block_size).with_process_mode(mode),
             );
         }
-        // Same baseline refresh as `activate` (no dirty flag): keep the
-        // caches consistent with the reset instance.
-        data.latency_cache
-            .store(instance.latency(), Ordering::Relaxed);
+        // Latency stays as reported at `activate`: a change shows up at
+        // the next block, which asks the host to restart.
         data.tail_cache.store(instance.tail(), Ordering::Relaxed);
     });
 }
@@ -1161,6 +1186,18 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
         }
         if notices.contains(HostNotice::VOICE_INFO) {
             voice_info::host_changed(data.host);
+        }
+        if notices.contains(HostNotice::AUDIO_PORTS) {
+            data.ports_rescan.store(true, Ordering::Relaxed);
+            if data.active.load(Ordering::Relaxed)
+                && !data.host.is_null()
+                && let Some(restart) = (*data.host).request_restart
+            {
+                restart(data.host);
+            }
+        }
+        if !data.active.load(Ordering::Relaxed) && data.ports_rescan.swap(false, Ordering::Relaxed) {
+            host_rescan_audio_ports(data.host);
         }
 
         if data.latency_dirty.swap(false, Ordering::Relaxed) && !data.host.is_null() {
@@ -1910,6 +1947,8 @@ fn typed_output_body_is_valid(body: &EventBody) -> bool {
             id != CLAP_INVALID_ID && note_id >= -1 && value.is_finite()
         }
         EventBody::Transport(_) | EventBody::SysEx { .. } => true,
+        // CLAP param events are points; a ramp has no output encoding.
+        EventBody::ParamRamp { .. } => false,
     }
 }
 
@@ -3103,7 +3142,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             meters_fn: None,
             latency_change_request: Some(&request_latency_change),
             param_infos: &scr.catalog,
-            min_subblock_samples: data.info.automation.min_subblock_samples,
+            automation: data.info.automation,
         };
         let status = process_chunked_with_bus_routing_and_catalog(
             &mut *instance,
@@ -3147,13 +3186,11 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             }
         }
 
-        // Refresh latency / tail caches so the host's main-thread
-        // queries don't have to touch the plugin. On an actual
-        // latency change, flag it and wake the main thread, which
-        // notifies the host (`clap.latency` requires the call off the
-        // audio thread).
+        // On a latency change, flag it and wake the main thread, which
+        // asks the host to restart (`clap.latency` requires the call off
+        // the audio thread). The reported value waits for that restart.
         let new_latency = instance.latency();
-        if data.latency_cache.swap(new_latency, Ordering::Relaxed) != new_latency
+        if data.latency_live.swap(new_latency, Ordering::Relaxed) != new_latency
             && !data.latency_dirty.swap(true, Ordering::Relaxed)
             && !data.host.is_null()
             && let Some(req_cb) = (*data.host).request_callback
@@ -3497,7 +3534,9 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                         };
                         push_output!(queue_open, &raw const ev.header);
                     }
-                    EventBody::ParamMod { .. } | EventBody::Transport(_) => {
+                    EventBody::ParamMod { .. }
+                    | EventBody::ParamRamp { .. }
+                    | EventBody::Transport(_) => {
                         output_status = OutputEventStatus::Unsupported;
                         break 'output_events;
                     }
@@ -4700,6 +4739,216 @@ unsafe extern "C" fn audio_ports_config_select<P: PluginExport>(
     }
 }
 
+/// Ask the host to re-read the whole port list. Inactive, main thread.
+///
+/// # Safety
+/// `host` is null or the live host of this instance.
+unsafe fn host_rescan_audio_ports(host: *const clap_host) {
+    // SAFETY: caller contract; `get_extension` is [thread-safe].
+    unsafe {
+        if host.is_null() {
+            return;
+        }
+        let Some(get) = (*host).get_extension else {
+            return;
+        };
+        let ext = get(host, CLAP_EXT_AUDIO_PORTS.as_ptr()).cast::<clap_host_audio_ports>();
+        if !ext.is_null()
+            && let Some(rescan) = (*ext).rescan
+        {
+            rescan(host, CLAP_AUDIO_PORTS_RESCAN_LIST);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extension: configurable-audio-ports (host proposes a port configuration)
+// ---------------------------------------------------------------------------
+
+/// The first declared layout (the selected one first) that satisfies every
+/// request: each named port exists among the enabled buses, with that
+/// channel count and, when the host gives one, that port type.
+///
+/// # Safety
+/// `requests` points at `count` readable requests whose `port_type`s are
+/// null or NUL-terminated.
+unsafe fn layout_for_requests<P: PluginExport>(
+    plugin: *const clap_plugin,
+    requests: *const clap_audio_port_configuration_request,
+    count: u32,
+) -> Option<usize> {
+    let requests: &[clap_audio_port_configuration_request] = if count == 0 {
+        &[]
+    } else if requests.is_null() {
+        return None;
+    } else {
+        // SAFETY: the host passes `count` requests (caller contract).
+        unsafe { std::slice::from_raw_parts(requests, count as usize) }
+    };
+    let layouts = P::bus_layouts();
+    // SAFETY: a live plugin for this main-thread callback.
+    let selected = unsafe { selected_layout_index::<P>(plugin, layouts.len()) };
+    let fits = |layout: &BusLayout| {
+        requests.iter().all(|request| {
+            let buses = if request.is_input {
+                &layout.inputs
+            } else {
+                &layout.outputs
+            };
+            let Some(bus) = buses
+                .iter()
+                .filter(|bus| bus.enabled)
+                .nth(request.port_index as usize)
+            else {
+                return false;
+            };
+            if bus.channels.channel_count() != request.channel_count {
+                return false;
+            }
+            let ours = clap_port_type_ptr(bus.channels);
+            // SAFETY: NUL-terminated or null (caller contract).
+            let wanted = (!request.port_type.is_null())
+                .then(|| unsafe { CStr::from_ptr(request.port_type) })
+                .filter(|t| !t.is_empty());
+            // SAFETY: ours are static CLAP constants.
+            let type_fits = wanted.is_none_or(|wanted| {
+                !ours.is_null() && wanted == unsafe { CStr::from_ptr(ours) }
+            });
+            // Mono and stereo ignore details. Surround details must match
+            // our canonical channel map; ambisonic types never match.
+            let details_fit = request.port_details.is_null()
+                || wanted == Some(CLAP_PORT_MONO)
+                || wanted == Some(CLAP_PORT_STEREO)
+                || (wanted == Some(CLAP_PORT_SURROUND) && {
+                    let map = surround_channels(bus.channels);
+                    // SAFETY: a surround request's details are
+                    // `channel_count` channel ids.
+                    !map.is_empty()
+                        && map
+                            == unsafe {
+                                std::slice::from_raw_parts(
+                                    request.port_details.cast::<u8>(),
+                                    request.channel_count as usize,
+                                )
+                            }
+                });
+            type_fits && details_fit
+        })
+    };
+    std::iter::once(selected)
+        .chain(0..layouts.len())
+        .find(|&index| layouts.get(index).is_some_and(fits))
+}
+
+unsafe extern "C" fn configurable_ports_can_apply<P: PluginExport>(
+    plugin: *const clap_plugin,
+    requests: *const clap_audio_port_configuration_request,
+    count: u32,
+) -> bool {
+    // SAFETY: the host's request array, per the CLAP contract.
+    unsafe { layout_for_requests::<P>(plugin, requests, count).is_some() }
+}
+
+unsafe extern "C" fn configurable_ports_apply<P: PluginExport>(
+    plugin: *const clap_plugin,
+    requests: *const clap_audio_port_configuration_request,
+    count: u32,
+) -> bool {
+    // SAFETY: as in `configurable_ports_can_apply`; called on the main
+    // thread while deactivated, like `audio_ports_config_select`.
+    unsafe {
+        let Some(index) = layout_for_requests::<P>(plugin, requests, count) else {
+            return false;
+        };
+        let data = data_from_plugin::<P>(plugin);
+        if data.active.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        data.selected_config.store(index, Ordering::Relaxed);
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extension: audio-ports-activation (host switches ports on and off)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn ports_activation_while_processing(_: *const clap_plugin) -> bool {
+    false
+}
+
+unsafe extern "C" fn ports_activation_set_active<P: PluginExport>(
+    plugin: *const clap_plugin,
+    is_input: bool,
+    port_index: u32,
+    is_active: bool,
+    _sample_size: u32,
+) -> bool {
+    // SAFETY: a live plugin; called while not processing.
+    unsafe {
+        let layouts = P::bus_layouts();
+        let selected = selected_layout_index::<P>(plugin, layouts.len());
+        let Some(layout) = layouts.get(selected) else {
+            return false;
+        };
+        let buses = if is_input {
+            &layout.inputs
+        } else {
+            &layout.outputs
+        };
+        if port_index >= 32 || port_index as usize >= buses.iter().filter(|b| b.enabled).count() {
+            return false;
+        }
+        let data = data_from_plugin::<P>(plugin);
+        let mask = &data.ports_inactive[usize::from(!is_input)];
+        if is_active {
+            mask.fetch_and(!(1 << port_index), Ordering::Relaxed);
+        } else {
+            mask.fetch_or(1 << port_index, Ordering::Relaxed);
+        }
+        data.ports_activation_used.store(true, Ordering::Relaxed);
+        // Active but not processing: route the change into this block's
+        // routing now; otherwise `activate` applies it.
+        if data.active.load(Ordering::Relaxed) {
+            let mut audio = data.audio.enter();
+            apply_port_activation(&mut audio.bus_routing, data, layout);
+        }
+        true
+    }
+}
+
+/// Write the host's port activation onto the routing built for `layout`.
+/// Routing indexes every declared bus; CLAP port indices count only the
+/// enabled ones.
+fn apply_port_activation<P: PluginExport>(
+    routing: &mut BusRouting,
+    data: &ClapPluginData<P>,
+    layout: &BusLayout,
+) {
+    if !data.ports_activation_used.load(Ordering::Relaxed) {
+        return;
+    }
+    for (dir, buses) in [&layout.inputs, &layout.outputs].into_iter().enumerate() {
+        let inactive = data.ports_inactive[dir].load(Ordering::Relaxed);
+        let enabled = buses.iter().enumerate().filter(|(_, bus)| bus.enabled);
+        for (port, (declared, _)) in enabled.enumerate() {
+            let activation = if port < 32 && inactive & (1 << port) != 0 {
+                BusActivation::Inactive
+            } else {
+                BusActivation::Active
+            };
+            if dir == 0 {
+                routing.set_input_activation(declared, activation);
+            } else {
+                routing.set_output_activation(declared, activation);
+            }
+        }
+    }
+}
+
 fn make_audio_ports_config_extension<P: PluginExport>() -> clap_plugin_audio_ports_config {
     clap_plugin_audio_ports_config {
         count: Some(audio_ports_config_count::<P>),
@@ -5800,6 +6049,8 @@ struct Extensions<P: PluginExport> {
     preset_load: clap_plugin_preset_load,
     audio_ports: clap_plugin_audio_ports,
     audio_ports_config: clap_plugin_audio_ports_config,
+    configurable_audio_ports: clap_plugin_configurable_audio_ports,
+    audio_ports_activation: clap_plugin_audio_ports_activation,
     surround: clap_plugin_surround,
     note_ports: clap_plugin_note_ports,
     gui: clap_plugin_gui,
@@ -5868,6 +6119,14 @@ impl<P: PluginExport> Extensions<P> {
             preset_load: make_preset_load_extension::<P>(),
             audio_ports: make_audio_ports_extension::<P>(),
             audio_ports_config: make_audio_ports_config_extension::<P>(),
+            configurable_audio_ports: clap_plugin_configurable_audio_ports {
+                can_apply_configuration: Some(configurable_ports_can_apply::<P>),
+                apply_configuration: Some(configurable_ports_apply::<P>),
+            },
+            audio_ports_activation: clap_plugin_audio_ports_activation {
+                can_activate_while_processing: Some(ports_activation_while_processing),
+                set_active: Some(ports_activation_set_active::<P>),
+            },
             surround: clap_plugin_surround {
                 is_channel_mask_supported: Some(surround_mask::<P>),
                 get_channel_map: Some(surround_map::<P>),
@@ -5943,6 +6202,16 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
             } else {
                 ptr::null()
             };
+        }
+        if ext_id == CLAP_EXT_CONFIGURABLE_AUDIO_PORTS
+            || ext_id == CLAP_EXT_CONFIGURABLE_AUDIO_PORTS_COMPAT
+        {
+            return (&raw const extensions.configurable_audio_ports).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_AUDIO_PORTS_ACTIVATION
+            || ext_id == CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT
+        {
+            return (&raw const extensions.audio_ports_activation).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_SURROUND || ext_id == CLAP_EXT_SURROUND_COMPAT {
             return (&raw const extensions.surround).cast::<c_void>();
@@ -6151,6 +6420,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let task_spawner = instance.task_spawner();
         let editor_builder = instance.editor_builder();
         let latency_cache = AtomicU32::new(instance.latency());
+        let latency_live = AtomicU32::new(instance.latency());
         let tail_cache = AtomicU32::new(instance.tail());
 
         // Pre-size the per-block channel-slice scratch from the worst-case
@@ -6182,8 +6452,11 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             task_spawner,
             editor_builder,
             latency_cache,
+            latency_live,
             tail_cache,
             selected_config: AtomicU32::new(0),
+            ports_inactive: [AtomicU32::new(0), AtomicU32::new(0)],
+            ports_activation_used: AtomicBool::new(false),
             exposed,
             parameter_restart_pending: AtomicBool::new(false),
             catalog_signal: None,
@@ -6200,6 +6473,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             host_tail: ptr::null(),
             host_track_info: ptr::null(),
             latency_dirty: AtomicBool::new(false),
+            ports_rescan: AtomicBool::new(false),
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
             pending_state: Arc::new(StateLoadQueue::new(1)),
             panic_latch: moose_core::wrapper::PanicLatch::new(),

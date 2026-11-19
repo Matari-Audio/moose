@@ -217,10 +217,19 @@ pub struct Vst3Callbacks {
     /// (offered only when `Vst3PluginDescriptor::supports_f64` is set).
     pub process_f64: ProcessFn,
     /// Queue one host parameter point (plain value) for the current block.
+    /// `from_offset` / `from_plain` is the previous point of the same queue
+    /// (offset 0 and the current value for the first point), so a
+    /// `PerSample` plugin gets the segment as a linear `ParamRamp`.
     /// Returns 0 when the block's event list is full; the COM layer then
     /// commits the queue's final value directly.
-    pub push_param_change:
-        unsafe extern "C" fn(ctx: *mut c_void, id: u32, sample_offset: i32, plain: f64) -> i32,
+    pub push_param_change: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        id: u32,
+        sample_offset: i32,
+        plain: f64,
+        from_offset: i32,
+        from_plain: f64,
+    ) -> i32,
     pub param_count: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
     pub param_get_value: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> f64,
     pub param_set_value: unsafe extern "C" fn(ctx: *mut c_void, id: u32, value: f64),

@@ -1076,7 +1076,7 @@ impl<P: PluginExport> PluginDriver<P> {
         let param_infos = plugin.params().param_infos();
         let params_arc = plugin.params_arc();
         let plugin_info = P::info();
-        let min_subblock_samples = plugin_info.automation.min_subblock_samples;
+        let automation = plugin_info.automation;
         let midi_output_ports = plugin_info.midi_output_ports;
 
         // Routes the offline-render loop through the same
@@ -1204,7 +1204,7 @@ impl<P: PluginExport> PluginDriver<P> {
                 meters_fn: None,
                 latency_change_request: None,
                 param_infos: &param_infos,
-                min_subblock_samples,
+                automation,
             };
             process_chunked_with_bus_routing(
                 &mut plugin,
@@ -1528,7 +1528,7 @@ mod routing_tests {
                 au_name: None,
                 au3_name: None,
                 mute_preview_output: false,
-                automation: moose_core::info::AutomationConfig::default(),
+                automation: moose_core::info::Automation::DEFAULT,
                 legacy_au_keys: &[],
             }
         }
