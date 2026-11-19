@@ -263,7 +263,10 @@ impl FloatParam {
     /// precision). See [`Self::raw_target`].
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_next(&self) -> f32 {
         let target = self.value.load();
         match &self.smoother {
@@ -276,7 +279,10 @@ impl FloatParam {
     /// [`Self::raw_target`].
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_current(&self) -> f32 {
         match &self.smoother {
             Some(smoother) => smoother.current(),
@@ -288,7 +294,10 @@ impl FloatParam {
     /// Returns `None` while a ramp still needs to advance.
     #[inline]
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn settled_value(&self) -> Option<f32> {
         let target = self.value.load();
         let settled = self
@@ -304,7 +313,10 @@ impl FloatParam {
     /// [`FloatParamReadF64::read_into`] in the prelude.
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_next_into(&self, out: &mut [f32]) {
         let target = self.value.load();
         match &self.smoother {
@@ -317,7 +329,10 @@ impl FloatParam {
     /// [`FloatParamReadF64`]: no `f32` rounding end to end.
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_next_f64(&self) -> f64 {
         let target = self.value.load();
         self.smoother
@@ -327,7 +342,10 @@ impl FloatParam {
 
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_next_into_f64(&self, out: &mut [f64]) {
         let target = self.value.load();
         match &self.smoother {
@@ -338,7 +356,10 @@ impl FloatParam {
 
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_next_after_f64(&self, n_samples: usize) -> f64 {
         let target = self.value.load();
         self.smoother
@@ -348,7 +369,10 @@ impl FloatParam {
 
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_current_f64(&self) -> f64 {
         self.smoother
             .as_ref()
@@ -361,7 +385,10 @@ impl FloatParam {
     /// [`FloatParamReadF64::read_after`] in the prelude.
     #[doc(hidden)]
     #[inline]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn raw_smoothed_next_after(&self, n_samples: usize) -> f32 {
         let target = self.value.load();
         match &self.smoother {
@@ -423,7 +450,10 @@ impl FloatParam {
     /// ```
     #[inline]
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     pub fn is_smoothing(&self) -> bool {
         self.smoother
             .as_ref()
@@ -451,7 +481,10 @@ impl FloatParam {
 pub trait FloatParamReadF32 {
     /// Next smoothed value. Call once per sample in `process()`.
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn read(&self) -> f32;
 
     /// Fill `out` with the next `out.len()` smoothed samples; advance
@@ -469,7 +502,10 @@ pub trait FloatParamReadF32 {
     ///     offset += n;
     /// }
     /// ```
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn read_into(&self, out: &mut [f32]);
 
     /// Advance the smoother by `n_samples` in one call, returning
@@ -481,12 +517,18 @@ pub trait FloatParamReadF32 {
     /// ~20 ms instead of ~20 blocks). One atomic load + one atomic
     /// store; the per-sample envelope is skipped.
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn read_after(&self, n_samples: usize) -> f32;
 
     /// Current smoothed value without advancing.
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn current(&self) -> f32;
 
     /// Raw target value (post-`set_normalized` / host automation),
@@ -500,25 +542,40 @@ pub trait FloatParamReadF32 {
 /// [`FloatParamReadF32`] for the contract.
 pub trait FloatParamReadF64 {
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn read(&self) -> f64;
     /// f64 view of [`FloatParamReadF32::read_into`]; one widen per
     /// slot on top of the same one-atomic-pair fast path.
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn read_into(&self, out: &mut [f64]);
     /// f64 view of [`FloatParamReadF32::read_after`]; one widen
     /// on top of the same one-atomic-pair fast path.
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn read_after(&self, n_samples: usize) -> f64;
     #[must_use]
-    #[deprecated(since = "7.1.0", note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`")]
+    #[deprecated(
+        since = "7.1.0",
+        note = "keeps the ramp in shared atomics; keep a `ParamSmoother` in the DSP state and step it in `process`"
+    )]
     fn current(&self) -> f64;
     #[must_use]
     fn value(&self) -> f64;
 }
 
-#[allow(deprecated, reason = "the deprecated read path forwards to the deprecated raw reads")]
+#[allow(
+    deprecated,
+    reason = "the deprecated read path forwards to the deprecated raw reads"
+)]
 impl FloatParamReadF32 for FloatParam {
     #[inline]
     fn read(&self) -> f32 {
@@ -546,7 +603,10 @@ impl FloatParamReadF32 for FloatParam {
     }
 }
 
-#[allow(deprecated, reason = "the deprecated read path forwards to the deprecated raw reads")]
+#[allow(
+    deprecated,
+    reason = "the deprecated read path forwards to the deprecated raw reads"
+)]
 impl FloatParamReadF64 for FloatParam {
     #[inline]
     fn read(&self) -> f64 {
@@ -623,7 +683,9 @@ impl ParamSmoother {
     /// target. Doesn't allocate; call it from the plugin's `reset`. A
     /// `Default` smoother does nothing useful until this runs.
     pub fn reset(&mut self, param: &FloatParam, sample_rate: f64) {
-        let style = param.smoother().map_or(SmoothingStyle::None, Smoother::style);
+        let style = param
+            .smoother()
+            .map_or(SmoothingStyle::None, Smoother::style);
         self.state = SmoothState::new(style, sample_rate);
         self.jump_to(param);
     }
@@ -1051,7 +1113,10 @@ impl From<&MeterSlot> for u32 {
 }
 
 #[cfg(test)]
-#[expect(deprecated, reason = "the bit-identity tests compare the owned smoother against the deprecated shared path")]
+#[expect(
+    deprecated,
+    reason = "the bit-identity tests compare the owned smoother against the deprecated shared path"
+)]
 mod tests {
     use super::*;
     use crate::info::{ParamFlags, ParamUnit, ParamValueKind};
@@ -1111,7 +1176,14 @@ mod tests {
     /// and follows a host snap (state load) through the snap generation.
     #[test]
     fn param_smoother_matches_shared_reads_and_follows_snaps() {
-        let info = info("Gain", ParamRange::Linear { min: 0.0, max: 10.0 }, 1.0);
+        let info = info(
+            "Gain",
+            ParamRange::Linear {
+                min: 0.0,
+                max: 10.0,
+            },
+            1.0,
+        );
         let shared = FloatParam::new(info, SmoothingStyle::Exponential(5.0));
         shared.set_sample_rate(48_000.0);
         let owned_param = FloatParam::new(info, SmoothingStyle::Exponential(5.0));

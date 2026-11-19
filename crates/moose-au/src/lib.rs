@@ -73,9 +73,8 @@ use moose_core::ump::{
 };
 use moose_core::wrapper::{
     ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
-    custom_state_for_save, default_io_channels, enter_plugin,
-    log_missing_bus_layout, run_audio_block_latched, run_extern_callback_with, run_register,
-    shared_plugin,
+    custom_state_for_save, default_io_channels, enter_plugin, log_missing_bus_layout,
+    run_audio_block_latched, run_extern_callback_with, run_register, shared_plugin,
 };
 use moose_params::{MidiSource, ParamFlags, Params};
 
@@ -555,7 +554,10 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                     prepared_mode: 0,
                     scratch: RawBufferScratch::default(),
                 }),
-                gui: PluginCell::new(AuGui { editor: None, view: 0 }),
+                gui: PluginCell::new(AuGui {
+                    editor: None,
+                    view: 0,
+                }),
                 pending_resize: AtomicU64::new(0),
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
@@ -3294,7 +3296,10 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                         get_state: Box::new(move || {
                             // Editor state read: never touches the plugin. A
                             // load still queued for the audio thread wins.
-                            moose_core::wrapper::custom_state_view(&snapshot, &pending_state_for_get)
+                            moose_core::wrapper::custom_state_view(
+                                &snapshot,
+                                &pending_state_for_get,
+                            )
                         }),
                         set_state: Box::new(move |bytes| {
                             // The editor sends RAW custom-state bytes -
@@ -4278,20 +4283,40 @@ mod large_state_tests {
         let mut list = EventList::with_capacity(64);
         for i in 0..40_u8 {
             let body = if i % 3 == 0 {
-                EventBody::ControlChange { group: 0, channel: 0, cc: 1, value: i }
+                EventBody::ControlChange {
+                    group: 0,
+                    channel: 0,
+                    cc: 1,
+                    value: i,
+                }
             } else {
-                EventBody::NoteOn { group: 0, channel: 0, note: i, velocity: 100 }
+                EventBody::NoteOn {
+                    group: 0,
+                    channel: 0,
+                    note: i,
+                    velocity: 100,
+                }
             };
             list.push(Event::new(u32::from(i), body));
         }
-        let pick = |e: &Event| matches!(e.body, EventBody::ControlChange { .. }).then_some(e.sample_offset);
+        let pick = |e: &Event| {
+            matches!(e.body, EventBody::ControlChange { .. }).then_some(e.sample_offset)
+        };
         let expect: Vec<u32> = list.iter().filter_map(pick).collect();
         let mut cur = NthCursor::HEAD;
         for (i, want) in expect.iter().enumerate() {
             assert_eq!(nth_matching(&list, i, &mut cur, pick), Some(*want));
-            assert_eq!(nth_matching(&list, i, &mut cur, pick), Some(*want), "repeat");
+            assert_eq!(
+                nth_matching(&list, i, &mut cur, pick),
+                Some(*want),
+                "repeat"
+            );
         }
         assert_eq!(nth_matching(&list, expect.len(), &mut cur, pick), None);
-        assert_eq!(nth_matching(&list, 2, &mut cur, pick), Some(expect[2]), "backwards");
+        assert_eq!(
+            nth_matching(&list, 2, &mut cur, pick),
+            Some(expect[2]),
+            "backwards"
+        );
     }
 }

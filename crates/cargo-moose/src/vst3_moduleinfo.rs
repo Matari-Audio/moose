@@ -4,7 +4,12 @@
 //! what the binary reports. Only a host-arch binary can be loaded; cross
 //! builds ship without it (the file is optional).
 
-#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::unnecessary_cast, clippy::needless_borrows_for_generic_args)]
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::unnecessary_cast,
+    clippy::needless_borrows_for_generic_args
+)]
 
 use std::ffi::c_char;
 use std::fmt::Write as _;
@@ -23,7 +28,9 @@ pub(crate) const PATH: &str = "Contents/Resources/moduleinfo.json";
 /// this host or its factory can't be read. Never fails the build.
 pub(crate) fn generate(binary: &Path, module_name: &str, host_arch: bool) -> Option<String> {
     if !host_arch {
-        crate::log_output(format!("VST3: no moduleinfo.json for a cross build of {module_name}"));
+        crate::log_output(format!(
+            "VST3: no moduleinfo.json for a cross build of {module_name}"
+        ));
         return None;
     }
     // SAFETY: loads the plug-in we just built and calls its exported
@@ -31,7 +38,9 @@ pub(crate) fn generate(binary: &Path, module_name: &str, host_arch: bool) -> Opt
     match unsafe { read_factory(binary, module_name) } {
         Ok(json) => Some(json),
         Err(e) => {
-            crate::log_output(format!("VST3: moduleinfo.json skipped for {module_name}: {e}"));
+            crate::log_output(format!(
+                "VST3: moduleinfo.json skipped for {module_name}: {e}"
+            ));
             None
         }
     }
@@ -49,10 +58,14 @@ pub(crate) fn write(bundle: &Path, json: &str) -> crate::Res {
 
 unsafe fn read_factory(binary: &Path, module_name: &str) -> Result<String, String> {
     let lib = unsafe { libloading::Library::new(binary) }.map_err(|e| e.to_string())?;
-    let get = unsafe { lib.get::<unsafe extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory") }
-        .map_err(|e| e.to_string())?;
+    let get = unsafe {
+        lib.get::<unsafe extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory")
+    }
+    .map_err(|e| e.to_string())?;
     let factory = unsafe { ComPtr::from_raw(get()) }.ok_or("GetPluginFactory returned null")?;
-    let factory2 = factory.cast::<IPluginFactory2>().ok_or("no IPluginFactory2")?;
+    let factory2 = factory
+        .cast::<IPluginFactory2>()
+        .ok_or("no IPluginFactory2")?;
 
     let mut info: PFactoryInfo = unsafe { std::mem::zeroed() };
     unsafe { factory.getFactoryInfo(&raw mut info) };
@@ -77,7 +90,11 @@ fn render(module_name: &str, info: &PFactoryInfo, classes: &[PClassInfo2]) -> St
         out,
         "{{\n  \"Name\": {},\n  \"Version\": {},\n  \"Factory Info\": {{\n    \"Vendor\": {},\n    \"URL\": {},\n    \"E-Mail\": {},\n    \"Flags\": {{\n      \"Unicode\": {},\n      \"Classes Discardable\": {},\n      \"Component Non Discardable\": {}\n    }}\n  }},\n  \"Classes\": [",
         quote(module_name),
-        quote(classes.first().map_or_else(String::new, |c| text(&c.version))),
+        quote(
+            classes
+                .first()
+                .map_or_else(String::new, |c| text(&c.version))
+        ),
         quote(&text(&info.vendor)),
         quote(&text(&info.url)),
         quote(&text(&info.email)),
@@ -87,7 +104,11 @@ fn render(module_name: &str, info: &PFactoryInfo, classes: &[PClassInfo2]) -> St
     );
     for (i, c) in classes.iter().enumerate() {
         let subs = text(&c.subCategories);
-        let subs: Vec<String> = subs.split('|').filter(|s| !s.is_empty()).map(quote).collect();
+        let subs: Vec<String> = subs
+            .split('|')
+            .filter(|s| !s.is_empty())
+            .map(quote)
+            .collect();
         let _ = write!(
             out,
             "{}\n    {{\n      \"CID\": {},\n      \"Category\": {},\n      \"Name\": {},\n      \"Vendor\": {},\n      \"Version\": {},\n      \"SDKVersion\": {},\n      \"Sub Categories\": [{}],\n      \"Class Flags\": {},\n      \"Cardinality\": {},\n      \"Snapshots\": []\n    }}",
@@ -113,13 +134,21 @@ fn cid_string(cid: &[u8; 16], com_compatible: bool) -> String {
     const COM_ORDER: [usize; 16] = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
     let mut s = String::with_capacity(32);
     for i in 0..16 {
-        let _ = write!(s, "{:02X}", cid[if com_compatible { COM_ORDER[i] } else { i }]);
+        let _ = write!(
+            s,
+            "{:02X}",
+            cid[if com_compatible { COM_ORDER[i] } else { i }]
+        );
     }
     s
 }
 
 fn text(buf: &[c_char]) -> String {
-    let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 

@@ -15,8 +15,8 @@
 //! introduce audio-thread blocking, both of which would let the
 //! visualizer drift from real transport state.
 
-use std::sync::Arc;
 use crate::sync::{AtomicU64, Ordering, fence};
+use std::sync::Arc;
 
 use crate::events::TransportInfo;
 
@@ -142,7 +142,16 @@ fn encode(info: &TransportInfo) -> [u64; WORDS] {
 
 /// Inverse of [`encode`].
 fn decode(words: [u64; WORDS]) -> TransportInfo {
-    let [flags, tempo, samples, seconds, beats, bar, loop_start, loop_end] = words;
+    let [
+        flags,
+        tempo,
+        samples,
+        seconds,
+        beats,
+        bar,
+        loop_start,
+        loop_end,
+    ] = words;
     let byte = |shift: u32| (flags >> shift).to_le_bytes()[0];
     TransportInfo {
         playing: flags & 1 != 0,

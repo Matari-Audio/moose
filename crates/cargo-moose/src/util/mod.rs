@@ -664,8 +664,7 @@ fn read_default_features(manifest: &Path) -> HashSet<String> {
 /// Resolves the crate's own manifest, so it works in both the single-crate
 /// and workspace layouts.
 pub(crate) fn plugin_default_features(root: &Path, crate_name: &str) -> HashSet<String> {
-    locate_plugin_manifest(root, crate_name)
-        .map_or_default(|m| read_default_features(&m))
+    locate_plugin_manifest(root, crate_name).map_or_default(|m| read_default_features(&m))
 }
 
 /// Cargo `--features` tokens (`crate/feature`) for every non-format

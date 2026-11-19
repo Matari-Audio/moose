@@ -8,7 +8,10 @@
 //!
 //! Run with `--features rt-paranoid` to also prove the steady-state
 //! blocks make no audio-thread allocation.
-#![expect(deprecated, reason = "covers the deprecated `PluginLogic` path, still supported until it is removed")]
+#![expect(
+    deprecated,
+    reason = "covers the deprecated `PluginLogic` path, still supported until it is removed"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,9 +21,9 @@ use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;
 use moose_core::editor::RawWindowHandle;
 use moose_core::events::EventList;
+use moose_core::events::TransportInfo;
 use moose_core::plugin::PluginRuntime;
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::events::TransportInfo;
 use moose_core::state::StateLoadError;
 use moose_derive::Params;
 use moose_gui::PluginLogic;
@@ -152,7 +155,9 @@ fn run_block_audited<L: PluginLogic<Params = StateParams>>(
 /// state.
 #[test]
 fn save_state_only_plugin_does_not_serialize_per_block() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut plugin = shell::<LegacyStatePlugin>();
     let slot = plugin.snapshot_slot();
     assert_eq!(slot.read(), Some(0u32.to_le_bytes().to_vec()), "baseline");
@@ -160,7 +165,11 @@ fn save_state_only_plugin_does_not_serialize_per_block() {
     for _ in 0..8 {
         run_block(&mut plugin);
     }
-    assert_eq!(SAVES.load(Ordering::Relaxed), before, "no per-block save_state");
+    assert_eq!(
+        SAVES.load(Ordering::Relaxed),
+        before,
+        "no per-block save_state"
+    );
     let mut buf = Vec::new();
     assert!(!plugin.snapshot_into(&mut buf), "not opted in");
 }
@@ -169,7 +178,9 @@ fn save_state_only_plugin_does_not_serialize_per_block() {
 /// allocation. Vacuous without `--features rt-paranoid`.
 #[test]
 fn save_state_only_plugin_blocks_are_allocation_free() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut plugin = shell::<LegacyStatePlugin>();
     run_block(&mut plugin);
     let ((), allocs) = moose::rt::audit(|| {
@@ -191,7 +202,9 @@ fn save_state_only_plugin_blocks_are_allocation_free() {
 /// next block serves it with live state, once.
 #[test]
 fn requested_snapshot_is_served_by_the_next_block() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut plugin = shell::<LegacyStatePlugin>();
     let slot = plugin.snapshot_slot();
     plugin.state_ref_mut().value = 42;
@@ -202,18 +215,27 @@ fn requested_snapshot_is_served_by_the_next_block() {
     assert!(slot.wait_served(ticket, std::time::Duration::ZERO));
     assert_eq!(slot.read(), Some(42u32.to_le_bytes().to_vec()));
     run_block(&mut plugin);
-    assert_eq!(SAVES.load(Ordering::Relaxed), before + 1, "served exactly once");
+    assert_eq!(
+        SAVES.load(Ordering::Relaxed),
+        before + 1,
+        "served exactly once"
+    );
 }
 
 /// A host-owned republish (load applied while not processing) stores live
 /// state, so a save that falls back to the slot sees the load.
 #[test]
 fn republish_stores_live_state_after_load() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut plugin = shell::<LegacyStatePlugin>();
     plugin.load_state(&7u32.to_le_bytes()).expect("load_state");
     plugin.republish_snapshot();
-    assert_eq!(plugin.snapshot_slot().read(), Some(7u32.to_le_bytes().to_vec()));
+    assert_eq!(
+        plugin.snapshot_slot().read(),
+        Some(7u32.to_le_bytes().to_vec())
+    );
 }
 
 /// A plugin with no custom state publishes an empty baseline and never

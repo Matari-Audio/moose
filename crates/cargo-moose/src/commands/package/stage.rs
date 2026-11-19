@@ -260,7 +260,9 @@ fn stage_vst3_macos(root: &Path, p: &PluginDef, config: &Config, bundle: &Path) 
     );
     fs::write(bundle.join("Contents/Info.plist"), &plist)?;
     // Before signing: the seal covers Contents/Resources.
-    if let Some(json) = crate::vst3_moduleinfo::generate(&macos_dir.join(&exec_name), &exec_name, true) {
+    if let Some(json) =
+        crate::vst3_moduleinfo::generate(&macos_dir.join(&exec_name), &exec_name, true)
+    {
         crate::vst3_moduleinfo::write(bundle, &json)?;
     }
     codesign_bundle(

@@ -19,11 +19,11 @@ use moose_params::{ParamFlags, ParamInfo, Params};
 use crate::buffer::AudioBuffer;
 use crate::bus_routing::BusRouting;
 use crate::config::ProcessMode;
-use crate::info::Automation;
 use crate::events::{
     Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventCursor, LosslessEventRef,
     TransportInfo,
 };
+use crate::info::Automation;
 use crate::plugin::PluginRuntime;
 use crate::process::{ProcessContext, ProcessStatus};
 use crate::sample::Sample;

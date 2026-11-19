@@ -166,7 +166,18 @@ fn per_sample_delivers_points_and_ramps_without_splitting() {
     process_chunked(&mut plugin, &params as &dyn Params, &mut buffer, args);
 
     assert_eq!(plugin.seen, vec![(0, 512)], "one call, no split");
-    assert_eq!(scratch.len(), 3, "the plugin saw the point, ramp and transport");
-    assert_eq!(params.get_plain(0), Some(0.75), "store holds the ramp's end");
-    assert_eq!(transport.position_samples, 9_999, "the cached transport moved on");
+    assert_eq!(
+        scratch.len(),
+        3,
+        "the plugin saw the point, ramp and transport"
+    );
+    assert_eq!(
+        params.get_plain(0),
+        Some(0.75),
+        "store holds the ramp's end"
+    );
+    assert_eq!(
+        transport.position_samples, 9_999,
+        "the cached transport moved on"
+    );
 }

@@ -1,7 +1,10 @@
 //! Regression test: `ParamChange` events carry PLAIN values.
 //! `StaticShell` must use `set_plain()`, not `set_normalized()`.
 //! Bug: double-denormalization caused gain to slam to extremes in VST3.
-#![expect(deprecated, reason = "covers the deprecated `PluginLogic` path, still supported until it is removed")]
+#![expect(
+    deprecated,
+    reason = "covers the deprecated `PluginLogic` path, still supported until it is removed"
+)]
 
 use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;

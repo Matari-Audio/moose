@@ -34,8 +34,8 @@ use moose_core::events::{
 use moose_core::export::PluginExport;
 use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
 use moose_core::main_thread::{
-    HostColor, HostNotice, HostNotifier, LearnSource, MainThreadHooks, Midi2Controller, Midi2ControllerKind,
-    TrackInfo,
+    HostColor, HostNotice, HostNotifier, LearnSource, MainThreadHooks, Midi2Controller,
+    Midi2ControllerKind, TrackInfo,
 };
 use moose_core::meters::MeterStore;
 use moose_core::midi::{
@@ -728,7 +728,11 @@ unsafe fn host_notice_woke<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     let Some(instance) = (unsafe { ctx.cast::<Vst3Instance<P>>().as_ref() }) else {
         return;
     };
-    if instance.host_notifier.take().contains(HostNotice::AUDIO_PORTS) {
+    if instance
+        .host_notifier
+        .take()
+        .contains(HostNotice::AUDIO_PORTS)
+    {
         ffi::moose_vst3_mark_restart(ctx, K_IO_CHANGED);
     }
 }
@@ -1364,7 +1368,13 @@ fn push_vst3_param_change<P: PluginExport>(
             body: midi_event_from_map(&inst.midi_maps[idx].1, value),
         });
     }
-    list.push(param_point_event(inst.automation, id, sample_offset, value, ramp_from));
+    list.push(param_point_event(
+        inst.automation,
+        id,
+        sample_offset,
+        value,
+        ramp_from,
+    ));
     true
 }
 
@@ -5352,7 +5362,10 @@ mod param_point_tests {
     #[test]
     fn per_sample_gets_the_segment_as_a_linear_ramp() {
         let event = param_point_event(Automation::PerSample, 7, 300, 0.75, Some((100, 0.25)));
-        assert_eq!(event.sample_offset, 100, "the ramp starts at the previous point");
+        assert_eq!(
+            event.sample_offset, 100,
+            "the ramp starts at the previous point"
+        );
         assert_eq!(
             event.body,
             EventBody::ParamRamp {

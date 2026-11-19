@@ -4,7 +4,10 @@
 //! (and state loads), and it is the SHELL's job - user `reset` bodies
 //! carry no params plumbing (`SmootherPlugin` below has no `reset` at
 //! all; it relies on the trait's default no-op).
-#![expect(deprecated, reason = "tests the deprecated shared-atomic smoothing path until it is removed")]
+#![expect(
+    deprecated,
+    reason = "tests the deprecated shared-atomic smoothing path until it is removed"
+)]
 
 use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;

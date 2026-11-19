@@ -21,7 +21,6 @@
 //! ~30 seconds. CI runs it explicitly via
 //! `cargo test --release -p moose-simd --test gain_perf_regression -- --ignored --nocapture`.
 #![expect(deprecated, reason = "pins the cost of the shared-atomic reads")]
-
 #![allow(clippy::cast_precision_loss)]
 
 use std::hint::black_box;

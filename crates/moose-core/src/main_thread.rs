@@ -327,7 +327,10 @@ mod tests {
         clone.notify(HostNotice::VOICE_INFO);
         clone.notify(HostNotice::NOTE_NAMES);
         assert_eq!(wakes.load(Ordering::Relaxed), 3);
-        assert_eq!(notifier.take(), HostNotice::NOTE_NAMES | HostNotice::VOICE_INFO);
+        assert_eq!(
+            notifier.take(),
+            HostNotice::NOTE_NAMES | HostNotice::VOICE_INFO
+        );
         assert_eq!(notifier.take(), HostNotice::empty());
 
         notifier.close();

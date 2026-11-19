@@ -1028,8 +1028,9 @@ impl Host {
                 }
                 last = Some(plain);
                 if pushed_all
-                    && unsafe { (cb.push_param_change)(self.ctx, id, offset, plain, from.0, from.1) }
-                        == 0
+                    && unsafe {
+                        (cb.push_param_change)(self.ctx, id, offset, plain, from.0, from.1)
+                    } == 0
                 {
                     pushed_all = false;
                     dropped = true;

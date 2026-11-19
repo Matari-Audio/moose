@@ -151,9 +151,11 @@ impl<S: Sample> LogicSymbols<S> {
             ),
             drop_state: sym!(b"moose_drop_state", fn(*mut ())),
             reset: sym!(b"moose_reset", fn(*mut (), *const (), &AudioConfig)),
-            prepare: unsafe { lib.get::<fn(*mut (), *const (), &AudioConfig) -> bool>(b"moose_prepare_v1") }
-                .ok()
-                .map(|s| *s),
+            prepare: unsafe {
+                lib.get::<fn(*mut (), *const (), &AudioConfig) -> bool>(b"moose_prepare_v1")
+            }
+            .ok()
+            .map(|s| *s),
             process: sym!(b"moose_process", ProcessFn<S>),
             latency: sym!(b"moose_latency", fn(*const ()) -> u32),
             tail: sym!(b"moose_tail", fn(*const ()) -> u32),
@@ -610,7 +612,10 @@ impl<S: Sample> NativeLoader<S> {
     #[must_use]
     pub fn prepare(&self, state: *mut (), config: &AudioConfig) -> bool {
         match self.symbols.as_ref() {
-            Some(LogicSymbols { prepare: Some(prepare), .. }) => prepare(state, self.params_ptr, config),
+            Some(LogicSymbols {
+                prepare: Some(prepare),
+                ..
+            }) => prepare(state, self.params_ptr, config),
             Some(s) => {
                 (s.reset)(state, self.params_ptr, config);
                 true

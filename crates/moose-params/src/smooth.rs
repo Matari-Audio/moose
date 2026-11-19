@@ -885,7 +885,10 @@ mod tests {
                 }
                 let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                 assert_eq!(bits(&a), bits(&b), "{style:?} block {k}");
-                assert_eq!(shared.current_f64().to_bits(), owned.current_f64().to_bits());
+                assert_eq!(
+                    shared.current_f64().to_bits(),
+                    owned.current_f64().to_bits()
+                );
             }
         }
     }

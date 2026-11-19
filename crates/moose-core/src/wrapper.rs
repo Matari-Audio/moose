@@ -232,10 +232,10 @@ pub fn custom_state_view(
 /// owners; when one does, `enter` parks until the other releases rather
 /// than dropping the call (audit finding 8).
 mod plugin_cell {
+    use crate::sync::{AtomicBool, AtomicU64, Ordering};
     use std::cell::UnsafeCell;
     use std::marker::PhantomData;
     use std::ops::{Deref, DerefMut};
-    use crate::sync::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::thread::{self, Thread};
 
@@ -570,7 +570,8 @@ impl PanicLatch {
                 slot.push_str(&part[..end]);
             }
         }
-        self.failed.store(true, std::sync::atomic::Ordering::Release);
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Host thread: print a recorded message, once.
@@ -589,7 +590,8 @@ impl PanicLatch {
     /// pending message and let `process` call the plugin again.
     pub fn clear(&self) {
         self.report();
-        self.failed.store(false, std::sync::atomic::Ordering::Release);
+        self.failed
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -839,7 +841,11 @@ mod plugin_cell_tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         *held = 41;
         drop(held);
-        assert_eq!(waiter.join().expect("waiter finished"), 42, "saw the owner's write");
+        assert_eq!(
+            waiter.join().expect("waiter finished"),
+            42,
+            "saw the owner's write"
+        );
     }
 
     #[test]
@@ -984,7 +990,10 @@ mod panic_latch_tests {
             let slot = latch.message.lock().unwrap();
             assert!(slot.len() <= PANIC_MESSAGE_CAP && slot.starts_with("[moose TEST]"));
             // The quiet hook kept the panic off stderr and handed its location to the latch.
-            assert!(slot.contains(" at ") && slot.contains("wrapper.rs:"), "{slot}");
+            assert!(
+                slot.contains(" at ") && slot.contains("wrapper.rs:"),
+                "{slot}"
+            );
             assert_eq!(slot.capacity(), PANIC_MESSAGE_CAP, "the slot never grows");
         }
         latch.clear();
