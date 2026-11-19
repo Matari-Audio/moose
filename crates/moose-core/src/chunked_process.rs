@@ -20,7 +20,8 @@ use crate::buffer::AudioBuffer;
 use crate::bus_routing::BusRouting;
 use crate::config::ProcessMode;
 use crate::events::{
-    Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventRef, TransportInfo,
+    Event, EventBody, EventList, ExactEvent, ExactEventBody, LosslessEventCursor, LosslessEventRef,
+    TransportInfo,
 };
 use crate::plugin::PluginRuntime;
 use crate::process::{ProcessContext, ProcessStatus};
@@ -179,6 +180,9 @@ where
     let total = buffer.num_samples();
     let mut block_start = 0usize;
     let mut event_idx = 0usize;
+    // Where the previous sub-block's rebase stopped, so each event is
+    // visited once per host block rather than once per sub-block.
+    let mut lossless_cursor = LosslessEventCursor::default();
     let mut last_status = ProcessStatus::Normal;
     // Sample offset the current `transport` snapshot's position is anchored
     // to. Starts at the block top; a `Transport` event re-anchors it to
@@ -227,7 +231,13 @@ where
         // ParamMod, plugins logging) see them at the right time
         // even though the wrapper has already applied them. Note
         // events / SysEx get included with rebased offsets.
-        rebase_events_into(events, sub_event_scratch, block_start, block_end);
+        rebase_events_into(
+            events,
+            &mut lossless_cursor,
+            sub_event_scratch,
+            block_start,
+            block_end,
+        );
 
         let mut sub_buffer = buffer.slice(block_start, block_end - block_start);
         let sub_output_start = output_events.len();
@@ -289,7 +299,7 @@ fn find_next_split(
     from: usize,
     min_offset: usize,
 ) -> Option<(usize, usize)> {
-    for (i, ev) in events_from(events, from) {
+    for (i, ev) in (from..).zip(events.iter_from(from)) {
         let offset = ev.sample_offset as usize;
         if offset < min_offset {
             continue;
@@ -299,14 +309,6 @@ fn find_next_split(
         }
     }
     None
-}
-
-/// Events from position `from` on, with their positions. Indexed through
-/// `EventList::get` (O(1)), so resuming mid-list costs nothing;
-/// `iter().skip(from)` walks the whole `FilterMap` prefix each time and
-/// made the chunker O(n²) in events per block (audit finding 10).
-fn events_from(events: &EventList, from: usize) -> impl Iterator<Item = (usize, &Event)> {
-    (from..events.len()).filter_map(move |i| Some((i, events.get(i)?)))
 }
 
 fn is_split_event(body: &EventBody, chunked: &impl Fn(u32) -> bool) -> bool {
@@ -378,7 +380,7 @@ fn apply_pending_events(
 ) -> bool {
     let mut i = *event_idx;
     let mut transport_applied = false;
-    for (_, ev) in events_from(events, i) {
+    for ev in events.iter_from(i) {
         if (ev.sample_offset as usize) >= block_end {
             break;
         }
@@ -418,6 +420,7 @@ fn apply_pending_events(
 /// `EventList::with_capacity`), so the copy stays allocation-free.
 fn rebase_events_into(
     events: &EventList,
+    cursor: &mut LosslessEventCursor,
     scratch: &mut EventList,
     block_start: usize,
     block_end: usize,
@@ -426,16 +429,22 @@ fn rebase_events_into(
     if let Some(error) = events.overflow() {
         scratch.record_overflow(error);
     }
-    for event in events.lossless_iter() {
+    loop {
+        // Probe a copy so the event that ends this window stays unread.
+        let mut probe = *cursor;
+        let Some(event) = events.lossless_next(&mut probe) else {
+            break;
+        };
         let off = match event {
             LosslessEventRef::Typed(event) => event.sample_offset,
             LosslessEventRef::Exact(event) => event.sample_offset(),
         } as usize;
-        if off < block_start {
-            continue;
-        }
         if off >= block_end {
             break;
+        }
+        *cursor = probe;
+        if off < block_start {
+            continue;
         }
         // Rebase the sample offset. The cast is bounded: `off -
         // block_start < block_end - block_start <= u32::MAX in
@@ -640,10 +649,39 @@ mod tests {
         events.push(Event::new(50, EventBody::ParamChange { id: 0, value: 0.2 }));
         events.push(Event::new(90, EventBody::ParamChange { id: 0, value: 0.3 }));
         let mut scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
-        rebase_events_into(&events, &mut scratch, 40, 80);
+        rebase_events_into(
+            &events,
+            &mut LosslessEventCursor::default(),
+            &mut scratch,
+            40,
+            80,
+        );
         let collected: Vec<u32> = scratch.iter().map(|e| e.sample_offset).collect();
         // Only the offset-50 event is in [40, 80); rebased to 10.
         assert_eq!(collected, vec![10]);
+    }
+
+    #[test]
+    fn rebase_cursor_resumes_across_sub_blocks() {
+        let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
+        for offset in [0, 10, 50, 79, 80, 90] {
+            events.push(Event::new(
+                offset,
+                EventBody::ParamChange { id: 0, value: 0.0 },
+            ));
+        }
+        let mut scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
+        let mut cursor = LosslessEventCursor::default();
+        let mut seen = Vec::new();
+        for (start, end) in [(0, 40), (40, 80), (80, 128)] {
+            rebase_events_into(&events, &mut cursor, &mut scratch, start, end);
+            seen.extend(scratch.iter().map(|e| (start, e.sample_offset)));
+        }
+        // Every event lands in exactly one window, rebased to its start.
+        assert_eq!(
+            seen,
+            vec![(0, 0), (0, 10), (40, 10), (40, 39), (80, 0), (80, 10)]
+        );
     }
 
     #[test]
@@ -662,7 +700,13 @@ mod tests {
             },
         ));
         let mut scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
-        rebase_events_into(&events, &mut scratch, 0, 64);
+        rebase_events_into(
+            &events,
+            &mut LosslessEventCursor::default(),
+            &mut scratch,
+            0,
+            64,
+        );
         assert_eq!(scratch.iter().map(|e| e.port).collect::<Vec<_>>(), vec![3]);
     }
 
@@ -757,7 +801,13 @@ mod tests {
         let mut events = EventList::with_capacity(EVENT_LIST_PREALLOC);
         events.push_sysex(50, &[0x11, 0x22, 0x33, 0x44]).unwrap();
         let mut scratch = EventList::with_capacity(EVENT_LIST_PREALLOC);
-        rebase_events_into(&events, &mut scratch, 40, 80);
+        rebase_events_into(
+            &events,
+            &mut LosslessEventCursor::default(),
+            &mut scratch,
+            40,
+            80,
+        );
 
         let ev = scratch.iter().next().expect("sysex rebased into scratch");
         assert_eq!(ev.sample_offset, 10); // 50 - 40
