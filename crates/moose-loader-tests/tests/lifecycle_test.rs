@@ -14,6 +14,7 @@ use moose_core::main_thread::{MainThreadHooks, TrackInfo};
 use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::state::StateLoadError;
+use moose_core::tasks::InitContext;
 use moose_core::thread::MainThread;
 use moose_derive::Params;
 use moose_gui::PluginLogicCore;
@@ -37,6 +38,8 @@ struct Counter {
     blocks: u32,
     resets: u32,
     value: u32,
+    /// `state_changed` calls.
+    changed: u32,
 }
 
 struct Hooks(Arc<LcParams>);
@@ -59,7 +62,13 @@ impl Plugin for Lc {
         Hooks(Arc::clone(shared))
     }
 
-    fn activate(shared: &LcParams, _config: &AudioConfig) -> Result<Counter, PreparationError> {
+    const SNAPSHOTS: bool = true;
+
+    fn activate(
+        shared: &LcParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Counter, PreparationError> {
         if shared.refuse.load(Ordering::Relaxed) {
             return Err(PreparationError::ResourceBudget);
         }
@@ -68,6 +77,7 @@ impl Plugin for Lc {
             blocks: 0,
             resets: 0,
             value: 0,
+            changed: 0,
         })
     }
 
@@ -97,6 +107,14 @@ impl Plugin for Lc {
         let bytes: [u8; 4] = data.try_into().expect("validated length");
         processor.value = u32::from_le_bytes(bytes);
         Ok(())
+    }
+
+    fn state_changed(processor: &mut Counter, _shared: &LcParams) {
+        processor.changed += 1;
+    }
+
+    fn snapshot_version(processor: &Counter) -> Option<u64> {
+        Some(u64::from(processor.value))
     }
 
     fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
@@ -210,6 +228,11 @@ fn state_loaded_before_activate_reaches_the_processor() {
     );
     plugin.prepare(&config()).expect("activates");
     assert_eq!(plugin.state_ref().processor().map(|p| p.value), Some(7));
+    assert_eq!(
+        plugin.state_ref().processor().map(|p| p.changed),
+        Some(1),
+        "state_changed follows the deferred load"
+    );
 
     // Re-activation (new sample rate) carries the state to the new processor.
     let before = ACTIVATIONS.load(Ordering::Relaxed);
@@ -227,4 +250,42 @@ fn main_thread_hooks_object_is_returned() {
     let cx = unsafe { MainThread::assume() };
     hooks.track_info_changed(&cx, &TrackInfo::new());
     assert!(params.track_seen.load(Ordering::Relaxed));
+}
+
+#[test]
+fn state_changed_follows_a_live_load() {
+    let (mut plugin, _params) = shell();
+    plugin.prepare(&config()).expect("activates");
+    plugin.load_state(&9u32.to_le_bytes()).expect("loads");
+    let processor = plugin.state_ref().processor().expect("active");
+    assert_eq!((processor.value, processor.changed), (9, 1));
+}
+
+#[test]
+fn snapshot_capability_is_static_and_tracks_the_processor() {
+    type Logic = Lifecycle<Lc>;
+    let (mut plugin, _params) = shell();
+    let mut buf = Vec::new();
+    // Probed before any processor exists: still a publisher.
+    assert!(<Logic as PluginLogicCore<f32>>::snapshot_into(
+        plugin.state_ref(),
+        &mut buf
+    ));
+    assert!(buf.is_empty(), "no state yet");
+    assert_eq!(
+        <Logic as PluginLogicCore<f32>>::snapshot_version(plugin.state_ref()),
+        None
+    );
+
+    plugin.prepare(&config()).expect("activates");
+    plugin.load_state(&3u32.to_le_bytes()).expect("loads");
+    assert!(<Logic as PluginLogicCore<f32>>::snapshot_into(
+        plugin.state_ref(),
+        &mut buf
+    ));
+    assert_eq!(buf, 3u32.to_le_bytes());
+    assert_eq!(
+        <Logic as PluginLogicCore<f32>>::snapshot_version(plugin.state_ref()),
+        Some(3)
+    );
 }

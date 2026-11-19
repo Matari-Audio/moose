@@ -4,6 +4,16 @@ Notable changes per release.
 
 ## Unreleased
 
+- **`Plugin` trait gaps closed; `plugin:` key.** `moose::plugin! { plugin:
+  MyPlugin, params: MyParams }` exports an `impl moose::Plugin` and names the
+  wrapper `PluginShell` only, so the prelude's `Plugin` trait is usable in
+  that module (`logic:` exports keep the old `Plugin` alias as well).
+  `activate` now takes `cx: &InitContext` (background-task spawners, the
+  off-thread snapshot publisher); the trait gains `const SNAPSHOTS`,
+  `snapshot_into` / `snapshot_version` / `snapshot_prealloc_hint`,
+  `state_changed` (also after a load held from before activation),
+  `supports_in_place`, `clap_extension` and `max_host_state_bytes`.
+  `InitContext` is `Clone + Default`.
 - **`Plugin` trait (lifecycle split).** `moose::Plugin<S = f32>` has three
   parts: `type Shared: Params` (any thread), `type MainThread:
   MainThreadHooks` and `type Processor`. `activate(&Shared, &AudioConfig)

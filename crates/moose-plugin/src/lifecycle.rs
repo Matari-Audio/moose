@@ -7,6 +7,11 @@
 //! - [`Plugin::Processor`] - the DSP state. It exists only after a successful
 //!   [`Plugin::activate`] and only the audio side holds it.
 //!
+//! Background tasks declared with `tasks: [..]` on `moose::plugin!` are
+//! reached through the [`InitContext`] handed to [`Plugin::activate`] (stash
+//! a spawner or the snapshot publisher in the processor) and through
+//! `ProcessContext::tasks` in [`Plugin::process`].
+//!
 //! [`Lifecycle`] adapts a [`Plugin`] to the existing leaf traits, so every
 //! wrapper runs it unchanged:
 //!
@@ -22,10 +27,12 @@ use moose_core::bus::BusLayout;
 use moose_core::config::AudioConfig;
 use moose_core::editor::Editor;
 use moose_core::events::EventList;
+use moose_core::export::CustomClapExtension;
 use moose_core::main_thread::MainThreadHooks;
 use moose_core::plugin::{PreparationConfig, PreparationError};
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::state::{ForeignState, MigratedState, StateLoadError};
+use moose_core::tasks::InitContext;
 use moose_params::Params;
 use moose_params::sample::Sample;
 
@@ -36,10 +43,6 @@ use crate::{PluginLogic, PluginLogic64};
 /// `S` is the audio precision of the processor: `impl Plugin for X` is `f32`,
 /// `impl Plugin<f64> for X` runs `f64` buffers (or `impl Plugin<Sample>` to
 /// follow the prelude). Export it with `moose::plugin!` through [`Lifecycle`].
-///
-/// Note that `moose::plugin!` declares a `Plugin` type alias in the module it
-/// is invoked in, which shadows this trait from the prelude there; write
-/// `impl moose::Plugin for X` in that module.
 pub trait Plugin<S: Sample = f32>: 'static {
     /// Params and atomics, shared lock-free with the host, editor and audio thread.
     type Shared: Params;
@@ -50,6 +53,35 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// [`Self::activate`]. Owned by the audio side between activate and
     /// deactivate.
     type Processor: Send + 'static;
+
+    /// Whether this plugin publishes a state snapshot after changed blocks,
+    /// through [`Self::snapshot_into`]. A static capability: the shell
+    /// probes it once, before any processor exists. Default `false`: a host
+    /// save asks [`Self::save_state`] on demand.
+    const SNAPSHOTS: bool = false;
+
+    /// Resolve a custom static CLAP extension table by id.
+    #[must_use]
+    fn clap_extension(id: &std::ffi::CStr) -> Option<CustomClapExtension> {
+        let _ = id;
+        None
+    }
+
+    /// Opt into zero-copy in-place I/O: the wrapper hands host-aliased
+    /// buffers through unchanged instead of copying them. Only return `true`
+    /// when [`Self::process`] reads each input sample before it writes the
+    /// matching output sample. Default `false`.
+    #[must_use]
+    fn supports_in_place() -> bool {
+        false
+    }
+
+    /// Maximum serialized host state in bytes; larger loads are refused
+    /// before they are admitted. Default 32 MiB.
+    #[must_use]
+    fn max_host_state_bytes() -> usize {
+        32 * 1024 * 1024
+    }
 
     /// Supported audio bus configurations. Default: stereo and mono effect.
     #[must_use]
@@ -66,6 +98,10 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// previous one (if any) is deactivated first and its custom state
     /// carried into the new one.
     ///
+    /// `cx` holds the instance's background-task spawners
+    /// ([`InitContext::tasks`]) and the off-thread snapshot publisher
+    /// ([`InitContext::snapshot_publisher`]); keep what the processor needs.
+    ///
     /// # Errors
     ///
     /// Return a [`PreparationError`] when the configuration can't be served;
@@ -74,6 +110,7 @@ pub trait Plugin<S: Sample = f32>: 'static {
     fn activate(
         shared: &Self::Shared,
         config: &AudioConfig,
+        cx: &InitContext,
     ) -> Result<Self::Processor, PreparationError>;
 
     /// Clear the processor back to silence. Runs on the audio thread (CLAP
@@ -117,6 +154,32 @@ pub trait Plugin<S: Sample = f32>: 'static {
         Vec::new()
     }
 
+    /// Fill `buf` (arriving cleared, capacity kept) with the bytes
+    /// [`Self::save_state`] would produce. Runs on the audio thread after
+    /// each block whose [`Self::snapshot_version`] changed, when
+    /// [`Self::SNAPSHOTS`] is `true`, under the same real-time rules as
+    /// `process`. The default copies [`Self::save_state`], which allocates:
+    /// override it for real-time-safe serialization.
+    fn snapshot_into(processor: &Self::Processor, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&Self::save_state(processor));
+    }
+
+    /// Generation token for [`Self::snapshot_into`]: bump it when custom
+    /// state changes so unchanged blocks skip serialization. Read on the
+    /// audio thread every block; keep it a field read. `None` (default)
+    /// re-serializes every block.
+    fn snapshot_version(processor: &Self::Processor) -> Option<u64> {
+        let _ = processor;
+        None
+    }
+
+    /// Bytes to pre-warm the inline snapshot buffer to, off the audio
+    /// thread. Default 256.
+    #[must_use]
+    fn snapshot_prealloc_hint() -> usize {
+        moose_core::snapshot::SNAPSHOT_PREALLOC
+    }
+
     /// Restore custom state. Same contract as [`PluginLogic::load_state`].
     /// A load before activation is kept and applied to the processor
     /// [`Self::activate`] returns.
@@ -127,6 +190,13 @@ pub trait Plugin<S: Sample = f32>: 'static {
     fn load_state(processor: &mut Self::Processor, data: &[u8]) -> Result<(), StateLoadError> {
         let _ = (processor, data);
         Ok(())
+    }
+
+    /// Called right after a successful [`Self::load_state`], on the same
+    /// thread (also when a load held from before activation is applied).
+    /// Recompute caches the next `process` reads. Default: no-op.
+    fn state_changed(processor: &mut Self::Processor, shared: &Self::Shared) {
+        let _ = (processor, shared);
     }
 
     /// Check custom state on the host thread. Same contract as
@@ -165,13 +235,27 @@ impl<P> std::fmt::Debug for Lifecycle<P> {
     }
 }
 
-/// The DSP state [`Lifecycle`] hands the shell: a processor once activated.
-#[derive(Debug)]
-pub struct ProcessorSlot<T>(Slot<T>);
+/// The DSP state [`Lifecycle`] hands the shell: a processor once
+/// activated, and the instance's [`InitContext`] for each activation.
+pub struct ProcessorSlot<T> {
+    slot: Slot<T>,
+    cx: InitContext,
+}
 
 impl<T> Default for ProcessorSlot<T> {
     fn default() -> Self {
-        Self(Slot::default())
+        Self {
+            slot: Slot::default(),
+            cx: InitContext::default(),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for ProcessorSlot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessorSlot")
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
     }
 }
 
@@ -196,7 +280,7 @@ impl<T> ProcessorSlot<T> {
     /// The processor, once [`Plugin::activate`] has succeeded.
     #[must_use]
     pub fn processor(&self) -> Option<&T> {
-        match &self.0 {
+        match &self.slot {
             Slot::Active(processor) => Some(processor),
             Slot::Inactive { .. } => None,
         }
@@ -204,7 +288,7 @@ impl<T> ProcessorSlot<T> {
 
     /// Mutable access to the processor, once activated.
     pub fn processor_mut(&mut self) -> Option<&mut T> {
-        match &mut self.0 {
+        match &mut self.slot {
             Slot::Active(processor) => Some(processor),
             Slot::Inactive { .. } => None,
         }
@@ -217,7 +301,7 @@ fn activate<S: Sample, P: Plugin<S>>(
     config: &PreparationConfig,
 ) -> Result<(), PreparationError> {
     config.validate()?;
-    let carried = match std::mem::take(&mut slot.0) {
+    let carried = match std::mem::take(&mut slot.slot) {
         Slot::Inactive { pending_state } => pending_state,
         Slot::Active(old) => {
             let bytes = P::save_state(&old);
@@ -225,19 +309,21 @@ fn activate<S: Sample, P: Plugin<S>>(
             (!bytes.is_empty()).then_some(bytes)
         }
     };
-    match P::activate(shared, &config.audio) {
+    match P::activate(shared, &config.audio, &slot.cx) {
         Ok(mut processor) => {
-            if let Some(bytes) = &carried {
-                // The bytes passed `validate_state` on load, or came from this
-                // plugin's own `save_state`; a failure here has no host to
-                // report to, and the fresh processor is still usable.
-                let _ = P::load_state(&mut processor, bytes);
+            // The bytes passed `validate_state` on load, or came from this
+            // plugin's own `save_state`; a failure here has no host to
+            // report to, and the fresh processor is still usable.
+            if let Some(bytes) = &carried
+                && P::load_state(&mut processor, bytes).is_ok()
+            {
+                P::state_changed(&mut processor, shared);
             }
-            slot.0 = Slot::Active(processor);
+            slot.slot = Slot::Active(processor);
             Ok(())
         }
         Err(error) => {
-            slot.0 = Slot::Inactive {
+            slot.slot = Slot::Inactive {
                 pending_state: carried,
             };
             Err(error)
@@ -249,7 +335,7 @@ fn load_state<S: Sample, P: Plugin<S>>(
     slot: &mut ProcessorSlot<P::Processor>,
     data: &[u8],
 ) -> Result<(), StateLoadError> {
-    match &mut slot.0 {
+    match &mut slot.slot {
         Slot::Active(processor) => P::load_state(processor, data),
         Slot::Inactive { pending_state } => {
             P::validate_state(data)?;
@@ -259,8 +345,27 @@ fn load_state<S: Sample, P: Plugin<S>>(
     }
 }
 
+fn snapshot_into<S: Sample, P: Plugin<S>>(
+    slot: &ProcessorSlot<P::Processor>,
+    buf: &mut Vec<u8>,
+) -> bool {
+    if !P::SNAPSHOTS {
+        return false;
+    }
+    match &slot.slot {
+        Slot::Active(processor) => P::snapshot_into(processor, buf),
+        Slot::Inactive {
+            pending_state: Some(bytes),
+        } => buf.extend_from_slice(bytes),
+        Slot::Inactive {
+            pending_state: None,
+        } => {}
+    }
+    true
+}
+
 fn save_state<S: Sample, P: Plugin<S>>(slot: &ProcessorSlot<P::Processor>) -> Vec<u8> {
-    match &slot.0 {
+    match &slot.slot {
         Slot::Active(processor) => P::save_state(processor),
         Slot::Inactive { pending_state } => pending_state.clone().unwrap_or_default(),
     }
@@ -273,7 +378,7 @@ fn process<S: Sample, P: Plugin<S>>(
     events: &EventList,
     context: &mut ProcessContext,
 ) -> ProcessStatus {
-    if let Slot::Active(processor) = &mut slot.0 {
+    if let Slot::Active(processor) = &mut slot.slot {
         return P::process(processor, shared, buffer, events, context);
     }
     for ch in 0..buffer.num_output_channels() {
@@ -289,8 +394,27 @@ macro_rules! lifecycle_leaf {
             type Params = P::Shared;
             type DspState = ProcessorSlot<P::Processor>;
 
+            fn clap_extension(id: &std::ffi::CStr) -> Option<CustomClapExtension> {
+                P::clap_extension(id)
+            }
+
+            fn supports_in_place() -> bool {
+                P::supports_in_place()
+            }
+
+            fn max_host_state_bytes() -> usize {
+                P::max_host_state_bytes()
+            }
+
             fn bus_layouts() -> Vec<BusLayout> {
                 P::bus_layouts()
+            }
+
+            fn init(_params: &P::Shared, cx: &InitContext) -> Self::DspState {
+                ProcessorSlot {
+                    slot: Slot::default(),
+                    cx: cx.clone(),
+                }
             }
 
             fn main_thread(params: &Arc<P::Shared>) -> Box<dyn MainThreadHooks> {
@@ -325,8 +449,26 @@ macro_rules! lifecycle_leaf {
                 save_state::<$sample, P>(state)
             }
 
+            fn snapshot_into(state: &Self::DspState, buf: &mut Vec<u8>) -> bool {
+                snapshot_into::<$sample, P>(state, buf)
+            }
+
+            fn snapshot_version(state: &Self::DspState) -> Option<u64> {
+                state.processor().and_then(P::snapshot_version)
+            }
+
+            fn snapshot_prealloc_hint() -> usize {
+                P::snapshot_prealloc_hint()
+            }
+
             fn load_state(state: &mut Self::DspState, data: &[u8]) -> Result<(), StateLoadError> {
                 load_state::<$sample, P>(state, data)
+            }
+
+            fn state_changed(state: &mut Self::DspState, params: &P::Shared) {
+                if let Some(processor) = state.processor_mut() {
+                    P::state_changed(processor, params);
+                }
             }
 
             fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {

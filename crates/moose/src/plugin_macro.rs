@@ -53,12 +53,51 @@
 /// ```
 ///
 /// Zero code changes. Same `moose::plugin!` macro.
-/// Both `logic:` and `params:` are required. For a derived store, `params:`
+///
+/// # `plugin:` or `logic:`
+///
+/// `plugin: X` exports an `impl moose::Plugin for X` (it is
+/// `logic: moose::Lifecycle<X>`) and names the exported wrapper
+/// `PluginShell` only, so the `Plugin` trait from the prelude stays usable
+/// in the invoking module. `logic: X` exports a `PluginLogic` impl and also
+/// keeps the older `Plugin` alias for the wrapper.
+///
+/// ```ignore
+/// moose::plugin! {
+///     plugin: Gain,
+///     params: GainParams,
+/// }
+/// // tests: moose_test::assert_valid_info::<PluginShell>();
+/// ```
+///
+/// Both `logic:` (or `plugin:`) and `params:` are required. For a derived store, `params:`
 /// also identifies its compile-time parameter index. A manual `Params`
 /// adapter can supply `param_index: DerivedStore` when it shares that
 /// derived store's parameter IDs and field names.
 #[macro_export]
 macro_rules! plugin {
+    (
+        plugin: $plugin:ty,
+        params: $params:ty $(,)?
+    ) => {
+        $crate::__plugin_impl!(@shell $crate::Lifecycle<$plugin>, $params, $params,);
+    };
+    (
+        plugin: $plugin:ty,
+        params: $params:ty,
+        tasks: [$($task:ty),+ $(,)?] $(,)?
+    ) => {
+        $crate::__plugin_impl!(
+            @shell $crate::Lifecycle<$plugin>, $params, $params, tasks: [$($task),+],
+        );
+    };
+    (
+        plugin: $plugin:ty,
+        params: $params:ty,
+        param_index: $index:ty $(,)?
+    ) => {
+        $crate::__plugin_impl!(@shell $crate::Lifecycle<$plugin>, $params, $index,);
+    };
     (
         logic: $logic:ty,
         params: $params:ty $(,)?
@@ -89,7 +128,14 @@ macro_rules! plugin {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __plugin_impl {
+    // `logic:` form: also keep the `Plugin` alias for the wrapper.
     ($logic:ty, $params:ty, $index:ty, $(tasks: [$($task:ty),+],)?) => {
+        $crate::__plugin_impl!(@shell $logic, $params, $index, $(tasks: [$($task),+],)?);
+
+        /// Older name of [`PluginShell`], kept for `logic:` exports.
+        pub type Plugin = __HotShellWrapper;
+    };
+    (@shell $logic:ty, $params:ty, $index:ty, $(tasks: [$($task:ty),+],)?) => {
         // Compile-time param index: walks the params type's sidecar
         // tree (written by `derive(Params)`) under `target/param-index/`
         // and writes the `param_index.toml` cargo-moose's preset
@@ -156,14 +202,15 @@ macro_rules! __plugin_impl {
             );
         }
 
-        // Re-export the wrapper so `pub type Plugin`, the screenshot
+        // Re-export the wrapper so `pub type PluginShell`, the screenshot
         // FFI shim, and the per-format `export_*!` macros below all
         // resolve `__HotShellWrapper` at the macro invocation scope.
         #[doc(hidden)]
         pub use __moose_runtime::__HotShellWrapper;
 
-        /// Type alias for use in tests and external references.
-        pub type Plugin = __HotShellWrapper;
+        /// The exported wrapper, for tests, standalone runners and other
+        /// external references.
+        pub type PluginShell = __HotShellWrapper;
 
         // `__moose_screenshot` is dev-only too: see `__moose_dev_exports`.
         #[allow(unexpected_cfgs, unused_imports)]
@@ -239,13 +286,13 @@ macro_rules! __plugin_impl {
                 // boundary the `cargo moose screenshot` process dlopens and
                 // calls, so a bare panic would abort (SIGABRT) it instead of
                 // the documented non-zero return. Catch it and report `2`.
-                $crate::core::wrapper::run_extern_callback_with::<Plugin, u32>(
+                $crate::core::wrapper::run_extern_callback_with::<PluginShell, u32>(
                     "screenshot",
                     "render",
                     2,
                     || {
                         let (pixels, w, h) =
-                            $crate::core::screenshot::render_with_state_at_scale::<Plugin>(
+                            $crate::core::screenshot::render_with_state_at_scale::<PluginShell>(
                                 state,
                                 resolved_scale,
                             );

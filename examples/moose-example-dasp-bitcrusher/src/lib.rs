@@ -52,9 +52,7 @@ fn quantize(s: f32, bits: u8) -> f32 {
     }
 }
 
-// `moose::plugin!` declares a `Plugin` alias in this module, so the trait
-// is named by path.
-impl moose::Plugin for Bitcrusher {
+impl Plugin for Bitcrusher {
     type Shared = BitcrusherParams;
     type MainThread = ();
     type Processor = BitcrusherProcessor;
@@ -64,6 +62,7 @@ impl moose::Plugin for Bitcrusher {
     fn activate(
         _shared: &BitcrusherParams,
         _config: &AudioConfig,
+        _cx: &InitContext,
     ) -> Result<BitcrusherProcessor, PreparationError> {
         Ok(BitcrusherProcessor {
             held: [0.0; 2],
@@ -119,7 +118,7 @@ impl moose::Plugin for Bitcrusher {
 }
 
 moose::plugin! {
-    logic: moose::Lifecycle<Bitcrusher>,
+    plugin: Bitcrusher,
     params: BitcrusherParams,
 }
 
@@ -134,7 +133,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -149,22 +148,22 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
@@ -173,7 +172,7 @@ mod tests {
         // through i16 is below the noise floor at the default constant).
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(20))
             .input(InputSource::Constant(0.5))
             .run();
@@ -184,13 +183,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/dasp_bitcrusher_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/dasp_bitcrusher_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/dasp_bitcrusher_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/dasp_bitcrusher_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -198,8 +197,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/dasp_bitcrusher_default_windows.png")
-            .pixel_threshold(2)
-            .run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/dasp_bitcrusher_default_windows.png"
+        )
+        .pixel_threshold(2)
+        .run();
     }
 }

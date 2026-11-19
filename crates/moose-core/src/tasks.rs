@@ -1304,7 +1304,8 @@ impl TaskSpawnerBundle {
 /// work before the first block. Concrete (not generic over the task
 /// type) because `init`'s signature lives on the leaf trait; recover the
 /// typed spawner with [`Self::tasks`]. Params arrive as the separate
-/// `init` argument.
+/// `init` argument. Cheap to clone (two `Arc`s).
+#[derive(Clone, Default)]
 pub struct InitContext {
     tasks: Option<AnyTaskSpawner>,
     /// Handle for the off-thread snapshot lane (large state save), when
