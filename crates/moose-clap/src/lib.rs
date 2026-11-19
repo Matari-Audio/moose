@@ -233,6 +233,85 @@ mod host_value_tests {
         }
     }
 
+    #[test]
+    #[allow(clippy::float_cmp, reason = "exact test values")]
+    fn flush_cancels_global_modulation_and_rejects_scoped_changes() {
+        use clap_sys::events::{CLAP_EVENT_PARAM_MOD, clap_event_param_mod};
+        unsafe extern "C" fn count(_: *const clap_input_events) -> u32 {
+            1
+        }
+        unsafe extern "C" fn event(
+            events: *const clap_input_events,
+            _: u32,
+        ) -> *const clap_event_header {
+            // SAFETY: the test retains the event for the full callback.
+            unsafe { (*events).ctx.cast() }
+        }
+        // SAFETY: all ABI buffers and the host outlive the owned plugin.
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = CLAP_VERSION;
+            host.get_extension = Some(extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let params = data_from_plugin::<TestPlugin>(plugin).params_arc.clone();
+            params.set_plain(0, -10.);
+            params.set_modulation(0, 2.5);
+            assert_eq!(params.gain_modulated_value(), -7.5);
+            let mut value: clap_event_param_mod = std::mem::zeroed();
+            value.header.size = size_of_u32::<clap_event_param_mod>();
+            value.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            value.header.type_ = CLAP_EVENT_PARAM_MOD;
+            value.param_id = 0;
+            value.note_id = -1;
+            value.port_index = -1;
+            value.channel = -1;
+            value.key = -1;
+            let input = clap_input_events {
+                ctx: (&raw mut value).cast(),
+                size: Some(count),
+                get: Some(event),
+            };
+            params_flush::<TestPlugin>(plugin, &raw const input, ptr::null());
+            assert_eq!(params.gain_modulated_value(), -10.);
+            assert_eq!(params.get_plain(0), Some(-10.));
+            // Conversion of the next block clears scratch, not the offset.
+            convert_input_events::<TestPlugin>(
+                &mut data_from_plugin::<TestPlugin>(plugin).audio.enter(),
+                &TestPlugin::info(),
+                ptr::null(),
+                false,
+                false,
+                Some(64),
+            );
+            assert_eq!(params.gain_modulated_value(), -10.);
+            for (port, channel, key, note_id) in [
+                (0, -1, -1, -1),
+                (-1, 2, -1, -1),
+                (-1, -1, 60, -1),
+                (-1, -1, -1, 7),
+            ] {
+                value.port_index = port;
+                value.channel = channel;
+                value.key = key;
+                value.note_id = note_id;
+                value.amount = 3.;
+                let input = clap_input_events {
+                    ctx: (&raw mut value).cast(),
+                    size: Some(count),
+                    get: Some(event),
+                };
+                params_flush::<TestPlugin>(plugin, &raw const input, ptr::null());
+                assert_eq!(params.gain_modulated_value(), -10.);
+            }
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+
     static PUSHED: AtomicU32 = AtomicU32::new(0);
     unsafe extern "C" fn accept(_: *const clap_output_events, _: *const clap_event_header) -> bool {
         PUSHED.fetch_add(1, Ordering::Relaxed);

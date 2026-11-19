@@ -51,9 +51,18 @@ pub enum ForeignState<'a> {
     /// whether to accept them. Forward `persist` into the returned
     /// [`MigratedState`] to keep GUI layout / file paths / instance
     /// names across the rename.
+    ///
+    /// An OAST v2 envelope carries its entries in `named_params` (stable
+    /// string ID plus numeric fallback) and its plugin schema in
+    /// `schema_version`; `params` holds only unnamed numeric entries (all
+    /// of a v1 envelope's). Forward both into the [`MigratedState`] so the
+    /// entries resolve by string ID and the schema migration chain starts
+    /// from the saved schema, not from 0.
     MismatchedEnvelope {
         plugin_id_hash: u64,
         params: &'a [(u32, f64)],
+        named_params: &'a [NamedParam],
+        schema_version: u32,
         extra: Option<&'a [u8]>,
         persist: &'a [u8],
     },
@@ -73,14 +82,26 @@ pub struct MigratedState {
     /// forward [`ForeignState::MismatchedEnvelope::persist`] to carry
     /// a renamed plugin's persisted fields across the migration.
     pub persist: Vec<u8>,
+    /// String-keyed entries, resolved against the parameter catalog by
+    /// stable string ID (numeric fallback when the key no longer exists)
+    /// like a native v2 load. Forward
+    /// [`ForeignState::MismatchedEnvelope::named_params`] here, or build
+    /// entries with [`NamedParam::new`]. Default: empty.
+    pub named_params: Vec<NamedParam>,
+    /// Plugin state schema of the returned entries; the plugin's
+    /// [`StateMigrationChain`] upgrades from here. `0` (the default) is
+    /// the pre-schema baseline - right for a foreign framework's blob.
+    /// Forward [`ForeignState::MismatchedEnvelope::schema_version`] for a
+    /// renamed plugin.
+    pub schema_version: u32,
 }
 
 impl From<MigratedState> for DeserializedState {
     fn from(migrated: MigratedState) -> Self {
         Self {
             params: migrated.params,
-            named_params: Vec::new(),
-            schema_version: 0,
+            named_params: migrated.named_params,
+            schema_version: migrated.schema_version,
             extra: migrated.extra,
             persist: migrated.persist,
         }
@@ -366,23 +387,40 @@ fn finish_parse_or_migrate<P: PluginExport>(
     format: PluginFormat,
     source_key: Option<&str>,
 ) -> Option<DeserializedState> {
-    let mut state = match parsed {
+    let mut state = route_parsed_state(parsed, data, format, source_key, P::migrate_state)?;
+    if let Err(err) = migrate_to_current::<P>(&mut state) {
+        eprintln!("moose: {err} - load failed");
+        return None;
+    }
+    Some(state)
+}
+
+/// Turn a parse outcome into state to restore, offering foreign bytes and
+/// renamed-plugin envelopes to `migrate` (the plugin's `migrate_state`).
+fn route_parsed_state(
+    parsed: StateParse,
+    data: &[u8],
+    format: PluginFormat,
+    source_key: Option<&str>,
+    migrate: impl FnOnce(&ForeignState<'_>) -> Option<MigratedState>,
+) -> Option<DeserializedState> {
+    match parsed {
         StateParse::Ok(state) => Some(state),
-        StateParse::NotAnEnvelope => P::migrate_state(&ForeignState::Raw {
+        StateParse::NotAnEnvelope => migrate(&ForeignState::Raw {
             format,
             source_key,
             bytes: data,
         })
         .map(Into::into),
-        StateParse::WrongPlugin { found, state } => {
-            P::migrate_state(&ForeignState::MismatchedEnvelope {
-                plugin_id_hash: found,
-                params: &state.params,
-                extra: state.extra.as_deref(),
-                persist: &state.persist,
-            })
-            .map(Into::into)
-        }
+        StateParse::WrongPlugin { found, state } => migrate(&ForeignState::MismatchedEnvelope {
+            plugin_id_hash: found,
+            params: &state.params,
+            named_params: &state.named_params,
+            schema_version: state.schema_version,
+            extra: state.extra.as_deref(),
+            persist: &state.persist,
+        })
+        .map(Into::into),
         StateParse::UnknownVersion(version) => {
             // Same logging rationale as `apply_state`: one-shot event,
             // no `log` dep in the audio-runtime crate.
@@ -396,12 +434,7 @@ fn finish_parse_or_migrate<P: PluginExport>(
             eprintln!("moose: state blob is a corrupt moose envelope - load failed");
             None
         }
-    }?;
-    if let Err(err) = migrate_to_current::<P>(&mut state) {
-        eprintln!("moose: {err} - load failed");
-        return None;
     }
-    Some(state)
 }
 
 /// Bring a decoded envelope up to this plugin's state schema: run
@@ -852,11 +885,70 @@ mod tests {
             params: vec![(0, 1.0)],
             extra: Some(vec![9, 9]),
             persist: vec![1, 2, 3],
+            ..MigratedState::default()
         };
         let restored: DeserializedState = migrated.into();
         assert_eq!(restored.persist, vec![1, 2, 3]);
         assert_eq!(restored.extra.as_deref(), Some(&[9, 9][..]));
         assert_eq!(restored.params, vec![(0, 1.0)]);
+    }
+
+    /// A renamed schema-v2 plugin sees its old envelope's string-keyed
+    /// entries and schema, and what it returns rides into the restore as
+    /// named entries at that schema (PR #76 review).
+    #[test]
+    fn renamed_v2_envelope_offers_and_returns_named_params() {
+        use super::{
+            ForeignState, NamedParam, PluginFormat, parse_state, route_parsed_state,
+            serialize_state_v2,
+        };
+        let blob = serialize_state_v2(
+            0xA11CE,
+            3,
+            &[("osc1.cutoff", 10, 0.75), ("mix", 11, 0.5)],
+            b"extra",
+            b"persist",
+        );
+        let parsed = parse_state(&blob, 0xB0B);
+        let mut offered = false;
+        let state = route_parsed_state(parsed, &blob, PluginFormat::Clap, None, |foreign| {
+            let ForeignState::MismatchedEnvelope {
+                plugin_id_hash,
+                params,
+                named_params,
+                schema_version,
+                extra,
+                persist,
+            } = foreign
+            else {
+                panic!("a renamed envelope must arrive as MismatchedEnvelope");
+            };
+            offered = true;
+            assert_eq!(*plugin_id_hash, 0xA11CE);
+            assert!(params.is_empty(), "v2 entries are all named");
+            assert_eq!(*schema_version, 3);
+            assert_eq!(*extra, Some(&b"extra"[..]));
+            assert_eq!(*persist, b"persist");
+            assert_eq!(named_params.len(), 2);
+            assert_eq!(named_params[0].key, "osc1.cutoff");
+            assert_eq!(named_params[0].fallback_id, Some(10));
+            // Keep every entry and add one under a renamed key.
+            let mut kept = named_params.to_vec();
+            kept.push(NamedParam::new("filter.drive", 0.25));
+            Some(MigratedState {
+                named_params: kept,
+                schema_version: *schema_version,
+                persist: persist.to_vec(),
+                ..MigratedState::default()
+            })
+        })
+        .expect("the plugin accepted the envelope");
+        assert!(offered);
+        assert_eq!(state.schema_version, 3);
+        assert_eq!(state.persist, b"persist");
+        assert_eq!(state.params, []);
+        let keys: Vec<&str> = state.named_params.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, ["osc1.cutoff", "mix", "filter.drive"]);
     }
 
     #[test]
@@ -865,6 +957,8 @@ mod tests {
         assert_eq!(restored.persist, []);
         assert!(restored.extra.is_none());
         assert_eq!(restored.params, []);
+        assert_eq!(restored.named_params, []);
+        assert_eq!(restored.schema_version, 0);
     }
 }
 

@@ -8,6 +8,14 @@
 //! see `set_target` at the right sample instead of at sample 0 of
 //! the whole audio block.
 //!
+//! Mono CLAP modulation (`ParamMod` with `note_id == -1`) is applied the
+//! same way through [`Params::set_modulation`]: a non-destructive offset
+//! that moves `FloatParam::modulated_value` at the event's boundary and
+//! never the stored base. Polyphonic modulation is left to the plugin.
+//! Every event, applied or not, still reaches the plugin in the rebased
+//! sub-block list, so `PerSample` plugins and plugins that read
+//! `ParamMod` themselves see exactly what the host sent.
+//!
 //! Every format wrapper routes its `process()` call through
 //! [`process_chunked_with_bus_routing`]. On formats whose host events all carry
 //! `sample_offset = 0` (VST2, AAX, LV2 in v1, AU until ramp decoding
@@ -224,18 +232,39 @@ where
         // transport-snapshot updates for `EventBody::Transport`.
         // Advances `event_idx` past everything consumed.
         // Unsplit (PerSample), the context keeps the transport at the
-        // block start; later updates reach the plugin as events and only
-        // the cached snapshot moves on.
+        // block start and only offset-0 modulation is applied before
+        // `plugin.process`; later mono modulation events in the block are
+        // delivered in `sub_event_scratch` and reconciled into `params`
+        // after `plugin.process` returns.
+        let mut deferred_mod_range = None;
         let start_transport = min_sub.is_none().then(|| {
-            if apply_pending_events(events, params, transport, &mut event_idx, block_start + 1) {
+            if apply_pending_events(
+                events,
+                params,
+                transport,
+                &mut event_idx,
+                block_start + 1,
+                true,
+            ) {
                 transport_anchor = block_start;
             }
             advance_transport(transport, block_start - transport_anchor, sample_rate)
         });
-        if apply_pending_events(events, params, transport, &mut event_idx, block_end) {
+        let deferred_mod_start = event_idx;
+        if apply_pending_events(
+            events,
+            params,
+            transport,
+            &mut event_idx,
+            block_end,
+            min_sub.is_some(),
+        ) {
             // A transport event refreshed the snapshot at this boundary,
             // so its position already reflects `block_start`.
             transport_anchor = block_start;
+        }
+        if min_sub.is_none() && deferred_mod_start < event_idx {
+            deferred_mod_range = Some(deferred_mod_start..event_idx);
         }
 
         // Rebase the in-window events into the scratch list with
@@ -281,6 +310,21 @@ where
         }
 
         last_status = plugin.process(&mut sub_buffer, sub_event_scratch, &mut ctx);
+
+        // Under `Automation::PerSample`, reconcile mono modulation events that
+        // sat past offset 0 now that the plugin has rendered the block.
+        if let Some(range) = deferred_mod_range {
+            for ev in events.iter_from(range.start).take(range.len()) {
+                if let EventBody::ParamMod {
+                    id,
+                    note_id: -1,
+                    value,
+                } = ev.body
+                {
+                    params.set_modulation(id, value);
+                }
+            }
+        }
 
         // Re-base any events the plugin pushed during this sub-block
         // back into block-relative coordinates so the wrapper's
@@ -376,10 +420,12 @@ fn advance_transport(t: &TransportInfo, delta_samples: usize, sample_rate: f64) 
 /// `sample_offset < block_end` to the param store / transport
 /// snapshot and advancing `*event_idx` past the consumed range.
 ///
-/// `ParamChange` writes through to `params.set_plain`; `Transport`
-/// overwrites the per-block snapshot. Note events / `ParamMod` / `SysEx`
-/// are not "applied" - they ride in the rebased sub-event list for
-/// the plugin to process itself; this function just advances past
+/// `ParamChange` writes through to `params.set_plain`; mono `ParamMod`
+/// (`note_id == -1`) sets the non-destructive offset through
+/// `params.set_modulation`; `Transport` overwrites the per-block snapshot.
+/// Note events / polyphonic `ParamMod` / `SysEx` are not "applied" - they
+/// ride in the rebased sub-event list for the plugin to process itself
+/// (mono `ParamMod` rides there too); this function just advances past
 /// them so the next split scan starts in the right place.
 ///
 /// Returns `true` when a `Transport` event was applied, so the caller can
@@ -391,6 +437,7 @@ fn apply_pending_events(
     transport: &mut TransportInfo,
     event_idx: &mut usize,
     block_end: usize,
+    apply_mod: bool,
 ) -> bool {
     let mut i = *event_idx;
     let mut transport_applied = false;
@@ -402,11 +449,19 @@ fn apply_pending_events(
             EventBody::ParamChange { id, value } | EventBody::ParamRamp { id, end: value, .. } => {
                 params.set_plain(id, value);
             }
+            // Mono modulation: an offset beside the base, never the base
+            // itself, so `value()` and saved state don't move. A per-voice
+            // offset (`note_id >= 0`) must not clobber the mono slot.
+            EventBody::ParamMod {
+                id,
+                note_id: -1,
+                value,
+            } if apply_mod => params.set_modulation(id, value),
             EventBody::Transport(t) => {
                 *transport = t;
                 transport_applied = true;
             }
-            // Note events, ParamMod, SysEx: the plugin handles these
+            // Note events, polyphonic ParamMod, SysEx: the plugin handles these
             // via the rebased sub-event list. The apply pass only
             // advances past them.
             _ => {}
