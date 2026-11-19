@@ -635,6 +635,11 @@ impl<P: Params> Editor for MuiEditor<P> {
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
         self.reset_requests();
+        // A floating window has no host window behind it: unused keys go
+        // to the host's listener (the standalone's shortcuts and MIDI keys).
+        let unhandled = context.clone();
+        self.requests
+            .on_unhandled_key(Arc::new(move |key| unhandled.unhandled_key(key)));
         lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
         match window::wayland::open(
             title,

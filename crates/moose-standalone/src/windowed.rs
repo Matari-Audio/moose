@@ -188,29 +188,61 @@ where
     }
 
     // No X server (a Wayland-only session): the outer X11 window cannot
-    // exist, so the editor opens as a native Wayland toplevel on its own.
-    // The outer window's extras (QWERTY MIDI, keyboard shortcuts) need it
-    // and are unavailable here.
+    // exist, so the editor opens as a native Wayland toplevel on its own,
+    // and offers the keys it doesn't use to the same shortcuts. The native
+    // menus don't exist on Linux either way.
     #[cfg(target_os = "linux")]
     if std::env::var_os("DISPLAY").is_none()
         && std::env::var_os("WAYLAND_DISPLAY").is_some()
         && editor.supports_floating_wayland()
     {
+        // The presets are main-thread only, and the main thread just waits
+        // for the window here, so it runs the shortcuts: the window thread
+        // asks it about each unused key and waits for the answer.
+        let mut keys = Shortcuts {
+            pending: Arc::clone(&pending),
+            transport: transport.clone(),
+            input_ctrl: input_ctrl.clone(),
+            output_ctrl: output_ctrl.clone(),
+            is_effect,
+            qwerty_enabled: Arc::clone(&qwerty_enabled),
+            octave_offset: 0,
+            presets: crate::presets::PresetController::new::<P>(
+                Arc::clone(&plugin),
+                opts.presets_dir.clone(),
+            ),
+        };
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<WaylandWake>();
+        let key_tx = wake_tx.clone();
         let ctx = synthesize_editor_context::<P>(
             &plugin,
             &transport,
             Arc::clone(&pending_state),
             Arc::clone(&pending_resize),
-        );
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        )
+        .with_unhandled_key(Arc::new(move |kb| {
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            key_tx.send(WaylandWake::Key(kb.clone(), reply)).is_ok()
+                && answer.recv().unwrap_or(false)
+        }));
         let closed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let _ = closed_tx.send(());
+            let _ = wake_tx.send(WaylandWake::Closed);
         });
         if editor.open_floating_wayland(ctx, P::info().name, closed) {
-            let _ = closed_rx.recv();
+            for wake in &wake_rx {
+                match wake {
+                    WaylandWake::Key(kb, reply) => {
+                        let _ = reply.send(keys.key(&kb) == EventStatus::Captured);
+                    }
+                    WaylandWake::Closed => break,
+                }
+            }
         } else {
             eprintln!("Error: could not open a Wayland window");
         }
+        // Drops any key still queued, so its window thread stops waiting
+        // before `close` joins it.
+        drop(wake_rx);
         editor.close();
         #[cfg(feature = "playback")]
         if let Some(capture) = capture {
@@ -462,14 +494,16 @@ where
             #[cfg(target_os = "linux")]
             size_hints_scale: 0.0,
             _plugin: plugin,
-            pending,
-            transport,
-            input_ctrl,
-            output_ctrl,
-            is_effect,
-            qwerty_enabled: qwerty_enabled.clone(),
-            octave_offset: 0,
-            presets: preset_ctrl,
+            keys: Shortcuts {
+                pending,
+                transport,
+                input_ctrl,
+                output_ctrl,
+                is_effect,
+                qwerty_enabled: qwerty_enabled.clone(),
+                octave_offset: 0,
+                presets: preset_ctrl,
+            },
             _midi_thread: midi_thread,
             _midi_ctrl: midi_ctrl,
             #[cfg(feature = "playback")]
@@ -585,24 +619,8 @@ where
     /// audio stream and the preset controller's clones; not read
     /// directly (preset actions go through `presets`).
     _plugin: Arc<Mutex<P>>,
-    pending: Arc<ArrayQueue<MidiEvent>>,
-    transport: Transport,
-    /// Toggle handle for mic input (sends to the worker thread
-    /// owning the cpal input stream).
-    input_ctrl: InputController,
-    /// Toggle / device-switch handle for the output. Cmd+O / Ctrl+O
-    /// dispatches mute through this; the menu owns device switching.
-    output_ctrl: OutputController,
-    /// True only for effect plugins; gates the `I` keyboard
-    /// shortcut.
-    is_effect: bool,
-    /// QWERTY-keyboard-to-MIDI, off by default. Shared with the
-    /// Settings menu item and flipped by Cmd/Ctrl+K; the note handler
-    /// only plays keys when this is set.
-    qwerty_enabled: Arc<AtomicBool>,
-    octave_offset: i8,
-    /// Preset library handle - Save / Save As keyboard shortcuts.
-    presets: crate::presets::PresetController,
+    /// Shortcuts and the computer-keyboard MIDI keys.
+    keys: Shortcuts,
     /// Keeps the MIDI hot-plug thread alive for the lifetime of the
     /// window; dropped when the window closes.
     _midi_thread: MidiInputThread,
@@ -914,24 +932,57 @@ where
         }
 
         match event {
-            Event::Keyboard(kb) => self.handle_keyboard(&kb),
+            Event::Keyboard(kb) => self.keys.key(&kb),
             _ => EventStatus::Ignored,
         }
     }
 }
 
-impl<P: PluginExport + 'static> StandaloneHandler<P>
-where
-    P::Params: 'static,
-{
-    fn handle_keyboard(&mut self, kb: &keyboard_types::KeyboardEvent) -> EventStatus {
+/// What the native Wayland window's thread tells the main thread.
+#[cfg(target_os = "linux")]
+enum WaylandWake {
+    /// A key the editor didn't use; answer whether a shortcut took it.
+    Key(
+        keyboard_types::KeyboardEvent,
+        std::sync::mpsc::SyncSender<bool>,
+    ),
+    Closed,
+}
+
+/// The standalone's keyboard: shortcuts (save, transport, mic, output,
+/// QWERTY toggle) and, when on, the QWERTY note keys. The outer window
+/// feeds it on X11, macOS and Windows; on native Wayland the editor's own
+/// window offers it the keys it didn't use.
+struct Shortcuts {
+    pending: Arc<ArrayQueue<MidiEvent>>,
+    transport: Transport,
+    /// Toggle handle for mic input (sends to the worker thread
+    /// owning the cpal input stream).
+    input_ctrl: InputController,
+    /// Toggle / device-switch handle for the output. Cmd+O / Ctrl+O
+    /// dispatches mute through this; the menu owns device switching.
+    output_ctrl: OutputController,
+    /// True only for effect plugins; gates the `I` keyboard
+    /// shortcut.
+    is_effect: bool,
+    /// QWERTY-keyboard-to-MIDI, off by default. Shared with the
+    /// Settings menu item and flipped by Cmd/Ctrl+K; the note handler
+    /// only plays keys when this is set.
+    qwerty_enabled: Arc<AtomicBool>,
+    octave_offset: i8,
+    /// Preset library handle - Save / Save As keyboard shortcuts.
+    presets: crate::presets::PresetController,
+}
+
+impl Shortcuts {
+    fn key(&mut self, kb: &keyboard_types::KeyboardEvent) -> EventStatus {
         // Swallow OS key auto-repeat: none of the actions below want to
         // fire per repeat tick. A held SPACE would machine-gun the
         // transport, a held note key would retrigger NoteOn without an
         // intervening NoteOff, and Z/X would race to the octave clamp.
         // (X11 always reports `repeat: false`, so this only fires on
-        // macOS / Windows, where a held key repeats KeyDown without a
-        // KeyUp - the worst case.)
+        // macOS, Windows and Wayland, where a held key repeats KeyDown
+        // without a KeyUp - the worst case.)
         if kb.state == KeyState::Down && kb.repeat {
             return EventStatus::Captured;
         }

@@ -696,6 +696,9 @@ pub struct PluginContext<P: ?Sized = dyn Params> {
     /// Tells the wrapper the window's OS scale changed (see
     /// [`Self::window_rescaled`]). `None` where nothing listens.
     window_rescaled: Option<WindowRescaled>,
+    /// Takes keys the editor's own window didn't use (see
+    /// [`Self::unhandled_key`]). `None` where nothing listens.
+    unhandled_key: Option<UnhandledKey>,
     params: Arc<P>,
 }
 
@@ -705,6 +708,10 @@ pub type MarkDirty = Arc<dyn Fn() + Send + Sync>;
 
 /// The wrapper's OS-scale listener: callable from any thread.
 pub type WindowRescaled = Arc<dyn Fn(f64) + Send + Sync>;
+
+/// The host's listener for keys an editor window didn't use: returns true
+/// when it took the key. Callable from any thread.
+pub type UnhandledKey = Arc<dyn Fn(&keyboard_types::KeyboardEvent) -> bool + Send + Sync>;
 
 /// One edge of a group of parameter edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -727,6 +734,7 @@ impl<P: ?Sized> Clone for PluginContext<P> {
             group_edits: self.group_edits.clone(),
             host_notifier: self.host_notifier.clone(),
             window_rescaled: self.window_rescaled.clone(),
+            unhandled_key: self.unhandled_key.clone(),
             params: Arc::clone(&self.params),
         }
     }
@@ -745,6 +753,7 @@ impl<P: ?Sized> PluginContext<P> {
             group_edits: None,
             host_notifier: None,
             window_rescaled: None,
+            unhandled_key: None,
             params,
         }
     }
@@ -785,6 +794,24 @@ impl<P: ?Sized> PluginContext<P> {
         if let Some(f) = &self.window_rescaled {
             f(scale);
         }
+    }
+
+    /// Install the host's listener for keys the editor's own top-level
+    /// window didn't use. The standalone uses it for its shortcuts and
+    /// computer-keyboard MIDI where the editor has its own window (native
+    /// Wayland). The closure must be safe to call from any thread.
+    #[must_use]
+    pub fn with_unhandled_key(mut self, unhandled: UnhandledKey) -> Self {
+        self.unhandled_key = Some(unhandled);
+        self
+    }
+
+    /// Offer the host a key the editor's top-level window didn't use;
+    /// true when the host took it. Embedded editors never call it: their
+    /// host's window gets unused keys by itself. Any thread.
+    #[must_use]
+    pub fn unhandled_key(&self, key: &keyboard_types::KeyboardEvent) -> bool {
+        self.unhandled_key.as_ref().is_some_and(|f| f(key))
     }
 
     /// Install the format's group-edit notifier (VST3
@@ -897,6 +924,7 @@ impl<P: ?Sized> PluginContext<P> {
             group_edits: self.group_edits.clone(),
             host_notifier: self.host_notifier.clone(),
             window_rescaled: self.window_rescaled.clone(),
+            unhandled_key: self.unhandled_key.clone(),
             params,
         }
     }
@@ -979,6 +1007,7 @@ impl PluginContext<dyn Params> {
             group_edits: None,
             host_notifier: None,
             window_rescaled: None,
+            unhandled_key: None,
             params,
         }
     }
@@ -997,6 +1026,7 @@ impl<P: Params + 'static> PluginContext<P> {
             group_edits: self.group_edits,
             host_notifier: self.host_notifier,
             window_rescaled: self.window_rescaled,
+            unhandled_key: self.unhandled_key,
             params: self.params as Arc<dyn Params>,
         }
     }

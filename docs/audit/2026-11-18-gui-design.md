@@ -290,14 +290,20 @@ Also logged in `DECISIONS.md` to bindings.
   place of mui-winit. Handler, presenters and the request queue are the X11
   path's. mui-baseview no longer depends on winit.
 - W3: on a session with `WAYLAND_DISPLAY` and no `DISPLAY`, the standalone opens
-  its editor as that native toplevel. QWERTY MIDI and the outer window's keyboard
-  shortcuts are not available on that path.
+  its editor as that native toplevel. Keys the editor doesn't use go to the
+  standalone's shortcuts and QWERTY MIDI through `PluginContext::unhandled_key`
+  (mui-baseview `Requests::on_unhandled_key`), as on X11.
 - Two pacing bugs found on Hyprland and fixed:
   1. A frame callback never arrives before the surface's first buffer, so
      frames are not gated on it until the first callback.
   2. A commit that paints nothing earns no callback. Explicit redraw and resize
      requests wait at most 50 ms; continuous animation stays callback-paced.
 - A size the compositor imposes (tiled, maximized) wins over a client resize.
+- Tested headless: mui-baseview `tests/wayland_frame.rs` opens the floating
+  window under `weston --backend=headless` (no server decorations: a
+  screenshot shows the fallback frame's title bar above content at its logical
+  size) and `kwin_wayland --virtual` (server decorations). Each half skips when
+  its compositor is missing.
 - Deferred, per the research doc:
   - The host-loop fd API (`event_fd` / `on_fd`) is deferred to VST3
     `WaylandSurfaceID`, the case where the host's `wl_display` is shared.

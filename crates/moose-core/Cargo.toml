@@ -32,6 +32,7 @@ moose-utils = { workspace = true }
 png = "0.18"
 # `HostNotice` (main_thread): independent host-notice flags.
 bitflags = "2"
+keyboard-types = { version = "0.8", default-features = false }
 # `AtomicCell<T>` backs the lock-free `#[persist]` path for `Copy`
 # config fields (re-exported from the prelude). Small types stay
 # genuinely atomic; larger ones fall back to a private lock.
