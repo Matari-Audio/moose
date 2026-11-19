@@ -6844,7 +6844,7 @@ mod bus_kind_tests {
     }
 }
 
-// The derive's umbrella paths resolve locally for this shared test fixture.
+// The derive names `::moose::{core, params}`; test-only `#[derive(Params)]`s resolve here.
 #[cfg(test)]
 extern crate self as moose;
 #[cfg(test)]
@@ -6852,8 +6852,7 @@ use moose_core as core;
 #[cfg(test)]
 use moose_params as params;
 #[cfg(test)]
-#[path = "../../../test-support/host_value_fixture.rs"]
-mod host_value_fixture;
+use moose_test_fixtures::host_value_fixture;
 
 #[cfg(test)]
 mod host_value_tests {
@@ -7541,8 +7540,7 @@ mod inactive_recall_tests {
 }
 
 #[cfg(test)]
-#[path = "../../../test-support/large_state_fixture.rs"]
-mod large_state_fixture;
+use moose_test_fixtures::large_state_fixture;
 #[cfg(test)]
 mod large_state_tests {
     use super::large_state_fixture::{LargePlugin, payload};

@@ -81,7 +81,7 @@ impl<const LIMIT: usize> PluginRuntime for LargePlugin<LIMIT> {
         LIMIT
     }
     fn info() -> PluginInfo {
-        super::host_value_fixture::TestPlugin::info()
+        crate::host_value_fixture::TestPlugin::info()
     }
     fn reset(&mut self, _: &AudioConfig) {}
     fn process(

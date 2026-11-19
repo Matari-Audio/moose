@@ -4235,15 +4235,9 @@ use moose_core as core;
 #[cfg(test)]
 use moose_params as params;
 #[cfg(test)]
-#[path = "../../../test-support/host_value_fixture.rs"]
-#[expect(
-    dead_code,
-    reason = "shared fixture includes completion helpers used by CLAP and VST3 tests"
-)]
-mod host_value_fixture;
+use moose_test_fixtures::host_value_fixture;
 #[cfg(test)]
-#[path = "../../../test-support/large_state_fixture.rs"]
-mod large_state_fixture;
+use moose_test_fixtures::large_state_fixture;
 #[cfg(test)]
 mod large_state_tests {
     use super::large_state_fixture::{LargePlugin, payload};

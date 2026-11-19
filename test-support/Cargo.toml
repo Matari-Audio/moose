@@ -1,0 +1,17 @@
+[package]
+name = "moose-test-fixtures"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Plugins the format wrappers' own tests drive through their FFI callbacks"
+publish = false
+
+[dependencies]
+moose-core = { workspace = true }
+moose-derive = { workspace = true }
+moose-params = { workspace = true }
+
+[lints]
+workspace = true

@@ -2095,6 +2095,7 @@ dependencies = [
  "moose-derive",
  "moose-params",
  "moose-shim-types",
+ "moose-test-fixtures",
 ]
 
 [[package]]
@@ -2149,6 +2150,7 @@ dependencies = [
  "moose-core",
  "moose-derive",
  "moose-params",
+ "moose-test-fixtures",
  "objc",
 ]
 
@@ -2980,6 +2982,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "moose-test-fixtures"
+version = "7.0.0"
+dependencies = [
+ "moose-core",
+ "moose-derive",
+ "moose-params",
+]
+
+[[package]]
 name = "moose-utils"
 version = "7.0.0"
 
@@ -2992,6 +3003,7 @@ dependencies = [
  "moose-core",
  "moose-derive",
  "moose-params",
+ "moose-test-fixtures",
  "vst3",
 ]
 

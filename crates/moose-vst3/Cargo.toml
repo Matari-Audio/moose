@@ -24,3 +24,4 @@ workspace = true
 
 [dev-dependencies]
 moose-derive = { workspace = true }
+moose-test-fixtures = { workspace = true }

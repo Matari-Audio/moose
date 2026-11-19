@@ -14,6 +14,7 @@ members = [
     "crates/moose-gui-utils",
     "crates/moose-plugin",
     "crates/moose-test",
+    "test-support",
     "crates/moose-build",
     "crates/moose-loader",
     "crates/moose-loader-tests",
@@ -125,6 +126,7 @@ moose-gui-types = { version = "7.0.0", path = "crates/moose-gui-types" }
 moose-gui-utils = { version = "7.0.0", path = "crates/moose-gui-utils" }
 moose-plugin = { version = "7.0.0", path = "crates/moose-plugin" }
 moose-test = { version = "7.0.0", path = "crates/moose-test" }
+moose-test-fixtures = { path = "test-support" }
 moose-loader = { version = "7.0.0", path = "crates/moose-loader" }
 moose-derive = { version = "7.0.0", path = "crates/moose-derive" }
 moose-cpu = { version = "7.0.0", path = "crates/moose-cpu" }
