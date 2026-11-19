@@ -6,10 +6,12 @@
 //!
 //! Flow: `is_api_supported(API, false)` → `create` → `set_size` →
 //! [`set_parent`] (ours, not `clap_plugin_gui.set_parent`) → `show`.
+
 use super::{
-    CStr, GuiMode, PhantomData, PluginExport, RawWindowHandle, c_char, c_void, clap_host,
-    clap_plugin, data_from_plugin, editor_context, ptr, run_extern_callback_with,
+    CStr, GuiMode, PluginExport, c_char, c_void, clap_host, clap_plugin, data_from_plugin, ptr,
+    run_extern_callback_with,
 };
+use crate::gui::editor_context;
 use clap_sys::ext::posix_fd_support::{
     CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_ERROR, CLAP_POSIX_FD_READ, clap_host_posix_fd_support,
     clap_plugin_posix_fd_support,
@@ -18,6 +20,8 @@ use clap_sys::ext::timer_support::{
     CLAP_EXT_TIMER_SUPPORT, clap_host_timer_support, clap_plugin_timer_support,
 };
 use clap_sys::id::clap_id;
+use moose_core::editor::RawWindowHandle;
+use std::marker::PhantomData;
 
 pub(super) const API: &CStr = c"wayland-surface-embedding-v1";
 const EXT_NESTED_COMPOSITOR: &CStr = c"clap.gui-wayland-nested-compositor/1";

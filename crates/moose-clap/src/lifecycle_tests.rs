@@ -81,7 +81,9 @@ impl PluginRuntime for Probe {
     }
     fn validate_state(data: &[u8]) -> Result<(), moose_core::state::StateLoadError> {
         if data == b"invalid" {
-            return Err(moose_core::state::StateLoadError::Other("invalid framing".into()));
+            return Err(moose_core::state::StateLoadError::Other(
+                "invalid framing".into(),
+            ));
         }
         Ok(())
     }
@@ -772,7 +774,10 @@ fn validate_state_rejects_a_queued_load_up_front() {
                 read: Some(read_cursor),
             };
             // Without the hook this load would time out queued and report success.
-            assert!(!state_ext.load.unwrap()(plugin, &raw const input), "invalid state reports failure");
+            assert!(
+                !state_ext.load.unwrap()(plugin, &raw const input),
+                "invalid state reports failure"
+            );
             assert_eq!(data.params_arc.get_plain(0), before, "params kept");
             callbacks.stop_processing.unwrap()(plugin);
             callbacks.deactivate.unwrap()(plugin);
@@ -853,7 +858,11 @@ fn process_panic_latches_until_reactivation() {
             PANIC_IN_PROCESS.set(false);
             let before = frames();
             out_l.fill(1.0);
-            assert_eq!(run(), CLAP_PROCESS_SLEEP, "latched: no second error");
+            assert_eq!(
+                run(),
+                clap_sys::process::CLAP_PROCESS_SLEEP,
+                "latched: no second error"
+            );
             assert_eq!(frames(), before, "latched: plugin not re-entered");
             assert!(out_l.iter().all(|s| *s == 0.0), "latched: silence");
             callbacks.stop_processing.unwrap()(plugin);
@@ -886,20 +895,43 @@ fn configurable_ports_pick_a_declared_layout_and_activation_reaches_routing() {
         let missing = [request(true, 1, 2)];
         let mut untyped = request(false, 0, 2);
         untyped.port_type = c"".as_ptr();
-        assert!(ports.can_apply_configuration.unwrap()(plugin, &raw const untyped, 1));
+        assert!(ports.can_apply_configuration.unwrap()(
+            plugin,
+            &raw const untyped,
+            1
+        ));
         let mut mapped = request(false, 0, 2);
         mapped.port_details = [1_u8, 0].as_ptr().cast();
-        assert!(!ports.can_apply_configuration.unwrap()(plugin, &raw const mapped, 1), "stereo has no channel map");
+        assert!(
+            !ports.can_apply_configuration.unwrap()(plugin, &raw const mapped, 1),
+            "stereo has no channel map"
+        );
         let details = [1_u8, 0];
         for (port_type, channel_count) in [(CLAP_PORT_MONO, 1), (CLAP_PORT_STEREO, 2)] {
             let mut typed = request(false, 0, channel_count);
             typed.port_type = port_type.as_ptr();
             typed.port_details = details.as_ptr().cast();
-            assert!(ports.can_apply_configuration.unwrap()(plugin, &raw const typed, 1));
-            assert!(ports.apply_configuration.unwrap()(plugin, &raw const typed, 1));
+            assert!(ports.can_apply_configuration.unwrap()(
+                plugin,
+                &raw const typed,
+                1
+            ));
+            assert!(ports.apply_configuration.unwrap()(
+                plugin,
+                &raw const typed,
+                1
+            ));
         }
-        assert!(!ports.can_apply_configuration.unwrap()(plugin, quad.as_ptr(), 1));
-        assert!(!ports.can_apply_configuration.unwrap()(plugin, missing.as_ptr(), 1));
+        assert!(!ports.can_apply_configuration.unwrap()(
+            plugin,
+            quad.as_ptr(),
+            1
+        ));
+        assert!(!ports.can_apply_configuration.unwrap()(
+            plugin,
+            missing.as_ptr(),
+            1
+        ));
         assert!(ports.apply_configuration.unwrap()(plugin, mono.as_ptr(), 2));
         let data = data_from_plugin::<Probe>(plugin);
         assert_eq!(data.selected_config.load(Ordering::Relaxed), 1);
@@ -907,13 +939,25 @@ fn configurable_ports_pick_a_declared_layout_and_activation_reaches_routing() {
         let activation = &*get(plugin, CLAP_EXT_AUDIO_PORTS_ACTIVATION.as_ptr())
             .cast::<clap_plugin_audio_ports_activation>();
         let set_active = activation.set_active.unwrap();
-        assert!(!set_active(plugin, true, 1, false, 32), "no second input port");
+        assert!(
+            !set_active(plugin, true, 1, false, 32),
+            "no second input port"
+        );
         assert!(set_active(plugin, true, 0, false, 32));
         assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
         let routing = data.audio.enter().bus_routing;
-        assert_eq!(routing.input(0).unwrap().activation(), BusActivation::Inactive);
-        assert_eq!(routing.output(0).unwrap().activation(), BusActivation::Active);
-        assert!(!ports.apply_configuration.unwrap()(plugin, mono.as_ptr(), 2), "active");
+        assert_eq!(
+            routing.input(0).unwrap().activation(),
+            BusActivation::Inactive
+        );
+        assert_eq!(
+            routing.output(0).unwrap().activation(),
+            BusActivation::Active
+        );
+        assert!(
+            !ports.apply_configuration.unwrap()(plugin, mono.as_ptr(), 2),
+            "active"
+        );
         (*plugin).deactivate.unwrap()(plugin);
     });
 }

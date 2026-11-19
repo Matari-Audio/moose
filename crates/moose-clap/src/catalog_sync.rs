@@ -27,7 +27,8 @@ use moose_core::export::PluginExport;
 use moose_core::thread::MainThread;
 use moose_params::{CatalogChange, CatalogSignal, ParamCatalog, ParamInfo, Params};
 
-use crate::{ClapPluginData, refresh_remote_control_pages, request_presentation_refresh};
+use crate::remote_controls::refresh_remote_control_pages;
+use crate::{ClapPluginData, request_presentation_refresh};
 
 /// The parameter list the host sees: the catalog and the indices of its
 /// available entries. One value, so the two can't disagree.

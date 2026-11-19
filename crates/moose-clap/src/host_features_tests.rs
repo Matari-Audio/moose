@@ -506,7 +506,11 @@ fn port_notice_restarts_an_active_plugin_and_rescans_once_inactive() {
         let rescans = || log.port_rescans.lock().expect("port rescans").clone();
         notifier.notify(HostNotice::AUDIO_PORTS);
         (*plugin).on_main_thread.unwrap()(plugin);
-        assert_eq!(rescans(), [CLAP_AUDIO_PORTS_RESCAN_LIST], "inactive: rescan now");
+        assert_eq!(
+            rescans(),
+            [CLAP_AUDIO_PORTS_RESCAN_LIST],
+            "inactive: rescan now"
+        );
 
         assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
         let restarts = log.restarts.load(Ordering::Relaxed);
