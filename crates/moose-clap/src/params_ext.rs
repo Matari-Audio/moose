@@ -42,7 +42,12 @@ pub(crate) unsafe extern "C" fn params_get_info<P: PluginExport>(
     param_index: u32,
     out: *mut clap_param_info,
 ) -> bool {
-    unsafe {
+    // Author `parameter_presentation` can panic; firewall it so a panic
+    // cannot unwind across this `extern "C"` boundary.
+    run_extern_callback_with::<P, bool>("CLAP", "params_get_info", false, || unsafe {
+        if out.is_null() {
+            return false;
+        }
         let data = data_from_plugin::<P>(plugin);
         let exposed = catalog_sync::lock_exposed(&data.exposed);
         let Some(info) = exposed.info(param_index) else {
@@ -120,7 +125,7 @@ pub(crate) unsafe extern "C" fn params_get_info<P: PluginExport>(
         );
 
         true
-    }
+    })
 }
 
 /// A runtime presentation's `hidden` overrides the static flag.

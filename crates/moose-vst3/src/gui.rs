@@ -568,10 +568,11 @@ pub(crate) unsafe extern "C" fn cb_gui_open_wayland<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_gui_event_fd<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> i32 {
-    run_extern_callback_with::<P, i32>("vst3", "gui_event_fd", -1, || unsafe {
+    run_extern_callback_with::<P, i32>("vst3", "gui_event_fd", -1, || {
         #[cfg(unix)]
         {
-            let inst = &*ctx.cast::<Vst3Instance<P>>();
+            // SAFETY: host callback passes a live `Vst3Instance<P>` pointer.
+            let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
             let gui = inst.gui.enter();
             gui.editor.as_ref().and_then(|e| e.event_fd()).unwrap_or(-1)
         }

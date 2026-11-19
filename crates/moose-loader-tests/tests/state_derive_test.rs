@@ -156,3 +156,24 @@ fn changed_field_type_does_not_corrupt_later_fields() {
         "field after the type change is not corrupted by an overrun"
     );
 }
+
+#[test]
+fn truncated_keyed_frames_reject_the_entire_state() {
+    let state = PrimitiveState {
+        flag: true,
+        count: 42,
+        rate: 48000.0,
+        tag: 7,
+    };
+    let bytes = state.serialize();
+    for end in 0..bytes.len() {
+        assert!(
+            PrimitiveState::deserialize(&bytes[..end]).is_none(),
+            "accepted prefix {end}"
+        );
+    }
+    assert_eq!(PrimitiveState::deserialize(&bytes), Some(state));
+    let mut hostile_count = bytes;
+    hostile_count[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(PrimitiveState::deserialize(&hostile_count).is_none());
+}

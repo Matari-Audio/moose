@@ -301,7 +301,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
         let main = MainThread::assume();
         catalog_sync::sync_parameters(data, &main);
         if data.ports_rescan.swap(false, Ordering::Relaxed) {
-            host_rescan_audio_ports(data.host);
+            host_rescan_audio_ports(data);
         }
     });
 }
@@ -420,7 +420,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
         }
         if !data.active.load(Ordering::Relaxed) && data.ports_rescan.swap(false, Ordering::Relaxed)
         {
-            host_rescan_audio_ports(data.host);
+            host_rescan_audio_ports(data);
         }
 
         if data.latency_dirty.swap(false, Ordering::Relaxed) && !data.host.is_null() {

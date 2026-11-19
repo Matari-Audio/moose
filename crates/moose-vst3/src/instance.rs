@@ -384,7 +384,18 @@ impl OutputNoteIds {
         pitch: u8,
     ) -> Option<(i32, PendingOutputMutation)> {
         let index = if source == OutputSourceIdentity::Anonymous {
-            self.unique_pck(bus, channel, pitch, true)?
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    slot.used
+                        && slot.bus == bus
+                        && slot.channel == channel
+                        && slot.pitch == pitch
+                        && slot.lifecycle == OutputVoiceLifecycle::Active
+                })
+                .min_by_key(|(_, slot)| slot.age)
+                .map(|(index, _)| index)?
         } else {
             self.slots.iter().position(|slot| {
                 slot.used && slot.source == source && slot.lifecycle == OutputVoiceLifecycle::Active
@@ -404,7 +415,8 @@ impl OutputNoteIds {
         pitch: u8,
     ) -> Option<i32> {
         let index = if source == OutputSourceIdentity::Anonymous {
-            self.unique_pck(bus, channel, pitch, false)?
+            self.unique_pck(bus, channel, pitch, true)
+                .or_else(|| self.unique_pck(bus, channel, pitch, false))?
         } else {
             self.slots
                 .iter()

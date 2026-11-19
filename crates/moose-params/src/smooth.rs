@@ -883,13 +883,53 @@ mod tests {
                         b[n - 1] = owned.next_after(target, n);
                     }
                 }
-                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-                assert_eq!(bits(&a), bits(&b), "{style:?} block {k}");
-                assert_eq!(
-                    shared.current_f64().to_bits(),
-                    owned.current_f64().to_bits()
+                assert_smooth_slice_f32(&a, &b, &format!("{style:?} block {k}"));
+                assert_smooth_f64(
+                    shared.current_f64(),
+                    owned.current_f64(),
+                    &format!("{style:?} block {k} current"),
                 );
             }
+        }
+    }
+
+    #[cfg(not(miri))]
+    fn assert_smooth_f32(left: f32, right: f32, ctx: &str) {
+        assert_eq!(left.to_bits(), right.to_bits(), "{ctx}");
+    }
+
+    #[cfg(miri)]
+    fn assert_smooth_f32(left: f32, right: f32, ctx: &str) {
+        // Miri adds small non-deterministic ULP perturbations to transcendental
+        // ops (`exp`/`ln`) across calls; allow a tight relative tolerance there
+        // while keeping bit-exact checks on native targets.
+        let tol = 1e-5 * left.abs().max(right.abs()).max(1.0);
+        assert!(
+            (left - right).abs() <= tol,
+            "{ctx}: left={left} right={right} diff={}",
+            (left - right).abs()
+        );
+    }
+
+    #[cfg(not(miri))]
+    fn assert_smooth_f64(left: f64, right: f64, ctx: &str) {
+        assert_eq!(left.to_bits(), right.to_bits(), "{ctx}");
+    }
+
+    #[cfg(miri)]
+    fn assert_smooth_f64(left: f64, right: f64, ctx: &str) {
+        let tol = 1e-9 * left.abs().max(right.abs()).max(1.0);
+        assert!(
+            (left - right).abs() <= tol,
+            "{ctx}: left={left} right={right} diff={}",
+            (left - right).abs()
+        );
+    }
+
+    fn assert_smooth_slice_f32(left: &[f32], right: &[f32], ctx: &str) {
+        assert_eq!(left.len(), right.len(), "{ctx}");
+        for (i, (&a, &b)) in left.iter().zip(right.iter()).enumerate() {
+            assert_smooth_f32(a, b, &format!("{ctx} sample {i}"));
         }
     }
 
@@ -920,29 +960,25 @@ mod tests {
                 for i in 0..n {
                     #[allow(clippy::cast_possible_truncation)]
                     let e32 = expect[i] as f32;
-                    assert_eq!(
-                        got[i].to_bits(),
-                        e32.to_bits(),
-                        "{style:?} block {k} sample {i}"
-                    );
-                    assert_eq!(
-                        got64[i].to_bits(),
-                        expect[i].to_bits(),
-                        "{style:?} block {k} sample {i}"
+                    assert_smooth_f32(got[i], e32, &format!("{style:?} block {k} sample {i}"));
+                    assert_smooth_f64(
+                        got64[i],
+                        expect[i],
+                        &format!("{style:?} block {k} sample {i}"),
                     );
                 }
                 let last = expect[n - 1];
                 #[allow(clippy::cast_possible_truncation)]
                 let last32 = last as f32;
-                assert_eq!(
-                    after.next_after(target, n).to_bits(),
-                    last32.to_bits(),
-                    "{style:?} block {k}"
+                assert_smooth_f32(
+                    after.next_after(target, n),
+                    last32,
+                    &format!("{style:?} block {k}"),
                 );
-                assert_eq!(
-                    after64.next_after_f64(target, n).to_bits(),
-                    last.to_bits(),
-                    "{style:?} block {k}"
+                assert_smooth_f64(
+                    after64.next_after_f64(target, n),
+                    last,
+                    &format!("{style:?} block {k}"),
                 );
             }
         }

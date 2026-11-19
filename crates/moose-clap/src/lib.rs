@@ -88,9 +88,11 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(test, target_os = "linux"))]
+use clap_sys::ext::params::CLAP_PARAM_RESCAN_VALUES;
 #[cfg(test)]
 use clap_sys::ext::params::{
-    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT, CLAP_PARAM_RESCAN_VALUES,
+    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
 };
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -171,7 +173,7 @@ mod host_value_tests {
             let mut stored = 0.;
             assert!(params_get_value::<TestPlugin>(plugin, 1, &raw mut stored));
             assert_eq!(stored, normalized);
-            let mut buffer = [0_i8; 128];
+            let mut buffer: [std::ffi::c_char; 128] = [0; 128];
             assert!(params_value_to_text::<TestPlugin>(
                 plugin,
                 1,
@@ -858,17 +860,17 @@ use clap_sys::ext::configurable_audio_ports::clap_plugin_configurable_audio_port
 use clap_sys::ext::context_menu::CLAP_EXT_CONTEXT_MENU;
 #[cfg(test)]
 use clap_sys::ext::context_menu::clap_plugin_context_menu;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::CLAP_EXT_GUI;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::CLAP_WINDOW_API_WAYLAND;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::CLAP_WINDOW_API_X11;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::clap_host_gui;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::clap_plugin_gui;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::clap_window;
 #[cfg(test)]
 use clap_sys::ext::latency::CLAP_EXT_LATENCY;
@@ -952,11 +954,11 @@ use moose_core::cast::len_u32;
 use moose_core::cast::size_of_u32;
 #[cfg(test)]
 use moose_core::config::AudioConfig;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use moose_core::editor::Editor;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use moose_core::editor::PluginContext;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use moose_core::editor::RawWindowHandle;
 #[cfg(test)]
 use moose_core::events::Event;

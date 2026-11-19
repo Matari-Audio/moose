@@ -601,7 +601,7 @@ impl Drop for PanicLatch {
     }
 }
 
-/// [`run_audio_block_with`] with a [`PanicLatch`]: `None` when `body`
+/// [`run_extern_callback_with`] with a [`PanicLatch`]: `None` when `body`
 /// panicked (the latch is now set and holds the message; nothing is
 /// printed on the audio thread). Wrappers check
 /// [`PanicLatch::is_failed`] inside `body` and output silence without
