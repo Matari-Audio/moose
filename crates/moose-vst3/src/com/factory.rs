@@ -65,7 +65,12 @@ impl IPluginFactoryTrait for Factory {
         kResultOk
     }
 
-    unsafe fn createInstance(&self, cid: FIDString, iid: FIDString, obj: *mut *mut c_void) -> tresult {
+    unsafe fn createInstance(
+        &self,
+        cid: FIDString,
+        iid: FIDString,
+        obj: *mut *mut c_void,
+    ) -> tresult {
         let Some(reg) = registration() else {
             return kInvalidArgument;
         };
@@ -77,7 +82,11 @@ impl IPluginFactoryTrait for Factory {
         if cid != reg.desc.cid {
             return kResultFalse;
         }
-        let run_loop = self.run_loop.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let run_loop = self
+            .run_loop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         // A null instance means the plugin's create() panicked: fail
         // instantiation instead of handing the host an inert plugin.
         let Some(host) = Host::new(reg, run_loop) else {
@@ -88,7 +97,9 @@ impl IPluginFactoryTrait for Factory {
             return kNoInterface;
         };
         let iid = unsafe { &*iid.cast::<[u8; 16]>() };
-        match unsafe { <FUnknown as vst3::com_scrape_types::Unknown>::query_interface(unknown.as_ptr(), iid) } {
+        match unsafe {
+            <FUnknown as vst3::com_scrape_types::Unknown>::query_interface(unknown.as_ptr(), iid)
+        } {
             Some(p) => {
                 unsafe { *obj = p };
                 kResultOk
@@ -147,7 +158,8 @@ impl IPluginFactory3Trait for Factory {
     unsafe fn setHostContext(&self, #[allow(unused_variables)] context: *mut FUnknown) -> tresult {
         #[cfg(target_os = "linux")]
         {
-            *self.run_loop.lock().unwrap_or_else(PoisonError::into_inner) = super::wake::linux::run_loop_of(context);
+            *self.run_loop.lock().unwrap_or_else(PoisonError::into_inner) =
+                super::wake::linux::run_loop_of(context);
         }
         kResultOk
     }

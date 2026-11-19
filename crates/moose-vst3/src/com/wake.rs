@@ -10,7 +10,10 @@
 //! Without a wake, pending work drains on the next host UI-thread call
 //! (parameter reads, edit gestures).
 
-#![cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
+#![cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 
 /// Poll interval of the Linux run-loop timer and the Windows thread timer.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -50,7 +53,9 @@ pub(super) mod linux {
             let mut value = 0u64;
             loop {
                 let r = unsafe { libc::read(self.fd, (&raw mut value).cast(), 8) };
-                if r >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                if r >= 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
                     break;
                 }
             }
@@ -69,13 +74,17 @@ pub(super) mod linux {
     }
 
     impl FdWake {
-        pub fn bind(run_loop: ComPtr<IRunLoop>, host: Weak<Host>, on_fd: fn(&Host)) -> Option<Self> {
+        pub fn bind(
+            run_loop: ComPtr<IRunLoop>,
+            host: Weak<Host>,
+            on_fd: fn(&Host),
+        ) -> Option<Self> {
             let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if fd < 0 {
                 return None;
             }
-            let handler = ComWrapper::new(FdHandler { host, fd, on_fd })
-                .to_com_ptr::<IEventHandler>()?;
+            let handler =
+                ComWrapper::new(FdHandler { host, fd, on_fd }).to_com_ptr::<IEventHandler>()?;
             if unsafe { run_loop.registerEventHandler(handler.as_ptr(), fd) } != kResultOk {
                 unsafe { libc::close(fd) };
                 return None;
@@ -101,7 +110,9 @@ pub(super) mod linux {
             let one = 1u64;
             loop {
                 let r = unsafe { libc::write(fd, (&raw const one).cast(), 8) };
-                if r >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                if r >= 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
                     break;
                 }
             }
@@ -195,7 +206,10 @@ pub(super) mod macos {
 
     impl MainQueueWake {
         /// `handler(context)` runs on the main queue after each `signal`.
-        pub fn new(context: *mut c_void, handler: unsafe extern "C" fn(*mut c_void)) -> Option<Self> {
+        pub fn new(
+            context: *mut c_void,
+            handler: unsafe extern "C" fn(*mut c_void),
+        ) -> Option<Self> {
             unsafe {
                 let source = dispatch_source_create(
                     &raw const _dispatch_source_type_data_or,
@@ -256,7 +270,14 @@ pub(super) mod windows {
 
     impl ThreadTimer {
         pub fn new(proc_: TimerProc) -> Option<Self> {
-            let id = unsafe { SetTimer(std::ptr::null_mut(), 0, super::RESTART_TIMER_MS, Some(proc_)) };
+            let id = unsafe {
+                SetTimer(
+                    std::ptr::null_mut(),
+                    0,
+                    super::RESTART_TIMER_MS,
+                    Some(proc_),
+                )
+            };
             (id != 0).then(|| Self {
                 id,
                 thread: std::thread::current().id(),

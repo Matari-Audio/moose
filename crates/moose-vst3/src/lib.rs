@@ -33,6 +33,7 @@ use moose_core::events::{
 };
 use moose_core::export::PluginExport;
 use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
+use moose_core::main_thread::{HostColor, MainThreadHooks, TrackInfo};
 use moose_core::meters::MeterStore;
 use moose_core::midi::{
     denorm_7bit, denorm_pitch_bend, per_note_bend_semitones, pitch_bend_to_bytes,
@@ -44,15 +45,17 @@ use moose_core::rt::{RtSection, audit};
 use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::tasks::AnyTaskSpawner;
+use moose_core::thread::{MainThread, MainThreadCell};
 use moose_core::wrapper::{
-    ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state,
-    copy_c_str, custom_state_for_save, custom_state_view, default_io_channels, enter_plugin,
-    find_bus_layout, log_missing_bus_layout, run_audio_block_latched, run_extern_callback_with,
-    run_register, shared_plugin,
+    ParamCStrings, PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
+    custom_state_for_save, custom_state_view, default_io_channels, enter_plugin, find_bus_layout,
+    log_missing_bus_layout, run_audio_block_latched, run_extern_callback_with, run_register,
+    shared_plugin,
 };
-use moose_params::MidiSource;
 use moose_params::sample::{Float, Sample};
-use moose_params::{ParamFlags, ParamInfo, ParamRange, Params};
+use moose_params::{
+    MidiSource, ParamFlags, ParamFunction, ParamInfo, ParamRange, Params, PersistChangeSignal,
+};
 
 use ffi::{Vst3Callbacks, Vst3NativeEvent, Vst3ParamDescriptor, Vst3PluginDescriptor};
 use std::sync::Arc;
@@ -82,7 +85,12 @@ const K_LATENCY_CHANGED: i32 = 8;
 const K_PARAM_VALUES_CHANGED: i32 = 4;
 
 struct Vst3Instance<P: PluginExport> {
-    persist_signal: std::sync::Mutex<Option<Arc<moose_params::PersistChangeSignal>>>,
+    persist_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
+    /// The bound `CatalogSignal` (same type as the persist signal).
+    catalog_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
+    /// The plugin's main-thread part; reached only from edit-controller
+    /// callbacks, which VST3 runs on the UI thread.
+    main_thread: MainThreadCell<Box<dyn MainThreadHooks>>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -617,6 +625,7 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 .collect();
             midi_maps.sort_by_key(|(id, _)| *id);
             let params_arc = plugin.params_arc();
+            let main_thread = MainThreadCell::new(plugin.main_thread());
             let meter_store = plugin.meter_store();
             let snapshot = plugin.snapshot_slot();
             let task_spawner = plugin.task_spawner();
@@ -638,6 +647,8 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 .collect();
             let instance = Box::new(Vst3Instance::<P> {
                 persist_signal: std::sync::Mutex::new(None),
+                catalog_signal: std::sync::Mutex::new(None),
+                main_thread,
                 plugin: shared_plugin(plugin),
                 params_arc,
                 meter_store,
@@ -697,14 +708,8 @@ unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
             let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
-            if let Some(signal) = instance
-                .persist_signal
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                signal.close();
-            }
+            rebind_signal(&instance.persist_signal, None, std::ptr::null_mut());
+            rebind_signal(&instance.catalog_signal, None, std::ptr::null_mut());
             drop(instance);
         }
     });
@@ -728,24 +733,181 @@ unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
 ) {
     run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
         let instance = &*ctx.cast::<Vst3Instance<P>>();
-        let mut binding = instance
-            .persist_signal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(old) = binding.take() {
-            old.close();
-        }
-        if let Some(wake) = wake {
-            let context = SendPtr::new(wake_context);
-            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
-                wake(context.as_ptr().cast_mut());
-            }));
-            instance
-                .params_arc
-                .set_persist_change_signal(Arc::downgrade(&signal));
-            *binding = Some(signal);
+        if let Some(signal) = rebind_signal(&instance.persist_signal, wake, wake_context) {
+            instance.params_arc.set_persist_change_signal(signal);
         }
     });
+}
+
+/// Close the signal in `slot` (waiting for a running wake) and, with
+/// `wake`, install one that calls `wake(wake_context)`; returns it for the
+/// params setter.
+///
+/// # Safety
+/// `wake_context` stays valid for `wake` until the next rebind of `slot`.
+unsafe fn rebind_signal(
+    slot: &std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
+    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    wake_context: *mut std::ffi::c_void,
+) -> Option<std::sync::Weak<PersistChangeSignal>> {
+    let mut binding = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(old) = binding.take() {
+        old.close();
+    }
+    let wake = wake?;
+    // SAFETY: the caller keeps `wake_context` alive until it rebinds, and
+    // `close` in that rebind waits out a running wake.
+    let context = unsafe { SendPtr::new(wake_context) };
+    // SAFETY: as above; `wake` is the COM layer's wake for that context.
+    let signal = Arc::new(PersistChangeSignal::new(move || unsafe {
+        wake(context.as_ptr().cast_mut());
+    }));
+    let weak = Arc::downgrade(&signal);
+    *binding = Some(signal);
+    Some(weak)
+}
+
+unsafe extern "C" fn cb_set_catalog_waker<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    wake_context: *mut std::ffi::c_void,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "catalog_bind", (), || unsafe {
+        let instance = &*ctx.cast::<Vst3Instance<P>>();
+        if let Some(signal) = rebind_signal(&instance.catalog_signal, wake, wake_context) {
+            instance.params_arc.set_catalog_signal(signal);
+        }
+    });
+}
+
+unsafe extern "C" fn cb_take_catalog_changes<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u8 {
+    run_extern_callback_with::<P, u8>("vst3", "catalog_changes", 0, || unsafe {
+        (*ctx.cast::<Vst3Instance<P>>())
+            .params_arc
+            .take_catalog_changes()
+            .flags
+            .bits()
+    })
+}
+
+unsafe extern "C" fn cb_param_affects_presentation<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: u32,
+) -> bool {
+    run_extern_callback_with::<P, bool>(
+        "vst3",
+        "parameter_affects_presentation",
+        false,
+        || unsafe {
+            (*ctx.cast::<Vst3Instance<P>>())
+                .params_arc
+                .parameter_affects_presentation(id)
+        },
+    )
+}
+
+/// The SDK `FunctionNameType` string for `function`.
+fn function_name(function: ParamFunction) -> *const c_char {
+    use vst3::Steinberg::Vst::FunctionNameType::{
+        kCompGainReduction, kCompGainReductionMax, kCompGainReductionPeakHold,
+        kCompResetGainReductionMax, kDryWetMix, kLowLatencyMode, kRandomize,
+    };
+    match function {
+        ParamFunction::DryWetMix => kDryWetMix,
+        ParamFunction::LowLatencyMode => kLowLatencyMode,
+        ParamFunction::Randomize => kRandomize,
+        ParamFunction::GainReduction => kCompGainReduction,
+        ParamFunction::GainReductionMax => kCompGainReductionMax,
+        ParamFunction::GainReductionPeakHold => kCompGainReductionPeakHold,
+        ParamFunction::ResetGainReductionMax => kCompResetGainReductionMax,
+        _ => std::ptr::null(),
+    }
+}
+
+unsafe extern "C" fn cb_param_function_name<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: u32,
+) -> *const c_char {
+    run_extern_callback_with::<P, *const c_char>(
+        "vst3",
+        "parameter_function",
+        std::ptr::null(),
+        || unsafe {
+            (*ctx.cast::<Vst3Instance<P>>())
+                .params_arc
+                .parameter_function(id)
+                .map_or(std::ptr::null(), function_name)
+        },
+    )
+}
+
+/// A VST3 `ColorSpec` (`0xAARRGGBB`).
+fn argb_color(argb: u32) -> HostColor {
+    let [a, r, g, b] = argb.to_be_bytes();
+    HostColor { r, g, b, a }
+}
+
+unsafe extern "C" fn cb_track_info_changed<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    info: *const ffi::Vst3TrackInfo,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "track_info", (), || unsafe {
+        let (Some(inst), Some(info)) = (ctx.cast::<Vst3Instance<P>>().as_ref(), info.as_ref())
+        else {
+            return;
+        };
+        let mut track = TrackInfo::new();
+        track.name = (!info.name.is_null())
+            .then(|| CStr::from_ptr(info.name).to_string_lossy().into_owned());
+        track.color = info.has_color.then(|| argb_color(info.color_argb));
+        // SAFETY: the COM layer calls this only from
+        // `IInfoListener::setChannelContextInfos`, an edit-controller call
+        // VST3 makes on the UI thread.
+        let main = MainThread::assume();
+        if let Some(mut hooks) = inst.main_thread.try_borrow_mut(&main) {
+            hooks.track_info_changed(&main, &track);
+        }
+    });
+}
+
+unsafe extern "C" fn cb_midi_learn<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    bus: u32,
+    channel: u8,
+    controller: i16,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "midi_learn", 0, || unsafe {
+        let (Some(inst), Some(source)) = (
+            ctx.cast::<Vst3Instance<P>>().as_ref(),
+            vst3_midi_source(controller),
+        ) else {
+            return 0;
+        };
+        // SAFETY: the COM layer calls this only from
+        // `IMidiLearn::onLiveMIDIControllerInput` / `IMidiLearn2`, which
+        // VST3 runs on the UI thread.
+        let main = MainThread::assume();
+        let learned = inst
+            .main_thread
+            .try_borrow_mut(&main)
+            .is_some_and(|mut hooks| hooks.midi_learn(&main, bus, channel, source));
+        i32::from(learned)
+    })
+}
+
+/// A VST3 `ControllerNumbers` value (`ivstmidicontrollers.h`): 0..=127 are
+/// CCs, then kAfterTouch, kPitchBend, kCtrlProgramChange.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn vst3_midi_source(controller: i16) -> Option<MidiSource> {
+    match controller {
+        0..=127 => Some(MidiSource::Cc(controller as u8)),
+        128 => Some(MidiSource::ChannelPressure),
+        129 => Some(MidiSource::PitchBend),
+        130 => Some(MidiSource::ProgramChange),
+        _ => None,
+    }
 }
 unsafe extern "C" fn cb_take_persist_change<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
@@ -1075,7 +1237,13 @@ unsafe extern "C" fn cb_push_param_change<P: PluginExport>(
     let Ok(sample_offset) = u32::try_from(sample_offset) else {
         return 0;
     };
-    i32::from(push_vst3_param_change::<P>(inst, &mut audio, id, sample_offset, plain))
+    i32::from(push_vst3_param_change::<P>(
+        inst,
+        &mut audio,
+        id,
+        sample_offset,
+        plain,
+    ))
 }
 
 /// Queue one sample-accurate parameter change. `set_plain` is deferred to
@@ -1095,11 +1263,16 @@ fn push_vst3_param_change<P: PluginExport>(
     // ids, so `value` is the host's raw `0..=1`. The id carries the event
     // bus it was mapped for, so multi-port plugins keep controllers per
     // port.
-    if let Some((port, channel, controller)) = allocated_midi_proxy_decode(&inst.midi_proxy_ids, id) {
+    if let Some((port, channel, controller)) = allocated_midi_proxy_decode(&inst.midi_proxy_ids, id)
+    {
         #[allow(clippy::cast_possible_truncation)]
         let normalized = value.clamp(0.0, 1.0) as f32;
         return list
-            .try_push(Event::on_port(sample_offset, port, midi_proxy_event(channel, controller, normalized)))
+            .try_push(Event::on_port(
+                sample_offset,
+                port,
+                midi_proxy_event(channel, controller, normalized),
+            ))
             .is_ok();
     }
     // MIDI-mapped controllers (pitch bend, CC, pressure, program) arrive
@@ -1784,7 +1957,14 @@ unsafe extern "C" fn cb_param_presentation<P: PluginExport>(
             return -1;
         };
         let _ = copy_c_str(out, capacity as usize, &presentation.name);
-        i32::from(presentation.hidden)
+        let mut bits = 0;
+        if presentation.hidden {
+            bits |= ffi::PRESENTATION_HIDDEN;
+        }
+        if !presentation.available {
+            bits |= ffi::PRESENTATION_UNAVAILABLE;
+        }
+        bits
     })
 }
 
@@ -2068,7 +2248,10 @@ unsafe fn apply_host_state<P: PluginExport>(
         editor.state_changed();
     }
     // Delivered now on the UI thread, else left for the next drain.
-    ffi::moose_vst3_mark_restart(std::ptr::from_ref(inst).cast_mut().cast(), K_PARAM_VALUES_CHANGED);
+    ffi::moose_vst3_mark_restart(
+        std::ptr::from_ref(inst).cast_mut().cast(),
+        K_PARAM_VALUES_CHANGED,
+    );
     1
 }
 
@@ -3398,14 +3581,8 @@ unsafe extern "C" fn cb_midi_mapping_get_param_id<P: PluginExport>(
         return 0;
     }
     let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
-    // VST3 `ControllerNumbers`: 0..=127 are CCs; the extended values
-    // mirror the output path's encoding (`ivstmidicontrollers.h`).
-    let source = match controller {
-        0..=127 => MidiSource::Cc(controller as u8),
-        128 => MidiSource::ChannelPressure, // kAfterTouch
-        129 => MidiSource::PitchBend,
-        130 => MidiSource::ProgramChange, // kCtrlProgramChange
-        _ => return 0,                    // kResultFalse
+    let Some(source) = vst3_midi_source(controller) else {
+        return 0; // kResultFalse
     };
     let channel = u8::try_from(channel).unwrap_or(0);
     // Returns a hit-flag (1/0); the shim maps it to kResultOk /
@@ -3597,6 +3774,9 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
             .with_tasks(task_spawner_for_ctx)
             .with_mark_dirty(Arc::new(move || {
                 ffi::moose_vst3_mark_dirty(ctx_raw.as_ptr().cast_mut());
+            }))
+            .with_group_edits(Arc::new(move |edge| {
+                ffi::moose_vst3_group_edit(ctx_raw.as_ptr().cast_mut(), edge);
             }));
             #[cfg(target_os = "macos")]
             let handle = RawWindowHandle::AppKit(parent);
@@ -3660,7 +3840,11 @@ fn max_layout_channels(layouts: &[BusLayout]) -> (u32, u32) {
 
 fn vst3_bus_widths_supported(layouts: &[BusLayout]) -> bool {
     layouts.iter().all(|layout| {
-        layout.inputs.iter().chain(&layout.outputs).all(|bus| bus.channels.channel_count() <= 64)
+        layout
+            .inputs
+            .iter()
+            .chain(&layout.outputs)
+            .all(|bus| bus.channels.channel_count() <= 64)
     })
 }
 
@@ -3675,7 +3859,10 @@ pub fn register_vst3<P: PluginExport>() {
         };
         let layouts = P::bus_layouts();
         if !vst3_bus_widths_supported(&layouts) {
-            eprintln!("[moose VST3] {} declares a bus wider than 64 channels - plugin will not register.", std::any::type_name::<P>());
+            eprintln!(
+                "[moose VST3] {} declares a bus wider than 64 channels - plugin will not register.",
+                std::any::type_name::<P>()
+            );
             return;
         }
         if !bus_layouts_fit_routing(&layouts) {
@@ -3944,6 +4131,12 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         wants_persist_notifications: cb_wants_persist_notifications::<P>,
         set_persist_waker: cb_set_persist_waker::<P>,
         take_persist_change: cb_take_persist_change::<P>,
+        param_affects_presentation: cb_param_affects_presentation::<P>,
+        param_function_name: cb_param_function_name::<P>,
+        set_catalog_waker: cb_set_catalog_waker::<P>,
+        take_catalog_changes: cb_take_catalog_changes::<P>,
+        track_info_changed: cb_track_info_changed::<P>,
+        midi_learn: cb_midi_learn::<P>,
         set_processing: cb_set_processing::<P>,
     }));
 
@@ -4226,7 +4419,10 @@ mod tests {
         assert_eq!(parse_midi_proxy_text("loud"), None);
     }
 
-    use crate::com::{read_state_chunk as moose_vst3_read_state_chunk, write_state_stream as moose_vst3_write_state_stream};
+    use crate::com::{
+        read_state_chunk as moose_vst3_read_state_chunk,
+        write_state_stream as moose_vst3_write_state_stream,
+    };
 
     /// A fake `IBStream`: the vtable pointer first, then a script of
     /// `(tresult, byte count)` replies the shim sees per read/write.
@@ -4694,7 +4890,11 @@ mod state_tests {
                 }
                 let blob = state::serialize_state(hash, &[], &[], &[4, 5, 6], &[]);
                 let len = u32::try_from(blob.len()).unwrap();
-                assert_eq!(cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len), 1, "{phase}");
+                assert_eq!(
+                    cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len),
+                    1,
+                    "{phase}"
+                );
                 let mut data = std::ptr::null_mut();
                 let mut saved_len = 0;
                 cb_state_save::<TestPlugin>(ctx, &raw mut data, &raw mut saved_len);
@@ -4733,17 +4933,118 @@ mod state_tests {
                     cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len)
                 };
                 assert_eq!(load(-12.0, &[1]), 1, "{phase}");
-                assert_eq!(load(-30.0, b"bad"), 0, "{phase}: rejected load reports failure");
-                assert_eq!(inst.params_arc.get_plain(0), Some(-12.0), "{phase}: params kept");
+                assert_eq!(
+                    load(-30.0, b"bad"),
+                    0,
+                    "{phase}: rejected load reports failure"
+                );
+                assert_eq!(
+                    inst.params_arc.get_plain(0),
+                    Some(-12.0),
+                    "{phase}: params kept"
+                );
                 let mut data = std::ptr::null_mut();
                 let mut saved_len = 0;
                 cb_state_save::<TestPlugin>(ctx, &raw mut data, &raw mut saved_len);
                 let saved = slice::from_raw_parts(data, saved_len as usize).to_vec();
                 cb_state_free(data, saved_len);
                 let restored = state::deserialize_state(&saved, hash).expect("own envelope");
-                assert_eq!(restored.extra.as_deref(), Some(&[1][..]), "{phase}: custom kept");
+                assert_eq!(
+                    restored.extra.as_deref(),
+                    Some(&[1][..]),
+                    "{phase}: custom kept"
+                );
                 cb_destroy::<TestPlugin>(ctx);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod main_thread_tests {
+    use super::host_value_fixture::TestPlugin;
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Hooks that keep what the host told them.
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<String>>>);
+
+    impl MainThreadHooks for Seen {
+        fn track_info_changed(&mut self, _: &MainThread, info: &TrackInfo) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{:?} {:?}", info.name, info.color));
+        }
+        fn midi_learn(
+            &mut self,
+            _: &MainThread,
+            bus: u32,
+            channel: u8,
+            source: MidiSource,
+        ) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{bus} {channel} {source:?}"));
+            matches!(source, MidiSource::Cc(_))
+        }
+    }
+
+    #[test]
+    fn host_info_and_midi_learn_reach_the_hooks() {
+        // SAFETY: the test thread stands in for the host UI thread and owns
+        // the instance for every callback.
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+            let seen = Seen::default();
+            *inst.main_thread.borrow_mut(&MainThread::assume()) = Box::new(seen.clone());
+            let info = ffi::Vst3TrackInfo {
+                name: c"Bass".as_ptr(),
+                color_argb: 0x80FF_2010,
+                has_color: true,
+            };
+            cb_track_info_changed::<TestPlugin>(ctx, &raw const info);
+            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 1, 2, 74), 1);
+            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 0, 0, 129), 0);
+            assert_eq!(
+                cb_midi_learn::<TestPlugin>(ctx, 0, 0, 131),
+                0,
+                "not a controller"
+            );
+            assert_eq!(
+                *seen.0.lock().unwrap(),
+                [
+                    r#"Some("Bass") Some(HostColor { r: 255, g: 32, b: 16, a: 128 })"#,
+                    "1 2 Cc(74)",
+                    "0 0 PitchBend",
+                ]
+            );
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+
+    #[test]
+    fn function_names_match_the_sdk() {
+        for (function, name) in [
+            (ParamFunction::DryWetMix, c"DryWetMix"),
+            (ParamFunction::Randomize, c"Randomize"),
+            (ParamFunction::LowLatencyMode, c"LowLatencyMode"),
+            (ParamFunction::GainReduction, c"Comp:GainReduction"),
+            (ParamFunction::GainReductionMax, c"Comp:GainReductionMax"),
+            (
+                ParamFunction::GainReductionPeakHold,
+                c"Comp:GainReductionPeakHold",
+            ),
+            (
+                ParamFunction::ResetGainReductionMax,
+                c"Comp:ResetGainReductionMax",
+            ),
+        ] {
+            // SAFETY: the SDK constants are static NUL-terminated strings.
+            assert_eq!(unsafe { CStr::from_ptr(function_name(function)) }, name);
         }
     }
 }

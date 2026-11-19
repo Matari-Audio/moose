@@ -89,7 +89,10 @@ fn build_units(params: &[Vst3ParamDescriptor]) -> (Vec<Unit>, Vec<i32>) {
         .map(|p| {
             let mut parent = 0;
             let mut path = String::new();
-            for name in unsafe { cstr(p.group) }.split('/').filter(|s| !s.is_empty()) {
+            for name in unsafe { cstr(p.group) }
+                .split('/')
+                .filter(|s| !s.is_empty())
+            {
                 if !path.is_empty() {
                     path.push('/');
                 }
@@ -266,7 +269,9 @@ pub(crate) unsafe extern "C" fn write_state_stream(
 static INSTANCES: Mutex<Vec<(usize, Weak<Host>)>> = Mutex::new(Vec::new());
 
 fn instances() -> std::sync::MutexGuard<'static, Vec<(usize, Weak<Host>)>> {
-    INSTANCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    INSTANCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub(crate) fn register_instance(host: &Arc<Host>) {
@@ -288,10 +293,7 @@ pub(crate) fn pin(ctx: *mut c_void) -> Option<Arc<Host>> {
 #[cfg(target_os = "windows")]
 pub(crate) fn find_instance(pred: impl Fn(&Host) -> bool) -> Option<Arc<Host>> {
     let snapshot: Vec<_> = instances().iter().map(|(_, weak)| weak.clone()).collect();
-    snapshot
-        .iter()
-        .filter_map(Weak::upgrade)
-        .find(|h| pred(h))
+    snapshot.iter().filter_map(Weak::upgrade).find(|h| pred(h))
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +325,12 @@ pub(crate) fn request_resize(ctx: *mut c_void, w: u32, h: u32) -> i32 {
 pub(crate) fn mark_dirty(ctx: *mut c_void) {
     if let Some(host) = pin(ctx) {
         host.submit(component::EditOp::Dirty);
+    }
+}
+
+pub(crate) fn group_edit(ctx: *mut c_void, edge: moose_core::editor::EditGroup) {
+    if let Some(host) = pin(ctx) {
+        host.submit(component::EditOp::Group(edge));
     }
 }
 

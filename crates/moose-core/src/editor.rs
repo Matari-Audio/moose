@@ -624,12 +624,26 @@ pub struct PluginContext<P: ?Sized = dyn Params> {
     /// Tells the host the project changed outside the parameter system
     /// (see [`Self::mark_dirty`]). `None` where the format has no such API.
     mark_dirty: Option<MarkDirty>,
+    /// Brackets several edits into one host undo step (see
+    /// [`Self::begin_group`]). `None` where the format has no such API.
+    group_edits: Option<GroupEdits>,
     params: Arc<P>,
 }
 
 /// The wrapper's "project modified" notifier: callable from any thread, it
 /// delivers the format's call on the host's main/UI thread.
 pub type MarkDirty = Arc<dyn Fn() + Send + Sync>;
+
+/// One edge of a group of parameter edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EditGroup {
+    Begin,
+    End,
+}
+
+/// The wrapper's group-edit notifier: callable from any thread, it delivers
+/// the format's call on the host's main/UI thread in order with the edits.
+pub type GroupEdits = Arc<dyn Fn(EditGroup) + Send + Sync>;
 
 impl<P: ?Sized> Clone for PluginContext<P> {
     fn clone(&self) -> Self {
@@ -638,6 +652,7 @@ impl<P: ?Sized> Clone for PluginContext<P> {
             notification_delivery: self.notification_delivery,
             tasks: self.tasks.clone(),
             mark_dirty: self.mark_dirty.clone(),
+            group_edits: self.group_edits.clone(),
             params: Arc::clone(&self.params),
         }
     }
@@ -653,6 +668,7 @@ impl<P: ?Sized> PluginContext<P> {
             notification_delivery: EditorNotificationDelivery::HostThread,
             tasks: None,
             mark_dirty: None,
+            group_edits: None,
             params,
         }
     }
@@ -673,6 +689,33 @@ impl<P: ?Sized> PluginContext<P> {
     pub fn mark_dirty(&self) {
         if let Some(f) = &self.mark_dirty {
             f();
+        }
+    }
+
+    /// Install the format's group-edit notifier (VST3
+    /// `IComponentHandler2::startGroupEdit` / `finishGroupEdit`). Format
+    /// wrappers call this; the closure must be safe to call from any thread.
+    #[must_use]
+    pub fn with_group_edits(mut self, group_edits: GroupEdits) -> Self {
+        self.group_edits = Some(group_edits);
+        self
+    }
+
+    /// Start a group of edits the host treats as one (one undo step), such
+    /// as a preset morph that moves several parameters. Close it with
+    /// [`Self::end_group`]; the gestures inside still need
+    /// `begin_edit` / `end_edit`. A no-op on formats without the API. Any
+    /// thread.
+    pub fn begin_group(&self) {
+        if let Some(f) = &self.group_edits {
+            f(EditGroup::Begin);
+        }
+    }
+
+    /// Close the group started by [`Self::begin_group`].
+    pub fn end_group(&self) {
+        if let Some(f) = &self.group_edits {
+            f(EditGroup::End);
         }
     }
 
@@ -740,6 +783,7 @@ impl<P: ?Sized> PluginContext<P> {
             notification_delivery: self.notification_delivery,
             tasks: self.tasks.clone(),
             mark_dirty: self.mark_dirty.clone(),
+            group_edits: self.group_edits.clone(),
             params,
         }
     }
@@ -819,6 +863,7 @@ impl PluginContext<dyn Params> {
             notification_delivery: EditorNotificationDelivery::HostThread,
             tasks: None,
             mark_dirty: None,
+            group_edits: None,
             params,
         }
     }
@@ -834,6 +879,7 @@ impl<P: Params + 'static> PluginContext<P> {
             notification_delivery: self.notification_delivery,
             tasks: self.tasks,
             mark_dirty: self.mark_dirty,
+            group_edits: self.group_edits,
             params: self.params as Arc<dyn Params>,
         }
     }

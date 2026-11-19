@@ -14,7 +14,10 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 use super::component::{Component, Host};
 use super::{Registration, build_units};
-use crate::ffi::{ProcessFn, Vst3Callbacks, Vst3NativeEvent, Vst3ParamDescriptor, Vst3PluginDescriptor, Vst3Transport};
+use crate::ffi::{
+    ProcessFn, Vst3Callbacks, Vst3NativeEvent, Vst3ParamDescriptor, Vst3PluginDescriptor,
+    Vst3TrackInfo, Vst3Transport,
+};
 
 // ---------------------------------------------------------------------------
 // Fake callback table
@@ -106,7 +109,14 @@ unsafe extern "C" fn set_size(_: *mut c_void, _: u32, _: u32) {}
 unsafe extern "C" fn no_midi_map(_: *mut c_void, _: i32, _: i16, _: i16, _: *mut u32) -> i32 {
     0
 }
-unsafe extern "C" fn no_output_param(_: *mut c_void, _: u32, _: *mut u32, _: *mut i32, _: *mut f64) {}
+unsafe extern "C" fn no_output_param(
+    _: *mut c_void,
+    _: u32,
+    _: *mut u32,
+    _: *mut i32,
+    _: *mut f64,
+) {
+}
 unsafe extern "C" fn set_active(_: *mut c_void, _: i32) {}
 unsafe extern "C" fn match_layout(_: u32, _: u32) -> i32 {
     0
@@ -129,11 +139,29 @@ unsafe extern "C" fn revision(_: *mut c_void) -> u64 {
 unsafe extern "C" fn no_persist(_: *mut c_void) -> bool {
     false
 }
-unsafe extern "C" fn no_waker(_: *mut c_void, _: Option<unsafe extern "C" fn(*mut c_void)>, _: *mut c_void) {}
+unsafe extern "C" fn no_waker(
+    _: *mut c_void,
+    _: Option<unsafe extern "C" fn(*mut c_void)>,
+    _: *mut c_void,
+) {
+}
 unsafe extern "C" fn no_take(_: *mut c_void, _: *mut u32, _: *mut f64) -> bool {
     false
 }
 unsafe extern "C" fn no_processing(_: *mut c_void, _: i32, _: f64, _: u32, _: i32) {}
+unsafe extern "C" fn never(_: *mut c_void, _: u32) -> bool {
+    false
+}
+unsafe extern "C" fn no_function(_: *mut c_void, _: u32) -> *const c_char {
+    std::ptr::null()
+}
+unsafe extern "C" fn no_changes(_: *mut c_void) -> u8 {
+    0
+}
+unsafe extern "C" fn no_track(_: *mut c_void, _: *const Vst3TrackInfo) {}
+unsafe extern "C" fn no_learn(_: *mut c_void, _: u32, _: u8, _: i16) -> i32 {
+    0
+}
 
 fn callbacks() -> Vst3Callbacks {
     let process: ProcessFn = ok_process;
@@ -186,6 +214,12 @@ fn callbacks() -> Vst3Callbacks {
         wants_persist_notifications: no_persist,
         set_persist_waker: no_waker,
         take_persist_change: no_take,
+        param_affects_presentation: never,
+        param_function_name: no_function,
+        set_catalog_waker: no_waker,
+        take_catalog_changes: no_changes,
+        track_info_changed: no_track,
+        midi_learn: no_learn,
         set_processing: no_processing,
     }
 }
@@ -195,7 +229,11 @@ fn descriptor() -> Vst3PluginDescriptor {
     unsafe { std::mem::zeroed() }
 }
 
-fn registration(desc: Vst3PluginDescriptor, cb: Vst3Callbacks, params: Vec<Vst3ParamDescriptor>) -> &'static Registration {
+fn registration(
+    desc: Vst3PluginDescriptor,
+    cb: Vst3Callbacks,
+    params: Vec<Vst3ParamDescriptor>,
+) -> &'static Registration {
     let params: &'static [Vst3ParamDescriptor] = Box::leak(params.into_boxed_slice());
     let (units, param_unit) = build_units(params);
     Box::leak(Box::new(Registration {
@@ -222,11 +260,17 @@ fn raw_component(reg: &'static Registration) -> *mut IComponent {
 /// [`raw_component`] plus its plugin ctx.
 fn raw_component_ctx(reg: &'static Registration) -> (*mut IComponent, *mut c_void) {
     let com = component(reg);
-    (com.to_com_ptr::<IComponent>().unwrap().into_raw(), com.host.ctx)
+    (
+        com.to_com_ptr::<IComponent>().unwrap().into_raw(),
+        com.host.ctx,
+    )
 }
 
 fn create_view(com: *mut IComponent) -> *mut IPlugView {
-    let controller = unsafe { ComRef::from_raw(com) }.unwrap().cast::<IEditController>().unwrap();
+    let controller = unsafe { ComRef::from_raw(com) }
+        .unwrap()
+        .cast::<IEditController>()
+        .unwrap();
     unsafe { controller.createView(c"editor".as_ptr()) }
 }
 
@@ -273,7 +317,11 @@ impl FrameCore {
         }
     }
 
-    fn resize(&self, #[allow(unused_variables)] view: *mut IPlugView, rect: *mut ViewRect) -> tresult {
+    fn resize(
+        &self,
+        #[allow(unused_variables)] view: *mut IPlugView,
+        rect: *mut ViewRect,
+    ) -> tresult {
         #[cfg(target_os = "linux")]
         if let Some(st) = &self.threads {
             st.record('r');
@@ -333,7 +381,12 @@ impl LoopFrame {
     /// What the host loop does when the fd is readable: call the handler
     /// on its own (this) thread.
     fn pump(&self) {
-        let handler = self.handler.lock().unwrap().clone().expect("event handler registered");
+        let handler = self
+            .handler
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("event handler registered");
         unsafe { Linux::IEventHandlerTrait::onFDIsSet(&handler, self.fd.load(SeqCst)) };
     }
 }
@@ -352,7 +405,11 @@ impl IPlugFrameTrait for LoopFrame {
 
 #[cfg(target_os = "linux")]
 impl Linux::IRunLoopTrait for LoopFrame {
-    unsafe fn registerEventHandler(&self, handler: *mut Linux::IEventHandler, fd: Linux::FileDescriptor) -> tresult {
+    unsafe fn registerEventHandler(
+        &self,
+        handler: *mut Linux::IEventHandler,
+        fd: Linux::FileDescriptor,
+    ) -> tresult {
         *self.handler.lock().unwrap() = unsafe { super::retain(handler) };
         self.fd.store(fd, SeqCst);
         kResultOk
@@ -366,7 +423,11 @@ impl Linux::IRunLoopTrait for LoopFrame {
         kResultOk
     }
 
-    unsafe fn registerTimer(&self, _: *mut Linux::ITimerHandler, _: Linux::TimerInterval) -> tresult {
+    unsafe fn registerTimer(
+        &self,
+        _: *mut Linux::ITimerHandler,
+        _: Linux::TimerInterval,
+    ) -> tresult {
         self.timers.fetch_add(1, SeqCst);
         kResultOk
     }
@@ -420,7 +481,12 @@ mod lifecycle {
     fn lifecycle_resets() {
         let reg = registration(
             descriptor(),
-            Vst3Callbacks { reset, prepare, set_processing, ..callbacks() },
+            Vst3Callbacks {
+                reset,
+                prepare,
+                set_processing,
+                ..callbacks()
+            },
             Vec::new(),
         );
         for processing in [false, true] {
@@ -575,7 +641,10 @@ mod editor_attach {
             }
             assert_eq!(view.isPlatformTypeSupported(std::ptr::null()), kResultFalse);
             assert_eq!(view.isPlatformTypeSupported(PLATFORM.as_ptr()), kResultOk);
-            assert_eq!(view.attached(std::ptr::null_mut(), PLATFORM.as_ptr()), kResultFalse);
+            assert_eq!(
+                view.attached(std::ptr::null_mut(), PLATFORM.as_ptr()),
+                kResultFalse
+            );
             assert_eq!(counts(), (0, 0));
             // An editor that fails to open leaves nothing attached.
             FAIL_OPEN.store(true, SeqCst);
@@ -594,10 +663,20 @@ mod editor_attach {
             assert_eq!(view.attached(parent, c"unsupported".as_ptr()), kResultFalse);
             assert_eq!(counts(), (1, 0));
 
-            let mut size = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut size = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             assert_eq!(view.getSize(&raw mut size), kResultOk);
             assert_eq!((size.right, size.bottom), (1180, 760));
-            let mut size = ViewRect { left: 10, top: 20, right: 1310, bottom: 920 };
+            let mut size = ViewRect {
+                left: 10,
+                top: 20,
+                right: 1310,
+                bottom: 920,
+            };
             assert_eq!(view.onSize(&raw mut size), kResultOk);
             assert_eq!((WIDTH.load(SeqCst), HEIGHT.load(SeqCst)), (1300, 900));
 
@@ -718,15 +797,27 @@ mod editor_lifetime {
             assert_eq!(release(com), 0);
             assert!(alive() && DESTROYS.load(SeqCst) == iteration);
             assert_eq!(release(first), 0);
-            assert!(super::super::pin(ctx()).unwrap().is_current_view(current as usize));
+            assert!(
+                super::super::pin(ctx())
+                    .unwrap()
+                    .is_current_view(current as usize)
+            );
             assert_eq!(attach(current), kResultOk);
             assert_eq!(remove(current), kResultOk);
             assert_eq!(attach(current), kResultOk);
             assert_eq!(remove(current), kResultOk);
             assert_eq!(release(current), 1);
             // The secondary scale interface keeps the same view and owner.
-            let view = unsafe { ComRef::from_raw(scale) }.unwrap().cast::<IPlugView>().unwrap();
-            let mut size = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+            let view = unsafe { ComRef::from_raw(scale) }
+                .unwrap()
+                .cast::<IPlugView>()
+                .unwrap();
+            let mut size = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             assert_eq!(unsafe { view.getSize(&raw mut size) }, kResultOk);
             assert_eq!(size.right, 1180);
             drop(view);
@@ -817,7 +908,10 @@ mod editor_lifetime {
         // The view, not the component interface, keeps the instance.
         assert!(release(com) == 0 && alive());
         assert!(release(view) == 0 && !open() && !alive() && DESTROYS.load(SeqCst) == 104);
-        assert_eq!((OPENS.load(SeqCst), CLOSES.load(SeqCst)), (opens + 4, closes + 3));
+        assert_eq!(
+            (OPENS.load(SeqCst), CLOSES.load(SeqCst)),
+            (opens + 4, closes + 3)
+        );
         assert!(!BAD.load(SeqCst));
     }
 }
@@ -833,8 +927,13 @@ fn parameter_units() {
     groups.push(format!("{long_prefix}A/Leaf"));
     groups.push(format!("{long_prefix}B/Leaf"));
     groups.push(String::new());
-    let groups: &'static [CString] =
-        Box::leak(groups.into_iter().map(|g| CString::new(g).unwrap()).collect::<Vec<_>>().into_boxed_slice());
+    let groups: &'static [CString] = Box::leak(
+        groups
+            .into_iter()
+            .map(|g| CString::new(g).unwrap())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
     let params: Vec<Vst3ParamDescriptor> = (0..5004)
         .map(|index: usize| Vst3ParamDescriptor {
             id: 0x0100_0000 + index as u32,
@@ -846,7 +945,12 @@ fn parameter_units() {
             default_normalized: 0.0,
             step_count: 63,
             flags: 1,
-            group: groups[if index < 5001 { index % 96 } else { 96 + (index - 5001) }].as_ptr(),
+            group: groups[if index < 5001 {
+                index % 96
+            } else {
+                96 + (index - 5001)
+            }]
+            .as_ptr(),
         })
         .collect();
     let ids: Vec<u32> = params.iter().map(|p| p.id).collect();
@@ -864,7 +968,10 @@ fn parameter_units() {
             assert_ne!(info.unitId, 0);
             let (mut child, mut parent) = (zero_unit(), zero_unit());
             assert_eq!(com.getUnitInfo(info.unitId, &raw mut child), kResultOk);
-            assert_eq!(com.getUnitInfo(child.parentUnitId, &raw mut parent), kResultOk);
+            assert_eq!(
+                com.getUnitInfo(child.parentUnitId, &raw mut parent),
+                kResultOk
+            );
             assert_eq!(parent.parentUnitId, 0);
             assert_eq!(child.programListId, -1);
         }
@@ -958,7 +1065,11 @@ mod output_silence {
                 return false;
             }
             for (ch, buf) in samples.iter().enumerate() {
-                let host = if output.silenceFlags & (1 << ch) != 0 { 0.0 } else { buf[0].into() };
+                let host = if output.silenceFlags & (1 << ch) != 0 {
+                    0.0
+                } else {
+                    buf[0].into()
+                };
                 if (host - 0.25).abs() > f64::EPSILON {
                     return false;
                 }
@@ -989,8 +1100,14 @@ mod output_silence {
             Vec::new(),
         );
         let com = component(reg);
-        assert!(audible_block::<f32>(&com, SymbolicSampleSizes_::kSample32 as i32), "32-bit");
-        assert!(audible_block::<f64>(&com, SymbolicSampleSizes_::kSample64 as i32), "64-bit");
+        assert!(
+            audible_block::<f32>(&com, SymbolicSampleSizes_::kSample32 as i32),
+            "32-bit"
+        );
+        assert!(
+            audible_block::<f64>(&com, SymbolicSampleSizes_::kSample64 as i32),
+            "64-bit"
+        );
     }
 }
 
@@ -999,21 +1116,36 @@ mod output_events {
 
     static NEXT: AtomicU32 = AtomicU32::new(0);
     static RESULT: AtomicU32 = AtomicU32::new(99);
-    unsafe extern "C" fn count(_: *mut c_void) -> u32 { 1 }
+    unsafe extern "C" fn count(_: *mut c_void) -> u32 {
+        1
+    }
     unsafe extern "C" fn next(_: *mut c_void, event: *mut Vst3NativeEvent) -> u32 {
         if NEXT.fetch_add(1, SeqCst) == 0 {
             unsafe { (*event).kind = Event_::EventTypes_::kNoteOnEvent as u32 };
             1
-        } else { 0 }
+        } else {
+            0
+        }
     }
-    unsafe extern "C" fn finish(_: *mut c_void, result: u32) { RESULT.store(result, SeqCst); }
+    unsafe extern "C" fn finish(_: *mut c_void, result: u32) {
+        RESULT.store(result, SeqCst);
+    }
     struct Events(AtomicU32);
-    impl Class for Events { type Interfaces = (IEventList,); }
+    impl Class for Events {
+        type Interfaces = (IEventList,);
+    }
     impl IEventListTrait for Events {
-        unsafe fn getEventCount(&self) -> i32 { 0 }
-        unsafe fn getEvent(&self, _: i32, _: *mut Event) -> tresult { kResultFalse }
+        unsafe fn getEventCount(&self) -> i32 {
+            0
+        }
+        unsafe fn getEvent(&self, _: i32, _: *mut Event) -> tresult {
+            kResultFalse
+        }
         unsafe fn addEvent(&self, event: *mut Event) -> tresult {
-            assert_eq!(unsafe { (*event).r#type }, Event_::EventTypes_::kNoteOnEvent as u16);
+            assert_eq!(
+                unsafe { (*event).r#type },
+                Event_::EventTypes_::kNoteOnEvent as u16
+            );
             self.0.fetch_add(1, SeqCst);
             kResultOk
         }
@@ -1022,10 +1154,16 @@ mod output_events {
     fn note_is_delivered_without_parameter_output_queue() {
         NEXT.store(0, SeqCst);
         RESULT.store(99, SeqCst);
-        let reg = registration(descriptor(), Vst3Callbacks {
-            get_output_param_count: count, next_output_event: next, finish_output_events: finish,
-            ..callbacks()
-        }, Vec::new());
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                get_output_param_count: count,
+                next_output_event: next,
+                finish_output_events: finish,
+                ..callbacks()
+            },
+            Vec::new(),
+        );
         let com = component(reg);
         let events = ComWrapper::new(Events(AtomicU32::new(0)));
         let mut data: ProcessData = unsafe { std::mem::zeroed() };
@@ -1039,18 +1177,40 @@ mod output_events {
 
 mod arrangements {
     use super::*;
-    unsafe extern "C" fn channels(_: u32, _: i32, _: u32) -> u32 { 8 }
+    unsafe extern "C" fn channels(_: u32, _: i32, _: u32) -> u32 {
+        8
+    }
     #[test]
     fn rejects_noncanonical_mask_without_changing_current_layout() {
-        let reg = registration(Vst3PluginDescriptor { num_output_buses: 1, num_outputs: 8, max_outputs: 8, ..descriptor() },
-            Vst3Callbacks { layout_bus_channels: channels, ..callbacks() }, Vec::new());
+        let reg = registration(
+            Vst3PluginDescriptor {
+                num_output_buses: 1,
+                num_outputs: 8,
+                max_outputs: 8,
+                ..descriptor()
+            },
+            Vst3Callbacks {
+                layout_bus_channels: channels,
+                ..callbacks()
+            },
+            Vec::new(),
+        );
         let com = component(reg);
         let mut cine: SpeakerArrangement = 0xff;
-        assert_eq!(unsafe { com.setBusArrangements(std::ptr::null_mut(), 0, &raw mut cine, 1) }, kResultFalse);
+        assert_eq!(
+            unsafe { com.setBusArrangements(std::ptr::null_mut(), 0, &raw mut cine, 1) },
+            kResultFalse
+        );
         let mut actual = 0;
-        assert_eq!(unsafe { com.getBusArrangement(BusDirections_::kOutput as i32, 0, &raw mut actual) }, kResultOk);
+        assert_eq!(
+            unsafe { com.getBusArrangement(BusDirections_::kOutput as i32, 0, &raw mut actual) },
+            kResultOk
+        );
         assert_eq!(actual, 0x63f);
-        assert_eq!(unsafe { com.setBusArrangements(std::ptr::null_mut(), 0, &raw mut actual, 1) }, kResultOk);
+        assert_eq!(
+            unsafe { com.setBusArrangements(std::ptr::null_mut(), 0, &raw mut actual, 1) },
+            kResultOk
+        );
     }
 }
 
@@ -1084,7 +1244,11 @@ mod threads {
     impl State {
         pub fn record(&self, c: char) {
             // A host call off the UI thread shows up as '!'.
-            let c = if std::thread::current().id() == self.ui { c } else { '!' };
+            let c = if std::thread::current().id() == self.ui {
+                c
+            } else {
+                '!'
+            };
             self.calls.lock().unwrap().push(c);
         }
         fn calls(&self) -> String {
@@ -1142,7 +1306,11 @@ mod threads {
                 }
                 return kResultOk;
             }
-            self.st.record(if self.kind == Kind::Replacement { 'B' } else { 'b' });
+            self.st.record(if self.kind == Kind::Replacement {
+                'B'
+            } else {
+                'b'
+            });
             if self.st.worker_on_begin.swap(false, SeqCst) {
                 let ctx = self.st.ctx.load(SeqCst);
                 off_ui(move || end_edit(ctx as *mut c_void, 7));
@@ -1177,7 +1345,11 @@ mod threads {
         }
 
         unsafe fn endEdit(&self, _: ParamID) -> tresult {
-            self.st.record(if self.kind == Kind::Replacement { 'E' } else { 'e' });
+            self.st.record(if self.kind == Kind::Replacement {
+                'E'
+            } else {
+                'e'
+            });
             kResultOk
         }
 
@@ -1276,7 +1448,9 @@ mod threads {
         st.clear();
         let view = unsafe { ComPtr::from_raw(c.createView(c"editor".as_ptr())) }.unwrap();
         let set_frame = |f: *mut IPlugFrame| unsafe { view.setFrame(f) };
-        assert!(set_frame(fp) == kResultOk && frame.has_handler() && frame.timers.load(SeqCst) == 1);
+        assert!(
+            set_frame(fp) == kResultOk && frame.has_handler() && frame.timers.load(SeqCst) == 1
+        );
         let edits = || com.host.edit_counts();
         let fd = || frame.fd.load(SeqCst);
         let resizes = || frame.core.resizes.load(SeqCst);
@@ -1422,7 +1596,10 @@ mod threads {
         let calls = st.calls();
         let e = calls.find('e').unwrap();
         assert_eq!(e, TRANSITION_EDITS);
-        assert_eq!(calls, "b".to_owned() + &p(e - 1) + "eB" + &"P".repeat(calls.len() - e - 3) + "E");
+        assert_eq!(
+            calls,
+            "b".to_owned() + &p(e - 1) + "eB" + &"P".repeat(calls.len() - e - 3) + "E"
+        );
         assert_eq!(edits(), (0, 0));
         set_handler(hp(&normal));
 
@@ -1446,7 +1623,10 @@ mod threads {
             let other_host = pin(other_ctx).unwrap();
             let other_ctx = other_ctx as usize;
             WATCH.store(other_ctx, SeqCst);
-            let controller = unsafe { ComRef::from_raw(other) }.unwrap().cast::<IEditController>().unwrap();
+            let controller = unsafe { ComRef::from_raw(other) }
+                .unwrap()
+                .cast::<IEditController>()
+                .unwrap();
             unsafe { controller.setComponentHandler(hp(&normal)) };
             drop(controller);
             let loop2 = ComWrapper::new(LoopFrame::new(FrameCore::new(640, 480)));
@@ -1537,12 +1717,17 @@ mod threads {
             let slow = handler(&st, Kind::Slow);
             let (other, other_ctx) = raw_component_ctx(reg);
             WATCH.store(other_ctx as usize, SeqCst);
-            let controller = unsafe { ComRef::from_raw(other) }.unwrap().cast::<IEditController>().unwrap();
+            let controller = unsafe { ComRef::from_raw(other) }
+                .unwrap()
+                .cast::<IEditController>()
+                .unwrap();
             unsafe { controller.setComponentHandler(hp(&slow)) };
             drop(controller);
             let other_u = other as usize;
             let worker = std::thread::spawn(move || {
-                while TEARDOWN_STAGE.load(SeqCst) != 1 { std::thread::yield_now(); }
+                while TEARDOWN_STAGE.load(SeqCst) != 1 {
+                    std::thread::yield_now();
+                }
                 release(other_u as *mut IComponent);
                 assert!(!DESTROYED.load(SeqCst));
                 TEARDOWN_STAGE.store(2, SeqCst);
@@ -1562,7 +1747,10 @@ mod threads {
             let (victim, victim_ctx) = raw_component_ctx(reg);
             WATCH.store(victim_ctx as usize, SeqCst);
             dropper.victim.store(victim as usize, SeqCst);
-            let controller = unsafe { ComRef::from_raw(victim) }.unwrap().cast::<IEditController>().unwrap();
+            let controller = unsafe { ComRef::from_raw(victim) }
+                .unwrap()
+                .cast::<IEditController>()
+                .unwrap();
             unsafe { controller.setComponentHandler(hp(&dropper)) };
             drop(controller);
             perform_edit(victim_ctx, 3, 0.5); // no frame: called in place
@@ -1574,14 +1762,20 @@ mod threads {
     #[test]
     fn factory_loop_delivers_restart_without_a_view() {
         let st = Arc::new(State {
-            ui: std::thread::current().id(), calls: Mutex::new(String::new()),
-            ctx: AtomicUsize::new(0), flood: AtomicBool::new(false), burst: AtomicI32::new(0),
-            worker_on_begin: AtomicBool::new(false), emit_on_resize: AtomicBool::new(false),
+            ui: std::thread::current().id(),
+            calls: Mutex::new(String::new()),
+            ctx: AtomicUsize::new(0),
+            flood: AtomicBool::new(false),
+            burst: AtomicI32::new(0),
+            worker_on_begin: AtomicBool::new(false),
+            emit_on_resize: AtomicBool::new(false),
         });
         let frame = ComWrapper::new(LoopFrame::new(FrameCore::new(640, 480)));
         let run_loop = frame.as_com_ref::<Linux::IRunLoop>().unwrap().to_com_ptr();
         let reg = registration(descriptor(), callbacks(), Vec::new());
-        let com = ComWrapper::new(Component { host: Host::new(reg, Some(run_loop)).unwrap() });
+        let com = ComWrapper::new(Component {
+            host: Host::new(reg, Some(run_loop)).unwrap(),
+        });
         let handler = handler(&st, Kind::Normal);
         assert_eq!(unsafe { com.setComponentHandler(hp(&handler)) }, kResultOk);
         let ctx = com.host.ctx as usize;
@@ -1590,5 +1784,540 @@ mod threads {
         frame.pump();
         assert_eq!(st.calls(), "x");
     }
+}
 
+// ---------------------------------------------------------------------------
+// host_features: runtime catalog, function names, info listener, MIDI learn,
+// group edits
+// ---------------------------------------------------------------------------
+
+mod host_features {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+
+    use moose_core::editor::EditGroup;
+    use moose_params::CatalogChange;
+    use vst3::Steinberg::Vst::ChannelContext::{
+        IInfoListener, IInfoListenerTrait, kChannelColorKey, kChannelNameKey,
+    };
+
+    use super::super::component::DynamicSupport;
+    use super::*;
+    use crate::ffi::{PRESENTATION_HIDDEN, PRESENTATION_UNAVAILABLE};
+
+    /// A component handler that logs every call it gets.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<String>>);
+
+    impl Recorder {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+        fn log(&self, entry: String) -> tresult {
+            self.0.lock().unwrap().push(entry);
+            kResultOk
+        }
+    }
+
+    impl Class for Recorder {
+        type Interfaces = (IComponentHandler, IComponentHandler2);
+    }
+
+    impl IComponentHandlerTrait for Recorder {
+        unsafe fn beginEdit(&self, id: ParamID) -> tresult {
+            self.log(format!("begin {id}"))
+        }
+        unsafe fn performEdit(&self, id: ParamID, _: ParamValue) -> tresult {
+            self.log(format!("perform {id}"))
+        }
+        unsafe fn endEdit(&self, id: ParamID) -> tresult {
+            self.log(format!("end {id}"))
+        }
+        unsafe fn restartComponent(&self, flags: int32) -> tresult {
+            self.log(format!("restart {flags}"))
+        }
+    }
+
+    impl IComponentHandler2Trait for Recorder {
+        unsafe fn setDirty(&self, _: TBool) -> tresult {
+            self.log("dirty".into())
+        }
+        unsafe fn requestOpenEditor(&self, _: FIDString) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn startGroupEdit(&self) -> tresult {
+            self.log("group".into())
+        }
+        unsafe fn finishGroupEdit(&self) -> tresult {
+            self.log("group end".into())
+        }
+    }
+
+    fn attach(com: &ComWrapper<Component>) -> ComWrapper<Recorder> {
+        let recorder = ComWrapper::new(Recorder::default());
+        let handler = recorder.as_com_ref::<IComponentHandler>().unwrap().as_ptr();
+        assert_eq!(unsafe { com.setComponentHandler(handler) }, kResultOk);
+        recorder
+    }
+
+    fn param(id: u32) -> Vst3ParamDescriptor {
+        Vst3ParamDescriptor {
+            id,
+            name: c"Param".as_ptr(),
+            short_name: c"Param".as_ptr(),
+            units: c"".as_ptr(),
+            min: 0.0,
+            max: 1.0,
+            default_normalized: 0.0,
+            step_count: 0,
+            flags: ParameterInfo_::ParameterFlags_::kCanAutomate as i32,
+            group: c"".as_ptr(),
+        }
+    }
+
+    /// `IHostApplication` that reports a fixed name.
+    struct App(&'static str);
+
+    impl Class for App {
+        type Interfaces = (IHostApplication,);
+    }
+
+    impl IHostApplicationTrait for App {
+        unsafe fn getName(&self, name: *mut String128) -> tresult {
+            super::super::utf16_into(unsafe { &mut *name }, self.0);
+            kResultOk
+        }
+        unsafe fn createInstance(
+            &self,
+            _: *mut TUID,
+            _: *mut TUID,
+            _: *mut *mut c_void,
+        ) -> tresult {
+            kNotImplemented
+        }
+    }
+
+    fn initialize_in(com: &ComWrapper<Component>, host: &'static str) {
+        let app = ComWrapper::new(App(host));
+        let context = app.as_com_ref::<FUnknown>().unwrap().as_ptr();
+        assert_eq!(unsafe { com.initialize(context) }, kResultOk);
+    }
+
+    #[test]
+    fn host_names_pick_the_dynamic_mode() {
+        assert_eq!(
+            DynamicSupport::for_host("Cubase Pro 14"),
+            DynamicSupport::Reload
+        );
+        assert_eq!(DynamicSupport::for_host("Nuendo"), DynamicSupport::Reload);
+        assert_eq!(DynamicSupport::for_host("REAPER"), DynamicSupport::SlotPool);
+        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let com = component(reg);
+        assert_eq!(
+            com.host.dynamic_support(),
+            DynamicSupport::SlotPool,
+            "before initialize"
+        );
+        initialize_in(&com, "Nuendo 13");
+        assert_eq!(com.host.dynamic_support(), DynamicSupport::Reload);
+    }
+
+    // --- catalog wake ---------------------------------------------------------
+
+    type Wake = (unsafe extern "C" fn(*mut c_void), usize);
+    static WAKE: Mutex<Option<Wake>> = Mutex::new(None);
+    static CHANGES: AtomicU8 = AtomicU8::new(0);
+
+    unsafe extern "C" fn store_waker(
+        _: *mut c_void,
+        wake: Option<unsafe extern "C" fn(*mut c_void)>,
+        ctx: *mut c_void,
+    ) {
+        *WAKE.lock().unwrap() = wake.map(|w| (w, ctx as usize));
+    }
+    unsafe extern "C" fn take_changes(_: *mut c_void) -> u8 {
+        CHANGES.swap(0, SeqCst)
+    }
+
+    /// What a committed `DynamicParams` edit does: set its pending bits and
+    /// notify the signal, from a worker thread.
+    fn commit(change: CatalogChange) {
+        CHANGES.fetch_or(change.bits(), SeqCst);
+        let (wake, ctx) = WAKE.lock().unwrap().expect("catalog waker bound");
+        std::thread::spawn(move || unsafe { wake(ctx as *mut c_void) })
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn catalog_wake_sends_restart_flags() {
+        use RestartFlags_::*;
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                set_catalog_waker: store_waker,
+                take_catalog_changes: take_changes,
+                ..callbacks()
+            },
+            Vec::new(),
+        );
+        let com = component(reg);
+        let recorder = attach(&com);
+        let restart = |flags: u32| vec![format!("restart {flags}")];
+
+        com.host.on_ui_tick();
+        assert_eq!(
+            recorder.take(),
+            Vec::<String>::new(),
+            "no wake, nothing to send"
+        );
+        for (change, flags) in [
+            (CatalogChange::VALUES, kParamValuesChanged),
+            (CatalogChange::INFO, kParamTitlesChanged),
+            (
+                CatalogChange::STRUCTURE,
+                kParamTitlesChanged | kParamValuesChanged,
+            ),
+        ] {
+            commit(change);
+            com.host.on_ui_tick();
+            assert_eq!(
+                recorder.take(),
+                restart(flags as u32),
+                "{change:?} in slot-pool mode"
+            );
+        }
+        com.host.set_dynamic_support(DynamicSupport::Reload);
+        commit(CatalogChange::STRUCTURE | CatalogChange::VALUES);
+        com.host.on_ui_tick();
+        assert_eq!(
+            recorder.take(),
+            restart((kReloadComponent | kParamValuesChanged) as u32)
+        );
+
+        drop(com);
+        assert!(WAKE.lock().unwrap().is_none(), "teardown unbinds the wake");
+    }
+
+    // --- parameter list ---------------------------------------------------------
+
+    /// Slot 11 is free until `BOUND`; `REVISION` follows it.
+    static BOUND: AtomicBool = AtomicBool::new(false);
+    static REVISION: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn slot_presentation(
+        _: *mut c_void,
+        id: u32,
+        name: *mut c_char,
+        capacity: u32,
+    ) -> i32 {
+        if id != 11 || BOUND.load(SeqCst) {
+            return -1;
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(name, capacity as usize) };
+        super::super::c8_into(dst, "Slot 2");
+        PRESENTATION_HIDDEN | PRESENTATION_UNAVAILABLE
+    }
+    unsafe extern "C" fn slot_revision(_: *mut c_void) -> u64 {
+        REVISION.load(SeqCst)
+    }
+    unsafe extern "C" fn binder_param(_: *mut c_void, id: u32) -> bool {
+        id == 10
+    }
+
+    fn listed(com: &Component) -> Vec<(u32, i32)> {
+        (0..unsafe { com.getParameterCount() })
+            .map(|i| {
+                let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { com.getParameterInfo(i, &raw mut info) }, kResultOk);
+                (info.id, info.flags)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slot_pool_hides_and_reload_omits_free_slots() {
+        use ParameterInfo_::ParameterFlags_::*;
+        use RestartFlags_::*;
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                param_presentation: slot_presentation,
+                param_presentation_revision: slot_revision,
+                param_affects_presentation: binder_param,
+                ..callbacks()
+            },
+            vec![param(10), param(11), param(12)],
+        );
+        let automate = kCanAutomate as i32;
+        let hidden = (kIsHidden | kIsReadOnly) as i32;
+
+        let pool = component(reg);
+        initialize_in(&pool, "REAPER");
+        assert_eq!(
+            listed(&pool),
+            [(10, automate), (11, hidden), (12, automate)]
+        );
+
+        let reload = component(reg);
+        initialize_in(&reload, "Cubase 14");
+        assert_eq!(listed(&reload), [(10, automate), (12, automate)]);
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { reload.getParameterInfo(2, &raw mut info) },
+            kInvalidArgument
+        );
+        let recorder = attach(&reload);
+
+        // A revision bump with no event behind it is not polled.
+        BOUND.store(true, SeqCst);
+        REVISION.store(1, SeqCst);
+        reload.host.on_ui_tick();
+        assert_eq!(recorder.take(), Vec::<String>::new());
+        // A host write to a parameter that renames others is the event.
+        assert_eq!(unsafe { reload.setParamNormalized(10, 0.5) }, kResultOk);
+        reload.host.on_ui_tick();
+        assert_eq!(
+            recorder.take(),
+            [format!(
+                "restart {}",
+                (kParamTitlesChanged | kReloadComponent) as u32
+            )]
+        );
+        assert_eq!(
+            listed(&reload),
+            [(10, automate), (11, automate), (12, automate)]
+        );
+    }
+
+    // --- function names ---------------------------------------------------------
+
+    unsafe extern "C" fn mix_is_11(_: *mut c_void, id: u32) -> *const c_char {
+        if id == 11 {
+            FunctionNameType::kDryWetMix
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    #[test]
+    fn function_names_find_their_parameter() {
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                param_function_name: mix_is_11,
+                ..callbacks()
+            },
+            vec![param(10), param(11)],
+        );
+        let com = component(reg);
+        let finder = com
+            .as_com_ref::<IParameterFunctionName>()
+            .expect("IParameterFunctionName");
+        let mut id = 0;
+        unsafe {
+            assert_eq!(
+                finder.getParameterIDFromFunctionName(
+                    kRootUnitId,
+                    c"DryWetMix".as_ptr(),
+                    &raw mut id
+                ),
+                kResultTrue
+            );
+            assert_eq!(id, 11);
+            assert_eq!(
+                finder.getParameterIDFromFunctionName(
+                    kRootUnitId,
+                    c"Randomize".as_ptr(),
+                    &raw mut id
+                ),
+                kResultFalse
+            );
+            assert_eq!(id, kNoParamId);
+            assert_eq!(
+                finder.getParameterIDFromFunctionName(5, c"DryWetMix".as_ptr(), &raw mut id),
+                kResultFalse
+            );
+        }
+    }
+
+    // --- info listener ----------------------------------------------------------
+
+    /// The host's channel attributes: a name and a colour.
+    struct Channel;
+
+    impl Class for Channel {
+        type Interfaces = (IAttributeList,);
+    }
+
+    fn key_is(id: *const c_char, key: *const c_char) -> bool {
+        unsafe { CStr::from_ptr(id) == CStr::from_ptr(key) }
+    }
+
+    impl IAttributeListTrait for Channel {
+        unsafe fn setInt(&self, _: IAttributeList_::AttrID, _: int64) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getInt(&self, id: IAttributeList_::AttrID, value: *mut int64) -> tresult {
+            if !key_is(id, kChannelColorKey) {
+                return kResultFalse;
+            }
+            unsafe { *value = 0x80FF_2010 };
+            kResultOk
+        }
+        unsafe fn setFloat(&self, _: IAttributeList_::AttrID, _: f64) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getFloat(&self, _: IAttributeList_::AttrID, _: *mut f64) -> tresult {
+            kResultFalse
+        }
+        unsafe fn setString(&self, _: IAttributeList_::AttrID, _: *const TChar) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getString(
+            &self,
+            id: IAttributeList_::AttrID,
+            string: *mut TChar,
+            bytes: uint32,
+        ) -> tresult {
+            if !key_is(id, kChannelNameKey) {
+                return kResultFalse;
+            }
+            let dst = unsafe { std::slice::from_raw_parts_mut(string, bytes as usize / 2) };
+            super::super::utf16_into(dst, "Lead \u{b5}");
+            kResultOk
+        }
+        unsafe fn setBinary(
+            &self,
+            _: IAttributeList_::AttrID,
+            _: *const c_void,
+            _: uint32,
+        ) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getBinary(
+            &self,
+            _: IAttributeList_::AttrID,
+            _: *mut *const c_void,
+            _: *mut uint32,
+        ) -> tresult {
+            kResultFalse
+        }
+    }
+
+    static TRACK: Mutex<Option<(String, u32, bool)>> = Mutex::new(None);
+
+    unsafe extern "C" fn record_track(_: *mut c_void, info: *const Vst3TrackInfo) {
+        let info = unsafe { &*info };
+        let name = unsafe { CStr::from_ptr(info.name) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        *TRACK.lock().unwrap() = Some((name, info.color_argb, info.has_color));
+    }
+
+    #[test]
+    fn info_listener_passes_name_and_colour() {
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                track_info_changed: record_track,
+                ..callbacks()
+            },
+            Vec::new(),
+        );
+        let com = component(reg);
+        let listener = com.as_com_ref::<IInfoListener>().expect("IInfoListener");
+        let channel = ComWrapper::new(Channel);
+        let list = channel.as_com_ref::<IAttributeList>().unwrap().as_ptr();
+        assert_eq!(
+            unsafe { listener.setChannelContextInfos(list) },
+            kResultTrue
+        );
+        assert_eq!(
+            *TRACK.lock().unwrap(),
+            Some(("Lead \u{b5}".to_owned(), 0x80FF_2010, true))
+        );
+        assert_eq!(
+            unsafe { listener.setChannelContextInfos(std::ptr::null_mut()) },
+            kInvalidArgument
+        );
+    }
+
+    // --- MIDI learn -------------------------------------------------------------
+
+    static LEARNED: Mutex<Vec<(u32, u8, i16)>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn learn_cc(_: *mut c_void, bus: u32, channel: u8, controller: i16) -> i32 {
+        LEARNED.lock().unwrap().push((bus, channel, controller));
+        i32::from(controller < 128)
+    }
+
+    #[test]
+    fn midi_learn_reaches_the_plugin() {
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                midi_learn: learn_cc,
+                ..callbacks()
+            },
+            Vec::new(),
+        );
+        let com = component(reg);
+        let learn = com.as_com_ref::<IMidiLearn>().expect("IMidiLearn");
+        let learn2 = com.as_com_ref::<IMidiLearn2>().expect("IMidiLearn2");
+        unsafe {
+            assert_eq!(learn.onLiveMIDIControllerInput(0, 3, 74), kResultTrue);
+            assert_eq!(
+                learn.onLiveMIDIControllerInput(1, 0, ControllerNumbers_::kPitchBend as i16),
+                kResultFalse
+            );
+            assert_eq!(learn.onLiveMIDIControllerInput(0, 16, 1), kInvalidArgument);
+            assert_eq!(learn2.onLiveMidi1ControllerInput(2, 15, 7), kResultTrue);
+            let rpn = Midi2Controller {
+                bank: 0,
+                registered: 1,
+                index: 0,
+                reserved: 0,
+            };
+            assert_eq!(learn2.onLiveMidi2ControllerInput(0, 0, rpn), kResultFalse);
+        }
+        assert_eq!(
+            *LEARNED.lock().unwrap(),
+            [(0, 3, 74), (1, 0, 129), (2, 15, 7)]
+        );
+    }
+
+    // --- group edits ------------------------------------------------------------
+
+    // macOS: the test thread isn't the main queue, so the calls would queue.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn group_edits_bracket_the_edits_in_order() {
+        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let com = component(reg);
+        let recorder = attach(&com);
+        let ctx = com.host.ctx;
+        crate::com::group_edit(ctx, EditGroup::Begin);
+        for id in [1, 2] {
+            crate::com::begin_edit(ctx, id);
+            crate::com::perform_edit(ctx, id, 0.5);
+            crate::com::end_edit(ctx, id);
+        }
+        crate::com::group_edit(ctx, EditGroup::End);
+        let log = recorder.take();
+        assert_eq!(
+            log,
+            [
+                "group",
+                "begin 1",
+                "perform 1",
+                "end 1",
+                "begin 2",
+                "perform 2",
+                "end 2",
+                "group end"
+            ],
+        );
+    }
 }

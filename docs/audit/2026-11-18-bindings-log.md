@@ -181,6 +181,50 @@ being static per class**
   --features clap-draft` (clean), `build-slot cargo test -p moose-clap`
   (46 passed).
 
+## Step 4: VST3 on the runtime catalog (branch `bindings/vst3-host-features`)
+
+Stacked on the runtime-catalog core (`moose/runtime-catalog`).
+
+- **Catalog wake.** `Host::new` binds a `CatalogSignal` through the new
+  `set_catalog_waker` callback. Its wake only sets `catalog_pending` and
+  schedules the UI-thread wake (the same eventfd / main-queue / thread-timer
+  path as `mark_restart`). The UI-thread flush takes the changes once:
+  VALUES → `kParamValuesChanged`, INFO → `kParamTitlesChanged`, STRUCTURE →
+  see below. Changes made during construction are discarded, because the
+  host hasn't read the list yet.
+- **No presentation polling.** `param_presentation_revision` is read only
+  after an event: a processed or host-set change to a
+  `parameter_affects_presentation` id (audio thread included; it sets a flag
+  and wakes, like CLAP's `request_changed_presentation`), an editor
+  `performEdit`, any `mark_restart` (state loads), or a catalog wake.
+- **Dynamic capability.** `DynamicSupport::{Reload, SlotPool}` is chosen in
+  `initialize` from `IHostApplication::getName`. Reload is used for hosts whose
+  name contains "Cubase" or "Nuendo" (unverified). Reload enumerates only
+  `presentation.available` parameters through an index table, rebuilt on the
+  UI thread when STRUCTURE is taken or the revision changes. STRUCTURE sends
+  `kReloadComponent`. SlotPool lists every slot; free ones are `kIsHidden`,
+  read-only and not automatable, and STRUCTURE sends `kParamTitlesChanged |
+  kParamValuesChanged`. Param ids never change, and the processor accepts
+  every id. `param_presentation` now returns hidden / unavailable bits.
+- **`IParameterFunctionName`**: matches `Params::parameter_function` mapped to
+  the SDK `FunctionNameType` strings (all seven `ParamFunction` roles); a
+  non-root unit restricts the search to that unit.
+- **`IInfoListener`**: channel name (UTF-16) and colour (ARGB) reach
+  `MainThreadHooks::track_info_changed`. The SDK channel context has no
+  channel count or track kind, so those stay unset.
+- **`IMidiLearn` / `IMidiLearn2`**: MIDI 1 controllers (CC 0..=127,
+  kAfterTouch, kPitchBend, kCtrlProgramChange) reach
+  `MainThreadHooks::midi_learn`. kResultTrue is returned when it binds the
+  controller. MIDI 2 (RPN/NRPN) input returns kResultFalse because
+  `MidiSource` has no such variant.
+- The hooks live in a `MainThreadCell` on `Vst3Instance`. `MainThread` is
+  minted only in the IInfoListener / IMidiLearn callbacks.
+- **Group edits**: `PluginContext::begin_group` / `end_group` (DECISION in
+  DECISIONS.md, additive) queue `EditOp::Group` alongside the gestures, so
+  `startGroupEdit` / `finishGroupEdit` reach the host on the UI thread in
+  order with the edits. Other formats: no-op.
+- Skipped: Wayland (a separate item).
+
 ## Step 5: CLAP on the runtime catalog (branch `bindings/clap-host-features`)
 
 - `crates/moose-clap/src/catalog_sync.rs` owns parameter publishing.
@@ -220,3 +264,4 @@ being static per class**
   hooks over a `DynamicParams<4>` plugin.
 - Commands: `build-slot cargo clippy -p moose-clap --all-targets -- -D
   warnings` (clean), `build-slot cargo test -p moose-clap` (57 passed).
+||||||| parent of dec727d29e (moose-vst3: runtime catalog, dynamic list modes, host features)

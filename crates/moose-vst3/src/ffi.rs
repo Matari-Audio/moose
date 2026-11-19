@@ -6,7 +6,6 @@ use std::ffi::c_void;
 use std::mem::{align_of, offset_of, size_of};
 use std::os::raw::c_char;
 
-
 /// Plugin descriptor handed to the COM layer at registration.
 #[repr(C)]
 pub struct Vst3PluginDescriptor {
@@ -127,6 +126,21 @@ const _: () = {
     assert!(offset_of!(Vst3NativeEvent, data1) == 68);
     assert!(offset_of!(Vst3NativeEvent, data2) == 69);
 };
+
+/// `param_presentation` bit: the parameter is hidden.
+pub const PRESENTATION_HIDDEN: i32 = 1;
+/// `param_presentation` bit: dynamic-list hosts should not list it.
+pub const PRESENTATION_UNAVAILABLE: i32 = 2;
+
+/// The channel the plugin sits on, from `IInfoListener`.
+#[repr(C)]
+pub struct Vst3TrackInfo {
+    /// UTF-8, NUL-terminated; null when the host didn't say.
+    pub name: *const c_char,
+    /// `0xAARRGGBB`, valid when `has_color`.
+    pub color_argb: u32,
+    pub has_color: bool,
+}
 
 /// Transport info for one block.
 #[repr(C)]
@@ -338,7 +352,8 @@ pub struct Vst3Callbacks {
     /// sample 0.
     pub param_is_chunked: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> i32,
     /// `Params::parameter_presentation`: writes the runtime title into
-    /// `name` and returns 0 / 1 (hidden), or -1 for "no override".
+    /// `name` and returns [`PRESENTATION_HIDDEN`] / [`PRESENTATION_UNAVAILABLE`]
+    /// bits, or -1 for "no override".
     pub param_presentation:
         unsafe extern "C" fn(ctx: *mut c_void, id: u32, name: *mut c_char, capacity: u32) -> i32,
     /// `Params::parameter_presentation_revision`.
@@ -347,6 +362,26 @@ pub struct Vst3Callbacks {
     pub set_persist_waker:
         unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void),
     pub take_persist_change: unsafe extern "C" fn(*mut c_void, *mut u32, *mut f64) -> bool,
+    /// `Params::parameter_affects_presentation`. Any thread, audio included:
+    /// must not allocate or lock.
+    pub param_affects_presentation: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> bool,
+    /// The SDK `FunctionNameType` string of `id`'s `ParamFunction`
+    /// (a static C string), or null.
+    pub param_function_name: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> *const c_char,
+    /// Bind (or with `None`, unbind and join) the `CatalogSignal` wake.
+    /// The wake runs on whatever thread committed the change and must only
+    /// schedule the UI thread.
+    pub set_catalog_waker:
+        unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void),
+    /// `Params::take_catalog_changes` as `CatalogChange` bits. UI thread.
+    pub take_catalog_changes: unsafe extern "C" fn(ctx: *mut c_void) -> u8,
+    /// `MainThreadHooks::track_info_changed` (`IInfoListener`). UI thread.
+    pub track_info_changed: unsafe extern "C" fn(ctx: *mut c_void, info: *const Vst3TrackInfo),
+    /// `MainThreadHooks::midi_learn` (`IMidiLearn`): a VST3 controller
+    /// number on `bus` / `channel`. Returns 1 when the plugin bound it. UI
+    /// thread.
+    pub midi_learn:
+        unsafe extern "C" fn(ctx: *mut c_void, bus: u32, channel: u8, controller: i16) -> i32,
     /// `IAudioProcessor::setProcessing`. `false` also resets the plugin
     /// (what the shim used to do through `reset`).
     pub set_processing: unsafe extern "C" fn(
@@ -411,6 +446,13 @@ pub fn moose_vst3_request_resize(ctx: *mut c_void, w: u32, h: u32) -> i32 {
 /// thread it is sent at once.
 pub fn moose_vst3_mark_restart(ctx: *mut c_void, flags: i32) {
     crate::com::mark_restart(ctx, flags);
+}
+
+/// Open (`Begin`) or close (`End`) a group of edits
+/// (`IComponentHandler2::startGroupEdit` / `finishGroupEdit`). Any thread;
+/// it is delivered on the UI thread in order with the edits.
+pub fn moose_vst3_group_edit(ctx: *mut c_void, edge: moose_core::editor::EditGroup) {
+    crate::com::group_edit(ctx, edge);
 }
 
 /// Tell the host the project changed (`IComponentHandler2::setDirty`), for

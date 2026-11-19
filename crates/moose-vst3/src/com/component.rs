@@ -7,17 +7,24 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
-use std::ffi::{c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use moose_core::editor::EditGroup;
+use moose_params::CatalogChange;
+use vst3::Steinberg::Vst::ChannelContext::{
+    IInfoListener, IInfoListenerTrait, kChannelColorKey, kChannelNameKey,
+};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef};
 
 use super::view::View;
 use super::{Registration, cstr, retain, utf16_from, utf16_into};
-use crate::ffi::{Vst3NativeEvent, Vst3Transport};
+use crate::ffi::{
+    PRESENTATION_HIDDEN, PRESENTATION_UNAVAILABLE, Vst3NativeEvent, Vst3TrackInfo, Vst3Transport,
+};
 
 /// A wake's drain makes at most this many host calls; the rest wait for the
 /// next wake, so a burst never holds the UI thread.
@@ -48,6 +55,63 @@ pub(crate) enum EditOp {
     Resize(u32, u32),
     /// `IComponentHandler2::setDirty(true)`: custom state changed.
     Dirty,
+    /// `IComponentHandler2::startGroupEdit` / `finishGroupEdit`.
+    Group(EditGroup),
+}
+
+/// How a host takes a changed parameter list. Param ids never change in
+/// either mode, and the processor accepts every id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DynamicSupport {
+    /// The host re-reads `getParameterCount` after `kReloadComponent`, so
+    /// only available parameters are listed.
+    Reload,
+    /// The full list stays; unavailable slots are hidden.
+    SlotPool,
+}
+
+impl DynamicSupport {
+    /// Hosts that reload the parameter list on `kReloadComponent`.
+    /// Unverified: Steinberg's own hosts, assumed from the SDK docs, not
+    /// tested one by one.
+    const RELOAD_HOSTS: [&str; 2] = ["Cubase", "Nuendo"];
+
+    /// The mode for the host named `name` (`IHostApplication::getName`).
+    pub(super) fn for_host(name: &str) -> Self {
+        if Self::RELOAD_HOSTS.iter().any(|host| name.contains(host)) {
+            Self::Reload
+        } else {
+            Self::SlotPool
+        }
+    }
+
+    /// The `restartComponent` flags for a taken catalog change.
+    pub(super) fn restart_flags(self, changes: CatalogChange) -> i32 {
+        use RestartFlags_::*;
+        let mut flags = 0;
+        if changes.contains(CatalogChange::VALUES) {
+            flags |= kParamValuesChanged as i32;
+        }
+        if changes.contains(CatalogChange::INFO) {
+            flags |= kParamTitlesChanged as i32;
+        }
+        if changes.contains(CatalogChange::STRUCTURE) {
+            flags |= match self {
+                Self::Reload => kReloadComponent as i32,
+                Self::SlotPool => (kParamTitlesChanged | kParamValuesChanged) as i32,
+            };
+        }
+        flags
+    }
+}
+
+/// What `getParameterCount` / `getParameterInfo` list.
+enum ParamList {
+    /// [`DynamicSupport::SlotPool`]: every registered parameter.
+    All,
+    /// [`DynamicSupport::Reload`]: indices into `Registration::params` of
+    /// the available ones.
+    Available(Vec<usize>),
 }
 
 #[derive(Default)]
@@ -116,6 +180,12 @@ pub(crate) struct Host {
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
     pending_restart: AtomicI32,
     presentation_revision: AtomicU64,
+    /// A change that may move `presentation_revision` happened; the UI
+    /// thread compares it once.
+    presentation_check: AtomicBool,
+    /// The catalog signal fired; the UI thread takes the changes.
+    catalog_pending: AtomicBool,
+    param_list: Mutex<ParamList>,
     /// Suppresses the host's `setParamNormalized` echo of our own edit.
     in_perform_edit: AtomicBool,
     persist_wanted: bool,
@@ -156,20 +226,16 @@ thread_local! {
 pub(super) fn mark_restart(ctx: *mut c_void, flags: i32) {
     let flag = |host: &Host| {
         host.pending_restart.fetch_or(flags, Ordering::Release);
-        #[cfg(target_os = "linux")]
-        {
-            let fd = host.restart_fd.load(Ordering::Acquire);
-            if fd >= 0 {
-                super::wake::linux::FdWake::notify_fd(fd);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        if let Some(q) = host.main_queue.get() {
-            q.signal();
-        }
+        // A state load can rename parameters too.
+        host.presentation_check.store(true, Ordering::Release);
+        host.wake_ui();
     };
     // SAFETY: set only for the duration of `Host::process`.
-    let on_audio = PROCESSING.with(|current| unsafe { current.get().as_ref() }.filter(|h| h.ctx == ctx).map(flag));
+    let on_audio = PROCESSING.with(|current| {
+        unsafe { current.get().as_ref() }
+            .filter(|h| h.ctx == ctx)
+            .map(flag)
+    });
     if on_audio.is_none()
         && let Some(host) = super::pin(ctx)
     {
@@ -227,9 +293,11 @@ impl Host {
     /// A new instance, or `None` when the plugin's constructor failed.
     pub(super) fn new(
         reg: &'static Registration,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables, clippy::needless_pass_by_value))] factory_run_loop: Option<
-            ComPtr<vst3::Steinberg::Linux::IRunLoop>,
-        >,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            allow(unused_variables, clippy::needless_pass_by_value)
+        )]
+        factory_run_loop: Option<ComPtr<vst3::Steinberg::Linux::IRunLoop>>,
     ) -> Option<Arc<Self>> {
         let desc = reg.desc;
         let cb = reg.cb;
@@ -259,11 +327,20 @@ impl Host {
                 silence: Vec::new(),
                 trash: Vec::new(),
             }),
-            in_active: AtomicU32::new(default_active_mask(desc.num_input_buses, desc.input_bus_kinds)),
-            out_active: AtomicU32::new(default_active_mask(desc.num_output_buses, desc.output_bus_kinds)),
+            in_active: AtomicU32::new(default_active_mask(
+                desc.num_input_buses,
+                desc.input_bus_kinds,
+            )),
+            out_active: AtomicU32::new(default_active_mask(
+                desc.num_output_buses,
+                desc.output_bus_kinds,
+            )),
             handler: Mutex::new(None),
             pending_restart: AtomicI32::new(0),
-            presentation_revision: AtomicU64::new(0),
+            presentation_revision: AtomicU64::new(unsafe { (cb.param_presentation_revision)(ctx) }),
+            presentation_check: AtomicBool::new(false),
+            catalog_pending: AtomicBool::new(false),
+            param_list: Mutex::new(ParamList::All),
             in_perform_edit: AtomicBool::new(false),
             persist_wanted: unsafe { (cb.wants_persist_notifications)(ctx) },
             persist_bound: AtomicBool::new(false),
@@ -301,7 +378,120 @@ impl Host {
             host.bind_persist_run_loop(rl);
         }
         host.bind_persist_signal();
+        // The host hasn't read the list yet: changes from construction are
+        // already in it.
+        let _ = unsafe { (cb.take_catalog_changes)(ctx) };
+        let me = Arc::as_ptr(&host).cast_mut().cast();
+        unsafe { (cb.set_catalog_waker)(ctx, Some(Self::wake_catalog), me) };
         Some(host)
+    }
+
+    /// Schedule a UI-thread flush. Lock-free, so the audio thread may call it.
+    // `self` holds the wake on Linux and macOS.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        allow(clippy::unused_self)
+    )]
+    fn wake_ui(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            let fd = self.restart_fd.load(Ordering::Acquire);
+            if fd >= 0 {
+                super::wake::linux::FdWake::notify_fd(fd);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(q) = self.main_queue.get() {
+            q.signal();
+        }
+        // Windows: the thread timer flushes on every tick.
+    }
+
+    /// The parameter set's `CatalogSignal` wake. Any non-audio thread.
+    unsafe extern "C" fn wake_catalog(context: *mut c_void) {
+        // SAFETY: `context` is this `Host`, bound in `new`; `drop` unbinds
+        // it first, which waits for a running wake.
+        let host = unsafe { &*context.cast::<Self>() };
+        host.catalog_pending.store(true, Ordering::Release);
+        host.wake_ui();
+    }
+
+    /// A processed or host-set change to `id`: if it can rename parameters,
+    /// have the UI thread compare the presentation revision. Audio-safe.
+    fn note_param_change(&self, id: u32) {
+        if unsafe { (self.reg.cb.param_affects_presentation)(self.ctx, id) }
+            && !self.presentation_check.swap(true, Ordering::AcqRel)
+        {
+            self.wake_ui();
+        }
+    }
+
+    // --- Parameter list ---------------------------------------------------------
+
+    /// Indices of the parameters a dynamic-list host should see. UI thread.
+    fn available_params(&self) -> Vec<usize> {
+        let mut title = [0 as c_char; 512];
+        (0..self.reg.params.len())
+            .filter(|&i| {
+                let bits = unsafe {
+                    (self.reg.cb.param_presentation)(
+                        self.ctx,
+                        self.reg.params[i].id,
+                        title.as_mut_ptr(),
+                        512,
+                    )
+                };
+                bits < 0 || bits & PRESENTATION_UNAVAILABLE == 0
+            })
+            .collect()
+    }
+
+    /// Choose the list mode for this host. UI thread (`initialize`).
+    pub(super) fn set_dynamic_support(&self, support: DynamicSupport) {
+        let list = match support {
+            DynamicSupport::Reload => ParamList::Available(self.available_params()),
+            DynamicSupport::SlotPool => ParamList::All,
+        };
+        *lock(&self.param_list) = list;
+    }
+
+    pub(super) fn dynamic_support(&self) -> DynamicSupport {
+        match *lock(&self.param_list) {
+            ParamList::All => DynamicSupport::SlotPool,
+            ParamList::Available(_) => DynamicSupport::Reload,
+        }
+    }
+
+    /// Rebuild the `Reload` list; true when it changed.
+    fn relist_params(&self) -> bool {
+        if self.dynamic_support() != DynamicSupport::Reload {
+            return false;
+        }
+        let fresh = self.available_params();
+        let mut list = lock(&self.param_list);
+        match &mut *list {
+            ParamList::Available(listed) if *listed != fresh => {
+                *listed = fresh;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn param_count(&self) -> usize {
+        match &*lock(&self.param_list) {
+            ParamList::All => self.reg.params.len(),
+            ParamList::Available(listed) => listed.len(),
+        }
+    }
+
+    /// The `Registration::params` index of host index `index`.
+    fn param_index(&self, index: i32) -> Option<usize> {
+        let index = usize::try_from(index).ok()?;
+        match &*lock(&self.param_list) {
+            ParamList::All => (index < self.reg.params.len()).then_some(index),
+            ParamList::Available(listed) => listed.get(index).copied(),
+        }
     }
 
     fn config(&self) -> &Config {
@@ -421,12 +611,20 @@ impl Host {
 
     /// Make queued calls oldest first. A transition drains wherever it runs;
     /// any other drain stops once this thread may no longer deliver.
-    fn drain_locked<'a>(&'a self, mut e: MutexGuard<'a, Edits>, transition: bool) -> MutexGuard<'a, Edits> {
+    fn drain_locked<'a>(
+        &'a self,
+        mut e: MutexGuard<'a, Edits>,
+        transition: bool,
+    ) -> MutexGuard<'a, Edits> {
         if e.draining {
             return e;
         }
         e.draining = true;
-        let mut left = if transition { TRANSITION_EDITS } else { DRAIN_EDITS };
+        let mut left = if transition {
+            TRANSITION_EDITS
+        } else {
+            DRAIN_EDITS
+        };
         while left > 0 && !e.pending.is_empty() && (transition || self.may_deliver(&e)) {
             let take = left.min(e.pending.len());
             let ops: Vec<EditOp> = e.pending.drain(..take).collect();
@@ -445,7 +643,10 @@ impl Host {
     }
 
     /// End every open gesture on the current handler; returns their ids.
-    fn close_open_gestures<'a>(&'a self, mut e: MutexGuard<'a, Edits>) -> (MutexGuard<'a, Edits>, Vec<u32>) {
+    fn close_open_gestures<'a>(
+        &'a self,
+        mut e: MutexGuard<'a, Edits>,
+    ) -> (MutexGuard<'a, Edits>, Vec<u32>) {
         let open = std::mem::take(&mut e.open_gestures);
         let Some(handler) = self.handler() else {
             return (e, open);
@@ -477,6 +678,7 @@ impl Host {
                     self.in_perform_edit.store(true, Ordering::Relaxed);
                     unsafe { h.performEdit(id, value) };
                     self.in_perform_edit.store(false, Ordering::Relaxed);
+                    self.note_param_change(id);
                     self.flush_pending_restart();
                 }
                 1
@@ -497,6 +699,15 @@ impl Host {
             EditOp::Dirty => {
                 if let Some(h) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) {
                     unsafe { h.setDirty(1) };
+                }
+                1
+            }
+            EditOp::Group(edge) => {
+                if let Some(h) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) {
+                    match edge {
+                        EditGroup::Begin => unsafe { h.startGroupEdit() },
+                        EditGroup::End => unsafe { h.finishGroupEdit() },
+                    };
                 }
                 1
             }
@@ -528,17 +739,35 @@ impl Host {
 
     // --- Restart and persist notifications -----------------------------------
 
-    /// Send any restart flags the audio thread or a presentation change
-    /// left pending. UI thread only.
+    /// Send any restart flags the audio thread, a catalog change or a
+    /// presentation change left pending. UI thread only.
     pub(super) fn flush_pending_restart(&self) {
         let Some(handler) = self.handler() else {
             return;
         };
         self.flush_persist_change();
-        let revision = unsafe { (self.reg.cb.param_presentation_revision)(self.ctx) };
-        if self.presentation_revision.swap(revision, Ordering::AcqRel) != revision {
+        let cb = self.reg.cb;
+        let mut check = self.presentation_check.swap(false, Ordering::AcqRel);
+        if self.catalog_pending.swap(false, Ordering::AcqRel) {
+            let changes =
+                CatalogChange::from_bits_truncate(unsafe { (cb.take_catalog_changes)(self.ctx) });
+            let support = self.dynamic_support();
+            if changes.contains(CatalogChange::STRUCTURE) {
+                self.relist_params();
+            }
             self.pending_restart
-                .fetch_or(RestartFlags_::kParamTitlesChanged as i32, Ordering::Release);
+                .fetch_or(support.restart_flags(changes), Ordering::Release);
+            check = true;
+        }
+        if check {
+            let revision = unsafe { (cb.param_presentation_revision)(self.ctx) };
+            if self.presentation_revision.swap(revision, Ordering::AcqRel) != revision {
+                let mut flags = RestartFlags_::kParamTitlesChanged as i32;
+                if self.relist_params() {
+                    flags |= RestartFlags_::kReloadComponent as i32;
+                }
+                self.pending_restart.fetch_or(flags, Ordering::Release);
+            }
         }
         let flags = self.pending_restart.swap(0, Ordering::AcqRel);
         if flags != 0 {
@@ -591,7 +820,9 @@ impl Host {
         let Some(handler) = self.handler() else {
             return;
         };
-        if self.persist_bound.load(Ordering::Acquire) && !self.persist_pending.swap(false, Ordering::AcqRel) {
+        if self.persist_bound.load(Ordering::Acquire)
+            && !self.persist_pending.swap(false, Ordering::AcqRel)
+        {
             return;
         }
         let (mut id, mut value) = (0u32, 0f64);
@@ -608,12 +839,19 @@ impl Host {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn bind_persist_run_loop(self: &Arc<Self>, run_loop: ComPtr<vst3::Steinberg::Linux::IRunLoop>) {
+    pub(super) fn bind_persist_run_loop(
+        self: &Arc<Self>,
+        run_loop: ComPtr<vst3::Steinberg::Linux::IRunLoop>,
+    ) {
         let mut slot = lock(&self.persist_wake);
         if slot.is_some() {
             return;
         }
-        *slot = super::wake::linux::FdWake::bind(run_loop, Arc::downgrade(self), Host::on_instance_wake);
+        *slot = super::wake::linux::FdWake::bind(
+            run_loop,
+            Arc::downgrade(self),
+            Host::on_instance_wake,
+        );
         if let Some(wake) = slot.as_ref() {
             self.restart_fd.store(wake.fd(), Ordering::Release);
         }
@@ -634,7 +872,9 @@ impl Host {
     pub(super) fn update_run_loop_registration(self: &Arc<Self>, frame: Option<*mut FUnknown>) {
         use super::wake::linux::{FdWake, TimerWake, run_loop_of};
         let run_loop = frame.and_then(run_loop_of);
-        if self.persist_wanted && let Some(rl) = &run_loop {
+        if self.persist_wanted
+            && let Some(rl) = &run_loop
+        {
             self.bind_persist_run_loop(rl.clone());
         }
         // Deliver everything queued before unbinding, so no worker steals
@@ -710,7 +950,11 @@ impl Host {
     /// parameter, or an event list that ran out of room). Returns true on
     /// an overflow: the caller then commits final values again after the
     /// block, so earlier queued points can't win.
-    unsafe fn read_param_changes(&self, changes: *mut IParameterChanges, will_process: bool) -> bool {
+    unsafe fn read_param_changes(
+        &self,
+        changes: *mut IParameterChanges,
+        will_process: bool,
+    ) -> bool {
         let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
             return false;
         };
@@ -730,7 +974,8 @@ impl Host {
                 }
                 let plain = unsafe { (cb.param_denormalize)(self.ctx, id, value) };
                 last = Some(plain);
-                if pushed_all && unsafe { (cb.push_param_change)(self.ctx, id, offset, plain) } == 0 {
+                if pushed_all && unsafe { (cb.push_param_change)(self.ctx, id, offset, plain) } == 0
+                {
                     pushed_all = false;
                     dropped = true;
                 }
@@ -739,6 +984,9 @@ impl Host {
                 && !(pushed_all && unsafe { (cb.param_is_chunked)(self.ctx, id) } != 0)
             {
                 unsafe { (cb.param_set_value)(self.ctx, id, plain) };
+            }
+            if last.is_some() {
+                self.note_param_change(id);
             }
         }
         dropped
@@ -756,9 +1004,14 @@ impl Host {
             };
             let count = unsafe { queue.getPointCount() };
             let (mut offset, mut value) = (0, 0.0);
-            if count > 0 && unsafe { queue.getPoint(count - 1, &raw mut offset, &raw mut value) } == kResultOk {
+            if count > 0
+                && unsafe { queue.getPoint(count - 1, &raw mut offset, &raw mut value) }
+                    == kResultOk
+            {
                 let id = unsafe { queue.getParameterId() };
-                unsafe { (cb.param_set_value)(self.ctx, id, (cb.param_denormalize)(self.ctx, id, value)) };
+                unsafe {
+                    (cb.param_set_value)(self.ctx, id, (cb.param_denormalize)(self.ctx, id, value));
+                };
             }
         }
     }
@@ -775,8 +1028,16 @@ impl Host {
             time_sig_num: if sig { ctx.timeSigNumerator } else { 4 },
             time_sig_den: if sig { ctx.timeSigDenominator } else { 4 },
             position_samples: ctx.projectTimeSamples as f64,
-            position_beats: if has(kProjectTimeMusicValid) { ctx.projectTimeMusic } else { 0.0 },
-            bar_start_beats: if has(kBarPositionValid) { ctx.barPositionMusic } else { 0.0 },
+            position_beats: if has(kProjectTimeMusicValid) {
+                ctx.projectTimeMusic
+            } else {
+                0.0
+            },
+            bar_start_beats: if has(kBarPositionValid) {
+                ctx.barPositionMusic
+            } else {
+                0.0
+            },
             cycle_start_beats: if cycle { ctx.cycleStartMusic } else { 0.0 },
             cycle_end_beats: if cycle { ctx.cycleEndMusic } else { 0.0 },
             // kCycleActive is "loop engaged"; kCycleValid only says the
@@ -939,14 +1200,21 @@ impl Host {
 
     /// Forward parameter values the plugin changed while processing, so the
     /// host UI and automation see them.
-    unsafe fn write_output_params(&self, changes: *mut IParameterChanges, count: u32, mut result: u32) -> u32 {
+    unsafe fn write_output_params(
+        &self,
+        changes: *mut IParameterChanges,
+        count: u32,
+        mut result: u32,
+    ) -> u32 {
         let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
             return result;
         };
         let cb = self.reg.cb;
         for i in 0..count {
             let (mut id, mut offset, mut value) = (0u32, 0i32, 0f64);
-            unsafe { (cb.get_output_param)(self.ctx, i, &raw mut id, &raw mut offset, &raw mut value) };
+            unsafe {
+                (cb.get_output_param)(self.ctx, i, &raw mut id, &raw mut offset, &raw mut value);
+            };
             let mut index = 0;
             let queue = unsafe { changes.addParameterData(&raw const id, &raw mut index) };
             let Some(queue) = (unsafe { ComRef::from_raw(queue) }) else {
@@ -974,8 +1242,9 @@ impl Host {
         // A parameter flush: no audio buses at all on a plugin that has
         // them (Live sends these with nonzero numSamples for suspended
         // devices). A pure-MIDI plugin legitimately processes this shape.
-        let suspended_flush =
-            (desc.num_inputs > 0 || desc.num_outputs > 0) && data.numInputs == 0 && data.numOutputs == 0;
+        let suspended_flush = (desc.num_inputs > 0 || desc.num_outputs > 0)
+            && data.numInputs == 0
+            && data.numOutputs == 0;
         let will_process = data.numSamples > 0 && !suspended_flush;
         let frames = data.numSamples.max(0) as u32;
 
@@ -998,8 +1267,24 @@ impl Host {
         // Flatten every declared bus at its negotiated width, in bus order.
         // Inactive or missing channels keep their position as null and are
         // filled from scratch below.
-        let num_in = gather(data.inputs, data.numInputs, &cfg.in_bus_channels, in_active, use64, &mut scratch.in_ptrs, <*mut c_void>::cast_const);
-        let num_out = gather(data.outputs, data.numOutputs, &cfg.out_bus_channels, out_active, use64, &mut scratch.out_ptrs, |p| p);
+        let num_in = gather(
+            data.inputs,
+            data.numInputs,
+            &cfg.in_bus_channels,
+            in_active,
+            use64,
+            &mut scratch.in_ptrs,
+            <*mut c_void>::cast_const,
+        );
+        let num_out = gather(
+            data.outputs,
+            data.numOutputs,
+            &cfg.out_bus_channels,
+            out_active,
+            use64,
+            &mut scratch.out_ptrs,
+            |p| p,
+        );
         let (mut num_in, mut num_out) = (num_in, num_out);
 
         // Missing inputs read shared silence; missing outputs write their own
@@ -1022,7 +1307,9 @@ impl Host {
             if !scratch.trash.is_empty() && max_frames > 0 {
                 let trash = scratch.trash.as_mut_ptr();
                 let blocks = scratch.trash.len() / max_frames;
-                let block = |c: usize| unsafe { trash.add(c.min(blocks - 1) * max_frames).cast::<c_void>() };
+                let block = |c: usize| unsafe {
+                    trash.add(c.min(blocks - 1) * max_frames).cast::<c_void>()
+                };
                 let want = (cfg.total_out as usize).min(scratch.out_ptrs.len());
                 for (c, slot) in scratch.out_ptrs[..num_out].iter_mut().enumerate() {
                     if slot.is_null() {
@@ -1045,7 +1332,9 @@ impl Host {
             }
         }
 
-        let transport_ptr = transport.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+        let transport_ptr = transport
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
         let process = if use64 { cb.process_f64 } else { cb.process };
         PROCESSING.with(|p| p.set(self));
         let ok = unsafe {
@@ -1078,7 +1367,8 @@ impl Host {
 
         // Rendered audio is not silent; clear the host's previous flags.
         if !data.outputs.is_null() {
-            let buses = (desc.num_output_buses.min(32) as usize).min(data.numOutputs.max(0) as usize);
+            let buses =
+                (desc.num_output_buses.min(32) as usize).min(data.numOutputs.max(0) as usize);
             for b in 0..buses {
                 if out_active & (1 << b) != 0 {
                     unsafe { (*data.outputs.add(b)).silenceFlags = 0 };
@@ -1101,7 +1391,11 @@ impl Host {
 
     fn bus_channels(&self, dir: i32, index: u32) -> u32 {
         let cfg = self.config();
-        let widths = if dir == BusDirections_::kInput as i32 { &cfg.in_bus_channels } else { &cfg.out_bus_channels };
+        let widths = if dir == BusDirections_::kInput as i32 {
+            &cfg.in_bus_channels
+        } else {
+            &cfg.out_bus_channels
+        };
         widths.get(index as usize).copied().unwrap_or(0)
     }
 }
@@ -1119,7 +1413,8 @@ fn gather<T>(
 ) -> usize {
     let mut n = 0;
     for (b, &declared) in widths.iter().enumerate() {
-        let bus = (!buses.is_null() && b < count.max(0) as usize).then(|| unsafe { &*buses.add(b) });
+        let bus =
+            (!buses.is_null() && b < count.max(0) as usize).then(|| unsafe { &*buses.add(b) });
         let on = b < 32 && active & (1 << b) != 0;
         let channels = bus.and_then(|bus| unsafe {
             let p = if use64 {
@@ -1149,6 +1444,8 @@ impl Drop for Host {
         // holds an `Arc`, so none is running.
         super::unregister_instance(self.ctx);
         let cb = self.reg.cb;
+        // Joins a running catalog wake, which points at `self`.
+        unsafe { (cb.set_catalog_waker)(self.ctx, None, std::ptr::null_mut()) };
         if self.persist_bound.load(Ordering::Acquire) {
             // Joins any worker wake before the wakes go away.
             unsafe { (cb.set_persist_waker)(self.ctx, None, std::ptr::null_mut()) };
@@ -1159,7 +1456,11 @@ impl Drop for Host {
             let e = lock(&self.edits);
             let mut e = if self.may_deliver(&e) {
                 let e = self.drain_locked(e, true);
-                if e.pending.is_empty() { e } else { self.close_open_gestures(e).0 }
+                if e.pending.is_empty() {
+                    e
+                } else {
+                    self.close_open_gestures(e).0
+                }
             } else {
                 e
             };
@@ -1215,6 +1516,10 @@ impl Class for Component {
         IProcessContextRequirements,
         IUnitInfo,
         INoteExpressionController,
+        IParameterFunctionName,
+        IInfoListener,
+        IMidiLearn,
+        IMidiLearn2,
     );
 }
 
@@ -1227,10 +1532,20 @@ fn is_dir(dir: BusDirection) -> Option<bool> {
 }
 
 impl IPluginBaseTrait for Component {
-    unsafe fn initialize(&self, #[allow(unused_variables)] context: *mut FUnknown) -> tresult {
+    unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
         #[cfg(target_os = "linux")]
         if let Some(rl) = super::wake::linux::run_loop_of(context) {
             self.host.bind_persist_run_loop(rl);
+        }
+        if let Some(app) =
+            unsafe { ComRef::from_raw(context) }.and_then(|c| c.cast::<IHostApplication>())
+        {
+            let mut name: String128 = [0; 128];
+            if unsafe { app.getName(&raw mut name) } == kResultOk {
+                let name = unsafe { utf16_from(name.as_ptr(), name.len()) };
+                self.host
+                    .set_dynamic_support(DynamicSupport::for_host(&name));
+            }
         }
         kResultOk
     }
@@ -1257,7 +1572,13 @@ impl IComponentTrait for Component {
         // An audio bus only where that side has channels: a phantom
         // zero-channel bus crashes strict hosts (Bitwig).
         match kind {
-            k if k == MediaTypes_::kAudio as i32 => (if input { d.num_input_buses } else { d.num_output_buses }) as i32,
+            k if k == MediaTypes_::kAudio as i32 => {
+                (if input {
+                    d.num_input_buses
+                } else {
+                    d.num_output_buses
+                }) as i32
+            }
             k if k == MediaTypes_::kEvent as i32 => {
                 if input {
                     d.midi_input_ports
@@ -1269,7 +1590,13 @@ impl IComponentTrait for Component {
         }
     }
 
-    unsafe fn getBusInfo(&self, kind: MediaType, dir: BusDirection, index: int32, bus: *mut BusInfo) -> tresult {
+    unsafe fn getBusInfo(
+        &self,
+        kind: MediaType,
+        dir: BusDirection,
+        index: int32,
+        bus: *mut BusInfo,
+    ) -> tresult {
         let (Some(bus), Some(input)) = (unsafe { bus.as_mut() }, is_dir(dir)) else {
             return kInvalidArgument;
         };
@@ -1279,7 +1606,11 @@ impl IComponentTrait for Component {
         let d = self.host.reg.desc;
         let default_active = BusInfo_::BusFlags_::kDefaultActive as u32;
         if kind == MediaTypes_::kEvent as i32 {
-            let ports = if input { d.midi_input_ports } else { d.midi_output_ports };
+            let ports = if input {
+                d.midi_input_ports
+            } else {
+                d.midi_output_ports
+            };
             if index >= ports {
                 return kInvalidArgument;
             }
@@ -1288,7 +1619,11 @@ impl IComponentTrait for Component {
             // moose carries all 16 MIDI channels end to end.
             bus.channelCount = 16;
             let base = if input { "Event In" } else { "Event Out" };
-            let name = if ports > 1 { format!("{base} {}", index + 1) } else { base.into() };
+            let name = if ports > 1 {
+                format!("{base} {}", index + 1)
+            } else {
+                base.into()
+            };
             utf16_into(&mut bus.name, &name);
             bus.busType = BusTypes_::kMain as i32;
             bus.flags = default_active;
@@ -1316,18 +1651,32 @@ impl IComponentTrait for Component {
             (false, true) => "Aux Output",
         };
         utf16_into(&mut bus.name, name);
-        bus.busType = if aux { BusTypes_::kAux as i32 } else { BusTypes_::kMain as i32 };
+        bus.busType = if aux {
+            BusTypes_::kAux as i32
+        } else {
+            BusTypes_::kMain as i32
+        };
         // Main buses are live on a fresh instance; aux buses wait for
         // activateBus.
         bus.flags = if aux { 0 } else { default_active };
         kResultOk
     }
 
-    unsafe fn getRoutingInfo(&self, _in_info: *mut RoutingInfo, _out_info: *mut RoutingInfo) -> tresult {
+    unsafe fn getRoutingInfo(
+        &self,
+        _in_info: *mut RoutingInfo,
+        _out_info: *mut RoutingInfo,
+    ) -> tresult {
         kNotImplemented
     }
 
-    unsafe fn activateBus(&self, kind: MediaType, dir: BusDirection, index: int32, state: TBool) -> tresult {
+    unsafe fn activateBus(
+        &self,
+        kind: MediaType,
+        dir: BusDirection,
+        index: int32,
+        state: TBool,
+    ) -> tresult {
         let d = self.host.reg.desc;
         let Some(input) = is_dir(dir) else {
             return kInvalidArgument;
@@ -1336,17 +1685,33 @@ impl IComponentTrait for Component {
             return kInvalidArgument;
         }
         if kind == MediaTypes_::kEvent as i32 {
-            let count = if input { d.midi_input_ports } else { d.midi_output_ports };
-            return if index < count { kResultOk } else { kInvalidArgument };
+            let count = if input {
+                d.midi_input_ports
+            } else {
+                d.midi_output_ports
+            };
+            return if index < count {
+                kResultOk
+            } else {
+                kInvalidArgument
+            };
         }
         if kind != MediaTypes_::kAudio as i32 {
             return kInvalidArgument;
         }
-        let count = if input { d.num_input_buses } else { d.num_output_buses };
+        let count = if input {
+            d.num_input_buses
+        } else {
+            d.num_output_buses
+        };
         if index as u32 >= count || index >= 32 {
             return kInvalidArgument;
         }
-        let mask = if input { &self.host.in_active } else { &self.host.out_active };
+        let mask = if input {
+            &self.host.in_active
+        } else {
+            &self.host.out_active
+        };
         if state != 0 {
             mask.fetch_or(1 << index, Ordering::Release);
         } else {
@@ -1375,7 +1740,10 @@ impl IComponentTrait for Component {
 
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
         let h = &self.host;
-        if !state.is_null() && unsafe { (h.reg.cb.state_load_stream)(h.ctx, state.cast(), super::read_state_chunk) } != 0 {
+        if !state.is_null()
+            && unsafe { (h.reg.cb.state_load_stream)(h.ctx, state.cast(), super::read_state_chunk) }
+                != 0
+        {
             kResultOk
         } else {
             kResultFalse
@@ -1384,7 +1752,11 @@ impl IComponentTrait for Component {
 
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
         let h = &self.host;
-        if !state.is_null() && unsafe { (h.reg.cb.state_save_stream)(h.ctx, state.cast(), super::write_state_chunk) } != 0 {
+        if !state.is_null()
+            && unsafe {
+                (h.reg.cb.state_save_stream)(h.ctx, state.cast(), super::write_state_chunk)
+            } != 0
+        {
             kResultOk
         } else {
             kResultFalse
@@ -1413,18 +1785,31 @@ impl IAudioProcessorTrait for Component {
         }
         let widths = |arr: *mut SpeakerArrangement, n: i32| -> Vec<u32> {
             (0..n.max(0) as usize)
-                .map(|i| if arr.is_null() { 0 } else { unsafe { *arr.add(i) }.count_ones() })
+                .map(|i| {
+                    if arr.is_null() {
+                        0
+                    } else {
+                        unsafe { *arr.add(i) }.count_ones()
+                    }
+                })
                 .collect()
         };
         let ins = widths(inputs, num_ins);
         let outs = widths(outputs, num_outs);
-        if ins.iter().enumerate().any(|(i, &width)| width == 0 || unsafe { *inputs.add(i) } != speaker_arrangement(width))
-            || outs.iter().enumerate().any(|(i, &width)| width == 0 || unsafe { *outputs.add(i) } != speaker_arrangement(width))
-        {
+        if ins.iter().enumerate().any(|(i, &width)| {
+            width == 0 || unsafe { *inputs.add(i) } != speaker_arrangement(width)
+        }) || outs.iter().enumerate().any(|(i, &width)| {
+            width == 0 || unsafe { *outputs.add(i) } != speaker_arrangement(width)
+        }) {
             return kResultFalse;
         }
         let layout = unsafe {
-            (h.reg.cb.match_bus_layout_perbus)(ins.as_ptr(), ins.len() as u32, outs.as_ptr(), outs.len() as u32)
+            (h.reg.cb.match_bus_layout_perbus)(
+                ins.as_ptr(),
+                ins.len() as u32,
+                outs.as_ptr(),
+                outs.len() as u32,
+            )
         };
         if layout < 0 {
             return kResultFalse;
@@ -1437,9 +1822,18 @@ impl IAudioProcessorTrait for Component {
         kResultOk
     }
 
-    unsafe fn getBusArrangement(&self, dir: BusDirection, index: int32, arr: *mut SpeakerArrangement) -> tresult {
+    unsafe fn getBusArrangement(
+        &self,
+        dir: BusDirection,
+        index: int32,
+        arr: *mut SpeakerArrangement,
+    ) -> tresult {
         let d = self.host.reg.desc;
-        let count = if dir == BusDirections_::kInput as i32 { d.num_input_buses } else { d.num_output_buses };
+        let count = if dir == BusDirections_::kInput as i32 {
+            d.num_input_buses
+        } else {
+            d.num_output_buses
+        };
         if arr.is_null() || index < 0 || index as u32 >= count {
             return kInvalidArgument;
         }
@@ -1453,7 +1847,8 @@ impl IAudioProcessorTrait for Component {
 
     unsafe fn canProcessSampleSize(&self, size: int32) -> tresult {
         let ok = size == SymbolicSampleSizes_::kSample32 as i32
-            || (size == SymbolicSampleSizes_::kSample64 as i32 && self.host.reg.desc.supports_f64 != 0);
+            || (size == SymbolicSampleSizes_::kSample64 as i32
+                && self.host.reg.desc.supports_f64 != 0);
         if ok { kResultOk } else { kResultFalse }
     }
 
@@ -1478,7 +1873,11 @@ impl IAudioProcessorTrait for Component {
         let frames = cfg.max_frames as usize;
         let d = h.reg.desc;
         let scratch = unsafe { &mut *h.scratch.get() };
-        scratch.silence = if d.max_inputs > 0 { vec![0.0; frames] } else { Vec::new() };
+        scratch.silence = if d.max_inputs > 0 {
+            vec![0.0; frames]
+        } else {
+            Vec::new()
+        };
         scratch.trash = vec![0.0; frames * d.max_outputs as usize];
         kResultOk
     }
@@ -1525,39 +1924,48 @@ impl IEditControllerTrait for Component {
     }
 
     unsafe fn getParameterCount(&self) -> int32 {
-        self.host.reg.params.len() as i32
+        self.host.param_count() as i32
     }
 
     unsafe fn getParameterInfo(&self, index: int32, info: *mut ParameterInfo) -> tresult {
         let reg = self.host.reg;
-        let p = usize::try_from(index).ok().and_then(|i| reg.params.get(i));
-        let (Some(info), Some(p)) = (unsafe { info.as_mut() }, p) else {
+        let (Some(info), Some(index)) = (unsafe { info.as_mut() }, self.host.param_index(index))
+        else {
             return kInvalidArgument;
         };
+        let p = &reg.params[index];
         info.id = p.id;
         utf16_into(&mut info.title, unsafe { cstr(p.name) });
         utf16_into(&mut info.shortTitle, unsafe { cstr(p.short_name) });
         utf16_into(&mut info.units, unsafe { cstr(p.units) });
         info.stepCount = p.step_count;
         info.defaultNormalizedValue = p.default_normalized;
-        info.unitId = reg.param_unit[index as usize];
+        info.unitId = reg.param_unit[index];
         info.flags = p.flags;
         let mut title = [0 as c_char; 512];
-        let hidden = unsafe { (reg.cb.param_presentation)(self.host.ctx, p.id, title.as_mut_ptr(), 512) };
-        if hidden >= 0 {
+        let bits =
+            unsafe { (reg.cb.param_presentation)(self.host.ctx, p.id, title.as_mut_ptr(), 512) };
+        if bits >= 0 {
             let title = unsafe { cstr(title.as_ptr()) };
             utf16_into(&mut info.title, title);
             utf16_into(&mut info.shortTitle, title);
-            if hidden != 0 {
+            // Listed but unavailable only in slot-pool mode: a free slot.
+            if bits & (PRESENTATION_HIDDEN | PRESENTATION_UNAVAILABLE) != 0 {
                 // The SDK defines hidden as read-only and not automatable.
                 use ParameterInfo_::ParameterFlags_::*;
-                info.flags = (info.flags | kIsReadOnly as i32 | kIsHidden as i32) & !(kCanAutomate as i32);
+                info.flags =
+                    (info.flags | kIsReadOnly as i32 | kIsHidden as i32) & !(kCanAutomate as i32);
             }
         }
         kResultOk
     }
 
-    unsafe fn getParamStringByValue(&self, id: ParamID, normalized: ParamValue, string: *mut String128) -> tresult {
+    unsafe fn getParamStringByValue(
+        &self,
+        id: ParamID,
+        normalized: ParamValue,
+        string: *mut String128,
+    ) -> tresult {
         let Some(string) = (unsafe { string.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -1572,7 +1980,12 @@ impl IEditControllerTrait for Component {
         kResultOk
     }
 
-    unsafe fn getParamValueByString(&self, id: ParamID, string: *mut TChar, normalized: *mut ParamValue) -> tresult {
+    unsafe fn getParamValueByString(
+        &self,
+        id: ParamID,
+        string: *mut TChar,
+        normalized: *mut ParamValue,
+    ) -> tresult {
         if string.is_null() || normalized.is_null() {
             return kInvalidArgument;
         }
@@ -1618,6 +2031,7 @@ impl IEditControllerTrait for Component {
             let plain = (h.reg.cb.param_denormalize)(h.ctx, id, value);
             (h.reg.cb.param_set_value)(h.ctx, id, plain);
         }
+        h.note_param_change(id);
         kResultOk
     }
 
@@ -1673,7 +2087,10 @@ impl IMidiMappingTrait for Component {
         id: *mut ParamID,
     ) -> tresult {
         let h = &self.host;
-        if !id.is_null() && unsafe { (h.reg.cb.midi_mapping_get_param_id)(h.ctx, bus, channel, controller, id) } != 0 {
+        if !id.is_null()
+            && unsafe { (h.reg.cb.midi_mapping_get_param_id)(h.ctx, bus, channel, controller, id) }
+                != 0
+        {
             kResultOk
         } else {
             kResultFalse
@@ -1691,7 +2108,16 @@ impl Component {
             for channel in 0..16i16 {
                 for controller in 0..=130i16 {
                     let mut id = 0;
-                    if unsafe { (h.reg.cb.midi_mapping_get_param_id)(h.ctx, bus, channel, controller, &raw mut id) } != 0 {
+                    if unsafe {
+                        (h.reg.cb.midi_mapping_get_param_id)(
+                            h.ctx,
+                            bus,
+                            channel,
+                            controller,
+                            &raw mut id,
+                        )
+                    } != 0
+                    {
                         each(Midi1ControllerParamIDAssignment {
                             pId: id,
                             busIndex: bus,
@@ -1737,7 +2163,9 @@ impl IMidiMapping2Trait for Component {
         let Some(list) = (unsafe { list.as_ref() }) else {
             return kInvalidArgument;
         };
-        if direction != BusDirections_::kInput as BusDirections || (list.map.is_null() && list.count > 0) {
+        if direction != BusDirections_::kInput as BusDirections
+            || (list.map.is_null() && list.count > 0)
+        {
             return kResultFalse;
         }
         // The host sized `map` from getNum...; never write past it.
@@ -1749,6 +2177,113 @@ impl IMidiMapping2Trait for Component {
             }
         });
         kResultOk
+    }
+}
+
+impl IParameterFunctionNameTrait for Component {
+    unsafe fn getParameterIDFromFunctionName(
+        &self,
+        unit: UnitID,
+        name: FIDString,
+        id: *mut ParamID,
+    ) -> tresult {
+        if name.is_null() || id.is_null() {
+            return kInvalidArgument;
+        }
+        let h = &self.host;
+        let want = unsafe { CStr::from_ptr(name) };
+        let found = h
+            .reg
+            .params
+            .iter()
+            .zip(&h.reg.param_unit)
+            .filter(|&(_, &u)| unit == kRootUnitId || u == unit)
+            .map(|(p, _)| p.id)
+            .find(|&pid| {
+                let f = unsafe { (h.reg.cb.param_function_name)(h.ctx, pid) };
+                !f.is_null() && unsafe { CStr::from_ptr(f) } == want
+            });
+        unsafe { *id = found.unwrap_or(kNoParamId) };
+        if found.is_some() {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
+    }
+}
+
+impl IInfoListenerTrait for Component {
+    unsafe fn setChannelContextInfos(&self, list: *mut IAttributeList) -> tresult {
+        let Some(list) = (unsafe { ComRef::from_raw(list) }) else {
+            return kInvalidArgument;
+        };
+        let mut name = [0 as TChar; 256];
+        let name = (unsafe {
+            list.getString(
+                kChannelNameKey,
+                name.as_mut_ptr(),
+                size_of_val(&name) as u32,
+            )
+        } == kResultOk)
+            .then(|| CString::new(unsafe { utf16_from(name.as_ptr(), name.len()) }).ok())
+            .flatten();
+        let mut color = 0i64;
+        let has_color = unsafe { list.getInt(kChannelColorKey, &raw mut color) } == kResultOk;
+        let info = Vst3TrackInfo {
+            name: name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
+            // `ColorSpec` is a 32-bit ARGB value carried in an int64.
+            color_argb: color as u32,
+            has_color,
+        };
+        unsafe { (self.host.reg.cb.track_info_changed)(self.host.ctx, &raw const info) };
+        kResultTrue
+    }
+}
+
+impl Component {
+    fn midi_learn(&self, bus: int32, channel: i16, controller: CtrlNumber) -> tresult {
+        let (Ok(bus), Ok(channel @ 0..=15)) = (u32::try_from(bus), u8::try_from(channel)) else {
+            return kInvalidArgument;
+        };
+        let h = &self.host;
+        if unsafe { (h.reg.cb.midi_learn)(h.ctx, bus, channel, controller) } != 0 {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
+    }
+}
+
+impl IMidiLearnTrait for Component {
+    unsafe fn onLiveMIDIControllerInput(
+        &self,
+        bus: int32,
+        channel: int16,
+        controller: CtrlNumber,
+    ) -> tresult {
+        self.midi_learn(bus, channel, controller)
+    }
+}
+
+/// MIDI 2 controllers (RPN / NRPN banks) have no `MidiSource`; only the
+/// MIDI 1 form learns.
+impl IMidiLearn2Trait for Component {
+    unsafe fn onLiveMidi2ControllerInput(
+        &self,
+        _bus: BusIndex,
+        _channel: MidiChannel,
+        _controller: Midi2Controller,
+    ) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onLiveMidi1ControllerInput(
+        &self,
+        bus: BusIndex,
+        channel: MidiChannel,
+        controller: CtrlNumber,
+    ) -> tresult {
+        self.midi_learn(bus, channel.into(), controller)
     }
 }
 
@@ -1766,7 +2301,9 @@ impl IUnitInfoTrait for Component {
     }
 
     unsafe fn getUnitInfo(&self, index: int32, info: *mut UnitInfo) -> tresult {
-        let unit = usize::try_from(index).ok().and_then(|i| self.host.reg.units.get(i));
+        let unit = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.host.reg.units.get(i));
         let (Some(info), Some(unit)) = (unsafe { info.as_mut() }, unit) else {
             return kInvalidArgument;
         };
@@ -1785,7 +2322,12 @@ impl IUnitInfoTrait for Component {
         kNotImplemented
     }
 
-    unsafe fn getProgramName(&self, _list: ProgramListID, _index: int32, _name: *mut String128) -> tresult {
+    unsafe fn getProgramName(
+        &self,
+        _list: ProgramListID,
+        _index: int32,
+        _name: *mut String128,
+    ) -> tresult {
         kNotImplemented
     }
 
@@ -1803,7 +2345,13 @@ impl IUnitInfoTrait for Component {
         kNotImplemented
     }
 
-    unsafe fn getProgramPitchName(&self, _list: ProgramListID, _index: int32, _pitch: int16, _name: *mut String128) -> tresult {
+    unsafe fn getProgramPitchName(
+        &self,
+        _list: ProgramListID,
+        _index: int32,
+        _pitch: int16,
+        _name: *mut String128,
+    ) -> tresult {
         kNotImplemented
     }
 
@@ -1815,11 +2363,23 @@ impl IUnitInfoTrait for Component {
         kResultOk
     }
 
-    unsafe fn getUnitByBus(&self, _kind: MediaType, _dir: BusDirection, _bus: int32, _channel: int32, _unit: *mut UnitID) -> tresult {
+    unsafe fn getUnitByBus(
+        &self,
+        _kind: MediaType,
+        _dir: BusDirection,
+        _bus: int32,
+        _channel: int32,
+        _unit: *mut UnitID,
+    ) -> tresult {
         kNotImplemented
     }
 
-    unsafe fn setUnitProgramData(&self, _list: int32, _index: int32, _data: *mut IBStream) -> tresult {
+    unsafe fn setUnitProgramData(
+        &self,
+        _list: int32,
+        _index: int32,
+        _data: *mut IBStream,
+    ) -> tresult {
         kNotImplemented
     }
 }
@@ -1846,9 +2406,19 @@ impl INoteExpressionControllerTrait for Component {
         }
     }
 
-    unsafe fn getNoteExpressionInfo(&self, bus: int32, channel: int16, index: int32, info: *mut NoteExpressionTypeInfo) -> tresult {
-        let entry = usize::try_from(index).ok().and_then(|i| NOTE_EXPRESSIONS.get(i));
-        let (Some(info), Some(&(id, title, short, default, bipolar))) = (unsafe { info.as_mut() }, entry) else {
+    unsafe fn getNoteExpressionInfo(
+        &self,
+        bus: int32,
+        channel: int16,
+        index: int32,
+        info: *mut NoteExpressionTypeInfo,
+    ) -> tresult {
+        let entry = usize::try_from(index)
+            .ok()
+            .and_then(|i| NOTE_EXPRESSIONS.get(i));
+        let (Some(info), Some(&(id, title, short, default, bipolar))) =
+            (unsafe { info.as_mut() }, entry)
+        else {
             return kInvalidArgument;
         };
         if unsafe { self.getNoteExpressionCount(bus, channel) } == 0 {
@@ -1865,7 +2435,11 @@ impl INoteExpressionControllerTrait for Component {
             maximum: 1.0,
             stepCount: 0,
         };
-        info.flags = if bipolar { NoteExpressionTypeInfo_::NoteExpressionTypeFlags_::kIsBipolar as i32 } else { 0 };
+        info.flags = if bipolar {
+            NoteExpressionTypeInfo_::NoteExpressionTypeFlags_::kIsBipolar as i32
+        } else {
+            0
+        };
         kResultOk
     }
 

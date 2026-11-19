@@ -99,7 +99,11 @@ impl Drop for View {
 
 impl IPlugViewTrait for View {
     unsafe fn isPlatformTypeSupported(&self, kind: FIDString) -> tresult {
-        if supported(kind) { kResultOk } else { kResultFalse }
+        if supported(kind) {
+            kResultOk
+        } else {
+            kResultFalse
+        }
     }
 
     unsafe fn attached(&self, parent: *mut c_void, kind: FIDString) -> tresult {
@@ -186,7 +190,13 @@ impl IPlugViewTrait for View {
             let (w, h) = (r.right - r.left, r.bottom - r.top);
             if w > 0 && h > 0 {
                 let (mut w, mut h) = (w as u32, h as u32);
-                unsafe { (self.host.reg.cb.gui_check_size_constraint)(self.host.ctx, &raw mut w, &raw mut h) };
+                unsafe {
+                    (self.host.reg.cb.gui_check_size_constraint)(
+                        self.host.ctx,
+                        &raw mut w,
+                        &raw mut h,
+                    );
+                };
                 r.right = r.left + w as i32;
                 r.bottom = r.top + h as i32;
             }
