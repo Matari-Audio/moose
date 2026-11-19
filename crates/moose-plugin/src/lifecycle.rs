@@ -36,6 +36,10 @@ use moose_core::tasks::InitContext;
 use moose_params::Params;
 use moose_params::sample::Sample;
 
+#[allow(
+    deprecated,
+    reason = "`Lifecycle` implements the leaf traits for the wrappers"
+)]
 use crate::{PluginLogic, PluginLogic64};
 
 /// A plugin split by thread: `Shared` params, a `MainThread` part and a `Processor`.
@@ -432,6 +436,7 @@ fn process<S: Sample, P: Plugin<S>>(
 /// `impl $leaf for Lifecycle<P>` where `P: Plugin<$sample>`.
 macro_rules! lifecycle_leaf {
     ($leaf:ident, $sample:ty) => {
+        #[allow(deprecated, reason = "the leaf traits are how the wrappers run a `Plugin` until they bind it directly")]
         impl<P: Plugin<$sample>> $leaf for Lifecycle<P> {
             type Params = P::Shared;
             type DspState = ProcessorSlot<P::Processor>;

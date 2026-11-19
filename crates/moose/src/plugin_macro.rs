@@ -125,11 +125,24 @@ macro_rules! plugin {
     };
 }
 
+/// Warnings the macros raise at their call site.
+#[doc(hidden)]
+pub mod __deprecated {
+    /// Named by `moose::plugin! { logic: .. }`.
+    #[deprecated(
+        since = "7.1.0",
+        note = "`moose::plugin! { logic: .. }` exports a deprecated `PluginLogic`; implement `moose::Plugin` and use `plugin: X`"
+    )]
+    pub const LOGIC_KEY: () = ();
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __plugin_impl {
-    // `logic:` form: also keep the `Plugin` alias for the wrapper.
+    // `logic:` form (deprecated): also keep the `Plugin` alias for the
+    // wrapper, and warn at the invocation.
     ($logic:ty, $params:ty, $index:ty, $(tasks: [$($task:ty),+],)?) => {
+        const _: () = $crate::__deprecated::LOGIC_KEY;
         $crate::__plugin_impl!(@shell $logic, $params, $index, $(tasks: [$($task),+],)?);
 
         /// Older name of [`PluginShell`], kept for `logic:` exports.

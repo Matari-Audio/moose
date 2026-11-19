@@ -42,6 +42,7 @@ fn as_u32(counter: u64) -> u32 {
 
 pub struct CounterLogic;
 
+#[expect(deprecated, reason = "covers the hot-reload carry of the legacy `PluginLogic` path")]
 impl PluginLogic for CounterLogic {
     type Params = FxParams;
     type DspState = CounterState;
@@ -81,6 +82,7 @@ impl PluginLogic for CounterLogic {
 
 pub struct ResetLogic;
 
+#[expect(deprecated, reason = "covers the hot-reload carry of the legacy `PluginLogic` path")]
 impl PluginLogic for ResetLogic {
     type Params = FxParams;
     type DspState = ResetState;

@@ -4,6 +4,7 @@
 //! stores the spawner, `process` stamps it into the `ProcessContext`,
 //! `ctx.tasks::<T>()` recovers it, and the pool runs the handler
 //! off-thread.
+#![expect(deprecated, reason = "covers the deprecated `PluginLogic` path, still supported until it is removed")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

@@ -92,6 +92,10 @@ use std::sync::Arc;
 
 // Re-export plugin-logic traits from `moose-plugin` for the same
 // backward-compat reason.
+#[allow(
+    deprecated,
+    reason = "re-exported for code still on the deprecated leaf traits"
+)]
 pub use moose_plugin::{PluginLogic, PluginLogic64, PluginLogicCore, default_hit_test};
 
 #[doc(hidden)]
@@ -114,7 +118,7 @@ pub use platform::{EditorScale, PaintPacer, to_physical_px};
 /// - iOS: always returns the iOS `BuiltinEditor` (UIView-hosted
 ///   `CAMetalLayer`); the `gpu` feature has no effect on iOS.
 ///
-/// Most layout-only plugins implement [`moose_plugin::PluginLogic::editor`] as:
+/// Most layout-only plugins implement [`moose_plugin::Plugin::editor`] as:
 ///
 /// ```ignore
 /// fn editor(params: Arc<MyParams>) -> Box<dyn moose_core::Editor> {

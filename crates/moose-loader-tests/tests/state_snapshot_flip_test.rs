@@ -8,6 +8,7 @@
 //!
 //! Run with `--features rt-paranoid` to also prove the steady-state
 //! blocks make no audio-thread allocation.
+#![expect(deprecated, reason = "covers the deprecated `PluginLogic` path, still supported until it is removed")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

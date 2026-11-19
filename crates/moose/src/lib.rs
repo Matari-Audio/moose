@@ -26,6 +26,8 @@ pub use moose_vst3 as vst3_wrapper;
 pub use moose_mui as mui;
 
 mod plugin_macro;
+#[doc(hidden)]
+pub use plugin_macro::__deprecated;
 
 /// Re-exports used by the plugin! macro internals.
 #[doc(hidden)]
@@ -175,11 +177,13 @@ macro_rules! define_prelude {
             // directly (rather than via the `moose_gui` re-export)
             // means the prelude doesn't pin a dep on the renderer
             // crate just to name the leaf trait.
+            #[allow(deprecated, reason = "re-exported for code still on the deprecated leaf traits")]
             pub use moose_plugin::$leaf as PluginLogic;
             /// Stateless leaf trait, precision-renamed like
             /// `PluginLogic`. A plugin with no DSP state implements
             /// this instead and skips `type DspState` / `init` /
             /// the `_state` arguments entirely.
+            #[allow(deprecated, reason = "re-exported for code still on the deprecated leaf traits")]
             pub use moose_plugin::$pure as PurePluginLogic;
             pub use moose_params::$float_read as _;
             /// Audio sample type for this prelude.

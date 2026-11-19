@@ -4,6 +4,11 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Deprecated: `PluginLogic`, `PluginLogic64`, `PurePluginLogic(64)` and
+  `moose::plugin! { logic: .. }`** (since 7.1.0, removal planned for 8.0).
+  Implement `moose::Plugin` and export with `plugin: X`; tests and runners
+  name the wrapper `PluginShell`. `PluginLogicCore` (what the wrappers bind)
+  is unchanged. Every in-tree example and plugin except kurv has moved.
 - **`Plugin::reactivate`.** A host re-activation the processor still fits
   now calls `reactivate(processor, shared, config)` on the main thread
   (default: `reset`), so a plugin can redo what `activate` reads from its
@@ -18,7 +23,7 @@ Notable changes per release.
   `main.rs` runs `PluginShell`. No scaffold names `PluginLogic` or
   `PurePluginLogic` any more.
 - **A re-activation the processor still fits keeps it.** `Lifecycle` keeps
-  the current `moose::Plugin` processor and calls `reset` when the host
+  the current `moose::Plugin` processor and calls `reactivate` when the host
   prepares again at the same sample rate and process mode with a max block
   no larger than the one it was built for (the legacy `prepare` default did
   the same). Only a config it can't serve builds a new processor.

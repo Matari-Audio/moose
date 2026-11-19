@@ -44,10 +44,23 @@ impl Editor for ProbeEditor {
 
 pub struct Probe;
 
-impl PurePluginLogic for Probe {
-    type Params = ProbeParams;
+impl Plugin for Probe {
+    type Shared = ProbeParams;
+    type MainThread = ();
+    type Processor = ();
+
+    fn main_thread(_shared: &Arc<ProbeParams>) {}
+
+    fn activate(
+        _shared: &ProbeParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<(), PreparationError> {
+        Ok(())
+    }
 
     fn process(
+        _processor: &mut (),
         _params: &ProbeParams,
         _buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -62,7 +75,7 @@ impl PurePluginLogic for Probe {
 }
 
 moose::plugin! {
-    logic: Probe,
+    plugin: Probe,
     params: ProbeParams,
 }
 

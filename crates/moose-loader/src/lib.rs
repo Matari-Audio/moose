@@ -68,6 +68,10 @@ pub use safe_types::*;
 // Source the leaf + core traits directly from `moose-plugin` rather
 // than via the optional `moose-gui` re-export, so these names are
 // reachable regardless of whether the `builtin-gui` feature is on.
+#[allow(
+    deprecated,
+    reason = "re-exported for code still on the deprecated leaf traits"
+)]
 pub use moose_plugin::{PluginLogic, PluginLogic64, PluginLogicCore};
 
 #[cfg(feature = "shell")]

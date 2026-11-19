@@ -663,6 +663,7 @@ plugin_logic_leaf_trait! {
     /// into params: making per-sample filter memory atomic-shared would
     /// put a synchronized access on the hottest path, and it isn't a
     /// "parameter" anyway.
+    #[deprecated(since = "7.1.0", note = "implement `moose::Plugin` and export it with `moose::plugin! { plugin: X, params: P }`")]
     pub trait PluginLogic<sample = f32>
 }
 
@@ -676,6 +677,7 @@ plugin_logic_leaf_trait! {
     /// `moose::prelude64` (and thus this leaf) when the DSP path runs
     /// in `f64` end-to-end and the wrapper-boundary widen/narrow
     /// memcpy is worth the cleaner DSP code.
+    #[deprecated(since = "7.1.0", note = "implement `moose::Plugin` and export it with `moose::plugin! { plugin: X, params: P }`")]
     pub trait PluginLogic64<sample = f64>
 }
 
@@ -765,6 +767,7 @@ macro_rules! pure_plugin_leaf_trait {
         // not forwarded here (`init`, `reset`, `save_state`, `latency`,
         // `tail`, ...) keep their $leaf defaults, which are exactly the
         // stateless behaviors.
+        #[allow(deprecated, reason = "the compat bridge from the deprecated leaf traits")]
         impl<T: $name> $leaf for T {
             type Params = <T as $name>::Params;
             type DspState = ();
@@ -841,6 +844,7 @@ pure_plugin_leaf_trait! {
     /// [`Self::migrate_state`]. Anything state-shaped (`reset`,
     /// `save_state`, `latency`, `tail`, ...) needs state to act on -
     /// implement [`PluginLogic`] directly if you need those.
+    #[deprecated(since = "7.1.0", note = "implement `moose::Plugin` and export it with `moose::plugin! { plugin: X, params: P }`")]
     pub trait PurePluginLogic: PluginLogic<sample = f32>
 }
 
@@ -850,6 +854,7 @@ pure_plugin_leaf_trait! {
     /// blanket-implements [`PluginLogic64`]. `moose::prelude64`
     /// re-exports it as `PurePluginLogic`, so the impl header reads the
     /// same regardless of precision.
+    #[deprecated(since = "7.1.0", note = "implement `moose::Plugin` and export it with `moose::plugin! { plugin: X, params: P }`")]
     pub trait PurePluginLogic64: PluginLogic64<sample = f64>
 }
 
@@ -962,6 +967,10 @@ pub trait BackgroundTask: Send + 'static {
 /// `(PluginLogic64, f64)` bridges.
 macro_rules! plugin_logic_bridge {
     ($leaf:ident, $sample:ty) => {
+        #[allow(
+            deprecated,
+            reason = "the compat bridge from the deprecated leaf traits"
+        )]
         impl<T: $leaf> PluginLogicCore<$sample> for T {
             type Params = <T as $leaf>::Params;
             type DspState = <T as $leaf>::DspState;
@@ -1072,6 +1081,10 @@ macro_rules! plugin_logic_bridge {
             }
         }
 
+        #[allow(
+            deprecated,
+            reason = "the compat bridge from the deprecated leaf traits"
+        )]
         impl<T: $leaf> PluginEditor<$sample> for T {
             type Params = <T as $leaf>::Params;
 
