@@ -246,6 +246,20 @@ pub trait Plugin<S: Sample = f32>: 'static {
         None
     }
 
+    /// Plugin-defined state schema version (`0` preserves legacy OAST v1;
+    /// `>= 1` writes OAST v2 carrying stable string parameter IDs).
+    #[must_use]
+    fn state_schema_version() -> u32 {
+        0
+    }
+
+    /// Composable `v -> v + 1` migration chain upgrading older state envelopes
+    /// up to [`Self::state_schema_version`].
+    #[must_use]
+    fn state_migrations() -> moose_core::state::StateMigrationChain {
+        moose_core::state::StateMigrationChain::new(Self::state_schema_version())
+    }
+
     /// Build the editor from the shared part.
     fn editor(shared: Arc<Self::Shared>) -> Box<dyn Editor>;
 }
@@ -528,6 +542,14 @@ macro_rules! lifecycle_leaf {
 
             fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
                 P::migrate_state(foreign)
+            }
+
+            fn state_schema_version() -> u32 {
+                P::state_schema_version()
+            }
+
+            fn state_migrations() -> moose_core::state::StateMigrationChain {
+                P::state_migrations()
             }
 
             fn latency(state: &Self::DspState) -> u32 {

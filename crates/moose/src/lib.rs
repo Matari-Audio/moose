@@ -100,7 +100,10 @@ mod prelude_impl {
     pub use moose_core::custom_state::{AtomicCell, State as StateTrait, StateBinding, StateField};
     pub use moose_core::plugin::PreparationError;
     pub use moose_core::sample::{Float, Sample as SampleTrait};
-    pub use moose_core::state::{ForeignState, MigratedState, PluginFormat, StateLoadError};
+    pub use moose_core::state::{
+        ForeignState, MigratedState, PluginFormat, StateLoadError, StateMigrationChain,
+        StateMigrationStep,
+    };
     pub use std::f64::consts::TAU;
     pub use std::sync::Arc;
     // Managed background tasks: the opt-in `BackgroundTask` trait, the
@@ -142,7 +145,7 @@ mod prelude_impl {
     pub use moose_params::{
         BoolParam, DynamicParams, EnumParam, FloatParam, IntParam, MeterSlot, ParamEnum,
         ParamFlags, ParamFunction, ParamInfo, ParamRange, ParamSmoother, ParamUnit, Params,
-        SlotDef, SlotRange, Smoother, SmoothingStyle,
+        SlotDef, SlotRange, Smoother, SmoothingStyle, ValueListParam,
     };
 }
 

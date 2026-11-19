@@ -6,12 +6,14 @@
 //! without inheriting `moose-core`'s runtime dependency chain.
 
 pub use moose_utils::state_stream::{
-    state_stream_size, write_state_stream, write_state_stream_with_persist,
+    state_stream_size, state_stream_size_v2, write_state_stream, write_state_stream_v2,
+    write_state_stream_v2_with_persist, write_state_stream_with_persist,
 };
 
 pub use moose_utils::state::{
-    DeserializedState, StateParse, deserialize_state, hash_plugin_id, parse_state,
-    resolve_vst3_cid, serialize_state, vst3_cid,
+    DeserializedState, NamedParam, STATE_VERSION_V1, STATE_VERSION_V2, StateParse,
+    deserialize_state, hash_plugin_id, parse_state, resolve_vst3_cid, serialize_state,
+    serialize_state_for_schema, serialize_state_v2, vst3_cid,
 };
 
 /// The plugin format whose wrapper found a foreign state blob.
@@ -77,10 +79,141 @@ impl From<MigratedState> for DeserializedState {
     fn from(migrated: MigratedState) -> Self {
         Self {
             params: migrated.params,
+            named_params: Vec::new(),
+            schema_version: 0,
             extra: migrated.extra,
             persist: migrated.persist,
         }
     }
+}
+
+/// One deterministic step `from_version -> from_version + 1` in a
+/// [`StateMigrationChain`].
+#[derive(Clone, Copy)]
+pub struct StateMigrationStep {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub migrate: fn(&mut DeserializedState) -> Result<(), StateLoadError>,
+}
+
+/// Composable schema-version migration chain (`v -> v + 1`) executed on the
+/// host thread when restoring an older state envelope.
+#[derive(Clone, Default)]
+pub struct StateMigrationChain {
+    target_version: u32,
+    steps: Vec<StateMigrationStep>,
+}
+
+impl StateMigrationChain {
+    /// Start an empty migration chain targeting `target_version`.
+    #[must_use]
+    pub fn new(target_version: u32) -> Self {
+        Self {
+            target_version,
+            steps: Vec::new(),
+        }
+    }
+
+    /// Register a migration step from `from_version` to `from_version + 1`.
+    ///
+    /// # Panics
+    /// Panics if `from_version == u32::MAX` or if a step for `from_version`
+    /// is already registered.
+    #[must_use]
+    pub fn step(
+        mut self,
+        from_version: u32,
+        migrate: fn(&mut DeserializedState) -> Result<(), StateLoadError>,
+    ) -> Self {
+        let to_version = from_version
+            .checked_add(1)
+            .expect("state migration from_version overflow");
+        assert!(
+            self.steps.iter().all(|s| s.from_version != from_version),
+            "duplicate state migration step for version {from_version}"
+        );
+        self.steps.push(StateMigrationStep {
+            from_version,
+            to_version,
+            migrate,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn target_version(&self) -> u32 {
+        self.target_version
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Upgrade `state` step-by-step from `state.schema_version` to
+    /// `self.target_version`.
+    ///
+    /// # Errors
+    /// Returns [`StateLoadError::Malformed`] if `state.schema_version` is
+    /// newer than `target_version` or a required step is missing, or forwards
+    /// any error returned by a step.
+    pub fn run(&self, state: &mut DeserializedState) -> Result<(), StateLoadError> {
+        if state.schema_version > self.target_version {
+            return Err(StateLoadError::Malformed(
+                "state schema version is newer than this plugin",
+            ));
+        }
+        while state.schema_version < self.target_version {
+            let current = state.schema_version;
+            let Some(step) = self.steps.iter().find(|s| s.from_version == current) else {
+                return Err(StateLoadError::Malformed("missing state migration step"));
+            };
+            (step.migrate)(state)?;
+            state.schema_version = step.to_version;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve v2 string-keyed parameter entries against `catalog`, updating
+/// `state.params` so string-matched entries win over stale numeric IDs while
+/// preserving fallback numeric entries only when their string key did not
+/// resolve. Never leaks a resolved record's old fallback ID onto another
+/// parameter that later reused that numeric ID.
+pub fn resolve_named_params(state: &mut DeserializedState, catalog: &moose_params::ParamCatalog) {
+    if state.named_params.is_empty() {
+        return;
+    }
+    let mut resolved: Vec<(u32, f64)> =
+        Vec::with_capacity(state.params.len() + state.named_params.len());
+    let mut claimed_ids = std::collections::HashSet::with_capacity(state.named_params.len());
+    let mut unresolved_fallbacks: Vec<(u32, f64)> = Vec::new();
+    // Pass 1: authoritative string-ID matches. Once a record matches by string
+    // key, its old fallback numeric ID is discarded so it cannot overwrite a
+    // different parameter that reused that numeric ID.
+    for entry in &state.named_params {
+        if let Some(id) = catalog.id_by_string(&entry.key) {
+            if claimed_ids.insert(id) {
+                resolved.push((id, entry.value));
+            }
+        } else if let Some(fallback_id) = entry.fallback_id {
+            unresolved_fallbacks.push((fallback_id, entry.value));
+        }
+    }
+    // Pass 2: numeric fallback for named records whose string key did not match.
+    for (id, value) in unresolved_fallbacks {
+        if catalog.by_id(id).is_some() && claimed_ids.insert(id) {
+            resolved.push((id, value));
+        }
+    }
+    // Pass 3: unnamed (v1 or empty-key v2) numeric entries.
+    for &(id, value) in &state.params {
+        if catalog.by_id(id).is_some() && claimed_ids.insert(id) {
+            resolved.push((id, value));
+        }
+    }
+    state.params = resolved;
+    state.named_params.clear();
 }
 
 /// Reason a [`crate::PluginRuntime::load_state`] /
@@ -233,7 +366,7 @@ fn finish_parse_or_migrate<P: PluginExport>(
     format: PluginFormat,
     source_key: Option<&str>,
 ) -> Option<DeserializedState> {
-    let state = match parsed {
+    let mut state = match parsed {
         StateParse::Ok(state) => Some(state),
         StateParse::NotAnEnvelope => P::migrate_state(&ForeignState::Raw {
             format,
@@ -255,7 +388,7 @@ fn finish_parse_or_migrate<P: PluginExport>(
             // no `log` dep in the audio-runtime crate.
             eprintln!(
                 "moose: state blob carries envelope version {version}; this build \
-                 reads version 1 - load failed"
+                 reads versions 1..=2 - load failed"
             );
             None
         }
@@ -264,13 +397,37 @@ fn finish_parse_or_migrate<P: PluginExport>(
             None
         }
     }?;
-    // Reject before any wrapper touches the params: a blob the store
-    // can't read must not leave it half-restored.
-    if !<P::Params as moose_params::Params>::validate_persist(&state.persist) {
-        eprintln!("moose: saved #[persist] state failed validation - load failed");
+    if let Err(err) = migrate_to_current::<P>(&mut state) {
+        eprintln!("moose: {err} - load failed");
         return None;
     }
     Some(state)
+}
+
+/// Bring a decoded envelope up to this plugin's state schema: run
+/// [`crate::plugin::PluginRuntime::state_migrations`] (`v -> v + 1`) when
+/// the saved schema differs, then validate the `#[persist]` block. The one
+/// migration gate shared by host state loads, [`restore_plugin`] and preset
+/// loads. Runs on the host thread, before anything touches live parameters,
+/// so a blob the store can't read never leaves it half-restored.
+///
+/// # Errors
+/// The failing migration step's error, or [`StateLoadError::Malformed`] when
+/// the saved schema is newer than the plugin, a step is missing, or the
+/// persist block fails validation.
+pub fn migrate_to_current<P: PluginExport>(
+    state: &mut DeserializedState,
+) -> Result<(), StateLoadError> {
+    let chain = P::state_migrations();
+    if state.schema_version != chain.target_version() {
+        chain.run(state)?;
+    }
+    if !<P::Params as moose_params::Params>::validate_persist(&state.persist) {
+        return Err(StateLoadError::Malformed(
+            "saved #[persist] state failed validation",
+        ));
+    }
+    Ok(())
 }
 
 /// Read canonical state incrementally into the final state lanes. Foreign
@@ -307,14 +464,19 @@ pub fn read_and_apply_params<P: PluginExport>(
     limit: usize,
 ) -> Option<DeserializedState> {
     use moose_utils::state_stream::{StreamState, read_state_stream_prepared};
-    let (stream, prepared) = read_state_stream_prepared(read, limit, |id, input, len| {
-        if id == expected_plugin_id {
+    let expected_schema = P::state_schema_version();
+    // Only use zero-copy prepared persistence streaming when the incoming
+    // envelope already matches the plugin's current schema version; older
+    // schemas keep their raw persist bytes so `StateMigrationChain` can
+    // migrate persisted fields before `apply_params` commits them.
+    let (stream, prepared) = read_state_stream_prepared(read, limit, |id, schema, input, len| {
+        if id == expected_plugin_id && schema == expected_schema {
             <P::Params as Params>::prepare_persist_stream(input, len)
         } else {
             None
         }
     })?;
-    let state = match stream {
+    let mut state = match stream {
         StreamState::Foreign(bytes) => {
             parse_or_migrate::<P>(&bytes, expected_plugin_id, format, source_key)
         }
@@ -327,6 +489,9 @@ pub fn read_and_apply_params<P: PluginExport>(
             finish_parse_or_migrate::<P>(parsed, &[], format, source_key)
         }
     }?;
+    if !state.named_params.is_empty() {
+        resolve_named_params(&mut state, &params.param_catalog());
+    }
     if let Some(commit) = prepared {
         commit(params, &state.params, &state.persist);
         params.snap_smoothers();
@@ -363,7 +528,13 @@ pub fn apply_params<P: moose_params::Params>(params: &P, state: &DeserializedSta
     if !P::validate_persist(&state.persist) {
         return;
     }
-    params.restore_state(&state.params, &state.persist);
+    if state.named_params.is_empty() {
+        params.restore_state(&state.params, &state.persist);
+    } else {
+        let mut resolved = state.clone();
+        resolve_named_params(&mut resolved, &params.param_catalog());
+        params.restore_state(&resolved.params, &resolved.persist);
+    }
     params.snap_smoothers();
 }
 
@@ -403,6 +574,74 @@ impl std::fmt::Display for RestoreError {
 
 impl std::error::Error for RestoreError {}
 
+/// Compute the exact serialized byte size for a plugin's state stream (v1 when
+/// `P::state_schema_version() == 0`, v2 otherwise).
+#[must_use]
+pub fn plugin_state_stream_size<P: PluginExport>(
+    params: &P::Params,
+    ids: &[u32],
+    values: &[f64],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+) -> Option<usize> {
+    if ids.len() != values.len() {
+        return None;
+    }
+    if P::state_schema_version() == 0 {
+        state_stream_size(ids, values, extra, persist_len, limit)
+    } else {
+        let catalog = params.param_catalog();
+        let entries = state_entries(&catalog, ids, values);
+        state_stream_size_v2(&entries, extra, persist_len, limit)
+    }
+}
+
+/// Stream a plugin's state envelope (v1 when `P::state_schema_version() == 0`,
+/// v2 carrying schema version + stable parameter string IDs otherwise).
+#[allow(clippy::too_many_arguments)]
+pub fn write_plugin_state_stream<P: PluginExport>(
+    plugin_id: u64,
+    params: &P::Params,
+    ids: &[u32],
+    values: &[f64],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+    persist: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    write: impl FnMut(&[u8]) -> i64,
+) -> bool {
+    if ids.len() != values.len() {
+        return false;
+    }
+    let schema_version = P::state_schema_version();
+    if schema_version == 0 {
+        write_state_stream_with_persist(
+            plugin_id,
+            ids,
+            values,
+            extra,
+            persist_len,
+            limit,
+            persist,
+            write,
+        )
+    } else {
+        let catalog = params.param_catalog();
+        let entries = state_entries(&catalog, ids, values);
+        write_state_stream_v2_with_persist(
+            plugin_id,
+            schema_version,
+            &entries,
+            extra,
+            persist_len,
+            limit,
+            persist,
+            write,
+        )
+    }
+}
+
 /// Serialize a plugin instance into the canonical state envelope -
 /// parameter values + optional custom-state payload, with the magic /
 /// version / plugin-ID header `serialize_state` writes.
@@ -411,7 +650,9 @@ impl std::error::Error for RestoreError {}
 /// written by one host loads in any other (subject to the
 /// plugin-ID match `deserialize_state` enforces).
 pub fn snapshot_plugin<P: PluginExport>(plugin: &P) -> Vec<u8> {
-    use moose_params::Params;
+    if P::state_schema_version() > 0 {
+        return snapshot_plugin_v2(plugin);
+    }
     let (ids, values) = plugin.params().collect_values();
     let extra = read_custom_state_offthread(plugin);
     let persist = plugin.params().serialize_persist();
@@ -424,28 +665,158 @@ pub fn snapshot_plugin<P: PluginExport>(plugin: &P) -> Vec<u8> {
     )
 }
 
+/// Serialize a plugin instance into an OAST v2 envelope carrying its schema
+/// version and stable parameter string IDs alongside fallback numeric IDs.
+pub fn snapshot_plugin_v2<P: PluginExport>(plugin: &P) -> Vec<u8> {
+    let catalog = plugin.params().param_catalog();
+    let (ids, values) = plugin.params().collect_values();
+    let entries = state_entries(&catalog, &ids, &values);
+    let extra = read_custom_state_offthread(plugin);
+    let persist = plugin.params().serialize_persist();
+    serialize_state_v2(
+        hash_plugin_id(P::info().clap_id),
+        P::state_schema_version(),
+        &entries,
+        &extra,
+        &persist,
+    )
+}
+
 /// Inverse of [`snapshot_plugin`]. Validates the envelope's magic,
-/// version, and plugin-ID hash; on success restores parameter
-/// values via `Params::restore_values` and forwards the optional
-/// extra payload to `Plugin::load_state`.
+/// version, and plugin-ID hash; on success runs
+/// [`crate::plugin::PluginRuntime::state_migrations`], resolves v2
+/// string-keyed parameter IDs, restores parameter values via
+/// `Params::restore_state`, and forwards the optional extra payload to
+/// `Plugin::load_state`.
 ///
 /// # Errors
 ///
 /// Returns [`RestoreError::Invalid`] if the magic / version /
-/// plugin-ID hash check fails or the envelope is truncated. A
-/// successful return guarantees the params and (optional) extra
+/// plugin-ID hash check fails or the envelope is truncated, and
+/// [`RestoreError::LoadState`] when a schema migration or `#[persist]`
+/// validation fails (see [`migrate_to_current`]). A successful return guarantees the params and (optional) extra
 /// payload were forwarded to the plugin.
 pub fn restore_plugin<P: PluginExport>(plugin: &mut P, bytes: &[u8]) -> Result<(), RestoreError> {
     let id = hash_plugin_id(P::info().clap_id);
-    let s = deserialize_state(bytes, id).ok_or(RestoreError::Invalid)?;
-    if !<P::Params as Params>::validate_persist(&s.persist) {
-        return Err(RestoreError::Invalid);
+    let mut s = deserialize_state(bytes, id).ok_or(RestoreError::Invalid)?;
+    migrate_to_current::<P>(&mut s).map_err(RestoreError::LoadState)?;
+    if !s.named_params.is_empty() {
+        resolve_named_params(&mut s, &plugin.params().param_catalog());
     }
     plugin.params().restore_state(&s.params, &s.persist);
     if let Some(extra) = s.extra {
         plugin.load_state(&extra).map_err(RestoreError::LoadState)?;
     }
     Ok(())
+}
+
+/// `(string_id, numeric_id, value)` entries for a v2 envelope. A parameter
+/// without a string ID gets `""` and round-trips by numeric ID alone.
+fn state_entries<'a>(
+    catalog: &'a moose_params::ParamCatalog,
+    ids: &[u32],
+    values: &[f64],
+) -> Vec<(&'a str, u32, f64)> {
+    ids.iter()
+        .zip(values)
+        .map(|(&id, &value)| (catalog.string_id(id).unwrap_or(""), id, value))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Presets: one schema-aware writer and one migration-aware reader shared by
+// every wrapper (standalone, AU factory presets, editor preset menus).
+// ---------------------------------------------------------------------------
+
+/// Serialize `params`' current values plus the custom-state `extra` blob as a
+/// preset envelope: OAST v1 when `P::state_schema_version() == 0` (so presets
+/// from plugins that never opted into schemas stay readable by older builds),
+/// OAST v2 with stable string IDs otherwise. Presets carry no `#[persist]`
+/// block - that is session state (window size, paths), not part of a sound.
+#[must_use]
+pub fn serialize_preset<P: PluginExport>(params: &P::Params, extra: &[u8]) -> Vec<u8> {
+    let catalog = params.param_catalog();
+    let (ids, values) = params.collect_values();
+    serialize_state_for_schema(
+        hash_plugin_id(P::info().clap_id),
+        P::state_schema_version(),
+        &state_entries(&catalog, &ids, &values),
+        extra,
+        &[],
+    )
+}
+
+/// Save `params`' current values plus `extra` to `store`'s user scope in the
+/// envelope [`serialize_preset`] would write.
+///
+/// # Errors
+/// As [`crate::presets::PresetStore::save`].
+pub fn save_user_preset<P: PluginExport>(
+    store: &crate::presets::PresetStore,
+    meta: crate::presets::PresetMeta,
+    params: &P::Params,
+    extra: &[u8],
+) -> Result<crate::presets::PresetRef, crate::presets::PresetError> {
+    let catalog = params.param_catalog();
+    let (ids, values) = params.collect_values();
+    store.save_for_schema(
+        meta,
+        P::state_schema_version(),
+        &state_entries(&catalog, &ids, &values),
+        extra,
+    )
+}
+
+/// Bring a decoded preset up to the current plugin: run
+/// [`migrate_to_current`] (schema migrations + `#[persist]` validation),
+/// then resolve v2 string-keyed entries against `params`' catalog so a
+/// renumbered parameter still receives its saved value. The returned state
+/// carries resolved numeric IDs only, ready for [`apply_params`] /
+/// [`apply_state`].
+///
+/// # Errors
+/// As [`migrate_to_current`].
+pub fn prepare_preset<P: PluginExport>(
+    params: &P::Params,
+    mut state: DeserializedState,
+) -> Result<DeserializedState, StateLoadError> {
+    migrate_to_current::<P>(&mut state)?;
+    if !state.named_params.is_empty() {
+        resolve_named_params(&mut state, &params.param_catalog());
+        state.named_params.clear();
+    }
+    Ok(state)
+}
+
+/// Read a preset file for this plugin and [`prepare_preset`] it. `None` for
+/// an unreadable or foreign file, or one whose migration fails (logged).
+#[must_use]
+pub fn load_preset_file<P: PluginExport>(
+    path: &std::path::Path,
+    plugin_id_hash: u64,
+    params: &P::Params,
+) -> Option<DeserializedState> {
+    let state = crate::presets::load_preset_file(path, plugin_id_hash)?;
+    prepare_preset::<P>(params, state)
+        .inspect_err(|err| eprintln!("moose: preset {}: {err}", path.display()))
+        .ok()
+}
+
+/// Load a preset from `store` by uri / uuid / name and [`prepare_preset`] it.
+///
+/// # Errors
+/// As [`crate::presets::PresetStore::load`]; a failed migration is
+/// [`crate::presets::PresetError::InvalidState`].
+pub fn load_preset<P: PluginExport>(
+    store: &crate::presets::PresetStore,
+    params: &P::Params,
+    uri_or_uuid: &str,
+) -> Result<DeserializedState, crate::presets::PresetError> {
+    let state = store.load(uri_or_uuid)?;
+    prepare_preset::<P>(params, state).map_err(|err| {
+        eprintln!("moose: preset {uri_or_uuid}: {err}");
+        crate::presets::PresetError::InvalidState
+    })
 }
 
 /// Resolve the state-envelope hash every format wrapper stamps into
@@ -605,9 +976,107 @@ mod state_handoff_tests {
     fn state(value: u8) -> DeserializedState {
         DeserializedState {
             params: vec![],
+            named_params: vec![],
+            schema_version: 0,
             extra: Some(vec![value; 1024]),
             persist: vec![value; 1024],
         }
+    }
+
+    #[test]
+    fn migration_chain_upgrades_step_by_step_and_rejects_future_or_gapped_versions() {
+        #[allow(clippy::unnecessary_wraps)]
+        fn v0_to_v1(s: &mut DeserializedState) -> Result<(), StateLoadError> {
+            s.named_params.push(NamedParam::new("osc1.cutoff", 500.0));
+            Ok(())
+        }
+        #[allow(clippy::unnecessary_wraps)]
+        fn v1_to_v2(s: &mut DeserializedState) -> Result<(), StateLoadError> {
+            for entry in &mut s.named_params {
+                if entry.key == "osc1.cutoff" {
+                    entry.value *= 2.0;
+                }
+            }
+            Ok(())
+        }
+        let chain = StateMigrationChain::new(2)
+            .step(0, v0_to_v1)
+            .step(1, v1_to_v2);
+
+        let mut old = DeserializedState::default();
+        chain.run(&mut old).expect("0 -> 1 -> 2 succeeds");
+        assert_eq!(old.schema_version, 2);
+        assert_eq!(
+            old.named_params,
+            vec![NamedParam::new("osc1.cutoff", 1000.0)]
+        );
+
+        let mut future = DeserializedState {
+            schema_version: 3,
+            ..DeserializedState::default()
+        };
+        assert!(chain.run(&mut future).is_err());
+
+        let gapped = StateMigrationChain::new(2).step(0, v0_to_v1);
+        let mut s = DeserializedState::default();
+        assert!(gapped.run(&mut s).is_err());
+    }
+
+    #[test]
+    fn resolve_named_params_remaps_by_string_id_and_never_leaks_fallback_into_reused_id() {
+        use moose_params::{
+            ParamCatalog, ParamFlags, ParamInfo, ParamRange, ParamUnit, ParamValueKind,
+        };
+        let mk = |id: u32, name: &'static str| ParamInfo {
+            id,
+            name,
+            short_name: name,
+            group: "",
+            range: ParamRange::Linear { min: 0.0, max: 1.0 },
+            default_plain: 0.0,
+            flags: ParamFlags::AUTOMATABLE,
+            unit: ParamUnit::None,
+            kind: ParamValueKind::Float,
+            midi_map: None,
+            midi_channel: None,
+        };
+        // Current catalog: `osc1.cutoff` moved from numeric ID 10 -> 100, and
+        // `mix` now reuses numeric ID 10.
+        let catalog = ParamCatalog::with_string_ids(
+            vec![mk(100, "Cutoff"), mk(10, "Mix")],
+            vec![(100, "osc1.cutoff".into()), (10, "mix".into())],
+        );
+        // Saved record for `osc1.cutoff` carried old numeric ID 10 as fallback.
+        // Resolving `osc1.cutoff` -> 100 must NOT also restore 0.75 onto `mix` (ID 10).
+        let mut s = DeserializedState {
+            params: Vec::new(),
+            named_params: vec![NamedParam {
+                key: "osc1.cutoff".into(),
+                fallback_id: Some(10),
+                value: 0.75,
+            }],
+            schema_version: 1,
+            extra: None,
+            persist: Vec::new(),
+        };
+        resolve_named_params(&mut s, &catalog);
+        assert_eq!(s.params, vec![(100, 0.75)]);
+        assert_eq!(s.named_params, Vec::new());
+
+        // When a string key does NOT resolve, its numeric fallback still applies.
+        let mut fallback = DeserializedState {
+            params: Vec::new(),
+            named_params: vec![NamedParam {
+                key: "removed.key".into(),
+                fallback_id: Some(10),
+                value: 0.4,
+            }],
+            schema_version: 1,
+            extra: None,
+            persist: Vec::new(),
+        };
+        resolve_named_params(&mut fallback, &catalog);
+        assert_eq!(fallback.params, vec![(10, 0.4)]);
     }
     #[test]
     fn audio_cannot_drop_the_last_owner_and_retention_is_bounded() {

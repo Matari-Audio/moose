@@ -302,6 +302,18 @@ pub trait MainThreadHooks: Send + 'static {
     fn perform_menu(&mut self, _cx: &MainThread, _target: MenuTarget, _action: u32) -> bool {
         false
     }
+
+    /// Map a parameter ID from an older or replaced plugin class (`old_plugin_cid`)
+    /// to a compatible parameter ID in this plugin (VST3 `IRemapParamID`).
+    /// Return `None` when no compatible parameter exists.
+    fn remap_param_id(
+        &self,
+        _cx: &MainThread,
+        _old_plugin_cid: [u8; 16],
+        _old_id: u32,
+    ) -> Option<u32> {
+        None
+    }
 }
 
 /// No main-thread part.

@@ -277,6 +277,28 @@ pub trait PluginRuntime: Send + 'static {
         None
     }
 
+    /// Plugin-defined state schema version. `0` (default) preserves legacy
+    /// OAST v1 envelopes; returning `>= 1` writes OAST v2 envelopes carrying
+    /// this schema version and stable string parameter IDs.
+    #[must_use]
+    fn state_schema_version() -> u32
+    where
+        Self: Sized,
+    {
+        0
+    }
+
+    /// Composable `v -> v + 1` migration chain upgrading older state envelopes
+    /// up to [`Self::state_schema_version`] on the host thread before applying
+    /// parameters or custom state.
+    #[must_use]
+    fn state_migrations() -> crate::state::StateMigrationChain
+    where
+        Self: Sized,
+    {
+        crate::state::StateMigrationChain::new(Self::state_schema_version())
+    }
+
     /// Check custom state bytes before a load is applied or queued.
     ///
     /// Runs on the host thread inside the wrapper's state callback, before

@@ -1218,7 +1218,8 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let Ok(persist) = inst.params_arc.prepare_persist_write() else {
             return;
         };
-        let Some(len) = state::state_stream_size(
+        let Some(len) = state::plugin_state_stream_size::<P>(
+            &inst.params_arc,
             &ids,
             &values,
             &extra,
@@ -1235,8 +1236,9 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
             return;
         }
         let mut offset = 0;
-        let ok = state::write_state_stream_with_persist(
+        let ok = state::write_plugin_state_stream::<P>(
             inst.plugin_id_hash,
+            &inst.params_arc,
             &ids,
             &values,
             &extra,

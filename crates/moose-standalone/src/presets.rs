@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use moose_core::export::{PluginExport, read_custom_state_offthread};
 use moose_core::presets::{PresetScope, PresetStore, mint_uuid, user_preset_root};
-use moose_core::state::{apply_params, apply_state, hash_plugin_id, serialize_state};
-use moose_params::Params;
+use moose_core::state::{
+    apply_params, apply_state, hash_plugin_id, load_preset, save_user_preset, serialize_preset,
+};
 use moose_utils::preset::write_preset_file;
 use moose_utils::safe_filename;
 
@@ -79,7 +80,9 @@ pub fn apply_selected<P: PluginExport>(store: &PresetStore, plugin: &mut P, sel:
         eprintln!("no preset matching {sel:?}");
         return false;
     };
-    match store.load(&preset.uri) {
+    // Migration-aware: runs the plugin's `StateMigrationChain` and resolves
+    // v2 string IDs before anything touches the live params.
+    match load_preset::<P>(store, plugin.params(), &preset.uri) {
         Ok(state) => {
             // `apply_state` no longer touches `#[persist]` fields (they
             // lock, so they're kept off the audio thread); apply them here
@@ -132,13 +135,12 @@ pub fn save_user<P: PluginExport>(
     plugin: &Arc<Mutex<P>>,
     meta: moose_utils::preset::PresetMeta,
 ) -> Option<String> {
-    let (ids, values, extra) = {
+    let saved = {
         let guard = plugin.lock().ok()?;
-        let (ids, values) = guard.params().collect_values();
-        (ids, values, read_custom_state_offthread(&*guard))
+        let extra = read_custom_state_offthread(&*guard);
+        save_user_preset::<P>(store, meta, guard.params(), &extra)
     };
-    let params: Vec<(u32, f64)> = ids.into_iter().zip(values).collect();
-    match store.save(meta, &params, &extra) {
+    match saved {
         Ok(preset) => {
             vlog!(
                 "saved preset \"{}\" -> {}",
@@ -282,9 +284,8 @@ impl PresetController {
         });
 
         let info = P::info();
-        let hash = hash_plugin_id(info.clap_id);
         let user_root = user_preset_root(info.vendor, info.name, info.preset_user_dir);
-        let save_as = Box::new(move || save_as_dialog::<P>(&plugin, hash, user_root.as_deref()));
+        let save_as = Box::new(move || save_as_dialog::<P>(&plugin, user_root.as_deref()));
 
         Self {
             inner: std::rc::Rc::new(PresetControllerInner {
@@ -437,12 +438,11 @@ impl PresetController {
     }
 }
 
-/// Snapshot `plugin` into a canonical state envelope.
-fn snapshot<P: PluginExport>(plugin: &Arc<Mutex<P>>, hash: u64) -> Option<Vec<u8>> {
+/// Snapshot `plugin` into a preset envelope (v1 or v2 per its schema).
+fn snapshot<P: PluginExport>(plugin: &Arc<Mutex<P>>) -> Option<Vec<u8>> {
     let guard = plugin.lock().ok()?;
-    let (ids, values) = guard.params().collect_values();
     let extra = read_custom_state_offthread(&*guard);
-    Some(serialize_state(hash, &ids, &values, &extra, &[]))
+    Some(serialize_preset::<P>(guard.params(), &extra))
 }
 
 /// Write `blob` as a `.trucepreset` named after `path`'s stem.
@@ -486,10 +486,9 @@ fn saved_user_uri<P: PluginExport>(name: &str) -> Option<String> {
 #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "windows")))]
 fn save_as_dialog<P: PluginExport>(
     plugin: &Arc<Mutex<P>>,
-    hash: u64,
     user_root: Option<&std::path::Path>,
 ) -> Option<String> {
-    let blob = snapshot(plugin, hash)?;
+    let blob = snapshot(plugin)?;
     let mut dialog = rfd::FileDialog::new()
         .set_title(format!("Save preset for {}", P::info().name))
         .add_filter("moose preset", &[P::info().preset_extension])
@@ -512,10 +511,9 @@ fn save_as_dialog<P: PluginExport>(
 #[cfg(not(all(feature = "gui", any(target_os = "macos", target_os = "windows"))))]
 fn save_as_dialog<P: PluginExport>(
     plugin: &Arc<Mutex<P>>,
-    hash: u64,
     user_root: Option<&std::path::Path>,
 ) -> Option<String> {
-    let blob = snapshot(plugin, hash)?;
+    let blob = snapshot(plugin)?;
     let Some(dir) = user_root else {
         eprintln!("save-as: no user preset directory available");
         return None;

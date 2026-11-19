@@ -47,7 +47,8 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
         let Ok(persist) = inst.params_arc.prepare_persist_write() else {
             return;
         };
-        let Some(len) = state::state_stream_size(
+        let Some(len) = state::plugin_state_stream_size::<P>(
+            &inst.params_arc,
             &ids,
             &values,
             &extra,
@@ -64,8 +65,9 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
             return;
         }
         let mut offset = 0;
-        let ok = state::write_state_stream_with_persist(
+        let ok = state::write_plugin_state_stream::<P>(
             inst.plugin_id_hash,
+            &inst.params_arc,
             &ids,
             &values,
             &extra,
@@ -107,7 +109,7 @@ pub(crate) unsafe extern "C" fn cb_state_load<P: PluginExport>(
         // Not this plugin's envelope? Offer the bytes to the plugin's
         // `migrate_state` hook (legacy sessions from a pre-moose
         // build); `None` fails the load honestly.
-        let Some(deserialized) = state::parse_or_migrate::<P>(
+        let Some(mut deserialized) = state::parse_or_migrate::<P>(
             blob,
             inst.plugin_id_hash,
             state::PluginFormat::Vst3,
@@ -115,6 +117,9 @@ pub(crate) unsafe extern "C" fn cb_state_load<P: PluginExport>(
         ) else {
             return 0;
         };
+        if !deserialized.named_params.is_empty() {
+            state::resolve_named_params(&mut deserialized, &inst.params_arc.param_catalog());
+        }
         apply_host_state(inst, deserialized, &backup, false)
     })
 }
@@ -192,8 +197,9 @@ pub(crate) unsafe extern "C" fn cb_state_save_stream<P: PluginExport>(
         let Ok(persist) = inst.params_arc.prepare_persist_write() else {
             return 0;
         };
-        i32::from(state::write_state_stream_with_persist(
+        i32::from(state::write_plugin_state_stream::<P>(
             inst.plugin_id_hash,
+            &inst.params_arc,
             &ids,
             &values,
             &extra,

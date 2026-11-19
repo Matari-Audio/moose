@@ -1,7 +1,7 @@
 //! Bounded incremental OAST input. No full-envelope staging allocation: read
 //! parameter records and the two owned state lanes directly into their final
 //! buffers. Legacy foreign blobs retain the bounded migration fallback.
-use crate::state::{DeserializedState, StateParse};
+use crate::state::{DeserializedState, NamedParam, STATE_VERSION_V1, STATE_VERSION_V2, StateParse};
 
 pub enum StreamState {
     Envelope(StateParse),
@@ -65,7 +65,7 @@ impl<F: FnMut(&mut [u8]) -> i64> std::io::Read for Input<F> {
 /// trailing bytes and oversized declared lanes before allocating them.
 /// All allocation and callbacks occur on the host's state thread.
 pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Option<StreamState> {
-    read_state_stream_prepared::<()>(read, limit, |_, _, _| None).map(|(state, _)| state)
+    read_state_stream_prepared::<()>(read, limit, |_, _, _, _| None).map(|(state, _)| state)
 }
 
 /// A prepared field decoder sees only the declared persistence section. Its
@@ -73,7 +73,12 @@ pub fn read_state_stream(read: impl FnMut(&mut [u8]) -> i64, limit: usize) -> Op
 pub fn read_state_stream_prepared<T>(
     read: impl FnMut(&mut [u8]) -> i64,
     limit: usize,
-    prepare: impl FnOnce(u64, &mut dyn std::io::Read, usize) -> Option<std::io::Result<(Vec<u8>, T)>>,
+    prepare: impl FnOnce(
+        u64,
+        u32,
+        &mut dyn std::io::Read,
+        usize,
+    ) -> Option<std::io::Result<(Vec<u8>, T)>>,
 ) -> Option<(StreamState, Option<T>)> {
     let mut input = Input {
         read,
@@ -101,25 +106,58 @@ pub fn read_state_stream_prepared<T>(
         return Some((StreamState::Foreign(prefix), None));
     }
     let version = u32::from_le_bytes(input.word()?);
-    if version != 1 {
+    if version != STATE_VERSION_V1 && version != STATE_VERSION_V2 {
         return Some((
             StreamState::Envelope(StateParse::UnknownVersion(version)),
             None,
         ));
     }
     let plugin_id = u64::from_le_bytes(input.word()?);
+    let schema_version = if version == STATE_VERSION_V2 {
+        u32::from_le_bytes(input.word()?)
+    } else {
+        0
+    };
     let count = u32::from_le_bytes(input.word()?) as usize;
-    if count.checked_mul(12)? > limit.checked_sub(input.used)? {
-        return None;
-    }
-    let mut params = Vec::new();
-    params.try_reserve_exact(count).ok()?;
-    for _ in 0..count {
-        params.push((
-            u32::from_le_bytes(input.word()?),
-            f64::from_le_bytes(input.word()?),
-        ));
-    }
+    let (params, named_params) = if version == STATE_VERSION_V1 {
+        if count.checked_mul(12)? > limit.checked_sub(input.used)? {
+            return None;
+        }
+        let mut params = Vec::new();
+        params.try_reserve_exact(count).ok()?;
+        for _ in 0..count {
+            params.push((
+                u32::from_le_bytes(input.word()?),
+                f64::from_le_bytes(input.word()?),
+            ));
+        }
+        (params, Vec::new())
+    } else {
+        if count.checked_mul(14)? > limit.checked_sub(input.used)? {
+            return None;
+        }
+        let mut params = Vec::new();
+        params.try_reserve_exact(count).ok()?;
+        let mut named_params = Vec::new();
+        named_params.try_reserve_exact(count).ok()?;
+        for _ in 0..count {
+            let key_len = usize::from(u16::from_le_bytes(input.word()?));
+            let key_bytes = input.bytes(key_len)?;
+            let key = String::from_utf8(key_bytes).ok()?;
+            let id = u32::from_le_bytes(input.word()?);
+            let value = f64::from_le_bytes(input.word()?);
+            if key.is_empty() {
+                params.push((id, value));
+            } else {
+                named_params.push(NamedParam {
+                    key,
+                    fallback_id: Some(id),
+                    value,
+                });
+            }
+        }
+        (params, named_params)
+    };
     let extra_len = usize::try_from(u64::from_le_bytes(input.word()?)).ok()?;
     let extra = if extra_len == 0 {
         None
@@ -139,7 +177,7 @@ pub fn read_state_stream_prepared<T>(
             return None;
         }
         let mut section = std::io::Read::take(&mut input, len as u64);
-        let result = prepare(plugin_id, &mut section, len);
+        let result = prepare(plugin_id, schema_version, &mut section, len);
         let bytes = if let Some(result) = result {
             let (bytes, commit) = result.ok()?;
             if section.limit() != 0 {
@@ -165,6 +203,8 @@ pub fn read_state_stream_prepared<T>(
             found: plugin_id,
             state: DeserializedState {
                 params,
+                named_params,
+                schema_version,
                 extra,
                 persist,
             },
@@ -280,6 +320,99 @@ pub fn write_state_stream_with_persist(
         output.write_all(&plugin_id.to_le_bytes())?;
         output.write_all(&count.to_le_bytes())?;
         for (&id, &value) in ids.iter().zip(values) {
+            output.write_all(&id.to_le_bytes())?;
+            output.write_all(&value.to_le_bytes())?;
+        }
+        output.write_all(&(extra.len() as u64).to_le_bytes())?;
+        output.write_all(extra)?;
+        output.write_all(&persist_len.to_le_bytes())?;
+        persist(&mut output)
+    })();
+    result.is_ok() && output.remaining == 0
+}
+
+/// Validate all lengths before allocating a contiguous host-owned v2 output.
+#[must_use]
+pub fn state_stream_size_v2(
+    named_params: &[(&str, u32, f64)],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+) -> Option<usize> {
+    if u32::try_from(named_params.len()).is_err() {
+        return None;
+    }
+    let persist_size = usize::try_from(persist_len).ok()?;
+    let mut total: usize = 40;
+    for &(key, _, _) in named_params {
+        if u16::try_from(key.len()).is_err() {
+            return None;
+        }
+        total = total.checked_add(14)?.checked_add(key.len())?;
+    }
+    total
+        .checked_add(extra.len())?
+        .checked_add(persist_size)
+        .filter(|size| *size <= limit)
+}
+
+/// Write byte-identical OAST v2 framing without a second full-state buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn write_state_stream_v2(
+    plugin_id: u64,
+    schema_version: u32,
+    named_params: &[(&str, u32, f64)],
+    extra: &[u8],
+    persist: &[u8],
+    limit: usize,
+    write: impl FnMut(&[u8]) -> i64,
+) -> bool {
+    write_state_stream_v2_with_persist(
+        plugin_id,
+        schema_version,
+        named_params,
+        extra,
+        persist.len() as u64,
+        limit,
+        |output| output.write_all(persist),
+        write,
+    )
+}
+
+/// Stream a frozen persistence snapshot inside an OAST v2 envelope.
+#[allow(clippy::too_many_arguments)]
+pub fn write_state_stream_v2_with_persist(
+    plugin_id: u64,
+    schema_version: u32,
+    named_params: &[(&str, u32, f64)],
+    extra: &[u8],
+    persist_len: u64,
+    limit: usize,
+    persist: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    write: impl FnMut(&[u8]) -> i64,
+) -> bool {
+    use std::io::Write;
+    let Some(size) = state_stream_size_v2(named_params, extra, persist_len, limit) else {
+        return false;
+    };
+    let Ok(count) = u32::try_from(named_params.len()) else {
+        return false;
+    };
+    let mut output = Output {
+        write,
+        remaining: size,
+    };
+    let result = (|| {
+        output.write_all(b"OAST")?;
+        output.write_all(&STATE_VERSION_V2.to_le_bytes())?;
+        output.write_all(&plugin_id.to_le_bytes())?;
+        output.write_all(&schema_version.to_le_bytes())?;
+        output.write_all(&count.to_le_bytes())?;
+        for &(key, id, value) in named_params {
+            let key_len = u16::try_from(key.len())
+                .map_err(|_| std::io::Error::other("parameter string ID exceeds u16::MAX"))?;
+            output.write_all(&key_len.to_le_bytes())?;
+            output.write_all(key.as_bytes())?;
             output.write_all(&id.to_le_bytes())?;
             output.write_all(&value.to_le_bytes())?;
         }
@@ -457,6 +590,7 @@ mod prepared_tests {
     )]
     fn prepare(
         _id: u64,
+        _schema: u32,
         input: &mut dyn std::io::Read,
         len: usize,
     ) -> Option<std::io::Result<(Vec<u8>, u64)>> {
@@ -532,9 +666,66 @@ mod prepared_tests {
                     i64::try_from(n).unwrap()
                 },
                 1024,
-                |_, _, _| Some(Ok((Vec::new(), ())))
+                |_, _, _, _| Some(Ok((Vec::new(), ())))
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn v2_stream_write_and_read_match_serialize_state_v2() {
+        let entries = [("osc1.cutoff", 10u32, 880.0), ("mix", 20u32, 0.25)];
+        let expected =
+            crate::state::serialize_state_v2(42, 7, &entries, b"extra-v2", b"persist-v2");
+        let mut out = Vec::new();
+        assert!(write_state_stream_v2(
+            42,
+            7,
+            &entries,
+            b"extra-v2",
+            b"persist-v2",
+            expected.len(),
+            |bytes| {
+                let n = bytes.len().min(11);
+                out.extend_from_slice(&bytes[..n]);
+                i64::try_from(n).unwrap()
+            }
+        ));
+        assert_eq!(out, expected);
+
+        let mut pos = 0;
+        let Some(StreamState::Envelope(StateParse::WrongPlugin { found, state })) =
+            read_state_stream(
+                |dst| {
+                    let n = dst.len().min(7).min(out.len() - pos);
+                    dst[..n].copy_from_slice(&out[pos..pos + n]);
+                    pos += n;
+                    i64::try_from(n).unwrap()
+                },
+                out.len(),
+            )
+        else {
+            panic!("v2 stream rejected");
+        };
+        assert_eq!(found, 42);
+        assert_eq!(state.schema_version, 7);
+        assert_eq!(state.params, Vec::new());
+        assert_eq!(
+            state.named_params,
+            vec![
+                NamedParam {
+                    key: "osc1.cutoff".to_string(),
+                    fallback_id: Some(10),
+                    value: 880.0,
+                },
+                NamedParam {
+                    key: "mix".to_string(),
+                    fallback_id: Some(20),
+                    value: 0.25,
+                },
+            ]
+        );
+        assert_eq!(state.extra.as_deref(), Some(&b"extra-v2"[..]));
+        assert_eq!(state.persist, b"persist-v2");
     }
 }

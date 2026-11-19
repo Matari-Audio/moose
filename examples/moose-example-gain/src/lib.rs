@@ -278,7 +278,7 @@ mod tests {
 
         // A future envelope version must fail, never reach the hook.
         let mut future = serialize_state(hash, &[], &[], &[], &[]);
-        future[4..8].copy_from_slice(&2u32.to_le_bytes());
+        future[4..8].copy_from_slice(&99u32.to_le_bytes());
         moose_test::assert_state_migration_rejected::<PluginShell>(
             PluginFormat::Clap,
             None,

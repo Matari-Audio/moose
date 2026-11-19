@@ -110,7 +110,7 @@ safety or scaling hazard; **S3** missing capability a modern host expects;
 | D6 | S2 | Each param write takes `normalize` → `denormalize` round trips and several dispatches by id. | Catalog lookup by dense index (CLAP `cookie` = index pointer; VST3 id → index via a perfect-hash or sorted table built at catalog swap). |
 | D7 | S3 | Missing host-facing parameter features: CLAP `param-indication` (show host mapping/automation colour in the GUI), `context-menu` (host items in the plugin's right-click menu), draft `param-origin`, `param-hovered`; VST3 `IParameterFunctionName` (e.g. "dry/wet" for host macros), `IParameterFinder` (host "learn" by mouse position), `IComponentHandler3` context menu, `IMidiLearn2` / `IMidiMapping2`, `IRemapParamID`. | Add each as an optional capability on the catalog entry or the editor (e.g. `ParamInfo::function: Option<ParamFunction>`, `Editor::param_at(x, y)`, `Editor::context_menu(param)`), with wrappers mapping to whatever the format offers. |
 | D8 | S3 | Value-to-text and text-to-value are per-param closures; no custom value lists exposed to hosts beyond enums. | Keep formatters, plus a `ValueList` kind (labelled discrete values, possibly runtime-populated, like a sample slot list) that maps to CLAP enum params with `value_to_text`, VST3 `kIsList` + `getParamStringByValue`, and AU value strings. Changing the list is a catalog transaction (D1). |
-| D9 | S4 | ids: 24-bit nested-id domain, rebasing, `AUTO_PARAM_ID_MASK`, projection id ranges. | Stable string ids (`"osc1.cutoff"`) hashed to a 32-bit host id once, collision-checked when the catalog is built; arrays and nested groups compose string paths. State keys by string (C3). |
+| D9 | S4 | ids: 24-bit nested-id domain, rebasing, `AUTO_PARAM_ID_MASK`, projection id ranges. | Stable string ids (`"osc1.cutoff"`) beside the numeric host ids, collision-checked when the catalog is built; arrays and nested groups compose string paths. State keys by string (C3). **Revised 2026-11-19:** numeric host ids are *not* hashed from string ids; see [D9 decision](#d9-string-ids-sit-beside-numeric-host-ids-decision-2026-11-19). |
 
 ### E. Events, MIDI and processing
 
@@ -243,6 +243,63 @@ Why not now:
 What we take from it now: the thread model is the target for step 2.
 Host extension pointers should become thread-typed handles when
 moose-clap is split per extension (G1).
+
+## D9: string IDs sit beside numeric host IDs (decision, 2026-11-19)
+
+The first D9 proposal hashed each stable string ID into the 32-bit host ID.
+We are not doing that. **Numeric host IDs stay exactly as declared** (explicit
+`id = N`, ordinal, or the field-path hash scheme, rebased by nesting), and a
+plugin that ships keeps them forever.
+
+Why: hosts store automation lanes, MIDI learn, remote-control pages and
+generic-UI bindings by the numeric ID (CLAP `clap_id`, VST3 `ParamID`, AU
+`AudioUnitParameterID`). Re-deriving those IDs from string IDs would give
+every existing parameter a new number, so every saved project would lose its
+automation and mappings on upgrade. A hash also cannot be renamed without
+changing the number, which is the opposite of what a stable string ID is for.
+
+What string IDs do instead:
+
+- **Side map in `ParamCatalog`.** `string_id(id)`, `id_by_string(key)` and
+  `by_string_id(key)` look them up; the derive fills them from field paths
+  (`osc1.cutoff`, `bands[2]`) or `#[param(key = "...")]`.
+- **OAST v2 state envelope.** When `state_schema_version() >= 1`, session
+  state *and presets* are written as v2: each entry carries its string ID, its
+  numeric fallback ID and the value, plus the plugin's schema version. On
+  load, `StateMigrationChain` runs first (`v -> v + 1`), then
+  `resolve_named_params` maps string IDs to the current numeric IDs, so a
+  renumbered parameter still gets its saved value. Plugins on schema `0`
+  (`kontra`, `kurv`) keep writing byte-identical v1, and every load path
+  still reads v1.
+- **One path for everything.** Host state (`parse_or_migrate`,
+  `read_and_apply_params`), `restore_plugin` and preset loads share
+  `migrate_to_current`; preset writes go through `serialize_preset` /
+  `save_user_preset` (`serialize_state_for_schema` underneath), preset reads
+  through `load_preset` / `load_preset_file` (`prepare_preset`).
+- **VST3 `IRemapParamID`** remaps a host's stale numeric ID through the same
+  catalog when a project names an ID this build no longer has.
+
+Collisions never panic a host:
+
+- **Compile time.** The derive rejects duplicate numeric IDs, duplicate own
+  string IDs, and an own string ID inside a `#[nested]` field's `prefix.`
+  namespace.
+- **Construction time.** `Params::assert_no_id_collisions` (run by the
+  derived `new()`) builds the catalog strictly and panics on a collision
+  across nested structs, before the plugin reaches a host.
+- **Runtime.** Catalogs built from runtime data (dynamic slots, string IDs
+  read back from a file or host) use `ParamCatalog::try_new` /
+  `try_with_string_ids`, which return a `CatalogError` (duplicate ID,
+  duplicate string ID, one ID given two string IDs, a string ID naming no
+  descriptor). The default `Params::param_catalog()` uses
+  `with_string_ids_lossy`, which keeps the first claim and drops the
+  conflicting string ID, so a bad runtime table degrades string lookup
+  instead of panicking inside a host callback. `ParamCatalog::new` /
+  `with_string_ids` keep panicking and are for tables already checked at
+  compile time.
+
+`moose_params::hash_param_id` still exists for a parameter set that has
+never shipped, but moose never calls it to assign host IDs.
 
 ## Sources
 

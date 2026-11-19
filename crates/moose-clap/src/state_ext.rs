@@ -54,8 +54,9 @@ pub(crate) unsafe extern "C" fn state_save<P: PluginExport>(
         let Some(write_fn) = (*stream).write else {
             return false;
         };
-        state::write_state_stream_with_persist(
+        state::write_plugin_state_stream::<P>(
             data.plugin_id_hash,
+            &data.params_arc,
             &ids,
             &values,
             &extra,
@@ -303,11 +304,14 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         let Some((_, blob)) = parse_preset_file(&bytes) else {
             return false;
         };
-        let Some(deserialized) =
+        let Some(mut deserialized) =
             state::parse_or_migrate::<P>(&blob, data.plugin_id_hash, PluginFormat::Clap, None)
         else {
             return false;
         };
+        if !deserialized.named_params.is_empty() {
+            state::resolve_named_params(&mut deserialized, &data.params_arc.param_catalog());
+        }
 
         let backup = state::ParamsBackup::capture(&*data.params_arc);
         state::apply_params(&*data.params_arc, &deserialized);

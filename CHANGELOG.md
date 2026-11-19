@@ -4,6 +4,13 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Parameter edit counters are per instance (D5).** A setter counts only on
+  its own tree's counter (or the field's own, outside a tree); the
+  process-wide `EDIT_EPOCH` is gone. A hand-written `Params` impl without a
+  counter now reports `parameter_edit_epoch() == 0`. Deprecated (since
+  7.1.0): `moose::params::{edit_epoch, bump_edit_epoch, custom_edit_epoch}`,
+  which now count only explicit custom-state bumps; keep a generation on the
+  custom state and call `PluginContext::mark_dirty`.
 - **Breaking: `Automation` replaces `AutomationConfig`.** `PluginInfo::automation`
   is `Automation::BlockSplit { min }` (the old behaviour, `min` was
   `min_subblock_samples`) or `Automation::PerSample`, chosen in `moose.toml`

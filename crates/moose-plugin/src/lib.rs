@@ -194,6 +194,14 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         let _ = foreign;
         None
     }
+    #[must_use]
+    fn state_schema_version() -> u32 {
+        0
+    }
+    #[must_use]
+    fn state_migrations() -> moose_core::state::StateMigrationChain {
+        moose_core::state::StateMigrationChain::new(Self::state_schema_version())
+    }
     /// Check custom state on the host thread before it is applied. See
     /// [`PluginLogic::validate_state`].
     ///
@@ -537,6 +545,16 @@ macro_rules! plugin_logic_leaf_trait {
                 None
             }
 
+            #[must_use]
+            fn state_schema_version() -> u32 {
+                0
+            }
+
+            #[must_use]
+            fn state_migrations() -> $crate::__plugin_logic_deps::StateMigrationChain {
+                $crate::__plugin_logic_deps::StateMigrationChain::new(Self::state_schema_version())
+            }
+
             /// Check custom state bytes on the host thread, before
             /// `load_state` sees them.
             ///
@@ -614,7 +632,7 @@ pub mod __plugin_logic_deps {
     pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::process::{ProcessContext, ProcessStatus};
     pub use moose_core::snapshot::SNAPSHOT_PREALLOC;
-    pub use moose_core::state::{ForeignState, MigratedState, StateLoadError};
+    pub use moose_core::state::{ForeignState, MigratedState, StateLoadError, StateMigrationChain};
     pub use moose_core::tasks::{InitContext, TaskSpawner};
     pub use moose_params::Params;
 }
@@ -1066,6 +1084,14 @@ macro_rules! plugin_logic_bridge {
 
             fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
                 <Self as $leaf>::migrate_state(foreign)
+            }
+
+            fn state_schema_version() -> u32 {
+                <Self as $leaf>::state_schema_version()
+            }
+
+            fn state_migrations() -> moose_core::state::StateMigrationChain {
+                <Self as $leaf>::state_migrations()
             }
 
             fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {

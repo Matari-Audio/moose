@@ -5,7 +5,7 @@ use crate::instance::AuInstance;
 
 use moose_core::cast::len_u32;
 use moose_core::export::PluginExport;
-use moose_core::presets::{PresetScope, enumerate_scope, load_preset_file};
+use moose_core::presets::{PresetScope, enumerate_scope};
 use moose_core::state;
 use moose_core::wrapper::run_extern_callback_with;
 use std::ffi::CString;
@@ -157,7 +157,11 @@ pub(crate) unsafe extern "C" fn cb_factory_preset_load<P: PluginExport>(
         let Some(entry) = factory_presets::<P>().get(index as usize) else {
             return 0;
         };
-        let Some(deserialized) = load_preset_file(&entry.path, inst.plugin_id_hash) else {
+        // Migration-aware read: the plugin's `StateMigrationChain` runs and
+        // v2 string IDs resolve before the params are touched.
+        let Some(deserialized) =
+            state::load_preset_file::<P>(&entry.path, inst.plugin_id_hash, &inst.params_arc)
+        else {
             return 0;
         };
         // Same apply path as cb_state_load: params synchronously on
