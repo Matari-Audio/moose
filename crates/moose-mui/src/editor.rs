@@ -421,6 +421,42 @@ impl<P: Params> MuiEditor<P> {
                 Arc::clone(&self.requests),
             )
         };
+        self.adopt_embedded(opened);
+    }
+
+    /// `open` in a host's nested compositor: our own connection, placed by token.
+    #[cfg(target_os = "linux")]
+    fn embed_nested(&mut self, socket: i32, token: *const std::ffi::c_char) {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `RawWindowHandle::WaylandNested`'s contract: `open` owns
+        // `socket` (closed on every path below), and `token` is a C string
+        // that is live for this call.
+        #[expect(unsafe_code, reason = "the host hands over a raw fd and C string")]
+        let (socket, token) = unsafe {
+            (
+                (socket >= 0).then(|| std::os::fd::OwnedFd::from_raw_fd(socket)),
+                (!token.is_null()).then(|| std::ffi::CStr::from_ptr(token).to_string_lossy()),
+            )
+        };
+        let (Some(socket), Some(token)) = (socket, token) else {
+            lock(&self.shared)
+                .view
+                .log("Wayland: the host gave no socket or token");
+            return;
+        };
+        lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
+        let opened = window::wayland::embed_nested(
+            socket,
+            &token,
+            self.size,
+            Arc::clone(&self.shared),
+            Arc::clone(&self.requests),
+        );
+        self.adopt_embedded(opened);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn adopt_embedded(&mut self, opened: Result<window::wayland::EmbeddedWindow, String>) {
         match opened {
             Ok(window) => self.embedded = Some(embedded::Embedded::adopt(window)),
             Err(error) => lock(&self.shared).view.log(&format!("Wayland: {error}")),
@@ -429,7 +465,11 @@ impl<P: Params> MuiEditor<P> {
 
     #[cfg(target_os = "linux")]
     fn pump_embedded(&mut self) {
-        let Some(result) = self.embedded.as_ref().and_then(|e| e.with(window::wayland::EmbeddedWindow::dispatch)) else {
+        let Some(result) = self
+            .embedded
+            .as_ref()
+            .and_then(|e| e.with(window::wayland::EmbeddedWindow::dispatch))
+        else {
             return;
         };
         if let Err(error) = result {
@@ -503,6 +543,11 @@ impl<P: Params> Editor for MuiEditor<P> {
         #[cfg(target_os = "linux")]
         if let RawWindowHandle::WaylandSurface { display, surface } = parent {
             self.embed(display, surface);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let RawWindowHandle::WaylandNested { socket, token } = parent {
+            self.embed_nested(socket, token);
             return;
         }
         #[cfg(target_os = "linux")]

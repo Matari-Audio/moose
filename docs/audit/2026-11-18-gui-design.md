@@ -111,6 +111,7 @@ enforced.
 | CLAP | Floating only | Done (1.6) | OK |
 | VST3 3.8 embedded | `kPlatformTypeWaylandSurfaceID`: `attached` gets the parent `wl_surface*`. The plugin gets a host-proxied `wl_display*` from `IWaylandHost::openWaylandConnection()` (queried from the host context), creates a `wl_subsurface` of the parent surface obtained through `IWaylandFrame` (queried from `IPlugFrame`), and dispatches that display's events through `IRunLoop::registerEventHandler(wl_display_get_fd(display))` | Not supported; MUI has no embedded Wayland backend (winit cannot parent to a foreign surface) | GAP W1 |
 | Standalone | A pure-Wayland session (no XWayland) | baseview X11 only | GAP W3 |
+| CLAP nested compositor (draft) | `clap-wayland-experiment`: `wayland-surface-embedding-v1`, the plugin connects on the host's `open_connection()` fd and calls `clap_surface_embedding_v1.get_embedded_surface(surface, token)`; the host pumps it via `posix-fd-support` / `timer-support` | Behind `clap-draft`: `wayland_nested.rs` in moose-clap, `EmbeddedWaylandWindow::open_nested` in baseview. Tested against a fake compositor (baseview) and a fake host (moose-clap); popups' `position` is ignored (no editor opens popups) | OK, untested in a real host |
 
 ### 1.8 Keyboard focus and key forwarding
 

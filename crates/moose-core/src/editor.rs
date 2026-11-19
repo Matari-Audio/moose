@@ -108,6 +108,17 @@ pub enum RawWindowHandle {
         /// The parent `wl_surface*`, a proxy on `display`.
         surface: *mut std::ffi::c_void,
     },
+    /// A slot in a host's nested Wayland compositor (CLAP
+    /// `wayland-surface-embedding-v1`, a draft): the editor connects on
+    /// `socket` and embeds its own surface with `token`. Only editors whose
+    /// [`Editor::supports_wayland_embedding`] is true get one.
+    WaylandNested {
+        /// A socket connected to the host's compositor. `open` takes
+        /// ownership: the editor closes it, whether or not it opens.
+        socket: i32,
+        /// The embedding token, NUL-terminated, valid during `open`.
+        token: *const std::ffi::c_char,
+    },
 }
 
 /// Plugin GUI editor.
@@ -166,7 +177,8 @@ pub trait Editor: Send {
     /// Update the native floating title, when supported.
     fn set_floating_title(&mut self, _title: &str) {}
 
-    /// Whether `open` accepts [`RawWindowHandle::WaylandSurface`]. Such an
+    /// Whether `open` accepts [`RawWindowHandle::WaylandSurface`] and
+    /// [`RawWindowHandle::WaylandNested`]. Such an
     /// editor runs no thread of its own: the host drives it through
     /// [`Self::event_fd`], [`Self::on_fd`] and [`Self::on_timer`].
     fn supports_wayland_embedding(&self) -> bool {
@@ -174,7 +186,8 @@ pub trait Editor: Send {
     }
 
     /// While an embedded Wayland editor is open: the fd the host watches on its
-    /// UI thread (VST3 `IRunLoop::registerEventHandler`). Readable means call
+    /// UI thread (VST3 `IRunLoop::registerEventHandler`, CLAP
+    /// `posix-fd-support`). Readable means call
     /// [`Self::on_fd`]. The fd stays the same until `close`.
     #[cfg(unix)]
     fn event_fd(&self) -> Option<std::os::fd::RawFd> {
@@ -184,7 +197,8 @@ pub trait Editor: Send {
     /// [`Self::event_fd`] became readable. Host UI thread.
     fn on_fd(&mut self) {}
 
-    /// The host's ~16 ms UI timer (VST3 `IRunLoop::registerTimer`), while an
+    /// The host's ~16 ms UI timer (VST3 `IRunLoop::registerTimer`, CLAP
+    /// `timer-support`), while an
     /// embedded Wayland editor is open. The host may read the shared display
     /// and queue the editor's events without the fd waking, and frame
     /// deadlines need a clock; this catches both. Host UI thread.

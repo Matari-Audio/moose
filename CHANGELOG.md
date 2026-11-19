@@ -20,6 +20,16 @@ Notable changes per release.
   legacy trait: `moose-example-sysex-echo` (its `BlockRunner` test cannot
   activate a processor) and the `Probe` fixture in
   `moose-example-gain/tests/clap_gui_scale.rs`.
+- **CLAP Wayland embedding (draft, `clap-draft` feature, Linux).** The
+  `clap-wayland-experiment` nested compositor: `is_api_supported`/`create`
+  with `wayland-surface-embedding-v1`, then the plugin extension
+  `clap.gui-wayland-nested-compositor/1` `set_parent(token)`. The editor
+  connects on the host's `open_connection()` socket and embeds its surface
+  with `clap_surface_embedding_v1`. The host pumps it through
+  `posix-fd-support` and `timer-support` (both required). New
+  `RawWindowHandle::WaylandNested { socket, token }`; moose-mui accepts it,
+  and baseview's `EmbeddedWaylandWindow::open_nested` does the protocol.
+  Not yet tried in a real host (Bitwig's compositor is unreleased).
 - **Deprecated: smoothing in shared atomics.** `FloatParamReadF32`/`F64`
   `read`, `read_into`, `read_after` and `current`, and `FloatParam`'s
   `raw_smoothed_*`, `settled_value` and `is_smoothing` keep the ramp inside

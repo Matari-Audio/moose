@@ -39,6 +39,8 @@ mod param_indication;
 pub mod presets;
 mod track_info;
 mod voice_info;
+#[cfg(all(target_os = "linux", feature = "clap-draft"))]
+mod wayland_nested;
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
@@ -468,6 +470,8 @@ enum GuiMode {
     Embedded,
     FloatingX11,
     FloatingWayland,
+    /// Embedded through the host's nested compositor (`wayland_nested`).
+    WaylandNested,
 }
 
 /// Main/UI-thread-owned editor state (see [`ClapPluginData::gui`]).
@@ -479,6 +483,8 @@ struct ClapGui {
     mode: GuiMode,
     visible: bool,
     title: String,
+    #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+    nested: wayland_nested::Session,
 }
 
 impl<P: PluginExport> ClapPluginData<P> {
@@ -4848,6 +4854,21 @@ unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
                 .as_ref()
                 .is_some_and(|editor| editor.supports_floating_x11());
         }
+        #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+        if api == wayland_nested::API {
+            let data = data_from_plugin::<P>(plugin);
+            if is_floating || !wayland_nested::host_supports(data.host) {
+                return false;
+            }
+            let mut gui = data.gui.enter();
+            if gui.editor.is_none() {
+                gui.editor = (data.editor_builder)(data.params_arc.clone());
+            }
+            return gui
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.supports_wayland_embedding());
+        }
         if is_floating {
             return false;
         }
@@ -4926,7 +4947,13 @@ unsafe extern "C" fn gui_create<P: PluginExport>(
         }
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
-        let mode = if !is_floating {
+        #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+        let nested = CStr::from_ptr(api) == wayland_nested::API;
+        #[cfg(not(all(target_os = "linux", feature = "clap-draft")))]
+        let nested = false;
+        let mode = if nested {
+            GuiMode::WaylandNested
+        } else if !is_floating {
             GuiMode::Embedded
         } else if CStr::from_ptr(api).to_bytes() == b"x11" {
             GuiMode::FloatingX11
@@ -4944,7 +4971,8 @@ unsafe extern "C" fn gui_create<P: PluginExport>(
         }
         gui.mode = mode;
         data.floating_mode.store(is_floating, Ordering::Release);
-        if is_floating {
+        // Floating and nested windows take their scale from the window system.
+        if is_floating || nested {
             data.host_scale.store(0, Ordering::Relaxed);
         }
         gui.title = resolved_name(&data.info).into();
@@ -4973,6 +5001,8 @@ unsafe extern "C" fn gui_destroy<P: PluginExport>(plugin: *const clap_plugin) {
             data.floating_closed.store(false, Ordering::Release);
             gui.visible = false;
             gui.gui_created = false;
+            #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+            wayland_nested::unregister(data.host, &mut gui.nested);
             gui.editor.take()
         };
         // Both `editor.close()` and the `Box<dyn Editor>` drop run author
@@ -5424,7 +5454,7 @@ unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_plugin) -> bo
         if !gui.gui_created {
             return false;
         }
-        if gui.mode == GuiMode::Embedded
+        if matches!(gui.mode, GuiMode::Embedded | GuiMode::WaylandNested)
             || (gui.visible && data.floating_visible.load(Ordering::Acquire))
         {
             return true;
@@ -5457,7 +5487,7 @@ unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_plugin) -> bo
             GuiMode::FloatingWayland => {
                 editor.open_floating_wayland(editor_context::<P>(plugin), &title, on_close)
             }
-            GuiMode::Embedded => false,
+            GuiMode::Embedded | GuiMode::WaylandNested => false,
         };
         data.floating_visible.store(opened, Ordering::Release);
         data.note_window_scale(editor.as_ref());
@@ -5473,7 +5503,7 @@ unsafe extern "C" fn gui_hide<P: PluginExport>(plugin: *const clap_plugin) -> bo
         if !gui.gui_created {
             return false;
         }
-        if gui.mode != GuiMode::Embedded {
+        if matches!(gui.mode, GuiMode::FloatingX11 | GuiMode::FloatingWayland) {
             data.floating_visible.store(false, Ordering::Release);
             if let Some(editor) = gui.editor.as_mut() {
                 editor.close();
@@ -5940,6 +5970,10 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         if ext_id == CLAP_EXT_CONTEXT_MENU || ext_id == CLAP_EXT_CONTEXT_MENU_COMPAT {
             return (&raw const extensions.context_menu).cast::<c_void>();
         }
+        #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+        if let Some(ext) = wayland_nested::extension::<P>(ext_id) {
+            return ext;
+        }
         run_extern_callback_with::<P, *const c_void>(
             "CLAP",
             "custom extension",
@@ -6196,6 +6230,8 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
                 mode: GuiMode::Embedded,
                 visible: false,
                 title: String::new(),
+                #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+                nested: wayland_nested::Session::default(),
             }),
         });
 
