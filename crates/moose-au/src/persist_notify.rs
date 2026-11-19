@@ -1,6 +1,6 @@
 //! `AUv2` persistent-document completion on the host main queue, without a GUI
 //! or a polling worker. Mirrors the VST3 main-queue dispatch-source bridge.
-use super::{
+use crate::gui::{
     moose_au_v2_host_begin_param_gesture, moose_au_v2_host_end_param_gesture,
     moose_au_v2_host_set_param,
 };
