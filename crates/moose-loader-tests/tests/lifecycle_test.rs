@@ -147,8 +147,12 @@ fn shell() -> (Shell, Arc<LcParams>) {
 }
 
 fn config() -> PreparationConfig {
+    config_at(48_000.0, 64)
+}
+
+fn config_at(sample_rate: f64, max_block: usize) -> PreparationConfig {
     PreparationConfig::new(
-        AudioConfig::new(48_000.0, 64),
+        AudioConfig::new(sample_rate, max_block),
         PreparationFrameBound::NegotiatedHost,
     )
 }
@@ -236,7 +240,9 @@ fn state_loaded_before_activate_reaches_the_processor() {
 
     // Re-activation (new sample rate) carries the state to the new processor.
     let before = ACTIVATIONS.load(Ordering::Relaxed);
-    plugin.prepare(&config()).expect("re-activates");
+    plugin
+        .prepare(&config_at(96_000.0, 64))
+        .expect("re-activates");
     assert!(ACTIVATIONS.load(Ordering::Relaxed) > before);
     assert_eq!(plugin.state_ref().processor().map(|p| p.value), Some(7));
 }
@@ -288,4 +294,29 @@ fn snapshot_capability_is_static_and_tracks_the_processor() {
         <Logic as PluginLogicCore<f32>>::snapshot_version(plugin.state_ref()),
         Some(3)
     );
+}
+
+#[test]
+fn reactivation_the_processor_fits_keeps_it() {
+    let (mut plugin, _params) = shell();
+    plugin
+        .prepare(&config_at(48_000.0, 256))
+        .expect("activates");
+    block(&mut plugin);
+    // Same rate, smaller max block: the processor is kept and reset.
+    plugin
+        .prepare(&config_at(48_000.0, 64))
+        .expect("re-prepares");
+    let processor = plugin.state_ref().processor().expect("active");
+    assert_eq!(
+        (processor.blocks, processor.resets),
+        (1, 1),
+        "kept and reset, not rebuilt"
+    );
+    // A larger block than it was built for needs a new processor.
+    plugin
+        .prepare(&config_at(48_000.0, 512))
+        .expect("re-activates");
+    let processor = plugin.state_ref().processor().expect("active");
+    assert_eq!((processor.blocks, processor.resets), (0, 0), "rebuilt");
 }

@@ -94,9 +94,13 @@ pub trait Plugin<S: Sample = f32>: 'static {
     fn main_thread(shared: &Arc<Self::Shared>) -> Self::MainThread;
 
     /// Build a processor for `config`, on the host main thread. May allocate
-    /// and block. This is the only way a processor comes into being; the
-    /// previous one (if any) is deactivated first and its custom state
-    /// carried into the new one.
+    /// and block. This is the only way a processor comes into being.
+    ///
+    /// A host re-activation the current processor still fits (same sample
+    /// rate and process mode, a max block no larger than the one it was
+    /// built for) keeps it and calls [`Self::reset`] instead. Otherwise the
+    /// previous processor is deactivated and its custom state carried into
+    /// the new one.
     ///
     /// `cx` holds the instance's background-task spawners
     /// ([`InitContext::tasks`]) and the off-thread snapshot publisher
@@ -262,10 +266,9 @@ impl<T: std::fmt::Debug> std::fmt::Debug for ProcessorSlot<T> {
 #[derive(Debug)]
 enum Slot<T> {
     /// Not activated. Holds a state load that arrived before activation.
-    Inactive {
-        pending_state: Option<Vec<u8>>,
-    },
-    Active(T),
+    Inactive { pending_state: Option<Vec<u8>> },
+    /// Built by `activate` for `config`.
+    Active { processor: T, config: AudioConfig },
 }
 
 impl<T> Default for Slot<T> {
@@ -281,7 +284,7 @@ impl<T> ProcessorSlot<T> {
     #[must_use]
     pub fn processor(&self) -> Option<&T> {
         match &self.slot {
-            Slot::Active(processor) => Some(processor),
+            Slot::Active { processor, .. } => Some(processor),
             Slot::Inactive { .. } => None,
         }
     }
@@ -289,7 +292,7 @@ impl<T> ProcessorSlot<T> {
     /// Mutable access to the processor, once activated.
     pub fn processor_mut(&mut self) -> Option<&mut T> {
         match &mut self.slot {
-            Slot::Active(processor) => Some(processor),
+            Slot::Active { processor, .. } => Some(processor),
             Slot::Inactive { .. } => None,
         }
     }
@@ -301,9 +304,18 @@ fn activate<S: Sample, P: Plugin<S>>(
     config: &PreparationConfig,
 ) -> Result<(), PreparationError> {
     config.validate()?;
+    if let Slot::Active {
+        processor,
+        config: built,
+    } = &mut slot.slot
+        && fits(built, &config.audio)
+    {
+        P::reset(processor, shared);
+        return Ok(());
+    }
     let carried = match std::mem::take(&mut slot.slot) {
         Slot::Inactive { pending_state } => pending_state,
-        Slot::Active(old) => {
+        Slot::Active { processor: old, .. } => {
             let bytes = P::save_state(&old);
             P::deactivate(old);
             (!bytes.is_empty()).then_some(bytes)
@@ -319,7 +331,10 @@ fn activate<S: Sample, P: Plugin<S>>(
             {
                 P::state_changed(&mut processor, shared);
             }
-            slot.slot = Slot::Active(processor);
+            slot.slot = Slot::Active {
+                processor,
+                config: config.audio,
+            };
             Ok(())
         }
         Err(error) => {
@@ -331,12 +346,19 @@ fn activate<S: Sample, P: Plugin<S>>(
     }
 }
 
+/// A processor built for `built` can serve `wanted` unchanged.
+fn fits(built: &AudioConfig, wanted: &AudioConfig) -> bool {
+    built.sample_rate.to_bits() == wanted.sample_rate.to_bits()
+        && built.process_mode == wanted.process_mode
+        && wanted.max_block_size <= built.max_block_size
+}
+
 fn load_state<S: Sample, P: Plugin<S>>(
     slot: &mut ProcessorSlot<P::Processor>,
     data: &[u8],
 ) -> Result<(), StateLoadError> {
     match &mut slot.slot {
-        Slot::Active(processor) => P::load_state(processor, data),
+        Slot::Active { processor, .. } => P::load_state(processor, data),
         Slot::Inactive { pending_state } => {
             P::validate_state(data)?;
             *pending_state = Some(data.to_vec());
@@ -353,7 +375,7 @@ fn snapshot_into<S: Sample, P: Plugin<S>>(
         return false;
     }
     match &slot.slot {
-        Slot::Active(processor) => P::snapshot_into(processor, buf),
+        Slot::Active { processor, .. } => P::snapshot_into(processor, buf),
         Slot::Inactive {
             pending_state: Some(bytes),
         } => buf.extend_from_slice(bytes),
@@ -366,7 +388,7 @@ fn snapshot_into<S: Sample, P: Plugin<S>>(
 
 fn save_state<S: Sample, P: Plugin<S>>(slot: &ProcessorSlot<P::Processor>) -> Vec<u8> {
     match &slot.slot {
-        Slot::Active(processor) => P::save_state(processor),
+        Slot::Active { processor, .. } => P::save_state(processor),
         Slot::Inactive { pending_state } => pending_state.clone().unwrap_or_default(),
     }
 }
@@ -378,7 +400,7 @@ fn process<S: Sample, P: Plugin<S>>(
     events: &EventList,
     context: &mut ProcessContext,
 ) -> ProcessStatus {
-    if let Slot::Active(processor) = &mut slot.slot {
+    if let Slot::Active { processor, .. } = &mut slot.slot {
         return P::process(processor, shared, buffer, events, context);
     }
     for ch in 0..buffer.num_output_channels() {

@@ -4,6 +4,11 @@ Notable changes per release.
 
 ## Unreleased
 
+- **A re-activation the processor still fits keeps it.** `Lifecycle` keeps
+  the current `moose::Plugin` processor and calls `reset` when the host
+  prepares again at the same sample rate and process mode with a max block
+  no larger than the one it was built for (the legacy `prepare` default did
+  the same). Only a config it can't serve builds a new processor.
 - **`BlockRunner` prepares before the first block.** `moose_test::BlockRunner`
   now calls `prepare` at its sample rate (max block at least 4096) on the
   first `run`, as a host activates before processing, so a `moose::Plugin`
