@@ -105,8 +105,7 @@ pub(crate) fn cmd_package_windows(args: &[String], selection: &super::SuiteSelec
     let target_cpu = opts
         .target_cpu_arg
         .as_deref()
-        .map(crate::util::parse_target_cpu_arg)
-        .unwrap_or_default();
+        .map_or_default(crate::util::parse_target_cpu_arg);
     crate::set_target_cpu(target_cpu);
 
     let config = load_config()?;
@@ -1930,9 +1929,7 @@ fn iss_dual_dest(
     } else {
         ""
     };
-    let arch = arch_check
-        .map(|c| format!(" Check: {c};"))
-        .unwrap_or_default();
+    let arch = arch_check.map_or_default(|c| format!(" Check: {c};"));
     format!(
         "Source: \"{src_quoted}\"; DestDir: \"{dest}\"; \
          Components: {component};{arch} \

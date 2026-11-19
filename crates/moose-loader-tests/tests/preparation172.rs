@@ -5,7 +5,7 @@ use moose_core::{
     AudioConfig,
     plugin::{PluginRuntime, PreparationConfig, PreparationError, PreparationFrameBound},
 };
-use moose_loader::{HotShell, NativeLoader};
+use moose_loader::{NativeLoader, shell::HotShell};
 use reload_fixture_common::FxParams;
 use std::{
     path::{Path, PathBuf},
@@ -37,6 +37,10 @@ use moose::prelude::*;
 use reload_fixture_common::{CounterLogic,CounterState,FxParams};
 const REQUIRED:bool=__CLASS__;
 struct Logic;
+#[expect(
+    deprecated,
+    reason = "covers the hot-reload preparation gate on the legacy `PluginLogic` path"
+)]
 impl PluginLogic for Logic{
  type Params=FxParams;type DspState=CounterState;
  fn requires_fallible_preparation()->bool{REQUIRED}
@@ -51,7 +55,7 @@ impl PluginLogic for Logic{
  fn latency(state:&CounterState)->u32{<CounterLogic as moose_loader::PluginLogicCore<f32>>::latency(state)}
  fn save_state(state:&CounterState)->Vec<u8>{<CounterLogic as moose_loader::PluginLogicCore<f32>>::save_state(state)}
  fn load_state(state:&mut CounterState,data:&[u8])->Result<(),StateLoadError>{<CounterLogic as moose_loader::PluginLogicCore<f32>>::load_state(state,data)}
- fn editor(params:Arc<FxParams>)->Box<dyn Editor>{<CounterLogic as moose_loader::PluginLogicCore<f32>>::editor(params)}
+ fn editor(params:Arc<FxParams>)->Box<dyn Editor>{<CounterLogic as moose_loader::__macro_deps::moose_plugin::PluginEditor<f32>>::editor(params)}
 }
 moose_loader::export_plugin!(Logic,FxParams);
 "#.replace("__CLASS__",if required{"true"}else{"false"});
@@ -158,6 +162,10 @@ fn real_complete_exports_gate_initial_and_reload_and_direct_hot_prepare() {
 }
 
 struct RequiredStatic;
+#[expect(
+    deprecated,
+    reason = "covers the fallible preparation gate on the legacy `PluginLogic` path"
+)]
 impl moose::prelude::PluginLogic for RequiredStatic {
     type Params = FxParams;
     type DspState = reload_fixture_common::CounterState;
@@ -186,7 +194,7 @@ impl moose::prelude::PluginLogic for RequiredStatic {
         )
     }
     fn editor(params: Arc<FxParams>) -> Box<dyn moose::prelude::Editor> {
-        <reload_fixture_common::CounterLogic as moose_loader::PluginLogicCore<f32>>::editor(params)
+        <reload_fixture_common::CounterLogic as moose_loader::__macro_deps::moose_plugin::PluginEditor<f32>>::editor(params)
     }
 }
 #[test]

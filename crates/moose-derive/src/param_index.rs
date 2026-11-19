@@ -15,7 +15,7 @@
 //! Cross-crate `#[nested]` types are unsupported: the aggregator only
 //! looks in the plugin crate's own sidecar directory.
 
-use crate::{ParamField, name_hash_id};
+use crate::fields::{ParamField, name_hash_id};
 use moose_params::AUTO_PARAM_ID_MASK;
 use proc_macro::TokenStream;
 use quote::quote;
@@ -28,6 +28,7 @@ use syn::Type;
 pub(crate) fn write_struct_sidecar(
     struct_name: &syn::Ident,
     hash_scheme: bool,
+    has_projection: bool,
     params: &[ParamField],
     nested: &[(syn::Ident, Type, Option<u32>)],
 ) {
@@ -42,9 +43,13 @@ pub(crate) fn write_struct_sidecar(
     // Drives how the aggregator bases nested groups, as at runtime.
     let _ = writeln!(
         buf,
-        "scheme = \"{}\"\n",
+        "scheme = \"{}\"",
         if hash_scheme { "hash" } else { "ordinal" }
     );
+    if has_projection {
+        let _ = writeln!(buf, "has_projection = true");
+    }
+    buf.push('\n');
     for p in params {
         let name = p.attrs.name.clone().unwrap_or_else(|| p.path());
         write_param(
@@ -101,7 +106,7 @@ pub(crate) fn emit_root_impl(input: TokenStream) -> TokenStream {
     let root_struct = seg.ident.to_string();
 
     // No plugin in moose.toml = nothing to index (helper crate).
-    let Ok((config, pkg_name, moose_toml_path)) = crate::try_resolve_plugin() else {
+    let Ok((config, pkg_name, moose_toml_path)) = crate::info::try_resolve_plugin() else {
         return TokenStream::new();
     };
     let Some(plugin) = config.plugin.iter().find(|p| p.serves(&pkg_name)) else {
@@ -133,7 +138,7 @@ fn aggregate(
     id_base: u32,
     entries: &mut Vec<IndexEntry>,
     ancestors: &mut std::collections::HashSet<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Track the active path, not every visited struct: one Params type
     // reused in two `#[nested]` slots is walked twice, a cycle is not.
     if !ancestors.insert(struct_name.to_string()) {
@@ -155,6 +160,10 @@ fn aggregate(
         .parse()
         .map_err(|e| format!("malformed {}: {e}", path.display()))?;
     let hash_scheme = toml.get("scheme").and_then(toml::Value::as_str) != Some("ordinal");
+    let has_projection = toml
+        .get("has_projection")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
     let str_of = |v: &toml::Value, key: &str| {
         v.get(key)
             .and_then(toml::Value::as_str)
@@ -179,15 +188,31 @@ fn aggregate(
             own_count += 1;
         }
     }
+    let mut child_has_projection = has_projection;
     if let Some(toml::Value::Array(arr)) = toml.get("nested") {
         // Ordinal packs each auto group after the previous ones (by
         // size, ignoring earlier explicit bases, like runtime
         // `offset_ids`); hash bases each group on its slot field name.
         let mut next_base = own_count;
+        let mut prior_projected_child: Option<String> = None;
         for entry in arr {
             let Some(t) = entry.get("type").and_then(toml::Value::as_str) else {
                 continue;
             };
+            let explicit_base = entry
+                .get("base")
+                .and_then(toml::Value::as_integer)
+                .and_then(|b| u32::try_from(b).ok());
+            if !hash_scheme
+                && explicit_base.is_none()
+                && let Some(prev) = &prior_projected_child
+            {
+                return Err(format!(
+                    "{struct_name}: `#[nested]` child `{t}` follows projected child `{prev}` under \
+                     ordinal id_scheme, whose projected alias count is unknown to param_index; \
+                     switch to hash id_scheme or give `{t}` an explicit `#[nested(base = ...)]`"
+                ));
+            }
             let auto_base = if hash_scheme {
                 entry
                     .get("field")
@@ -196,24 +221,24 @@ fn aggregate(
             } else {
                 next_base
             };
-            let base = entry
-                .get("base")
-                .and_then(toml::Value::as_integer)
-                .and_then(|b| u32::try_from(b).ok())
-                .unwrap_or(auto_base);
+            let base = explicit_base.unwrap_or(auto_base);
             let before = entries.len();
-            aggregate(
+            let nested_projected = aggregate(
                 sidecar_dir,
                 t,
                 (id_base + base) & AUTO_PARAM_ID_MASK,
                 entries,
                 ancestors,
             )?;
+            if nested_projected {
+                child_has_projection = true;
+                prior_projected_child = Some(t.to_string());
+            }
             next_base += u32::try_from(entries.len() - before).unwrap_or(0);
         }
     }
     ancestors.remove(struct_name);
-    Ok(())
+    Ok(child_has_projection)
 }
 
 fn toml_escape(s: &str) -> String {

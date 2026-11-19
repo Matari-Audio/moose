@@ -1806,6 +1806,7 @@ mod host_features {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU8, AtomicU64};
 
+    #[cfg(not(target_os = "macos"))]
     use moose_core::editor::EditGroup;
     use moose_params::CatalogChange;
     use vst3::Steinberg::Vst::ChannelContext::{

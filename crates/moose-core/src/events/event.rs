@@ -313,7 +313,7 @@ pub enum EventBody {
 
     // -- System layer --
     /// System Exclusive (`SysEx`) message - MIDI 1.0 and MIDI 2.0
-    /// alike. The payload bytes live in [`EventList::sysex_bytes`];
+    /// alike. The payload bytes live in [`super::EventList::sysex_bytes`];
     /// resolve a body to its slice with
     /// `event_list.sysex_bytes(&body)` rather than indexing the
     /// pool directly. The bytes are the inner `SysEx` data

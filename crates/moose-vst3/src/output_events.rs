@@ -176,16 +176,20 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
                 .output_events
                 .lossless_iter()
                 .find_map(|event| {
-                    if let LosslessEventRef::Typed(Event {
-                        sample_offset,
-                        body: EventBody::ParamChange { id, value },
-                        ..
-                    }) = event
+                    if let LosslessEventRef::Typed(
+                        event @ Event {
+                            body: EventBody::ParamChange { .. },
+                            ..
+                        },
+                    ) = event
                     {
-                        let valid = *sample_offset < audio.input_num_frames
-                            && value.is_finite()
-                            && inst.param_infos.by_id(*id).is_some();
-                        return (!valid).then_some(VST3_EVENT_INVALID);
+                        return valid_output_param(
+                            event,
+                            audio.input_num_frames,
+                            &inst.param_infos,
+                        )
+                        .is_none()
+                        .then_some(VST3_EVENT_INVALID);
                     }
                     match encode_vst3_output_event::<P>(
                         event,
@@ -807,6 +811,22 @@ pub(crate) fn unit_to_u32(v: f64) -> u32 {
     scaled
 }
 
+fn valid_output_param(
+    event: &Event,
+    input_num_frames: u32,
+    param_infos: &moose_params::ParamCatalog,
+) -> Option<(u32, i32, f64)> {
+    let EventBody::ParamChange { id, value } = event.body else {
+        return None;
+    };
+    if event.sample_offset >= input_num_frames || !value.is_finite() {
+        return None;
+    }
+    let info = param_infos.by_id(id)?;
+    let sample_offset = i32::try_from(event.sample_offset).unwrap_or(0);
+    Some((id, sample_offset, info.range.normalize(value)))
+}
+
 pub(crate) unsafe extern "C" fn cb_get_output_param_count<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
@@ -817,7 +837,9 @@ pub(crate) unsafe extern "C" fn cb_get_output_param_count<P: PluginExport>(
             audio
                 .output_events
                 .iter()
-                .filter(|e| matches!(e.body, EventBody::ParamChange { .. }))
+                .filter(|e| {
+                    valid_output_param(e, audio.input_num_frames, &inst.param_infos).is_some()
+                })
                 .count(),
         )
     }
@@ -833,23 +855,14 @@ pub(crate) unsafe extern "C" fn cb_get_output_param<P: PluginExport>(
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let audio = inst.audio.enter();
-        if let Some(event) = audio
+        if let Some((id, sample_offset, normalized)) = audio
             .output_events
             .iter()
-            .filter(|e| matches!(e.body, EventBody::ParamChange { .. }))
+            .filter_map(|e| valid_output_param(e, audio.input_num_frames, &inst.param_infos))
             .nth(index as usize)
-            && let EventBody::ParamChange { id, value } = event.body
         {
-            // VST3 output param queues carry normalized values; the
-            // plugin emits plain. Fall back to the plain value if the
-            // id has no descriptor (shouldn't happen for real params).
-            let normalized = inst
-                .param_infos
-                .iter()
-                .find(|i| i.id == id)
-                .map_or(value, |i| i.range.normalize(value));
             *out_id = id;
-            *out_sample_offset = i32::try_from(event.sample_offset).unwrap_or(0);
+            *out_sample_offset = sample_offset;
             *out_value = normalized;
         }
     }

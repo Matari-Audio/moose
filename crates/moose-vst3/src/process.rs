@@ -202,14 +202,15 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
                     .iter()
                     .enumerate()
             {
-                debug_assert!(bus_routing.push_input(
+                let pushed = bus_routing.push_input(
                     channels,
                     if input_bus_active & (1_u32 << index) == 0 {
                         BusActivation::Inactive
                     } else {
                         BusActivation::Active
                     },
-                ));
+                );
+                debug_assert!(pushed);
             }
         }
         if !output_bus_channels.is_null() {
@@ -219,14 +220,15 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
                     .iter()
                     .enumerate()
             {
-                debug_assert!(bus_routing.push_output(
+                let pushed = bus_routing.push_output(
                     channels,
                     if output_bus_active & (1_u32 << index) == 0 {
                         BusActivation::Inactive
                     } else {
                         BusActivation::Active
                     },
-                ));
+                );
+                debug_assert!(pushed);
             }
         }
 
@@ -341,6 +343,14 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
 #[doc(hidden)]
 #[must_use]
 pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
+    struct DestroyGuard<P: PluginExport>(*mut std::ffi::c_void, std::marker::PhantomData<P>);
+    impl<P: PluginExport> Drop for DestroyGuard<P> {
+        fn drop(&mut self) {
+            // SAFETY: owns `self.0` constructed by `cb_create::<P>()`.
+            unsafe { cb_destroy::<P>(self.0) };
+        }
+    }
+
     const FRAMES: u32 = 512;
     const CH: u32 = 2;
     let frames = FRAMES as usize;
@@ -350,6 +360,11 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
     // (which `process_block` tolerates).
     unsafe {
         let ctx = cb_create::<P>();
+        assert!(
+            !ctx.is_null(),
+            "vst3 smoke: cb_create returned null (plugin construction failed)"
+        );
+        let _guard = DestroyGuard::<P>(ctx, std::marker::PhantomData);
         assert_eq!(cb_prepare::<P>(ctx, 48_000.0, FRAMES, 0), 1);
 
         // Non-zero input so the sanity check below can confirm the block
@@ -390,7 +405,6 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
             out_left.iter().any(|s| s.abs() > 0.0),
             "vst3 smoke: process did not run (output stayed zero)"
         );
-        cb_destroy::<P>(ctx);
         count
     }
 }
