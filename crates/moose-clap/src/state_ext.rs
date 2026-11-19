@@ -246,6 +246,24 @@ pub(crate) fn make_state_extension<P: PluginExport>() -> clap_plugin_state {
 // Extension: preset-load
 // ---------------------------------------------------------------------------
 
+/// Largest `.trucepreset` container `preset_load` will read from disk for
+/// a plugin with the default 32 MiB host-state ceiling (state envelope plus
+/// 64 KiB headroom for the `TRPS` header and `key=value` metadata block).
+pub(crate) const MAX_PRESET_FILE_BYTES: usize = 32 * 1024 * 1024 + 64 * 1024;
+const PRESET_METADATA_HEADROOM_BYTES: usize = 64 * 1024;
+
+pub(crate) fn read_preset_file_bounded(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().is_ok_and(|m| m.len() > max_bytes as u64) {
+        return None;
+    }
+    let limit = (max_bytes as u64).saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
 /// `CLAP_EXT_PRESET_LOAD.from_location`: read a `.trucepreset` file
 /// the discovery provider surfaced and apply its embedded state
 /// envelope - the same host-thread-apply + audio-thread-handoff path
@@ -276,7 +294,10 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         // to the plugin's `migrate_state` hook instead of refused
         // outright. Discovery only lists same-id presets, but a host
         // can hand any path here (drag-drop, saved location).
-        let Some(bytes) = std::fs::read(Path::new(path)).ok() else {
+        let max_bytes = P::max_host_state_bytes()
+            .saturating_add(PRESET_METADATA_HEADROOM_BYTES)
+            .max(MAX_PRESET_FILE_BYTES);
+        let Some(bytes) = read_preset_file_bounded(Path::new(path), max_bytes) else {
             return false;
         };
         let Some((_, blob)) = parse_preset_file(&bytes) else {

@@ -14,7 +14,7 @@ mod rt_paranoid_scaffold_check {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
 
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(30))
                 .input(InputSource::Constant(0.5))
                 .run()

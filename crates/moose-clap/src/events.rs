@@ -1448,18 +1448,17 @@ pub(crate) unsafe fn convert_input_events<P: PluginExport>(
                     ));
                 }
                 CLAP_EVENT_MIDI => {
-                    // CLAP carries MIDI 1.0 channel-voice messages as
-                    // 3-byte packets. Demux back into the typed
-                    // `EventBody` variants the plugin sees on every
-                    // other format. Without this, hosts that route
-                    // raw MIDI (`CLAP_NOTE_DIALECT_MIDI` ports)
-                    // silently drop CC / PitchBend / Aftertouch /
-                    // ChannelPressure / ProgramChange at the wrapper.
+                    // CLAP carries MIDI 1.0 channel-voice messages in fixed
+                    // 3-byte slots (with trailing padding for 1-/2-byte
+                    // status bytes); derive the true length from the status
+                    // byte and demux back into typed `EventBody` variants.
                     if !clap_event_has_size::<clap_event_midi>(header) {
                         continue;
                     }
                     let midi = &*header_ptr.cast::<clap_event_midi>();
-                    if let Some(message) = RawMidi1::new(midi.data, 3) {
+                    let len =
+                        u8::try_from(midi1_message_len(midi.data[0]).unwrap_or(3)).unwrap_or(3);
+                    if let Some(message) = RawMidi1::new(midi.data, len) {
                         let exact = ExactEvent::new(
                             sample_offset,
                             ExactEventBody::Midi1 {

@@ -145,7 +145,7 @@ pub enum ExactEventBody {
         port: u16,
         packet: RawUmp,
     },
-    /// System Exclusive payload. Bytes remain in the owning [`EventList`]'s
+    /// System Exclusive payload. Bytes remain in the owning [`super::EventList`]'s
     /// bounded pool and are exposed through [`ExactEventRef::sysex_bytes`].
     SysEx {
         port: u16,
@@ -345,7 +345,7 @@ pub enum LosslessEventRef<'a> {
     Exact(ExactEventRef<'a>),
 }
 
-/// Allocation-free position in an [`EventList::lossless_iter`] traversal.
+/// Allocation-free position in an [`super::EventList::lossless_iter`] traversal.
 /// Wrappers keep one in their preallocated audio scratch when their native
 /// ABI pulls events one at a time.
 #[derive(Clone, Copy, Debug, Default)]
@@ -381,8 +381,8 @@ impl<'a> ExactEventPayload<'a> {
         self.exact.metadata
     }
 
-    /// Semantic-only typed companions suppressed by [`EventList::lossless_iter`].
-    /// These remain visible through [`EventList::iter`] for typed plugins.
+    /// Semantic-only typed companions suppressed by [`super::EventList::lossless_iter`].
+    /// These remain visible through [`super::EventList::iter`] for typed plugins.
     pub fn companions(self) -> impl Iterator<Item = &'a Event> {
         let mut next = self.first_companion;
         core::iter::from_fn(move || {
@@ -417,7 +417,7 @@ impl<'a> ExactEventPayload<'a> {
     }
 
     /// Effective timestamp. A linked exact payload follows the fallback's
-    /// timestamp, including mutations made through [`EventList::events_mut`].
+    /// timestamp, including mutations made through [`super::EventList::events_mut`].
     #[must_use]
     pub fn sample_offset(self) -> u32 {
         self.fallback

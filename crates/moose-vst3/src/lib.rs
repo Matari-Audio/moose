@@ -24,7 +24,7 @@ pub use registration::register_vst3;
 #[cfg(test)]
 use crate::{
     host_state::*, input_events::*, instance::*, lifecycle::*, midi_proxy::*, output_events::*,
-    params::*, registration::*,
+    params::*, process::*, registration::*,
 };
 #[cfg(test)]
 use ffi::Vst3NativeEvent;

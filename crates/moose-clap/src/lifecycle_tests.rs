@@ -961,3 +961,372 @@ fn configurable_ports_pick_a_declared_layout_and_activation_reaches_routing() {
         (*plugin).deactivate.unwrap()(plugin);
     });
 }
+
+#[test]
+fn two_byte_clap_midi_events_preserve_length_and_round_trip_exact_replay() {
+    use crate::events::{ExactEmit, convert_input_events, emit_exact_clap};
+    use clap_sys::events::{
+        CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI, clap_event_header, clap_event_midi,
+        clap_input_events, clap_output_events,
+    };
+    use moose_core::events::{ExactEventBody, LosslessEventRef};
+
+    unsafe extern "C" fn in_size(list: *const clap_input_events) -> u32 {
+        let slice = unsafe { &*(*list).ctx.cast::<[clap_event_midi; 2]>() };
+        len_u32(slice.len())
+    }
+    unsafe extern "C" fn in_get(
+        list: *const clap_input_events,
+        index: u32,
+    ) -> *const clap_event_header {
+        let slice = unsafe { &*(*list).ctx.cast::<[clap_event_midi; 2]>() };
+        &raw const slice[index as usize].header
+    }
+    unsafe extern "C" fn out_push(
+        list: *const clap_output_events,
+        header: *const clap_event_header,
+    ) -> bool {
+        let pushed = unsafe { &mut *(*list).ctx.cast::<Vec<clap_event_midi>>() };
+        assert_eq!(unsafe { (*header).type_ }, CLAP_EVENT_MIDI);
+        pushed.push(unsafe { *header.cast::<clap_event_midi>() });
+        true
+    }
+
+    with_probe(|plugin| unsafe {
+        let data = data_from_plugin::<Probe>(plugin);
+        let mut audio = data.audio.enter();
+        let packets = [
+            clap_event_midi {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_midi>(),
+                    time: 3,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_MIDI,
+                    flags: 0,
+                },
+                port_index: 0,
+                data: [0xC2, 42, 0x7F],
+            },
+            clap_event_midi {
+                header: clap_event_header {
+                    size: size_of_u32::<clap_event_midi>(),
+                    time: 7,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_MIDI,
+                    flags: 0,
+                },
+                port_index: 0,
+                data: [0xD5, 100, 0x7F],
+            },
+        ];
+        let in_events = clap_input_events {
+            ctx: (&raw const packets).cast_mut().cast(),
+            size: Some(in_size),
+            get: Some(in_get),
+        };
+        let info = Probe::info();
+        convert_input_events(
+            &mut audio,
+            &info,
+            &raw const in_events,
+            false,
+            false,
+            Some(64),
+        );
+
+        let typed: Vec<_> = audio.event_list.iter().map(|e| e.body).collect();
+        assert_eq!(
+            typed,
+            [
+                EventBody::ProgramChange {
+                    group: 0,
+                    channel: 2,
+                    program: 42,
+                },
+                EventBody::ChannelPressure {
+                    group: 0,
+                    channel: 5,
+                    pressure: 100,
+                },
+            ]
+        );
+
+        let mut emitted = Vec::<clap_event_midi>::new();
+        let out_events = clap_output_events {
+            ctx: (&raw mut emitted).cast(),
+            try_push: Some(out_push),
+        };
+        let exact_items: Vec<_> = audio
+            .event_list
+            .lossless_iter()
+            .map(|item| match item {
+                LosslessEventRef::Exact(exact) => exact,
+                LosslessEventRef::Typed(_) => panic!("expected exact representation"),
+            })
+            .collect();
+        assert_eq!(exact_items.len(), 2);
+        for (exact, expected_bytes) in exact_items.into_iter().zip([&[0xC2, 42][..], &[0xD5, 100]])
+        {
+            match exact.body() {
+                ExactEventBody::Midi1 { message, .. } => {
+                    assert_eq!(message.bytes(), expected_bytes);
+                }
+                other => panic!("unexpected exact body: {other:?}"),
+            }
+            assert!(matches!(
+                emit_exact_clap(&raw const out_events, out_push, exact, &info, 64),
+                ExactEmit::Emitted
+            ));
+        }
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(&emitted[0].data[..2], &[0xC2, 42]);
+        assert_eq!(&emitted[1].data[..2], &[0xD5, 100]);
+    });
+}
+
+#[derive(moose_derive::Params)]
+#[params(presentation = "panic_pres")]
+struct PanickingPresentationParams {
+    #[param(id = 0, name = "Gain", range = "linear(-24.0, 24.0)", default = 0.0)]
+    gain: moose_params::FloatParam,
+    #[skip]
+    armed: AtomicBool,
+}
+
+impl PanickingPresentationParams {
+    fn panic_pres(&self, _id: u32) -> Option<moose_params::ParameterPresentation> {
+        assert!(
+            !self.armed.load(Ordering::Acquire),
+            "simulated parameter_presentation panic"
+        );
+        None
+    }
+}
+
+struct PanickingPresentationPlugin {
+    params: Arc<PanickingPresentationParams>,
+    meters: Arc<MeterStore>,
+    snapshot: Arc<SnapshotSlot>,
+}
+
+impl PluginExport for PanickingPresentationPlugin {
+    type Params = PanickingPresentationParams;
+    fn create() -> Self {
+        Self {
+            params: Arc::new(PanickingPresentationParams::new()),
+            meters: MeterStore::new(),
+            snapshot: SnapshotSlot::new(),
+        }
+    }
+    fn params(&self) -> &Self::Params {
+        &self.params
+    }
+    fn params_arc(&self) -> Arc<Self::Params> {
+        Arc::clone(&self.params)
+    }
+    fn meter_store(&self) -> Arc<MeterStore> {
+        Arc::clone(&self.meters)
+    }
+    fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+        Arc::clone(&self.snapshot)
+    }
+}
+
+impl PluginRuntime for PanickingPresentationPlugin {
+    type Sample = f32;
+    fn info() -> PluginInfo {
+        TestPlugin::info()
+    }
+    fn reset(&mut self, _: &AudioConfig) {}
+    fn process(
+        &mut self,
+        _: &mut AudioBuffer,
+        _: &EventList,
+        _: &mut ProcessContext,
+    ) -> ProcessStatus {
+        ProcessStatus::Normal
+    }
+}
+
+#[test]
+fn params_get_info_catches_panic_in_parameter_presentation() {
+    unsafe {
+        let mut host: clap_host = std::mem::zeroed();
+        host.clap_version = clap_sys::version::CLAP_VERSION;
+        host.get_extension = Some(no_extension);
+        let descriptor = DescriptorHolder::new(&PanickingPresentationPlugin::info());
+        let plugin = create_plugin_instance::<PanickingPresentationPlugin>(
+            &raw const descriptor.descriptor,
+            &raw const host,
+        );
+        assert!(!plugin.is_null());
+        assert!((*plugin).init.unwrap()(plugin));
+        data_from_plugin::<PanickingPresentationPlugin>(plugin)
+            .params_arc
+            .armed
+            .store(true, Ordering::Release);
+        let mut info: clap_param_info = std::mem::zeroed();
+        assert!(
+            !params_get_info::<PanickingPresentationPlugin>(plugin, 0, &raw mut info),
+            "panic in parameter_presentation must be caught and return false"
+        );
+        (*plugin).destroy.unwrap()(plugin);
+    }
+}
+
+#[test]
+fn audio_ports_config_select_and_list_rescan_clear_cached_ports_inactive() {
+    with_probe(|plugin| unsafe {
+        let get = (*plugin).get_extension.unwrap();
+        let activation = &*get(plugin, CLAP_EXT_AUDIO_PORTS_ACTIVATION.as_ptr())
+            .cast::<clap_plugin_audio_ports_activation>();
+        let set_active = activation.set_active.unwrap();
+        let data = data_from_plugin::<Probe>(plugin);
+
+        // 1. Deactivate input port 0, then select a valid audio_ports_config.
+        assert!(set_active(plugin, true, 0, false, 32));
+        assert_ne!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+        assert!(
+            !audio_ports_config_select::<Probe>(plugin, 99),
+            "out-of-range config select fails and keeps activation mask"
+        );
+        assert_ne!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+
+        assert!(audio_ports_config_select::<Probe>(plugin, 1));
+        assert_eq!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+        assert_eq!(data.ports_inactive[1].load(Ordering::Relaxed), 0);
+
+        assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
+        assert_eq!(
+            data.audio
+                .enter()
+                .bus_routing
+                .input(0)
+                .unwrap()
+                .activation(),
+            BusActivation::Active
+        );
+        (*plugin).deactivate.unwrap()(plugin);
+
+        // 2. Deactivate input port 0 again, then trigger CLAP_AUDIO_PORTS_RESCAN_LIST.
+        assert!(set_active(plugin, true, 0, false, 32));
+        assert_ne!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+        data.host_notifier
+            .notify(moose_core::main_thread::HostNotice::AUDIO_PORTS);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+        assert_eq!(data.ports_inactive[1].load(Ordering::Relaxed), 0);
+
+        // 3. Deactivate input port 0 again, then apply a configurable-audio-ports layout.
+        assert!(set_active(plugin, true, 0, false, 32));
+        assert_ne!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+        let configurable = &*get(plugin, CLAP_EXT_CONFIGURABLE_AUDIO_PORTS.as_ptr())
+            .cast::<clap_plugin_configurable_audio_ports>();
+        let stereo = [
+            clap_audio_port_configuration_request {
+                is_input: true,
+                port_index: 0,
+                channel_count: 2,
+                port_type: CLAP_PORT_STEREO.as_ptr(),
+                port_details: ptr::null(),
+            },
+            clap_audio_port_configuration_request {
+                is_input: false,
+                port_index: 0,
+                channel_count: 2,
+                port_type: CLAP_PORT_STEREO.as_ptr(),
+                port_details: ptr::null(),
+            },
+        ];
+        assert!(configurable.apply_configuration.unwrap()(
+            plugin,
+            stereo.as_ptr(),
+            2
+        ));
+        assert_eq!(data.ports_inactive[0].load(Ordering::Relaxed), 0);
+        assert_eq!(data.ports_inactive[1].load(Ordering::Relaxed), 0);
+
+        assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
+        assert_eq!(
+            data.audio
+                .enter()
+                .bus_routing
+                .input(0)
+                .unwrap()
+                .activation(),
+            BusActivation::Active
+        );
+        (*plugin).deactivate.unwrap()(plugin);
+    });
+}
+
+#[test]
+fn preset_load_enforces_bounded_file_read_and_rejects_oversized_files() {
+    use crate::state_ext::{
+        MAX_PRESET_FILE_BYTES, preset_load_from_location, read_preset_file_bounded,
+    };
+    use clap_sys::factory::preset_discovery::CLAP_PRESET_DISCOVERY_LOCATION_FILE;
+    use moose_params::Params;
+    use std::ffi::CString;
+
+    with_probe(|plugin| unsafe {
+        let data = data_from_plugin::<Probe>(plugin);
+        let dir =
+            std::env::temp_dir().join(format!("moose_clap_preset_bound_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let valid_path = dir.join("valid.trucepreset");
+        let blob = state::serialize_state(data.plugin_id_hash, &[0], &[-9.0], b"ok", &[]);
+        let meta = b"name=Valid\n";
+        let mut preset_bytes = Vec::new();
+        preset_bytes.extend_from_slice(b"TRPS");
+        preset_bytes.extend_from_slice(&1u32.to_le_bytes());
+        preset_bytes.extend_from_slice(&len_u32(meta.len()).to_le_bytes());
+        preset_bytes.extend_from_slice(meta);
+        preset_bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        preset_bytes.extend_from_slice(&blob);
+        std::fs::write(&valid_path, &preset_bytes).unwrap();
+
+        // Direct bounded reader rejects when file exceeds a tight limit.
+        assert!(read_preset_file_bounded(&valid_path, preset_bytes.len()).is_some());
+        assert!(read_preset_file_bounded(&valid_path, preset_bytes.len() - 1).is_none());
+
+        let valid_c = CString::new(valid_path.to_str().unwrap()).unwrap();
+        assert!(preset_load_from_location::<Probe>(
+            plugin,
+            CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+            valid_c.as_ptr(),
+            ptr::null(),
+        ));
+        assert_eq!(data.params_arc.get_plain(0), Some(-9.0));
+
+        // Oversized valid TRPS preset file (> MAX_PRESET_FILE_BYTES) is rejected by the size cap.
+        let oversized_path = dir.join("oversized.trucepreset");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&oversized_path).unwrap();
+            let oversized_blob_len = (MAX_PRESET_FILE_BYTES + 1) as u64;
+            file.write_all(b"TRPS").unwrap();
+            file.write_all(&1u32.to_le_bytes()).unwrap();
+            file.write_all(&len_u32(meta.len()).to_le_bytes()).unwrap();
+            file.write_all(meta).unwrap();
+            file.write_all(&oversized_blob_len.to_le_bytes()).unwrap();
+            file.set_len(20 + meta.len() as u64 + oversized_blob_len)
+                .unwrap();
+        }
+        let oversized_c = CString::new(oversized_path.to_str().unwrap()).unwrap();
+        assert!(!preset_load_from_location::<Probe>(
+            plugin,
+            CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+            oversized_c.as_ptr(),
+            ptr::null(),
+        ));
+        assert_eq!(
+            data.params_arc.get_plain(0),
+            Some(-9.0),
+            "rejected oversized preset leaves existing state intact"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

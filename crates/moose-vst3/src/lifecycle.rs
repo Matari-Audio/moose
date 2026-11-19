@@ -43,9 +43,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 // SAFETY for all unsafe extern "C" fn below:
 // - `ctx` is a *mut c_void created by Box::into_raw in cb_create().
 //   Valid until cb_destroy() (called exactly once by the C++ shim).
-// - The C++ shim (MooseComponent) owns the Rust context and
-//   guarantees exclusive access: process() on the audio thread,
-//   all other callbacks on the main thread, never concurrent.
+// - The COM layer (Host) owns the Rust context and guarantees
+//   exclusive access to audio/plugin state: `process()` and
+//   `setProcessing(false)` / `cb_reset` may run on the audio/processing
+//   thread, lifecycle/UI callbacks on the main thread, never concurrent.
 // - Audio buffer pointers come from the VST3 host via ProcessData
 //   and are valid for the declared channel count × numSamples.
 // - Parameter IDs and values come from IParamValueQueue and are
@@ -262,6 +263,10 @@ pub(crate) unsafe extern "C" fn cb_set_catalog_waker<P: PluginExport>(
         let instance = &*ctx.cast::<Vst3Instance<P>>();
         if let Some(signal) = rebind_signal(&instance.catalog_signal, wake, wake_context) {
             instance.params_arc.set_catalog_signal(signal);
+            // Now that the COM Host has registered `ctx`, drain any
+            // `HostNotice` raised synchronously during `hooks.connect(...)`
+            // before the instance was registered.
+            host_notice_woke::<P>(ctx);
         }
     });
 }

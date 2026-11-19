@@ -18,7 +18,6 @@ use clap_sys::ext::note_ports::{
     clap_plugin_note_ports,
 };
 use clap_sys::ext::surround::CLAP_PORT_SURROUND;
-use clap_sys::host::clap_host;
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
@@ -252,6 +251,12 @@ pub(crate) unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
     }
 }
 
+pub(crate) fn clear_ports_inactive<P: PluginExport>(data: &ClapPluginData<P>) {
+    for mask in &data.ports_inactive {
+        mask.store(0, Ordering::Relaxed);
+    }
+}
+
 pub(crate) unsafe extern "C" fn audio_ports_config_select<P: PluginExport>(
     plugin: *const clap_plugin,
     config_id: clap_id,
@@ -262,9 +267,11 @@ pub(crate) unsafe extern "C" fn audio_ports_config_select<P: PluginExport>(
         }
         // Called on the main thread while deactivated; the host rescans
         // `audio_ports` afterward, which now reports this layout.
-        data_from_plugin::<P>(plugin)
-            .selected_config
-            .store(config_id, Ordering::Relaxed);
+        // Per `clap.audio-ports-activation`, selecting a config invalidates
+        // the cached port activation state and resets ports to active.
+        let data = data_from_plugin::<P>(plugin);
+        data.selected_config.store(config_id, Ordering::Relaxed);
+        clear_ports_inactive(data);
         true
     }
 }
@@ -272,8 +279,12 @@ pub(crate) unsafe extern "C" fn audio_ports_config_select<P: PluginExport>(
 /// Ask the host to re-read the whole port list. Inactive, main thread.
 ///
 /// # Safety
-/// `host` is null or the live host of this instance.
-pub(crate) unsafe fn host_rescan_audio_ports(host: *const clap_host) {
+/// `data.host` is null or the live host of this instance.
+pub(crate) unsafe fn host_rescan_audio_ports<P: PluginExport>(data: &ClapPluginData<P>) {
+    // Per `clap.audio-ports-activation`, `CLAP_AUDIO_PORTS_RESCAN_LIST`
+    // invalidates the activation state and resets ports to active.
+    clear_ports_inactive(data);
+    let host = data.host;
     // SAFETY: caller contract; `get_extension` is [thread-safe].
     unsafe {
         if host.is_null() {
@@ -397,6 +408,7 @@ pub(crate) unsafe extern "C" fn configurable_ports_apply<P: PluginExport>(
             return false;
         };
         data.selected_config.store(index, Ordering::Relaxed);
+        clear_ports_inactive(data);
         true
     }
 }
