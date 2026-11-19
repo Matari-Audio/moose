@@ -78,6 +78,8 @@ const METER_FLOOR_DB: f32 = -60.0;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Smoothing {
     trim: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 impl Smoothing {
@@ -87,12 +89,28 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for SurroundMeter {
-    type Params = SurroundMeterParams;
-    type DspState = Smoothing;
+impl Plugin for SurroundMeter {
+    type Shared = SurroundMeterParams;
+    type MainThread = ();
+    type Processor = Smoothing;
 
-    fn reset(state: &mut Smoothing, params: &SurroundMeterParams, config: &AudioConfig) {
-        state.reset(params, config.sample_rate);
+    fn main_thread(_shared: &Arc<SurroundMeterParams>) {}
+
+    fn activate(
+        shared: &SurroundMeterParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Smoothing, PreparationError> {
+        let mut smoothing = Smoothing {
+            sample_rate: config.sample_rate,
+            ..Smoothing::default()
+        };
+        smoothing.reset(shared, config.sample_rate);
+        Ok(smoothing)
+    }
+
+    fn reset(state: &mut Smoothing, params: &SurroundMeterParams) {
+        state.reset(params, state.sample_rate);
     }
 
     fn bus_layouts() -> Vec<BusLayout> {
@@ -167,7 +185,7 @@ impl PluginLogic for SurroundMeter {
 }
 
 moose::plugin! {
-    logic: SurroundMeter,
+    plugin: SurroundMeter,
     params: SurroundMeterParams,
 }
 
@@ -182,7 +200,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -197,14 +215,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.3))
             .run();
@@ -214,32 +232,32 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     /// At default trim = 0 dB, output equals input. Sanity check
@@ -248,7 +266,7 @@ mod tests {
     fn unity_at_default_trim() {
         use moose_test::{InputSource, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.4))
             .run();
@@ -262,22 +280,29 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/block_surround_meter_default_macos.png").run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/block_surround_meter_default_macos.png"
+        )
+        .run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/block_surround_meter_default_linux.png")
-            .pixel_threshold(2)
-            .run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/block_surround_meter_default_linux.png"
+        )
+        .pixel_threshold(2)
+        .run();
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
         moose_test::screenshot!(
-            Plugin,
+            PluginShell,
             "screenshots/block_surround_meter_default_windows.png"
         )
         .pixel_threshold(2)

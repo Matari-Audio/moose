@@ -71,10 +71,23 @@ pub struct InstanceMemo {
 /// lives in the persisted params, and the audio path is a pass-through.
 pub struct StateExample;
 
-impl PurePluginLogic for StateExample {
-    type Params = StateExampleParams;
+impl Plugin for StateExample {
+    type Shared = StateExampleParams;
+    type MainThread = ();
+    type Processor = ();
+
+    fn main_thread(_shared: &Arc<StateExampleParams>) {}
+
+    fn activate(
+        _shared: &StateExampleParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<(), PreparationError> {
+        Ok(())
+    }
 
     fn process(
+        _processor: &mut (),
         _params: &StateExampleParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -174,7 +187,7 @@ impl EditorUi<StateExampleParams> for StateExampleUi {
 }
 
 moose::plugin! {
-    logic: StateExample,
+    plugin: StateExample,
     params: StateExampleParams,
 }
 
@@ -202,7 +215,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -217,12 +230,12 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     /// Set a label, snapshot the persist blob, restore into a fresh
@@ -300,7 +313,7 @@ mod tests {
     /// regressions in the wrapping logic the direct test above can't see.
     #[test]
     fn envelope_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     /// `#[persist]` fields are applied by `apply_params` (host thread),
@@ -330,7 +343,7 @@ mod tests {
 
         // Audio-thread path: must not touch persist (that lock can't run
         // inside process()).
-        let mut plugin = Plugin::create();
+        let mut plugin = PluginShell::create();
         state::apply_state(&mut plugin, &ds);
         assert_eq!(
             label_of(plugin.params()),
@@ -488,13 +501,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/state_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/state_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/state_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/state_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -502,7 +515,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/state_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/state_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

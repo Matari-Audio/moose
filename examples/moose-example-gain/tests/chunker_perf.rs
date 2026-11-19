@@ -18,7 +18,7 @@
 
 #![cfg(not(debug_assertions))]
 
-use moose_example_gain::Plugin;
+use moose_example_gain::PluginShell;
 use moose_test::{InputSource, driver};
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,7 @@ where
     let _ = events_per_block;
 
     let start = Instant::now();
-    let _result = driver!(Plugin)
+    let _result = driver!(PluginShell)
         .sample_rate(sr)
         .duration(duration)
         .input(InputSource::Constant(0.5))

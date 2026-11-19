@@ -53,17 +53,18 @@ pub struct DryWetParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor; the SIMD scratch lives in [`DryWetDsp`], sized in `prepare`.
+/// Descriptor; the SIMD scratch lives in [`DryWetProcessor`], sized in `prepare`.
 pub struct DryWet;
 
 /// Per-instance SIMD scratch, sized to the host's max block in `reset`.
-#[derive(Default)]
-pub struct DryWetDsp {
+pub struct DryWetProcessor {
     smoothing: Smoothing,
     /// Holds the saturated signal; `tanh_block` wants distinct in/out,
     /// then `mix_block` folds wet and dry into out in one SIMD pass.
     wet: Vec<f32>,
     driven: Vec<f32>,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 /// The processor's ramp for each smoothed parameter. Plain state owned by
@@ -82,33 +83,37 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for DryWet {
-    type Params = DryWetParams;
-    type DspState = DryWetDsp;
+impl Plugin for DryWet {
+    type Shared = DryWetParams;
+    type MainThread = ();
+    type Processor = DryWetProcessor;
 
-    /// Size the scratch to the host's max block, off the audio thread.
-    fn prepare(
-        state: &mut DryWetDsp,
+    fn main_thread(_shared: &Arc<DryWetParams>) {}
+
+    fn activate(
         params: &DryWetParams,
-        config: &moose::core::plugin::PreparationConfig,
-    ) -> Result<(), moose::core::plugin::PreparationError> {
-        config.validate()?;
-        let n = config.audio.max_block_size;
-        state.wet.resize(n, 0.0);
-        state.driven.resize(n, 0.0);
-        <Self as PluginLogic>::reset(state, params, &config.audio);
-        Ok(())
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<DryWetProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let n = config.max_block_size;
+        Ok(DryWetProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            wet: vec![0.0; n],
+            driven: vec![0.0; n],
+        })
     }
 
-    /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut DryWetDsp, params: &DryWetParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        state.wet.fill(0.0);
-        state.driven.fill(0.0);
+    fn reset(processor: &mut DryWetProcessor, params: &DryWetParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.wet.fill(0.0);
+        processor.driven.fill(0.0);
     }
 
     fn process(
-        state: &mut DryWetDsp,
+        state: &mut DryWetProcessor,
         params: &DryWetParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -164,7 +169,7 @@ impl PluginLogic for DryWet {
 }
 
 moose::plugin! {
-    logic: DryWet,
+    plugin: DryWet,
     params: DryWetParams,
 }
 
@@ -179,7 +184,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -198,7 +203,7 @@ mod tests {
         use std::time::Duration;
         // A block larger than the former hard-coded 1024 scratch. The whole
         // block must be written, not truncated at 1024 samples.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .block_size(2048)
             .duration(Duration::from_millis(100))
             .input(InputSource::Constant(0.5))
@@ -214,14 +219,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.3))
             .run();
@@ -231,39 +236,39 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     #[test]
     fn output_within_bounds() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.4))
             .run();
@@ -276,13 +281,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/block_drywet_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/block_drywet_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/block_drywet_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_drywet_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -290,7 +295,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/block_drywet_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_drywet_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

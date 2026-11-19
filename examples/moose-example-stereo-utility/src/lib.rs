@@ -43,29 +43,17 @@ pub struct StereoUtilityParams {
     pub right: ChannelStrip,
 }
 
-/// Stateless descriptor - DSP state lives in [`StereoUtilityDspState`].
+/// Stateless descriptor - DSP state lives in [`StereoUtilityProcessor`].
 pub struct StereoUtility;
 
 /// Per-instance DSP state: the delay lines and their write heads.
-pub struct StereoUtilityDspState {
+pub struct StereoUtilityProcessor {
     smoothing: Smoothing,
     /// One delay line per channel, sized in `prepare()` for `MAX_DELAY_MS`.
     lines: [Vec<f32>; 2],
     write_pos: [usize; 2],
     line_len: usize,
     sample_rate: f64,
-}
-
-impl Default for StereoUtilityDspState {
-    fn default() -> Self {
-        Self {
-            smoothing: Smoothing::default(),
-            lines: [Vec::new(), Vec::new()],
-            write_pos: [0; 2],
-            line_len: 0,
-            sample_rate: 44100.0,
-        }
-    }
 }
 
 /// Delay-line length for `MAX_DELAY_MS` at `sr`, plus one slot so a
@@ -103,43 +91,40 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for StereoUtility {
-    type Params = StereoUtilityParams;
-    type DspState = StereoUtilityDspState;
+impl Plugin for StereoUtility {
+    type Shared = StereoUtilityParams;
+    type MainThread = ();
+    type Processor = StereoUtilityProcessor;
 
-    /// Size the delay lines for the sample rate, off the audio thread.
-    fn prepare(
-        state: &mut StereoUtilityDspState,
-        params: &StereoUtilityParams,
-        config: &moose::core::plugin::PreparationConfig,
-    ) -> Result<(), moose::core::plugin::PreparationError> {
-        config.validate()?;
-        let sample_rate = config.audio.sample_rate;
-        state.sample_rate = sample_rate;
-        let len = delay_line_len(sample_rate);
-        state.line_len = len;
-        for line in &mut state.lines {
-            line.resize(len, 0.0);
-        }
-        <Self as PluginLogic>::reset(state, params, &config.audio);
-        Ok(())
-    }
+    fn main_thread(_shared: &Arc<StereoUtilityParams>) {}
 
-    /// Clear the delay lines; may run on the audio thread, so no allocation.
-    fn reset(
-        state: &mut StereoUtilityDspState,
+    fn activate(
         params: &StereoUtilityParams,
         config: &AudioConfig,
-    ) {
-        state.smoothing.reset(params, config.sample_rate);
-        for line in &mut state.lines {
+        _cx: &InitContext,
+    ) -> Result<StereoUtilityProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let len = delay_line_len(config.sample_rate);
+        Ok(StereoUtilityProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            lines: [vec![0.0; len], vec![0.0; len]],
+            write_pos: [0; 2],
+            line_len: len,
+        })
+    }
+
+    fn reset(processor: &mut StereoUtilityProcessor, params: &StereoUtilityParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        for line in &mut processor.lines {
             line.fill(0.0);
         }
-        state.write_pos = [0; 2];
+        processor.write_pos = [0; 2];
     }
 
     fn process(
-        state: &mut StereoUtilityDspState,
+        state: &mut StereoUtilityProcessor,
         params: &StereoUtilityParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -204,7 +189,7 @@ impl PluginLogic for StereoUtility {
 }
 
 moose::plugin! {
-    logic: StereoUtility,
+    plugin: StereoUtility,
     params: StereoUtilityParams,
 }
 
@@ -219,7 +204,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -234,7 +219,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -263,7 +248,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
         // Defaults are transparent: 0 dB, 0 ms, non-inverted.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -277,92 +262,92 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     // --- AU metadata ---
 
     #[test]
     fn au_type_codes_ascii() {
-        moose_test::assert_au_type_codes_ascii::<Plugin>();
+        moose_test::assert_au_type_codes_ascii::<PluginShell>();
     }
 
     #[test]
     fn fourcc_roundtrip() {
-        moose_test::assert_fourcc_roundtrip::<Plugin>();
+        moose_test::assert_fourcc_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn bus_config_effect() {
-        moose_test::assert_bus_config_effect::<Plugin>();
+        moose_test::assert_bus_config_effect::<PluginShell>();
     }
 
     // --- GUI lifecycle ---
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<Plugin>();
+        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     // --- Parameters ---
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn param_count_matches() {
-        moose_test::assert_param_count_matches::<Plugin>();
+        moose_test::assert_param_count_matches::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     // --- State resilience ---
 
     #[test]
     fn corrupt_state_no_crash() {
-        moose_test::assert_corrupt_state_no_crash::<Plugin>();
+        moose_test::assert_corrupt_state_no_crash::<PluginShell>();
     }
 
     #[test]
     fn empty_state_no_crash() {
-        moose_test::assert_empty_state_no_crash::<Plugin>();
+        moose_test::assert_empty_state_no_crash::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/stereo_utility_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/stereo_utility_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/stereo_utility_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/stereo_utility_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -370,8 +355,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/stereo_utility_default_windows.png")
-            .pixel_threshold(2)
-            .run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/stereo_utility_default_windows.png"
+        )
+        .pixel_threshold(2)
+        .run();
     }
 }

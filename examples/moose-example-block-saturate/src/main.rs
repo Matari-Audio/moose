@@ -1,5 +1,5 @@
-use moose_example_block_saturate::Plugin;
+use moose_example_block_saturate::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

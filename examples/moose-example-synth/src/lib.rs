@@ -154,10 +154,10 @@ const PITCH_BEND_RANGE: f64 = 2.0;
 const VIBRATO_RATE_HZ: f64 = 5.0;
 const VIBRATO_DEPTH_SEMITONES: f64 = 0.5;
 
-/// Stateless descriptor - the synth's per-block DSP state is [`SynthDspState`].
+/// Stateless descriptor - the synth's per-block DSP state is [`SynthProcessor`].
 pub struct Synth;
 
-pub struct SynthDspState {
+pub struct SynthProcessor {
     smoothing: Smoothing,
     voices: Vec<Voice>,
     sample_rate: f64,
@@ -169,22 +169,7 @@ pub struct SynthDspState {
     lfo_phase: f64,
 }
 
-impl Default for SynthDspState {
-    fn default() -> Self {
-        SynthDspState {
-            smoothing: Smoothing::default(),
-            // Pre-sized so `process` never grows the pool on the
-            // audio thread.
-            voices: Vec::with_capacity(MAX_VOICES),
-            sample_rate: 44100.0,
-            pitch_bend_mult: 1.0,
-            mod_wheel: 0.0,
-            lfo_phase: 0.0,
-        }
-    }
-}
-
-impl SynthDspState {
+impl SynthProcessor {
     /// Map a 14-bit pitch-bend code to a frequency multiplier.
     fn pitch_bend(&mut self, value: u16) {
         let semitones = f64::from(norm_pitch_bend(value)) * PITCH_BEND_RANGE;
@@ -243,26 +228,44 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Synth {
-    type Params = SynthParams;
-    type DspState = SynthDspState;
+impl Plugin<Sample> for Synth {
+    type Shared = SynthParams;
+    type MainThread = ();
+    type Processor = SynthProcessor;
+
+    fn main_thread(_shared: &Arc<SynthParams>) {}
 
     fn bus_layouts() -> Vec<BusLayout> {
         BusLayout::stereo_and_mono_output()
     }
 
-    fn reset(state: &mut SynthDspState, params: &SynthParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.voices.clear();
-        state.pitch_bend_mult = 1.0;
-        state.mod_wheel = 0.0;
-        state.lfo_phase = 0.0;
+    fn activate(
+        params: &SynthParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<SynthProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        Ok(SynthProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            voices: Vec::with_capacity(MAX_VOICES),
+            pitch_bend_mult: 1.0,
+            mod_wheel: 0.0,
+            lfo_phase: 0.0,
+        })
+    }
+
+    fn reset(processor: &mut SynthProcessor, params: &SynthParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.voices.clear();
+        processor.pitch_bend_mult = 1.0;
+        processor.mod_wheel = 0.0;
+        processor.lfo_phase = 0.0;
     }
 
     fn process(
-        state: &mut SynthDspState,
+        state: &mut SynthProcessor,
         params: &SynthParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -365,7 +368,7 @@ impl PluginLogic for Synth {
 }
 
 moose::plugin! {
-    logic: Synth,
+    plugin: Synth,
     params: SynthParams,
 }
 
@@ -380,7 +383,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -403,7 +406,7 @@ mod tests {
         // oldest voice must happen before the push, so `voices` never grows
         // past its reserved capacity and reallocates on the audio thread.
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(20))
                 .script(|s| {
                     for note in 48..72u8 {
@@ -417,14 +420,16 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn silence_without_midi() {
         use moose_test::{assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin).duration(Duration::from_millis(12)).run();
+        let result = driver!(PluginShell)
+            .duration(Duration::from_millis(12))
+            .run();
         assertions::assert_silence(&result);
     }
 
@@ -432,7 +437,7 @@ mod tests {
     fn produces_sound_on_note_on() {
         use moose_test::{assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .script(|s| s.note_on(60, 100.0 / 127.0))
             .run();
@@ -454,12 +459,12 @@ mod tests {
                 .count()
         }
 
-        let plain = driver!(Plugin)
+        let plain = driver!(PluginShell)
             .duration(Duration::from_millis(200))
             .script(|s| s.note_on(60, 100.0 / 127.0))
             .run();
 
-        let bent = driver!(Plugin)
+        let bent = driver!(PluginShell)
             .duration(Duration::from_millis(200))
             .script(|s| {
                 s.note_on(60, 100.0 / 127.0);
@@ -484,12 +489,12 @@ mod tests {
 
         // A raised mod wheel applies a pitch LFO, so the output diverges
         // from the steady, unmodulated note.
-        let plain = driver!(Plugin)
+        let plain = driver!(PluginShell)
             .duration(Duration::from_millis(200))
             .script(|s| s.note_on(60, 100.0 / 127.0))
             .run();
 
-        let vibrato = driver!(Plugin)
+        let vibrato = driver!(PluginShell)
             .duration(Duration::from_millis(200))
             .script(|s| {
                 s.note_on(60, 100.0 / 127.0);
@@ -514,7 +519,7 @@ mod tests {
         use moose_test::driver;
         use std::time::Duration;
         // Render ~1 second to let the release tail finish.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_secs(1))
             .script(|s| {
                 s.note_on(60, 100.0 / 127.0);
@@ -529,92 +534,92 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     // --- AU metadata ---
 
     #[test]
     fn au_type_codes_ascii() {
-        moose_test::assert_au_type_codes_ascii::<Plugin>();
+        moose_test::assert_au_type_codes_ascii::<PluginShell>();
     }
 
     #[test]
     fn fourcc_roundtrip() {
-        moose_test::assert_fourcc_roundtrip::<Plugin>();
+        moose_test::assert_fourcc_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn bus_config_instrument() {
-        moose_test::assert_bus_config_instrument::<Plugin>();
+        moose_test::assert_bus_config_instrument::<PluginShell>();
     }
 
     // --- GUI lifecycle ---
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<Plugin>();
+        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     // --- Parameters ---
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn param_count_matches() {
-        moose_test::assert_param_count_matches::<Plugin>();
+        moose_test::assert_param_count_matches::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     // --- State resilience ---
 
     #[test]
     fn corrupt_state_no_crash() {
-        moose_test::assert_corrupt_state_no_crash::<Plugin>();
+        moose_test::assert_corrupt_state_no_crash::<PluginShell>();
     }
 
     #[test]
     fn empty_state_no_crash() {
-        moose_test::assert_empty_state_no_crash::<Plugin>();
+        moose_test::assert_empty_state_no_crash::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/synth_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/synth_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/synth_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/synth_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -622,7 +627,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/synth_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/synth_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

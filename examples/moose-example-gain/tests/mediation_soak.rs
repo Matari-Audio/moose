@@ -18,7 +18,7 @@ use moose_core::export::PluginExport;
 use moose_core::plugin::PluginRuntime;
 use moose_core::process::ProcessContext;
 use moose_core::wrapper::{enter_plugin, shared_plugin};
-use moose_example_gain::Plugin;
+use moose_example_gain::PluginShell;
 
 const BLOCKS: usize = 2_000;
 const BLOCK_SIZE: usize = 256;
@@ -28,7 +28,7 @@ const BLOCK_DEADLINE: Duration = Duration::from_secs(1);
 
 #[test]
 fn concurrent_save_never_wedges_the_audio_thread() {
-    let mut plugin = Plugin::create();
+    let mut plugin = PluginShell::create();
     plugin.init();
     plugin.reset(&AudioConfig::new(48_000.0, BLOCK_SIZE));
     // The lock-free slot the audio thread publishes into and a host save

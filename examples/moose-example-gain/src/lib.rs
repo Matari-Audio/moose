@@ -38,6 +38,8 @@ pub struct Gain;
 pub struct Smoothing {
     gain: ParamSmoother,
     pan: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 impl Smoothing {
@@ -48,12 +50,28 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Gain {
-    type Params = GainParams;
-    type DspState = Smoothing;
+impl Plugin for Gain {
+    type Shared = GainParams;
+    type MainThread = ();
+    type Processor = Smoothing;
 
-    fn reset(state: &mut Smoothing, params: &GainParams, config: &AudioConfig) {
-        state.reset(params, config.sample_rate);
+    fn main_thread(_shared: &Arc<GainParams>) {}
+
+    fn activate(
+        shared: &GainParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Smoothing, PreparationError> {
+        let mut smoothing = Smoothing {
+            sample_rate: config.sample_rate,
+            ..Smoothing::default()
+        };
+        smoothing.reset(shared, config.sample_rate);
+        Ok(smoothing)
+    }
+
+    fn reset(state: &mut Smoothing, params: &GainParams) {
+        state.reset(params, state.sample_rate);
     }
 
     fn process(
@@ -127,7 +145,7 @@ impl PluginLogic for Gain {
 }
 
 moose::plugin! {
-    logic: Gain,
+    plugin: Gain,
     params: GainParams,
 }
 
@@ -155,7 +173,7 @@ mod tests {
         use moose_test::{InputSource, assert_realtime_clean, driver};
         use std::time::Duration;
         assert_realtime_clean(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -177,7 +195,7 @@ mod tests {
     #[test]
     fn clap_wrapper_glue_is_allocation_free() {
         assert_eq!(
-            wrapper_glue_violations(moose_clap::rt_paranoid_smoke::<Plugin>),
+            wrapper_glue_violations(moose_clap::rt_paranoid_smoke::<PluginShell>),
             0,
             "the CLAP wrapper's per-block glue must not allocate or free on the audio thread"
         );
@@ -187,7 +205,7 @@ mod tests {
     #[test]
     fn vst3_wrapper_glue_is_allocation_free() {
         assert_eq!(
-            wrapper_glue_violations(moose_vst3::rt_paranoid_smoke::<Plugin>),
+            wrapper_glue_violations(moose_vst3::rt_paranoid_smoke::<PluginShell>),
             0,
             "the VST3 wrapper's per-block glue must not allocate or free on the audio thread"
         );
@@ -199,7 +217,7 @@ mod tests {
     #[test]
     fn au_wrapper_glue_is_allocation_free() {
         assert_eq!(
-            wrapper_glue_violations(moose_au::rt_paranoid_smoke::<Plugin>),
+            wrapper_glue_violations(moose_au::rt_paranoid_smoke::<PluginShell>),
             0,
             "the AU wrapper's per-block glue must not allocate or free on the audio thread"
         );
@@ -207,7 +225,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -215,7 +233,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -225,12 +243,12 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     // State-load routing without a `migrate_state` override (this
@@ -244,15 +262,15 @@ mod tests {
         use moose_core::state::{
             PluginFormat, parse_or_migrate, serialize_state, shared_plugin_state_hash,
         };
-        let hash = shared_plugin_state_hash(&Plugin::info());
+        let hash = shared_plugin_state_hash(&PluginShell::info());
 
         let envelope = serialize_state(hash, &[0], &[-6.0], &[], &[]);
-        let loaded = parse_or_migrate::<Plugin>(&envelope, hash, PluginFormat::Clap, None)
+        let loaded = parse_or_migrate::<PluginShell>(&envelope, hash, PluginFormat::Clap, None)
             .expect("own envelope must load");
         assert_eq!(loaded.params, vec![(0, -6.0)]);
 
         // Foreign bytes must fail without a hook.
-        moose_test::assert_state_migration_rejected::<Plugin>(
+        moose_test::assert_state_migration_rejected::<PluginShell>(
             PluginFormat::Clap,
             None,
             b"{\"legacy\":true}",
@@ -261,41 +279,49 @@ mod tests {
         // A future envelope version must fail, never reach the hook.
         let mut future = serialize_state(hash, &[], &[], &[], &[]);
         future[4..8].copy_from_slice(&2u32.to_le_bytes());
-        moose_test::assert_state_migration_rejected::<Plugin>(PluginFormat::Clap, None, &future);
+        moose_test::assert_state_migration_rejected::<PluginShell>(
+            PluginFormat::Clap,
+            None,
+            &future,
+        );
 
         // A wrong-plugin envelope must fail without a hook.
         let renamed = serialize_state(hash ^ 1, &[0], &[-6.0], &[], &[]);
-        moose_test::assert_state_migration_rejected::<Plugin>(PluginFormat::Clap, None, &renamed);
+        moose_test::assert_state_migration_rejected::<PluginShell>(
+            PluginFormat::Clap,
+            None,
+            &renamed,
+        );
     }
 
     #[test]
     fn au_type_codes_ascii() {
-        moose_test::assert_au_type_codes_ascii::<Plugin>();
+        moose_test::assert_au_type_codes_ascii::<PluginShell>();
     }
 
     #[test]
     fn fourcc_roundtrip() {
-        moose_test::assert_fourcc_roundtrip::<Plugin>();
+        moose_test::assert_fourcc_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn bus_config_effect() {
-        moose_test::assert_bus_config_effect::<Plugin>();
+        moose_test::assert_bus_config_effect::<PluginShell>();
     }
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<Plugin>();
+        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     /// Sample-accurate chunking: a `set_param` scheduled mid-block
@@ -316,7 +342,7 @@ mod tests {
         use std::time::Duration;
 
         let sr = 48_000.0;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .sample_rate(sr)
             .duration(Duration::from_millis(200))
             .input(InputSource::Constant(1.0))
@@ -364,44 +390,44 @@ mod tests {
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn param_count_matches() {
-        moose_test::assert_param_count_matches::<Plugin>();
+        moose_test::assert_param_count_matches::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     #[test]
     fn corrupt_state_no_crash() {
-        moose_test::assert_corrupt_state_no_crash::<Plugin>();
+        moose_test::assert_corrupt_state_no_crash::<PluginShell>();
     }
 
     #[test]
     fn empty_state_no_crash() {
-        moose_test::assert_empty_state_no_crash::<Plugin>();
+        moose_test::assert_empty_state_no_crash::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/gain_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/gain_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/gain_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/gain_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -409,7 +435,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/gain_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/gain_default_windows.png")
             .pixel_threshold(2)
             .run();
     }
@@ -423,7 +449,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .sample_rate(44_100.0)
             .channels(2)
             .block_size(256)

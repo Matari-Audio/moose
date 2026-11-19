@@ -46,15 +46,14 @@ pub struct SaturateParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor; the SIMD scratch lives in [`SaturateDsp`], sized in `prepare`.
+/// Descriptor; the SIMD scratch lives in [`SaturateProcessor`], sized in `prepare`.
 pub struct Saturate;
 
 /// Per-instance SIMD scratch, sized to the host's max block in `reset`.
 /// `sx` holds the driven input, `sy` holds `tanh(sx)`; the three-stage
 /// chain (drive -> tanh -> output) can't alias the audio output with the
 /// tanh input, so a distinct scratch pair is the cleanest shape.
-#[derive(Default)]
-pub struct SaturateDsp {
+pub struct SaturateProcessor {
     smoothing: Smoothing,
     sx: Vec<f32>,
     sy: Vec<f32>,
@@ -62,6 +61,8 @@ pub struct SaturateDsp {
     output_db: Vec<f32>,
     drive_lin_buf: Vec<f32>,
     output_lin_buf: Vec<f32>,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 /// The processor's ramp for each smoothed parameter. Plain state owned by
@@ -80,54 +81,57 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Saturate {
-    type Params = SaturateParams;
-    type DspState = SaturateDsp;
+impl Plugin for Saturate {
+    type Shared = SaturateParams;
+    type MainThread = ();
+    type Processor = SaturateProcessor;
 
-    /// Size the scratch to the host's max block, off the audio thread.
-    fn prepare(
-        state: &mut SaturateDsp,
+    fn main_thread(_shared: &Arc<SaturateParams>) {}
+
+    fn activate(
         params: &SaturateParams,
-        config: &moose::core::plugin::PreparationConfig,
-    ) -> Result<(), moose::core::plugin::PreparationError> {
-        config.validate()?;
-        for buf in [
-            &mut state.sx,
-            &mut state.sy,
-            &mut state.drive_db,
-            &mut state.output_db,
-            &mut state.drive_lin_buf,
-            &mut state.output_lin_buf,
-        ] {
-            buf.resize(config.audio.max_block_size, 0.0);
-        }
-        <Self as PluginLogic>::reset(state, params, &config.audio);
-        Ok(())
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<SaturateProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let n = config.max_block_size;
+        Ok(SaturateProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            sx: vec![0.0; n],
+            sy: vec![0.0; n],
+            drive_db: vec![0.0; n],
+            output_db: vec![0.0; n],
+            drive_lin_buf: vec![0.0; n],
+            output_lin_buf: vec![0.0; n],
+        })
     }
 
-    /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut SaturateDsp, params: &SaturateParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
+    fn reset(processor: &mut SaturateProcessor, params: &SaturateParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
         for buf in [
-            &mut state.sx,
-            &mut state.sy,
-            &mut state.drive_db,
-            &mut state.output_db,
-            &mut state.drive_lin_buf,
-            &mut state.output_lin_buf,
+            &mut processor.sx,
+            &mut processor.sy,
+            &mut processor.drive_db,
+            &mut processor.output_db,
+            &mut processor.drive_lin_buf,
+            &mut processor.output_lin_buf,
         ] {
             buf.fill(0.0);
         }
     }
 
     fn process(
-        state: &mut SaturateDsp,
+        state: &mut SaturateProcessor,
         params: &SaturateParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
-        if !state.smoothing.drive.is_smoothing(&params.drive) && !state.smoothing.output.is_smoothing(&params.output) {
+        if !state.smoothing.drive.is_smoothing(&params.drive)
+            && !state.smoothing.output.is_smoothing(&params.output)
+        {
             // Fast path: constant drive + output gains.
             let drive_lin = db_to_linear(params.drive.value());
             let output_lin = db_to_linear(params.output.value());
@@ -146,8 +150,14 @@ impl PluginLogic for Saturate {
             // `next_into` advances each smoother by exactly `n`, so the
             // value doesn't step at the next block edge.
             let n = buffer.num_samples();
-            state.smoothing.drive.next_into(&params.drive, &mut state.drive_db[..n]);
-            state.smoothing.output.next_into(&params.output, &mut state.output_db[..n]);
+            state
+                .smoothing
+                .drive
+                .next_into(&params.drive, &mut state.drive_db[..n]);
+            state
+                .smoothing
+                .output
+                .next_into(&params.output, &mut state.output_db[..n]);
             math::db_to_linear_block(&mut state.drive_lin_buf[..n], &state.drive_db[..n]);
             math::db_to_linear_block(&mut state.output_lin_buf[..n], &state.output_db[..n]);
 
@@ -188,7 +198,7 @@ impl PluginLogic for Saturate {
 }
 
 moose::plugin! {
-    logic: Saturate,
+    plugin: Saturate,
     params: SaturateParams,
 }
 
@@ -203,7 +213,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -222,7 +232,7 @@ mod tests {
         use std::time::Duration;
         // A block larger than the former hard-coded 1024 scratch. The whole
         // block must be written, not truncated at 1024 samples.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .block_size(2048)
             .duration(Duration::from_millis(100))
             .input(InputSource::Constant(0.5))
@@ -238,14 +248,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.3))
             .run();
@@ -255,32 +265,32 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     /// Drive a 0.5 DC signal: with default drive (+6 dB) and
@@ -291,7 +301,7 @@ mod tests {
     fn output_stays_in_range() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.5))
             .run();
@@ -303,13 +313,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/block_saturate_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/block_saturate_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/block_saturate_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_saturate_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -317,8 +327,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/block_saturate_default_windows.png")
-            .pixel_threshold(2)
-            .run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/block_saturate_default_windows.png"
+        )
+        .pixel_threshold(2)
+        .run();
     }
 }

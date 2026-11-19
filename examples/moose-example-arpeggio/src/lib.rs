@@ -113,10 +113,10 @@ fn step_to_seq_idx(step: i64, seq_len: usize) -> usize {
 
 // --- Plugin ---
 
-/// Stateless descriptor - the arp's per-block DSP state is [`ArpeggioDspState`].
+/// Stateless descriptor - the arp's per-block DSP state is [`ArpeggioProcessor`].
 pub struct Arpeggio;
 
-pub struct ArpeggioDspState {
+pub struct ArpeggioProcessor {
     held_notes: Vec<u8>,
     /// Reusable arp sequence, rebuilt in place each block (never
     /// reallocated on the audio thread). Sized for the worst case: 4
@@ -141,25 +141,7 @@ pub struct ArpeggioDspState {
     rng: u32,
 }
 
-impl Default for ArpeggioDspState {
-    fn default() -> Self {
-        ArpeggioDspState {
-            // Pre-size so the audio thread never reallocates: at most 128
-            // distinct held notes, and a worst-case 4-octave up-down
-            // sequence.
-            held_notes: Vec::with_capacity(128),
-            sequence: Vec::with_capacity(1024),
-            scratch_down: Vec::with_capacity(512),
-            sample_rate: 44100.0,
-            last_step: None,
-            active_note: None,
-            free_beat: 0.0,
-            rng: 12345,
-        }
-    }
-}
-
-impl ArpeggioDspState {
+impl ArpeggioProcessor {
     /// Rebuild `self.sequence` in place from the held notes - no audio-
     /// thread allocation, since every buffer is pre-sized in `init`.
     fn rebuild_sequence(&mut self, params: &ArpParams) {
@@ -206,9 +188,29 @@ impl ArpeggioDspState {
     }
 }
 
-impl PluginLogic for Arpeggio {
-    type Params = ArpParams;
-    type DspState = ArpeggioDspState;
+impl Plugin for Arpeggio {
+    type Shared = ArpParams;
+    type MainThread = ();
+    type Processor = ArpeggioProcessor;
+
+    fn main_thread(_shared: &Arc<ArpParams>) {}
+
+    fn activate(
+        _shared: &ArpParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<ArpeggioProcessor, PreparationError> {
+        Ok(ArpeggioProcessor {
+            held_notes: Vec::with_capacity(128),
+            sequence: Vec::with_capacity(1024),
+            scratch_down: Vec::with_capacity(512),
+            sample_rate: config.sample_rate,
+            last_step: None,
+            active_note: None,
+            free_beat: 0.0,
+            rng: 12345,
+        })
+    }
 
     /// MIDI effect: no audio I/O. CLAP/VST3/AU(aumi)/LV2 honor this;
     /// AAX (which has no audio-less plugin category) auto-adds a
@@ -218,17 +220,15 @@ impl PluginLogic for Arpeggio {
         vec![BusLayout::new()]
     }
 
-    fn reset(state: &mut ArpeggioDspState, _params: &ArpParams, config: &AudioConfig) {
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.held_notes.clear();
-        state.last_step = None;
-        state.active_note = None;
-        state.free_beat = 0.0;
+    fn reset(processor: &mut ArpeggioProcessor, _params: &ArpParams) {
+        processor.held_notes.clear();
+        processor.last_step = None;
+        processor.active_note = None;
+        processor.free_beat = 0.0;
     }
 
     fn process(
-        state: &mut ArpeggioDspState,
+        state: &mut ArpeggioProcessor,
         params: &ArpParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -384,7 +384,7 @@ impl PluginLogic for Arpeggio {
 }
 
 moose::plugin! {
-    logic: Arpeggio,
+    plugin: Arpeggio,
     params: ArpParams,
 }
 
@@ -399,7 +399,7 @@ mod tests {
         use moose_test::{InputSource, assert_realtime_clean, driver};
         use std::time::Duration;
         assert_realtime_clean(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -417,13 +417,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/arpeggio_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/arpeggio_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/arpeggio_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/arpeggio_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -431,7 +431,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/arpeggio_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/arpeggio_default_windows.png")
             .pixel_threshold(2)
             .run();
     }
@@ -444,7 +444,7 @@ mod tests {
         use moose_core::info::PluginCategory;
         use moose_core::plugin::PluginRuntime;
         assert_eq!(
-            <Plugin as PluginRuntime>::info().category,
+            <PluginShell as PluginRuntime>::info().category,
             PluginCategory::NoteEffect
         );
     }

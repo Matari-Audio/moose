@@ -1,5 +1,5 @@
-use moose_example_eq::Plugin;
+use moose_example_eq::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

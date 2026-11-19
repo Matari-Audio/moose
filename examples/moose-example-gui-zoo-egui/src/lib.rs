@@ -118,10 +118,23 @@ impl EditorUi<ZooParams> for ZooUi {
     }
 }
 
-impl PurePluginLogic for ZooEgui {
-    type Params = ZooParams;
+impl Plugin for ZooEgui {
+    type Shared = ZooParams;
+    type MainThread = ();
+    type Processor = ();
+
+    fn main_thread(_shared: &Arc<ZooParams>) {}
+
+    fn activate(
+        _shared: &ZooParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<(), PreparationError> {
+        Ok(())
+    }
 
     fn process(
+        _processor: &mut (),
         _params: &ZooParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -540,7 +553,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 moose::plugin! {
-    logic: ZooEgui,
+    plugin: ZooEgui,
     params: ZooParams,
 }
 
@@ -550,7 +563,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -565,32 +578,32 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<Plugin>();
+        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     #[test]
@@ -598,7 +611,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .sample_rate(44_100.0)
             .channels(2)
             .duration(Duration::from_millis(20))
@@ -611,13 +624,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/gui_zoo_egui_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/gui_zoo_egui_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/gui_zoo_egui_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/gui_zoo_egui_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -625,7 +638,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/gui_zoo_egui_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/gui_zoo_egui_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

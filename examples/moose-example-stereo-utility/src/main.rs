@@ -1,5 +1,5 @@
-use moose_example_stereo_utility::Plugin;
+use moose_example_stereo_utility::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

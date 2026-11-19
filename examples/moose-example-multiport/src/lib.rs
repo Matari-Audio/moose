@@ -142,26 +142,16 @@ struct Voice {
     lp: f32,
 }
 
-/// Stateless descriptor. The per-block DSP state lives in [`MultiportDspState`].
+/// Stateless descriptor. The per-block DSP state lives in [`MultiportProcessor`].
 pub struct Multiport;
 
-pub struct MultiportDspState {
+pub struct MultiportProcessor {
     smoothing: Smoothing,
     sample_rate: f64,
     voices: [Voice; NUM_VOICES],
 }
 
-impl Default for MultiportDspState {
-    fn default() -> Self {
-        MultiportDspState {
-            smoothing: Smoothing::default(),
-            sample_rate: 44100.0,
-            voices: [Voice::default(); NUM_VOICES],
-        }
-    }
-}
-
-impl MultiportDspState {
+impl MultiportProcessor {
     fn note_on(&mut self, port: u8, channel: u8, note: u8, amp: f32) {
         // Prefer a free slot; if the pool is full, steal a voice
         // that's already fading (in release) before cutting a still-
@@ -265,24 +255,39 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Multiport {
-    type Params = MultiportParams;
-    type DspState = MultiportDspState;
+impl Plugin for Multiport {
+    type Shared = MultiportParams;
+    type MainThread = ();
+    type Processor = MultiportProcessor;
+
+    fn main_thread(_shared: &Arc<MultiportParams>) {}
 
     fn bus_layouts() -> Vec<BusLayout> {
         BusLayout::stereo_and_mono_output()
     }
 
-    fn reset(state: &mut MultiportDspState, params: &MultiportParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.voices = [Voice::default(); NUM_VOICES];
+    fn activate(
+        params: &MultiportParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<MultiportProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        Ok(MultiportProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            voices: [Voice::default(); NUM_VOICES],
+        })
+    }
+
+    fn reset(processor: &mut MultiportProcessor, params: &MultiportParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.voices = [Voice::default(); NUM_VOICES];
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process(
-        state: &mut MultiportDspState,
+        state: &mut MultiportProcessor,
         params: &MultiportParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -299,13 +304,21 @@ impl PluginLogic for Multiport {
         let lanes = [
             Lane {
                 wave: p0.wave.value(),
-                cutoff: state.smoothing.port0_cutoff.next_after(&p0.cutoff, n).clamp(0.002, 1.0),
+                cutoff: state
+                    .smoothing
+                    .port0_cutoff
+                    .next_after(&p0.cutoff, n)
+                    .clamp(0.002, 1.0),
                 volume: db_to_linear(state.smoothing.port0_volume.next_after(&p0.volume, n)),
                 rel_step: (1.0 / (p0.release.raw_target().max(0.01) * sample_rate)) as f32,
             },
             Lane {
                 wave: p1.wave.value(),
-                cutoff: state.smoothing.port1_cutoff.next_after(&p1.cutoff, n).clamp(0.002, 1.0),
+                cutoff: state
+                    .smoothing
+                    .port1_cutoff
+                    .next_after(&p1.cutoff, n)
+                    .clamp(0.002, 1.0),
                 volume: db_to_linear(state.smoothing.port1_volume.next_after(&p1.volume, n)),
                 rel_step: (1.0 / (p1.release.raw_target().max(0.01) * sample_rate)) as f32,
             },
@@ -382,7 +395,7 @@ impl PluginLogic for Multiport {
 }
 
 moose::plugin! {
-    logic: Multiport,
+    plugin: Multiport,
     params: MultiportParams,
 }
 
@@ -397,7 +410,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -412,7 +425,7 @@ mod tests {
         });
     }
 
-    fn render(input: &[Event]) -> (MultiportDspState, Vec<f32>) {
+    fn render(input: &[Event]) -> (MultiportProcessor, Vec<f32>) {
         render_with(|_| {}, input)
     }
 
@@ -426,8 +439,12 @@ mod tests {
         // pre-reset tweaks (snapped by `reset`) worked, which is why
         // no other test caught it.
         let params = MultiportParams::new();
-        let mut state = Multiport::init(&params, &InitContext::new(None));
-        Multiport::reset(&mut state, &params, &AudioConfig::new(44100.0, 64));
+        let mut state = Multiport::activate(
+            &params,
+            &AudioConfig::new(44100.0, 64),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let mut block = |events: &EventList| -> f32 {
             let in_refs: Vec<&[f32]> = Vec::new();
@@ -472,11 +489,15 @@ mod tests {
     fn render_with(
         setup: impl Fn(&MultiportParams),
         input: &[Event],
-    ) -> (MultiportDspState, Vec<f32>) {
+    ) -> (MultiportProcessor, Vec<f32>) {
         let params = MultiportParams::new();
         setup(&params);
-        let mut state = Multiport::init(&params, &InitContext::new(None));
-        Multiport::reset(&mut state, &params, &AudioConfig::new(44100.0, 64));
+        let mut state = Multiport::activate(
+            &params,
+            &AudioConfig::new(44100.0, 64),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let in_refs: Vec<&[f32]> = Vec::new();
         let mut l = vec![0.0f32; 64];
@@ -528,7 +549,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -611,13 +632,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/multiport_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/multiport_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/multiport_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/multiport_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -625,7 +646,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/multiport_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/multiport_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

@@ -36,10 +36,10 @@ pub struct EnvelopeParams {
     pub release: FloatParam,
 }
 
-/// Stateless descriptor - the follower's per-block DSP state is [`EnvelopeDspState`].
+/// Stateless descriptor - the follower's per-block DSP state is [`EnvelopeProcessor`].
 pub struct Envelope;
 
-pub struct EnvelopeDspState {
+pub struct EnvelopeProcessor {
     smoothing: Smoothing,
     sample_rate: f64,
     /// Follower state, peak-tracked with instant attack and a
@@ -48,17 +48,6 @@ pub struct EnvelopeDspState {
     /// Last CC value sent, so identical values aren't re-sent every
     /// block (which would flood the host).
     last_sent: Option<u8>,
-}
-
-impl Default for EnvelopeDspState {
-    fn default() -> Self {
-        EnvelopeDspState {
-            smoothing: Smoothing::default(),
-            sample_rate: 44100.0,
-            env: 0.0,
-            last_sent: None,
-        }
-    }
 }
 
 /// Per-sample release coefficient for a time constant of `ms`.
@@ -88,20 +77,36 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Envelope {
-    type Params = EnvelopeParams;
-    type DspState = EnvelopeDspState;
+impl Plugin for Envelope {
+    type Shared = EnvelopeParams;
+    type MainThread = ();
+    type Processor = EnvelopeProcessor;
 
-    fn reset(state: &mut EnvelopeDspState, params: &EnvelopeParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.env = 0.0;
-        state.last_sent = None;
+    fn main_thread(_shared: &Arc<EnvelopeParams>) {}
+
+    fn activate(
+        params: &EnvelopeParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<EnvelopeProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        Ok(EnvelopeProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            env: 0.0,
+            last_sent: None,
+        })
+    }
+
+    fn reset(processor: &mut EnvelopeProcessor, params: &EnvelopeParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.env = 0.0;
+        processor.last_sent = None;
     }
 
     fn process(
-        state: &mut EnvelopeDspState,
+        state: &mut EnvelopeProcessor,
         params: &EnvelopeParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -120,7 +125,10 @@ impl PluginLogic for Envelope {
         // 0` - keeps the stream smooth and tracks rises/falls within a
         // block; the old block-rate form showed up in a MIDI monitor as
         // a delayed `@0` burst once per block.
-        let coeff = release_coeff(state.smoothing.release.next(&params.release), state.sample_rate);
+        let coeff = release_coeff(
+            state.smoothing.release.next(&params.release),
+            state.sample_rate,
+        );
         let cc = params.cc.value_u8();
         let nch = buffer.channels();
         for i in 0..buffer.num_samples() {
@@ -165,7 +173,7 @@ impl PluginLogic for Envelope {
 }
 
 moose::plugin! {
-    logic: Envelope,
+    plugin: Envelope,
     params: EnvelopeParams,
 }
 
@@ -180,14 +188,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn emits_midi_capability() {
         use moose_core::plugin::PluginRuntime;
         assert!(
-            <Plugin as PluginRuntime>::info().emits_midi,
+            <PluginShell as PluginRuntime>::info().emits_midi,
             "midi_output = true should set emits_midi"
         );
     }
@@ -197,7 +205,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -213,8 +221,12 @@ mod tests {
     #[test]
     fn follows_level_to_cc() {
         let params = EnvelopeParams::new();
-        let mut state = Envelope::init(&params, &InitContext::new(None));
-        Envelope::reset(&mut state, &params, &AudioConfig::new(44100.0, 256));
+        let mut state = Envelope::activate(
+            &params,
+            &AudioConfig::new(44100.0, 256),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         // A half-scale constant signal → env settles at ~0.5 → CC ~63.
         let input = vec![vec![0.5f32; 256]; 2];
@@ -243,13 +255,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/envelope_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/envelope_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/envelope_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/envelope_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -257,7 +269,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/envelope_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/envelope_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

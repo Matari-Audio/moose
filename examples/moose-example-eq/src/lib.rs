@@ -162,12 +162,12 @@ const NUM_BANDS: usize = 3;
 /// arrays instead of calling 10 atomic loads per sample.
 const MAX_BLOCK: usize = 512;
 
-/// Stateless descriptor - DSP state lives in [`EqDspState`].
+/// Stateless descriptor - DSP state lives in [`EqProcessor`].
 pub struct Eq;
 
 /// Per-instance DSP state: one stereo filter per band plus the
 /// sample rate cached at `reset()`.
-pub struct EqDspState {
+pub struct EqProcessor {
     smoothing: Smoothing,
     /// One stereo filter per band; L and R advance through the
     /// same coefficients in parallel `f64x2` lanes. Mono input
@@ -186,21 +186,6 @@ fn identity_coeffs() -> ::biquad::Coefficients<f64> {
         b0: 1.0,
         b1: 0.0,
         b2: 0.0,
-    }
-}
-
-impl Default for EqDspState {
-    fn default() -> Self {
-        let id = identity_coeffs();
-        EqDspState {
-            smoothing: Smoothing::default(),
-            bands: [
-                StereoBiquad::new(id),
-                StereoBiquad::new(id),
-                StereoBiquad::new(id),
-            ],
-            sample_rate: 44100.0,
-        }
     }
 }
 
@@ -236,9 +221,12 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Eq {
-    type Params = EqParams;
-    type DspState = EqDspState;
+impl Plugin<Sample> for Eq {
+    type Shared = EqParams;
+    type MainThread = ();
+    type Processor = EqProcessor;
+
+    fn main_thread(_shared: &Arc<EqParams>) {}
 
     // A hypothetical pre-moose build of this EQ saved its sessions as
     // `EQS1` + ten little-endian f64s (low/mid/high x freq/gain/q,
@@ -280,17 +268,34 @@ impl PluginLogic for Eq {
         })
     }
 
-    fn reset(state: &mut EqDspState, params: &EqParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        for band in &mut state.bands {
+    fn activate(
+        params: &EqParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<EqProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let id = identity_coeffs();
+        Ok(EqProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            bands: [
+                StereoBiquad::new(id),
+                StereoBiquad::new(id),
+                StereoBiquad::new(id),
+            ],
+        })
+    }
+
+    fn reset(processor: &mut EqProcessor, params: &EqParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        for band in &mut processor.bands {
             band.reset_state();
         }
     }
 
     fn process(
-        state: &mut EqDspState,
+        state: &mut EqProcessor,
         params: &EqParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -329,16 +334,46 @@ impl PluginLogic for Eq {
             // still happen per sample so a fast knob sweep stays
             // click-free; only the smoother traffic moves out of the
             // inner loop.
-            state.smoothing.low_freq.next_into_f64(&params.low.freq, &mut low_freq[..n]);
-            state.smoothing.low_gain.next_into_f64(&params.low.gain, &mut low_gain[..n]);
-            state.smoothing.low_q.next_into_f64(&params.low.q, &mut low_q[..n]);
-            state.smoothing.mid_freq.next_into_f64(&params.mid.freq, &mut mid_freq[..n]);
-            state.smoothing.mid_gain.next_into_f64(&params.mid.gain, &mut mid_gain[..n]);
-            state.smoothing.mid_q.next_into_f64(&params.mid.q, &mut mid_q[..n]);
-            state.smoothing.high_freq.next_into_f64(&params.high.freq, &mut high_freq[..n]);
-            state.smoothing.high_gain.next_into_f64(&params.high.gain, &mut high_gain[..n]);
-            state.smoothing.high_q.next_into_f64(&params.high.q, &mut high_q[..n]);
-            state.smoothing.output.next_into_f64(&params.output, &mut output[..n]);
+            state
+                .smoothing
+                .low_freq
+                .next_into_f64(&params.low.freq, &mut low_freq[..n]);
+            state
+                .smoothing
+                .low_gain
+                .next_into_f64(&params.low.gain, &mut low_gain[..n]);
+            state
+                .smoothing
+                .low_q
+                .next_into_f64(&params.low.q, &mut low_q[..n]);
+            state
+                .smoothing
+                .mid_freq
+                .next_into_f64(&params.mid.freq, &mut mid_freq[..n]);
+            state
+                .smoothing
+                .mid_gain
+                .next_into_f64(&params.mid.gain, &mut mid_gain[..n]);
+            state
+                .smoothing
+                .mid_q
+                .next_into_f64(&params.mid.q, &mut mid_q[..n]);
+            state
+                .smoothing
+                .high_freq
+                .next_into_f64(&params.high.freq, &mut high_freq[..n]);
+            state
+                .smoothing
+                .high_gain
+                .next_into_f64(&params.high.gain, &mut high_gain[..n]);
+            state
+                .smoothing
+                .high_q
+                .next_into_f64(&params.high.q, &mut high_q[..n]);
+            state
+                .smoothing
+                .output
+                .next_into_f64(&params.output, &mut output[..n]);
 
             // Vectorize the output dB → linear conversion once per
             // chunk. f64::powf is opaque to LLVM's autovectorizer;
@@ -437,7 +472,7 @@ impl PluginLogic for Eq {
 }
 
 moose::plugin! {
-    logic: Eq,
+    plugin: Eq,
     params: EqParams,
 }
 
@@ -452,7 +487,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -487,8 +522,11 @@ mod tests {
 
     #[test]
     fn legacy_state_migrates() {
-        let migrated =
-            moose_test::assert_state_migration::<Plugin>(PluginFormat::Clap, None, &legacy_blob());
+        let migrated = moose_test::assert_state_migration::<PluginShell>(
+            PluginFormat::Clap,
+            None,
+            &legacy_blob(),
+        );
         assert_eq!(migrated.params.len(), 10);
         let p = EqParams::new();
         assert_eq!(migrated.params[3], (p.mid.freq.id(), 1000.0));
@@ -498,7 +536,7 @@ mod tests {
 
     #[test]
     fn truncated_legacy_state_is_refused() {
-        moose_test::assert_state_migration_rejected::<Plugin>(
+        moose_test::assert_state_migration_rejected::<PluginShell>(
             PluginFormat::Clap,
             None,
             &legacy_blob()[..40],
@@ -507,14 +545,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -527,7 +565,7 @@ mod tests {
         use moose_test::{InputSource, driver};
         use std::time::Duration;
         // Default EQ (0dB gain on all bands) should pass audio ~unchanged
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -546,7 +584,7 @@ mod tests {
         // `MAX_BLOCK`; `process` must walk the whole buffer. A 2048
         // block (common DAW setting) used to leave samples 512..2048
         // pass-through stale, producing periodic noise.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .block_size(2048)
             .duration(Duration::from_millis(100))
             .input(InputSource::Constant(0.5))
@@ -564,92 +602,92 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     // --- AU metadata ---
 
     #[test]
     fn au_type_codes_ascii() {
-        moose_test::assert_au_type_codes_ascii::<Plugin>();
+        moose_test::assert_au_type_codes_ascii::<PluginShell>();
     }
 
     #[test]
     fn fourcc_roundtrip() {
-        moose_test::assert_fourcc_roundtrip::<Plugin>();
+        moose_test::assert_fourcc_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn bus_config_effect() {
-        moose_test::assert_bus_config_effect::<Plugin>();
+        moose_test::assert_bus_config_effect::<PluginShell>();
     }
 
     // --- GUI lifecycle ---
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<Plugin>();
+        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     // --- Parameters ---
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn param_count_matches() {
-        moose_test::assert_param_count_matches::<Plugin>();
+        moose_test::assert_param_count_matches::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     // --- State resilience ---
 
     #[test]
     fn corrupt_state_no_crash() {
-        moose_test::assert_corrupt_state_no_crash::<Plugin>();
+        moose_test::assert_corrupt_state_no_crash::<PluginShell>();
     }
 
     #[test]
     fn empty_state_no_crash() {
-        moose_test::assert_empty_state_no_crash::<Plugin>();
+        moose_test::assert_empty_state_no_crash::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/eq_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/eq_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/eq_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/eq_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -657,7 +695,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/eq_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/eq_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

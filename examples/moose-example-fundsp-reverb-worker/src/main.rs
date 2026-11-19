@@ -1,5 +1,5 @@
-use moose_example_fundsp_reverb_worker::Plugin;
+use moose_example_fundsp_reverb_worker::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

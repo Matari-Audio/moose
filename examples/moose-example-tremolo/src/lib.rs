@@ -102,11 +102,11 @@ pub struct TremoloParams {
 
 // --- Plugin ---
 
-/// The tremolo's per-block DSP state. `type DspState = Self` folds the
-/// stateless descriptor into this struct, so `Tremolo` is both the
-/// `PluginLogic` carrier and the hot-reload-preserved DSP state - no
-/// separate descriptor type.
-pub struct Tremolo {
+/// Stateless descriptor - the per-block DSP state is [`TremoloProcessor`].
+pub struct Tremolo;
+
+/// The tremolo's per-block DSP state.
+pub struct TremoloProcessor {
     /// Free-running phase used when the host provides no tempo (e.g.
     /// standalone running, or a host that does not report transport).
     /// Advances at 2 Hz so the effect stays visibly active offline.
@@ -116,32 +116,37 @@ pub struct Tremolo {
     depth: ParamSmoother,
 }
 
-impl Default for Tremolo {
-    fn default() -> Self {
-        Tremolo {
-            free_phase: 0.0,
-            sample_rate: 44_100.0,
-            depth: ParamSmoother::default(),
-        }
-    }
-}
-
 /// Rate at which `free_phase` advances when no host tempo is available.
 const FREE_LFO_HZ: f64 = 2.0;
 
-impl PluginLogic for Tremolo {
-    type Params = TremoloParams;
-    type DspState = Self;
+impl Plugin for Tremolo {
+    type Shared = TremoloParams;
+    type MainThread = ();
+    type Processor = TremoloProcessor;
 
-    fn reset(state: &mut Self, params: &TremoloParams, config: &AudioConfig) {
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.free_phase = 0.0;
-        state.depth.reset(&params.depth, sample_rate);
+    fn main_thread(_shared: &Arc<TremoloParams>) {}
+
+    fn activate(
+        shared: &TremoloParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<TremoloProcessor, PreparationError> {
+        let mut depth = ParamSmoother::default();
+        depth.reset(&shared.depth, config.sample_rate);
+        Ok(TremoloProcessor {
+            free_phase: 0.0,
+            sample_rate: config.sample_rate,
+            depth,
+        })
+    }
+
+    fn reset(processor: &mut TremoloProcessor, params: &TremoloParams) {
+        processor.free_phase = 0.0;
+        processor.depth.reset(&params.depth, processor.sample_rate);
     }
 
     fn process(
-        state: &mut Self,
+        state: &mut TremoloProcessor,
         params: &TremoloParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -295,7 +300,7 @@ fn transport_cells(info: Option<&TransportInfo>) -> Option<[String; 4]> {
 }
 
 moose::plugin! {
-    logic: Tremolo,
+    plugin: Tremolo,
     params: TremoloParams,
 }
 
@@ -315,7 +320,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -330,14 +335,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_without_nans() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -346,12 +351,12 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
@@ -413,13 +418,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/tremolo_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/tremolo_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/tremolo_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/tremolo_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -427,7 +432,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/tremolo_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/tremolo_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

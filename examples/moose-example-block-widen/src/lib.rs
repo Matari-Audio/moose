@@ -37,15 +37,16 @@ pub struct WidenParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor; the mid/side scratch lives in [`WidenDsp`], sized in `prepare`.
+/// Descriptor; the mid/side scratch lives in [`WidenProcessor`], sized in `prepare`.
 pub struct Widen;
 
 /// Per-instance mid/side scratch, sized to the host's max block in `reset`.
-#[derive(Default)]
-pub struct WidenDsp {
+pub struct WidenProcessor {
     smoothing: Smoothing,
     mid: Vec<f32>,
     side: Vec<f32>,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 /// The processor's ramp for each smoothed parameter. Plain state owned by
@@ -62,33 +63,37 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Widen {
-    type Params = WidenParams;
-    type DspState = WidenDsp;
+impl Plugin for Widen {
+    type Shared = WidenParams;
+    type MainThread = ();
+    type Processor = WidenProcessor;
 
-    /// Size the scratch to the host's max block, off the audio thread.
-    fn prepare(
-        state: &mut WidenDsp,
+    fn main_thread(_shared: &Arc<WidenParams>) {}
+
+    fn activate(
         params: &WidenParams,
-        config: &moose::core::plugin::PreparationConfig,
-    ) -> Result<(), moose::core::plugin::PreparationError> {
-        config.validate()?;
-        let n = config.audio.max_block_size;
-        state.mid.resize(n, 0.0);
-        state.side.resize(n, 0.0);
-        <Self as PluginLogic>::reset(state, params, &config.audio);
-        Ok(())
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<WidenProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let n = config.max_block_size;
+        Ok(WidenProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            mid: vec![0.0; n],
+            side: vec![0.0; n],
+        })
     }
 
-    /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut WidenDsp, params: &WidenParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        state.mid.fill(0.0);
-        state.side.fill(0.0);
+    fn reset(processor: &mut WidenProcessor, params: &WidenParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.mid.fill(0.0);
+        processor.side.fill(0.0);
     }
 
     fn process(
-        state: &mut WidenDsp,
+        state: &mut WidenProcessor,
         params: &WidenParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -156,7 +161,7 @@ impl PluginLogic for Widen {
 }
 
 moose::plugin! {
-    logic: Widen,
+    plugin: Widen,
     params: WidenParams,
 }
 
@@ -171,7 +176,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -190,7 +195,7 @@ mod tests {
         use std::time::Duration;
         // A block larger than the former hard-coded 1024 scratch. The whole
         // block must be written, not truncated at 1024 samples.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .block_size(2048)
             .duration(Duration::from_millis(100))
             .input(InputSource::Constant(0.5))
@@ -206,14 +211,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.3))
             .run();
@@ -223,32 +228,32 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     /// At default width = 1.0, recombination should be the
@@ -259,7 +264,7 @@ mod tests {
     fn unity_at_default_width() {
         use moose_test::{InputSource, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.4))
             .run();
@@ -281,13 +286,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/block_widen_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/block_widen_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/block_widen_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_widen_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -295,7 +300,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/block_widen_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_widen_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

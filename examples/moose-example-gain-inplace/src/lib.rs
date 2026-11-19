@@ -71,6 +71,8 @@ pub struct GainInPlace;
 pub struct Smoothing {
     gain: ParamSmoother,
     pan: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 impl Smoothing {
@@ -81,12 +83,28 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for GainInPlace {
-    type Params = GainInPlaceParams;
-    type DspState = Smoothing;
+impl Plugin for GainInPlace {
+    type Shared = GainInPlaceParams;
+    type MainThread = ();
+    type Processor = Smoothing;
 
-    fn reset(state: &mut Smoothing, params: &GainInPlaceParams, config: &AudioConfig) {
-        state.reset(params, config.sample_rate);
+    fn main_thread(_shared: &Arc<GainInPlaceParams>) {}
+
+    fn activate(
+        shared: &GainInPlaceParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Smoothing, PreparationError> {
+        let mut smoothing = Smoothing {
+            sample_rate: config.sample_rate,
+            ..Smoothing::default()
+        };
+        smoothing.reset(shared, config.sample_rate);
+        Ok(smoothing)
+    }
+
+    fn reset(state: &mut Smoothing, params: &GainInPlaceParams) {
+        state.reset(params, state.sample_rate);
     }
 
     /// Opt into zero-copy in-place I/O. EXPERIMENTAL and NOT RECOMMENDED
@@ -189,7 +207,7 @@ impl PluginLogic for GainInPlace {
 }
 
 moose::plugin! {
-    logic: GainInPlace,
+    plugin: GainInPlace,
     params: GainInPlaceParams,
 }
 
@@ -201,22 +219,22 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn bus_config_effect() {
-        moose_test::assert_bus_config_effect::<Plugin>();
+        moose_test::assert_bus_config_effect::<PluginShell>();
     }
 
     /// Correctness of the gain DSP through the offline driver. The driver
@@ -228,7 +246,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.5))
             .set_param(P::Gain, 1.0) // +6 dB, centered pan

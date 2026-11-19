@@ -1,5 +1,5 @@
-use moose_example_chord::Plugin;
+use moose_example_chord::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

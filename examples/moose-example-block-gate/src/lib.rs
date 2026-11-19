@@ -48,6 +48,8 @@ pub struct Gate;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Smoothing {
     threshold: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 impl Smoothing {
@@ -57,12 +59,28 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Gate {
-    type Params = GateParams;
-    type DspState = Smoothing;
+impl Plugin for Gate {
+    type Shared = GateParams;
+    type MainThread = ();
+    type Processor = Smoothing;
 
-    fn reset(state: &mut Smoothing, params: &GateParams, config: &AudioConfig) {
-        state.reset(params, config.sample_rate);
+    fn main_thread(_shared: &Arc<GateParams>) {}
+
+    fn activate(
+        shared: &GateParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Smoothing, PreparationError> {
+        let mut smoothing = Smoothing {
+            sample_rate: config.sample_rate,
+            ..Smoothing::default()
+        };
+        smoothing.reset(shared, config.sample_rate);
+        Ok(smoothing)
+    }
+
+    fn reset(state: &mut Smoothing, params: &GateParams) {
+        state.reset(params, state.sample_rate);
     }
 
     fn process(
@@ -76,7 +94,11 @@ impl PluginLogic for Gate {
         // in one atomic pair, so the threshold's `exp(20)` smoothing
         // settles in ~20 ms wall-clock instead of ~20 blocks (which
         // a per-block `.next()` would silently downsample to).
-        let threshold_lin = db_to_linear(state.threshold.next_after(&params.threshold, buffer.num_samples()));
+        let threshold_lin = db_to_linear(
+            state
+                .threshold
+                .next_after(&params.threshold, buffer.num_samples()),
+        );
         let nch = buffer.channels();
 
         // Detect: peak over every input channel. The gate opens
@@ -128,7 +150,7 @@ impl PluginLogic for Gate {
 }
 
 moose::plugin! {
-    logic: Gate,
+    plugin: Gate,
     params: GateParams,
 }
 
@@ -143,7 +165,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -158,14 +180,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output_when_above_threshold() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.3))
             .run();
@@ -176,32 +198,32 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     /// Silent input → silent output regardless of threshold.
@@ -211,7 +233,7 @@ mod tests {
     fn silence_passes_to_silence() {
         use moose_test::{InputSource, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.0))
             .run();
@@ -225,13 +247,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/block_gate_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/block_gate_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/block_gate_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_gate_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -239,7 +261,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/block_gate_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_gate_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

@@ -36,29 +36,18 @@ pub struct CcFilterParams {
     pub cc: IntParam,
 }
 
-/// Stateless descriptor - DSP state lives in [`CcFilterDspState`].
+/// Stateless descriptor - DSP state lives in [`CcFilterProcessor`].
 pub struct CcFilter;
 
 /// Per-instance DSP state: the one-pole filter memory and the
 /// CC-driven cutoff.
-pub struct CcFilterDspState {
+pub struct CcFilterProcessor {
     smoothing: Smoothing,
     sample_rate: f64,
     /// One-pole state per channel.
     z1: [f64; 2],
     /// Cutoff in Hz, updated when a matching CC arrives.
     cutoff_hz: f64,
-}
-
-impl Default for CcFilterDspState {
-    fn default() -> Self {
-        Self {
-            smoothing: Smoothing::default(),
-            sample_rate: 44100.0,
-            z1: [0.0; 2],
-            cutoff_hz: 1000.0,
-        }
-    }
 }
 
 /// Map a 7-bit CC value to a cutoff in Hz on a log scale (20..20000),
@@ -88,20 +77,37 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for CcFilter {
-    type Params = CcFilterParams;
-    type DspState = CcFilterDspState;
+impl Plugin for CcFilter {
+    type Shared = CcFilterParams;
+    type MainThread = ();
+    type Processor = CcFilterProcessor;
 
-    fn reset(state: &mut CcFilterDspState, params: &CcFilterParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.z1 = [0.0; 2];
-        state.cutoff_hz = f64::from(state.smoothing.cutoff.next(&params.cutoff));
+    fn main_thread(_shared: &Arc<CcFilterParams>) {}
+
+    fn activate(
+        params: &CcFilterParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<CcFilterProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let cutoff_hz = f64::from(smoothing.cutoff.next(&params.cutoff));
+        Ok(CcFilterProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            z1: [0.0; 2],
+            cutoff_hz,
+        })
+    }
+
+    fn reset(processor: &mut CcFilterProcessor, params: &CcFilterParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.z1 = [0.0; 2];
+        processor.cutoff_hz = f64::from(processor.smoothing.cutoff.next(&params.cutoff));
     }
 
     fn process(
-        state: &mut CcFilterDspState,
+        state: &mut CcFilterProcessor,
         params: &CcFilterParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -118,14 +124,15 @@ impl PluginLogic for CcFilter {
         }
 
         let a = one_pole_a(state.cutoff_hz, state.sample_rate);
-        for ch in 0..buffer.channels().min(2) {
-            let mut z = state.z1[ch];
+        let channels = buffer.channels();
+        for (ch, z1) in state.z1.iter_mut().enumerate().take(channels) {
+            let mut z = *z1;
             let (inp, out) = buffer.io(ch);
             for i in 0..inp.len() {
                 z += a * (f64::from(inp[i]) - z);
                 out[i] = filtered_f32(z);
             }
-            state.z1[ch] = z;
+            *z1 = z;
         }
 
         ProcessStatus::Normal
@@ -148,7 +155,7 @@ fn filtered_f32(z: f64) -> f32 {
 }
 
 moose::plugin! {
-    logic: CcFilter,
+    plugin: CcFilter,
     params: CcFilterParams,
 }
 
@@ -163,7 +170,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -179,7 +186,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -199,7 +206,7 @@ mod tests {
     #[test]
     fn effect_accepts_midi_input() {
         use moose_core::plugin::PluginRuntime;
-        let info = <Plugin as PluginRuntime>::info();
+        let info = <PluginShell as PluginRuntime>::info();
         assert!(
             info.accepts_midi_in,
             "midi_input = true should set accepts_midi_in on an effect"
@@ -210,8 +217,12 @@ mod tests {
     #[test]
     fn cc_steers_cutoff() {
         let params = CcFilterParams::new();
-        let mut state = CcFilter::init(&params, &InitContext::new(None));
-        CcFilter::reset(&mut state, &params, &AudioConfig::new(44100.0, 64));
+        let mut state = CcFilter::activate(
+            &params,
+            &AudioConfig::new(44100.0, 64),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let before = state.cutoff_hz;
         let input = vec![vec![0.0f32; 64]; 2];
@@ -247,13 +258,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/cc_filter_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/cc_filter_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/cc_filter_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/cc_filter_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -261,7 +272,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/cc_filter_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/cc_filter_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

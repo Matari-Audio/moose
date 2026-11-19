@@ -1,5 +1,5 @@
-use moose_example_block_drywet::Plugin;
+use moose_example_block_drywet::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

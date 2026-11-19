@@ -101,7 +101,7 @@ fn reopened_editor_keeps_the_host_scale() {
     // SAFETY: drives its own instance through the plugin vtable; no
     // `set_parent`, so no window is ever made.
     unsafe {
-        let plugin = moose_clap::create_plugin_instance::<Plugin>(descriptor, host);
+        let plugin = moose_clap::create_plugin_instance::<PluginShell>(descriptor, host);
         let vt = &*plugin;
         assert!((vt.init.unwrap())(plugin));
         let gui =

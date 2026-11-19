@@ -53,6 +53,8 @@ const SC_METERS: [P; 2] = [P::ScL, P::ScR];
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Smoothing {
     mix: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 impl Smoothing {
@@ -62,12 +64,28 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Sidechain {
-    type Params = SidechainParams;
-    type DspState = Smoothing;
+impl Plugin for Sidechain {
+    type Shared = SidechainParams;
+    type MainThread = ();
+    type Processor = Smoothing;
 
-    fn reset(state: &mut Smoothing, params: &SidechainParams, config: &AudioConfig) {
-        state.reset(params, config.sample_rate);
+    fn main_thread(_shared: &Arc<SidechainParams>) {}
+
+    fn activate(
+        shared: &SidechainParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Smoothing, PreparationError> {
+        let mut smoothing = Smoothing {
+            sample_rate: config.sample_rate,
+            ..Smoothing::default()
+        };
+        smoothing.reset(shared, config.sample_rate);
+        Ok(smoothing)
+    }
+
+    fn reset(state: &mut Smoothing, params: &SidechainParams) {
+        state.reset(params, state.sample_rate);
     }
 
     fn bus_layouts() -> Vec<BusLayout> {
@@ -143,7 +161,7 @@ impl PluginLogic for Sidechain {
 }
 
 moose::plugin! {
-    logic: Sidechain,
+    plugin: Sidechain,
     params: SidechainParams,
 }
 
@@ -155,22 +173,22 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn declares_a_separate_sidechain_bus() {
-        let layout = <Sidechain as PluginLogic>::bus_layouts()
+        let layout = <Sidechain as Plugin>::bus_layouts()
             .into_iter()
             .next()
             .unwrap();
@@ -191,7 +209,7 @@ mod tests {
         let frames = 4096;
         let main = vec![vec![1.0f32; frames], vec![0.0f32; frames]];
         let side = vec![vec![0.0f32; frames], vec![1.0f32; frames]];
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(20))
             .input(InputSource::Buffer(main))
             .sidechain(InputSource::Buffer(side))
@@ -224,7 +242,7 @@ mod tests {
         let main = || InputSource::Buffer(vec![vec![0.25f32; frames]; 2]);
         let side = || InputSource::Buffer(vec![vec![0.75f32; frames]; 2]);
         let tail = |mix: f64| {
-            let out = driver!(Plugin)
+            let out = driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(main())
                 .sidechain(side())
@@ -248,7 +266,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(30))
                 .input(InputSource::Constant(0.3))
                 .script(|s| {

@@ -76,10 +76,10 @@ struct Voice {
     pan_r: f32,
 }
 
-/// Stateless descriptor - the synth's per-block DSP state is [`SynthDspState`].
+/// Stateless descriptor - the synth's per-block DSP state is [`SynthProcessor`].
 pub struct Synth;
 
-pub struct SynthDspState {
+pub struct SynthProcessor {
     smoothing: Smoothing,
     sample_rate: f64,
     voices: [Voice; NUM_VOICES],
@@ -87,18 +87,7 @@ pub struct SynthDspState {
     channel_bend: [f64; 16],
 }
 
-impl Default for SynthDspState {
-    fn default() -> Self {
-        SynthDspState {
-            smoothing: Smoothing::default(),
-            sample_rate: 44100.0,
-            voices: [Voice::default(); NUM_VOICES],
-            channel_bend: [0.0; 16],
-        }
-    }
-}
-
-impl SynthDspState {
+impl SynthProcessor {
     /// Store a channel bend and retune every sounding voice on the
     /// channel so the cached `freq` tracks it.
     fn set_channel_bend(&mut self, channel: u8, semis: f64) {
@@ -279,9 +268,12 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Synth {
-    type Params = SynthParams;
-    type DspState = SynthDspState;
+impl Plugin for Synth {
+    type Shared = SynthParams;
+    type MainThread = ();
+    type Processor = SynthProcessor;
+
+    fn main_thread(_shared: &Arc<SynthParams>) {}
 
     fn bus_layouts() -> Vec<BusLayout> {
         // Stereo only: voices are panned across the stereo field, so a
@@ -289,17 +281,30 @@ impl PluginLogic for Synth {
         vec![BusLayout::new().with_output("Main", ChannelConfig::Stereo)]
     }
 
-    fn reset(state: &mut SynthDspState, params: &SynthParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.voices = [Voice::default(); NUM_VOICES];
-        state.channel_bend = [0.0; 16];
+    fn activate(
+        params: &SynthParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<SynthProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        Ok(SynthProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            voices: [Voice::default(); NUM_VOICES],
+            channel_bend: [0.0; 16],
+        })
+    }
+
+    fn reset(processor: &mut SynthProcessor, params: &SynthParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.voices = [Voice::default(); NUM_VOICES];
+        processor.channel_bend = [0.0; 16];
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn process(
-        state: &mut SynthDspState,
+        state: &mut SynthProcessor,
         params: &SynthParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -308,7 +313,10 @@ impl PluginLogic for Synth {
         let n = buffer.num_samples();
         // Advance the smoothers by the block (`current()`
         // alone never advances - the knobs would freeze at reset).
-        let master = state.smoothing.master_cutoff.next_after(&params.master_cutoff, n);
+        let master = state
+            .smoothing
+            .master_cutoff
+            .next_after(&params.master_cutoff, n);
         let volume = db_to_linear(state.smoothing.volume.next_after(&params.volume, n));
         let rel_s = params.release.raw_target().max(0.01);
         let atk_step = (1.0 / (0.005 * state.sample_rate)) as f32; // ~5 ms attack
@@ -377,7 +385,7 @@ impl PluginLogic for Synth {
 }
 
 moose::plugin! {
-    logic: Synth,
+    plugin: Synth,
     params: SynthParams,
 }
 
@@ -392,7 +400,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -407,10 +415,14 @@ mod tests {
         });
     }
 
-    fn render_full(input: &[Event]) -> (SynthDspState, Vec<f32>, Vec<f32>) {
+    fn render_full(input: &[Event]) -> (SynthProcessor, Vec<f32>, Vec<f32>) {
         let params = SynthParams::new();
-        let mut state = Synth::init(&params, &InitContext::new(None));
-        Synth::reset(&mut state, &params, &AudioConfig::new(44100.0, 64));
+        let mut state = Synth::activate(
+            &params,
+            &AudioConfig::new(44100.0, 64),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let in_refs: Vec<&[f32]> = Vec::new();
         let mut l = vec![0.0f32; 64];
@@ -430,7 +442,7 @@ mod tests {
         (state, l, r)
     }
 
-    fn render(input: &[Event]) -> (SynthDspState, Vec<f32>) {
+    fn render(input: &[Event]) -> (SynthProcessor, Vec<f32>) {
         let (state, l, _r) = render_full(input);
         (state, l)
     }
@@ -446,7 +458,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -565,13 +577,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/mpe_synth_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/mpe_synth_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/mpe_synth_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/mpe_synth_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -579,7 +591,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/mpe_synth_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/mpe_synth_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

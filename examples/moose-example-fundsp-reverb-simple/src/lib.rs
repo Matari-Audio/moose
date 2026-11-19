@@ -17,6 +17,9 @@
 //!
 //! See `README.md` for the integration patterns + gotchas.
 
+// fundsp's type-level graph combinators nest deeper than the default limit.
+#![recursion_limit = "256"]
+
 use fundsp::prelude::{
     AudioUnit, Shared, U2, dc, highpass, lowpass, multipass, pass, reverb_stereo, shared, var,
 };
@@ -30,7 +33,6 @@ use FundspReverbSimpleParamsParamId as P;
 const DEFAULT_LOW_CUT_HZ: f32 = 120.0;
 const DEFAULT_HIGH_CUT_HZ: f32 = 8000.0;
 const DEFAULT_REVERB_MIX: f32 = 0.25;
-const DEFAULT_TIME_S: f32 = 3.0;
 const FILTER_Q: f32 = 0.707;
 const ROOM_SIZE: f64 = 10.0;
 const DAMPING: f64 = 0.5;
@@ -88,12 +90,12 @@ pub struct FundspReverbSimpleParams {
     pub meter_r: MeterSlot,
 }
 
-/// Stateless descriptor - DSP state lives in [`FundspReverbSimpleDspState`].
+/// Stateless descriptor - DSP state lives in [`FundspReverbSimpleProcessor`].
 pub struct FundspReverbSimple;
 
 /// Per-instance DSP state: the fundsp graph, the atomic cells it
 /// reads, and the inputs the current graph was built with.
-pub struct FundspReverbSimpleDspState {
+pub struct FundspReverbSimpleProcessor {
     smoothing: Smoothing,
     // Atomic cells the fundsp graph reads each sample via `var()`.
     low_cut_shared: Shared,
@@ -106,21 +108,7 @@ pub struct FundspReverbSimpleDspState {
     last_built_time_s: f32,
 }
 
-impl Default for FundspReverbSimpleDspState {
-    fn default() -> Self {
-        Self {
-            smoothing: Smoothing::default(),
-            low_cut_shared: shared(DEFAULT_LOW_CUT_HZ),
-            high_cut_shared: shared(DEFAULT_HIGH_CUT_HZ),
-            mix_shared: shared(DEFAULT_REVERB_MIX),
-            graph: Box::new(multipass::<U2>()),
-            last_built_sr: 0.0,
-            last_built_time_s: DEFAULT_TIME_S,
-        }
-    }
-}
-
-impl FundspReverbSimpleDspState {
+impl FundspReverbSimpleProcessor {
     /// Allocates via `Box::new` + `allocate()`. **Called from
     /// `process()` on the audio thread when Time changes** - that's
     /// the simplification this variant exists to highlight. See the
@@ -172,9 +160,12 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for FundspReverbSimple {
-    type Params = FundspReverbSimpleParams;
-    type DspState = FundspReverbSimpleDspState;
+impl Plugin for FundspReverbSimple {
+    type Shared = FundspReverbSimpleParams;
+    type MainThread = ();
+    type Processor = FundspReverbSimpleProcessor;
+
+    fn main_thread(_shared: &Arc<FundspReverbSimpleParams>) {}
 
     fn bus_layouts() -> Vec<BusLayout> {
         vec![
@@ -186,26 +177,31 @@ impl PluginLogic for FundspReverbSimple {
         ]
     }
 
-    fn reset(
-        state: &mut FundspReverbSimpleDspState,
+    fn activate(
         params: &FundspReverbSimpleParams,
         config: &AudioConfig,
-    ) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
+        _cx: &InitContext,
+    ) -> Result<FundspReverbSimpleProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
         let time_s = params.time.value();
-        // SR is a discrete host setting, not a measurement.
-        let sr_changed = sample_rate.to_bits() != state.last_built_sr.to_bits();
-        let time_changed = (time_s - state.last_built_time_s).abs() > TIME_REBUILD_THRESHOLD_S;
-        if sr_changed || time_changed {
-            state.rebuild_graph(sample_rate, time_s);
-            state.last_built_sr = sample_rate;
-            state.last_built_time_s = time_s;
-        }
+        Ok(FundspReverbSimpleProcessor {
+            smoothing,
+            low_cut_shared: shared(DEFAULT_LOW_CUT_HZ),
+            high_cut_shared: shared(DEFAULT_HIGH_CUT_HZ),
+            mix_shared: shared(DEFAULT_REVERB_MIX),
+            graph: Box::new(multipass::<U2>()),
+            last_built_sr: config.sample_rate,
+            last_built_time_s: time_s,
+        })
+    }
+
+    fn reset(processor: &mut FundspReverbSimpleProcessor, params: &FundspReverbSimpleParams) {
+        processor.smoothing.reset(params, processor.last_built_sr);
     }
 
     fn process(
-        state: &mut FundspReverbSimpleDspState,
+        state: &mut FundspReverbSimpleProcessor,
         params: &FundspReverbSimpleParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -229,9 +225,15 @@ impl PluginLogic for FundspReverbSimple {
         // both graph inputs (the stereo->stereo bus maps 1:1), so no
         // per-width branch is needed.
         buffer.for_each_stereo_frame(|frame_in, frame_out| {
-            state.low_cut_shared.set_value(state.smoothing.low_cut.next(&params.low_cut));
-            state.high_cut_shared.set_value(state.smoothing.high_cut.next(&params.high_cut));
-            state.mix_shared.set_value(state.smoothing.mix.next(&params.mix));
+            state
+                .low_cut_shared
+                .set_value(state.smoothing.low_cut.next(&params.low_cut));
+            state
+                .high_cut_shared
+                .set_value(state.smoothing.high_cut.next(&params.high_cut));
+            state
+                .mix_shared
+                .set_value(state.smoothing.mix.next(&params.mix));
             state.graph.tick(frame_in, frame_out);
         });
 
@@ -259,7 +261,7 @@ impl PluginLogic for FundspReverbSimple {
 }
 
 moose::plugin! {
-    logic: FundspReverbSimple,
+    plugin: FundspReverbSimple,
     params: FundspReverbSimpleParams,
 }
 
@@ -273,7 +275,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -281,7 +283,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.5))
             .run();
@@ -296,7 +298,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(500))
             .input(InputSource::Constant(0.5))
             .run();
@@ -312,7 +314,7 @@ mod tests {
         use std::time::Duration;
 
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.5))
                 .run()
@@ -331,7 +333,7 @@ mod tests {
         use std::time::Duration;
 
         assert_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.5))
                 .script(|sc| {
@@ -356,7 +358,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_secs(2))
             .input(InputSource::Constant(0.5))
             .run();
@@ -373,7 +375,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(750))
             .input(InputSource::Constant(0.3))
             .script(|s| {
@@ -397,7 +399,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .sample_rate(96_000.0)
             .duration(Duration::from_secs(1))
             .input(InputSource::Constant(0.5))
@@ -408,53 +410,60 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn bus_config_effect() {
-        moose_test::assert_bus_config_effect::<Plugin>();
+        moose_test::assert_bus_config_effect::<PluginShell>();
     }
 
     #[test]
     fn param_count_matches() {
-        moose_test::assert_param_count_matches::<Plugin>();
+        moose_test::assert_param_count_matches::<PluginShell>();
     }
 
     #[test]
     fn corrupt_state_no_crash() {
-        moose_test::assert_corrupt_state_no_crash::<Plugin>();
+        moose_test::assert_corrupt_state_no_crash::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/fundsp_reverb_simple_default_macos.png").run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/fundsp_reverb_simple_default_macos.png"
+        )
+        .run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/fundsp_reverb_simple_default_linux.png")
-            .pixel_threshold(2)
-            .run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/fundsp_reverb_simple_default_linux.png"
+        )
+        .pixel_threshold(2)
+        .run();
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
         moose_test::screenshot!(
-            Plugin,
+            PluginShell,
             "screenshots/fundsp_reverb_simple_default_windows.png"
         )
         .pixel_threshold(2)

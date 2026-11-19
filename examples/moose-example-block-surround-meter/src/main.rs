@@ -1,5 +1,5 @@
-use moose_example_block_surround_meter::Plugin;
+use moose_example_block_surround_meter::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

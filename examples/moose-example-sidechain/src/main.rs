@@ -1,5 +1,5 @@
-use moose_example_sidechain::Plugin;
+use moose_example_sidechain::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

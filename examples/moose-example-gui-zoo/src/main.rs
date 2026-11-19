@@ -1,5 +1,5 @@
-use moose_example_gui_zoo::Plugin;
+use moose_example_gui_zoo::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

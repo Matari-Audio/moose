@@ -138,10 +138,10 @@ struct Held {
     phase: f64,
 }
 
-/// Stateless descriptor. The per-block DSP state lives in [`SpreaderDspState`].
+/// Stateless descriptor. The per-block DSP state lives in [`SpreaderProcessor`].
 pub struct Spreader;
 
-pub struct SpreaderDspState {
+pub struct SpreaderProcessor {
     sample_rate: f64,
     /// Held notes indexed by note number. One entry per pitch - a second
     /// `NoteOn` of the same pitch overwrites (a test tool, not a full
@@ -154,17 +154,6 @@ pub struct SpreaderDspState {
     vibrato: Option<VibratoKind>,
 }
 
-impl Default for SpreaderDspState {
-    fn default() -> Self {
-        SpreaderDspState {
-            sample_rate: 44100.0,
-            held: [None; 128],
-            next_channel: 0,
-            vibrato: None,
-        }
-    }
-}
-
 // LFO sample -> 32-bit per-note pitch bend around centre.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn lfo_bend(depth: f64, s: f64) -> u32 {
@@ -174,27 +163,41 @@ fn lfo_bend(depth: f64, s: f64) -> u32 {
         .clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
-impl PluginLogic for Spreader {
-    type Params = SpreaderParams;
-    type DspState = SpreaderDspState;
+impl Plugin for Spreader {
+    type Shared = SpreaderParams;
+    type MainThread = ();
+    type Processor = SpreaderProcessor;
+
+    fn main_thread(_shared: &Arc<SpreaderParams>) {}
+
+    fn activate(
+        _shared: &SpreaderParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<SpreaderProcessor, PreparationError> {
+        Ok(SpreaderProcessor {
+            sample_rate: config.sample_rate,
+            held: [None; 128],
+            next_channel: 0,
+            vibrato: None,
+        })
+    }
 
     fn bus_layouts() -> Vec<BusLayout> {
         // MIDI effect: no audio I/O.
         vec![BusLayout::new()]
     }
 
-    fn reset(state: &mut SpreaderDspState, _params: &SpreaderParams, config: &AudioConfig) {
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.held = [None; 128];
-        state.next_channel = 0;
-        state.vibrato = None;
+    fn reset(processor: &mut SpreaderProcessor, _params: &SpreaderParams) {
+        processor.held = [None; 128];
+        processor.next_channel = 0;
+        processor.vibrato = None;
     }
 
     // One arm per promoted event type - long but flat.
     #[allow(clippy::too_many_lines)]
     fn process(
-        state: &mut SpreaderDspState,
+        state: &mut SpreaderProcessor,
         params: &SpreaderParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -466,7 +469,7 @@ impl Spreader {
     /// any round-robin counters. Only called on `NoteOn`. `MPE Vibrato`
     /// fans like `Channel Fan` so each channel bend lands on one note.
     fn route(
-        state: &mut SpreaderDspState,
+        state: &mut SpreaderProcessor,
         algo: Algo,
         width: u8,
         group: u8,
@@ -487,7 +490,7 @@ impl Spreader {
     /// `offset` is the block's last sample (see the ordering note at
     /// the call site).
     fn recentre_held(
-        state: &mut SpreaderDspState,
+        state: &mut SpreaderProcessor,
         kind: VibratoKind,
         offset: u32,
         context: &mut ProcessContext,
@@ -507,7 +510,7 @@ impl Spreader {
     /// bend on `kind`'s wire at `offset` (the block's last sample). The
     /// semitone depth param scales into the wire's bend range.
     fn emit_vibrato(
-        state: &mut SpreaderDspState,
+        state: &mut SpreaderProcessor,
         params: &SpreaderParams,
         kind: VibratoKind,
         block_samples: usize,
@@ -546,7 +549,7 @@ impl Spreader {
 }
 
 moose::plugin! {
-    logic: Spreader,
+    plugin: Spreader,
     params: SpreaderParams,
 }
 
@@ -561,7 +564,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -580,8 +583,12 @@ mod tests {
         let params = SpreaderParams::new();
         params.algo.set_value(algo);
         params.channels.set_value(width);
-        let mut state = Spreader::init(&params, &InitContext::new(None));
-        Spreader::reset(&mut state, &params, &AudioConfig::new(44100.0, 64));
+        let mut state = Spreader::activate(
+            &params,
+            &AudioConfig::new(44100.0, 64),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let in_refs: Vec<&[f32]> = Vec::new();
         let mut out_refs: Vec<&mut [f32]> = Vec::new();
@@ -609,7 +616,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -704,8 +711,12 @@ mod tests {
     fn second_block(first_algo: Algo, second_algo: Algo, second_events: &[EventBody]) -> EventList {
         let params = SpreaderParams::new();
         params.algo.set_value(first_algo);
-        let mut state = Spreader::init(&params, &InitContext::new(None));
-        Spreader::reset(&mut state, &params, &AudioConfig::new(44100.0, 64));
+        let mut state = Spreader::activate(
+            &params,
+            &AudioConfig::new(44100.0, 64),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let in_refs: Vec<&[f32]> = Vec::new();
         let mut out_refs: Vec<&mut [f32]> = Vec::new();
@@ -834,13 +845,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/mpe_spreader_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/mpe_spreader_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/mpe_spreader_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/mpe_spreader_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -848,7 +859,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/mpe_spreader_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/mpe_spreader_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

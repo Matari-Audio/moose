@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use moose_core::plugin::PluginRuntime as _;
 use moose_core::state::{serialize_state, shared_plugin_state_hash};
-use moose_example_gain::{GainParamsParamId, Plugin};
+use moose_example_gain::{GainParamsParamId, PluginShell};
 
 const SAMPLE_RATE: u32 = 48_000;
 const DURATION_SECS: f32 = 1.0;
@@ -178,7 +178,7 @@ fn write_sine_wav(path: &Path) {
 }
 
 fn write_gain_state(path: &Path, gain_db: f64) {
-    let info = Plugin::info();
+    let info = PluginShell::info();
     let hash = shared_plugin_state_hash(&info);
     let ids = [GainParamsParamId::Gain.as_u32()];
     let values = [gain_db];

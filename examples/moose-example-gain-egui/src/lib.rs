@@ -63,6 +63,8 @@ pub struct GainEgui;
 pub struct Smoothing {
     gain: ParamSmoother,
     pan: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
 }
 
 impl Smoothing {
@@ -73,12 +75,28 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for GainEgui {
-    type Params = GainParams;
-    type DspState = Smoothing;
+impl Plugin for GainEgui {
+    type Shared = GainParams;
+    type MainThread = ();
+    type Processor = Smoothing;
 
-    fn reset(state: &mut Smoothing, params: &GainParams, config: &AudioConfig) {
-        state.reset(params, config.sample_rate);
+    fn main_thread(_shared: &Arc<GainParams>) {}
+
+    fn activate(
+        shared: &GainParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Smoothing, PreparationError> {
+        let mut smoothing = Smoothing {
+            sample_rate: config.sample_rate,
+            ..Smoothing::default()
+        };
+        smoothing.reset(shared, config.sample_rate);
+        Ok(smoothing)
+    }
+
+    fn reset(state: &mut Smoothing, params: &GainParams) {
+        state.reset(params, state.sample_rate);
     }
 
     fn process(
@@ -200,7 +218,7 @@ fn gain_ui(ui: &mut egui::Ui, state: &PluginContext<GainParams>) {
 }
 
 moose::plugin! {
-    logic: GainEgui,
+    plugin: GainEgui,
     params: GainParams,
 }
 
@@ -210,14 +228,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn renders_nonzero_output() {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -227,24 +245,24 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/gain_egui_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/gain_egui_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/gain_egui_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/gain_egui_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -252,7 +270,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/gain_egui_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/gain_egui_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

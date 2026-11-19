@@ -14,6 +14,9 @@
 //!
 //! See `README.md` for the integration patterns + gotchas.
 
+// fundsp's type-level graph combinators nest deeper than the default limit.
+#![recursion_limit = "256"]
+
 use crossbeam_queue::ArrayQueue;
 use fundsp::prelude::{
     AudioUnit, Shared, U2, dc, highpass, lowpass, multipass, pass, reverb_stereo, shared, var,
@@ -28,7 +31,6 @@ use FundspReverbWorkerParamsParamId as P;
 const DEFAULT_LOW_CUT_HZ: f32 = 120.0;
 const DEFAULT_HIGH_CUT_HZ: f32 = 8000.0;
 const DEFAULT_REVERB_MIX: f32 = 0.25;
-const DEFAULT_TIME_S: f32 = 3.0;
 const FILTER_Q: f32 = 0.707;
 const ROOM_SIZE: f64 = 10.0;
 const DAMPING: f64 = 0.5;
@@ -94,8 +96,8 @@ pub struct FundspReverbWorkerParams {
 }
 
 /// Allocates via `Box::new` + `allocate()`. The worker thread calls
-/// this off the audio thread; `reset()` also calls it directly since
-/// the host invokes `reset` off the audio thread.
+/// this off the audio thread, and `activate` calls it on the host main
+/// thread.
 fn build_graph(
     sample_rate: f64,
     time_s: f32,
@@ -176,31 +178,19 @@ impl Default for WorkerShared {
     }
 }
 
-/// Stateless descriptor - DSP state lives in [`FundspReverbWorkerDspState`].
+/// Stateless descriptor - DSP state lives in [`FundspReverbWorkerProcessor`].
 pub struct FundspReverbWorker;
 
 /// Per-instance DSP state: just the live graph and the inputs it was
 /// built with. The `Shared` cells + rebuild handoff queues live on the
 /// params (`WorkerShared`), and the rebuild runs on the framework's
 /// shared task pool - so there is no worker thread to own here.
-pub struct FundspReverbWorkerDspState {
+pub struct FundspReverbWorkerProcessor {
     smoothing: Smoothing,
     graph: Box<dyn AudioUnit>,
-    // Inputs the current graph was built with. `reset()` skips the
-    // rebuild when neither changed.
+    // Inputs the current graph was built with.
     last_built_sr: f64,
     last_built_time_s: f32,
-}
-
-impl Default for FundspReverbWorkerDspState {
-    fn default() -> Self {
-        Self {
-            smoothing: Smoothing::default(),
-            graph: Box::new(multipass::<U2>()),
-            last_built_sr: 0.0,
-            last_built_time_s: DEFAULT_TIME_S,
-        }
-    }
 }
 
 /// The processor's ramp for each smoothed parameter. Plain state owned by
@@ -221,9 +211,12 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for FundspReverbWorker {
-    type Params = FundspReverbWorkerParams;
-    type DspState = FundspReverbWorkerDspState;
+impl Plugin for FundspReverbWorker {
+    type Shared = FundspReverbWorkerParams;
+    type MainThread = ();
+    type Processor = FundspReverbWorkerProcessor;
+
+    fn main_thread(_shared: &Arc<FundspReverbWorkerParams>) {}
 
     fn bus_layouts() -> Vec<BusLayout> {
         vec![
@@ -235,31 +228,32 @@ impl PluginLogic for FundspReverbWorker {
         ]
     }
 
-    fn reset(
-        state: &mut FundspReverbWorkerDspState,
+    fn activate(
         params: &FundspReverbWorkerParams,
         config: &AudioConfig,
-    ) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
+        _cx: &InitContext,
+    ) -> Result<FundspReverbWorkerProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
         let time_s = params.time.value();
-        // SR is a discrete host setting, not a measurement.
-        let sr_changed = sample_rate.to_bits() != state.last_built_sr.to_bits();
-        let time_changed = (time_s - state.last_built_time_s).abs() > TIME_REBUILD_THRESHOLD_S;
-        if sr_changed || time_changed {
-            // Synchronous rebuild off the audio thread (reset isn't
-            // real-time). Drop any ready graph the pool built for the
-            // previous SR so it can't slip into the next `process`.
-            let w = &params.worker;
-            state.graph = build_graph(sample_rate, time_s, &w.low_cut, &w.high_cut, &w.mix);
-            state.last_built_sr = sample_rate;
-            state.last_built_time_s = time_s;
-            while w.ready.pop().is_some() {}
-        }
+        let w = &params.worker;
+        // Drop any ready graph built for a previous activation so it can't
+        // slip into the next `process`.
+        while w.ready.pop().is_some() {}
+        Ok(FundspReverbWorkerProcessor {
+            smoothing,
+            graph: build_graph(config.sample_rate, time_s, &w.low_cut, &w.high_cut, &w.mix),
+            last_built_sr: config.sample_rate,
+            last_built_time_s: time_s,
+        })
+    }
+
+    fn reset(processor: &mut FundspReverbWorkerProcessor, params: &FundspReverbWorkerParams) {
+        processor.smoothing.reset(params, processor.last_built_sr);
     }
 
     fn process(
-        state: &mut FundspReverbWorkerDspState,
+        state: &mut FundspReverbWorkerProcessor,
         params: &FundspReverbWorkerParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -311,8 +305,10 @@ impl PluginLogic for FundspReverbWorker {
         // both graph inputs (the stereo->stereo bus maps 1:1), so no
         // per-width branch is needed.
         buffer.for_each_stereo_frame(|frame_in, frame_out| {
-            w.low_cut.set_value(state.smoothing.low_cut.next(&params.low_cut));
-            w.high_cut.set_value(state.smoothing.high_cut.next(&params.high_cut));
+            w.low_cut
+                .set_value(state.smoothing.low_cut.next(&params.low_cut));
+            w.high_cut
+                .set_value(state.smoothing.high_cut.next(&params.high_cut));
             w.mix.set_value(state.smoothing.mix.next(&params.mix));
             state.graph.tick(frame_in, frame_out);
         });
@@ -372,7 +368,7 @@ impl BackgroundTask for RebuildRequest {
 }
 
 moose::plugin! {
-    logic: FundspReverbWorker,
+    plugin: FundspReverbWorker,
     params: FundspReverbWorkerParams,
     tasks: [RebuildRequest],
 }
@@ -387,7 +383,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     /// The point of the worker variant: a Time change hands the graph
@@ -403,7 +399,7 @@ mod tests {
         use std::time::Duration;
 
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.5))
                 .script(|sc| {
@@ -421,7 +417,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.5))
             .run();
@@ -436,7 +432,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(500))
             .input(InputSource::Constant(0.5))
             .run();
@@ -454,7 +450,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_secs(2))
             .input(InputSource::Constant(0.5))
             .run();
@@ -472,7 +468,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(1500))
             .input(InputSource::Constant(0.3))
             .script(|s| {
@@ -499,7 +495,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(750))
             .input(InputSource::Constant(0.3))
             .script(|s| {
@@ -523,7 +519,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .sample_rate(96_000.0)
             .duration(Duration::from_secs(1))
             .input(InputSource::Constant(0.5))
@@ -534,53 +530,60 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<Plugin>();
+        moose_test::assert_editor_lifecycle::<PluginShell>();
     }
 
     #[test]
     fn bus_config_effect() {
-        moose_test::assert_bus_config_effect::<Plugin>();
+        moose_test::assert_bus_config_effect::<PluginShell>();
     }
 
     #[test]
     fn param_count_matches() {
-        moose_test::assert_param_count_matches::<Plugin>();
+        moose_test::assert_param_count_matches::<PluginShell>();
     }
 
     #[test]
     fn corrupt_state_no_crash() {
-        moose_test::assert_corrupt_state_no_crash::<Plugin>();
+        moose_test::assert_corrupt_state_no_crash::<PluginShell>();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/fundsp_reverb_worker_default_macos.png").run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/fundsp_reverb_worker_default_macos.png"
+        )
+        .run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/fundsp_reverb_worker_default_linux.png")
-            .pixel_threshold(2)
-            .run();
+        moose_test::screenshot!(
+            PluginShell,
+            "screenshots/fundsp_reverb_worker_default_linux.png"
+        )
+        .pixel_threshold(2)
+        .run();
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
         moose_test::screenshot!(
-            Plugin,
+            PluginShell,
             "screenshots/fundsp_reverb_worker_default_windows.png"
         )
         .pixel_threshold(2)

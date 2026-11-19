@@ -1,5 +1,5 @@
-use moose_example_mpe_synth::Plugin;
+use moose_example_mpe_synth::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

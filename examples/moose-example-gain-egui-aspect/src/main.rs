@@ -1,5 +1,5 @@
-use moose_example_gain_egui_aspect::Plugin;
+use moose_example_gain_egui_aspect::PluginShell;
 
 fn main() {
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

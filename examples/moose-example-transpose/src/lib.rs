@@ -25,22 +25,14 @@ pub struct TransposeParams {
 
 // --- Plugin ---
 
-/// Stateless descriptor - DSP state lives in [`TransposeDspState`].
+/// Stateless descriptor - DSP state lives in [`TransposeProcessor`].
 pub struct Transpose;
 
 /// Per-instance DSP state: the note-tracking table.
-pub struct TransposeDspState {
+pub struct TransposeProcessor {
     /// Maps input note -> output note that was actually sent.
     /// Used to send correct `NoteOff` even if shift changes mid-hold.
     active_notes: [Option<u8>; 128],
-}
-
-impl Default for TransposeDspState {
-    fn default() -> Self {
-        Self {
-            active_notes: [None; 128],
-        }
-    }
 }
 
 /// Apply `shift` to a MIDI `note` and clamp the result to `0..=127`.
@@ -51,9 +43,22 @@ fn shift_midi(note: u8, shift: i32) -> u8 {
     (i32::from(note) + shift).clamp(0, 127) as u8
 }
 
-impl PluginLogic for Transpose {
-    type Params = TransposeParams;
-    type DspState = TransposeDspState;
+impl Plugin for Transpose {
+    type Shared = TransposeParams;
+    type MainThread = ();
+    type Processor = TransposeProcessor;
+
+    fn main_thread(_shared: &Arc<TransposeParams>) {}
+
+    fn activate(
+        _shared: &TransposeParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<TransposeProcessor, PreparationError> {
+        Ok(TransposeProcessor {
+            active_notes: [None; 128],
+        })
+    }
 
     /// MIDI effect: no audio I/O. CLAP/VST3/AU(aumi)/LV2 honor this;
     /// AAX (which has no audio-less plugin category) auto-adds a
@@ -64,7 +69,7 @@ impl PluginLogic for Transpose {
     }
 
     fn process(
-        state: &mut TransposeDspState,
+        state: &mut TransposeProcessor,
         params: &TransposeParams,
         _buffer: &mut AudioBuffer,
         events: &EventList,
@@ -134,7 +139,7 @@ impl PluginLogic for Transpose {
 }
 
 moose::plugin! {
-    logic: Transpose,
+    plugin: Transpose,
     params: TransposeParams,
 }
 
@@ -151,7 +156,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -169,9 +174,13 @@ mod tests {
     #[test]
     fn transpose_up_octave() {
         let params = TransposeParams::new();
-        let mut state = Transpose::init(&params, &InitContext::new(None));
+        let mut state = Transpose::activate(
+            &params,
+            &AudioConfig::new(44100.0, 512),
+            &InitContext::new(None),
+        )
+        .expect("activate");
         params.octave.set_value(1);
-        Transpose::reset(&mut state, &params, &AudioConfig::new(44100.0, 512));
 
         let input = vec![vec![0.0f32; 512]; 2];
         let input_refs: Vec<&[f32]> = input.iter().map(std::vec::Vec::as_slice).collect();
@@ -208,13 +217,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/transpose_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/transpose_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/transpose_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/transpose_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -222,7 +231,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/transpose_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/transpose_default_windows.png")
             .pixel_threshold(2)
             .run();
     }
@@ -233,7 +242,7 @@ mod tests {
         use moose_core::info::PluginCategory;
         use moose_core::plugin::PluginRuntime;
         assert_eq!(
-            <Plugin as PluginRuntime>::info().category,
+            <PluginShell as PluginRuntime>::info().category,
             PluginCategory::NoteEffect
         );
     }

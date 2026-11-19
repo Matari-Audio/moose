@@ -39,13 +39,17 @@ struct Note {
 }
 
 /// Render `notes` on `port` across `total` samples, returning the
-/// left output channel. Drives the real `PluginLogic::process` in
+/// left output channel. Drives the real `Plugin::process` in
 /// `BLOCK`-sized chunks, injecting each note's on/off at its
 /// sample-accurate offset within the block it falls in.
 fn render_port(port: u8, notes: &[Note], total: usize) -> Vec<f32> {
     let params = MultiportParams::new();
-    let mut state = Multiport::init(&params, &InitContext::new(None));
-    Multiport::reset(&mut state, &params, &AudioConfig::new(SR, BLOCK));
+    let mut state = Multiport::activate(
+        &params,
+        &AudioConfig::new(SR, BLOCK),
+        &InitContext::new(None),
+    )
+    .expect("activate");
 
     let mut out = Vec::with_capacity(total);
     let transport = TransportInfo::default();

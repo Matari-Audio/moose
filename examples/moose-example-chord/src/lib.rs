@@ -78,10 +78,10 @@ pub struct ChordParams {
 
 const _: () = assert!(MAX_VOICES == 4, "one level per voice");
 
-/// Stateless descriptor - the chord's per-block DSP state is [`ChordDspState`].
+/// Stateless descriptor - the chord's per-block DSP state is [`ChordProcessor`].
 pub struct Chord;
 
-pub struct ChordDspState {
+pub struct ChordProcessor {
     smoothing: Smoothing,
     sample_rate: f64,
     /// Notes currently sounding (and emitted), one per voice.
@@ -91,19 +91,7 @@ pub struct ChordDspState {
     root: Option<u8>,
 }
 
-impl Default for ChordDspState {
-    fn default() -> Self {
-        ChordDspState {
-            smoothing: Smoothing::default(),
-            sample_rate: 44100.0,
-            notes: [None; MAX_VOICES],
-            phases: [0.0; MAX_VOICES],
-            root: None,
-        }
-    }
-}
-
-impl ChordDspState {
+impl ChordProcessor {
     /// Silence every sounding voice and emit a matching `NoteOff` for
     /// each, on `channel` / `group`.
     fn stop(&mut self, out: &mut EventList, offset: u32, group: u8, channel: u8) {
@@ -160,25 +148,42 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Chord {
-    type Params = ChordParams;
-    type DspState = ChordDspState;
+impl Plugin for Chord {
+    type Shared = ChordParams;
+    type MainThread = ();
+    type Processor = ChordProcessor;
+
+    fn main_thread(_shared: &Arc<ChordParams>) {}
 
     fn bus_layouts() -> Vec<BusLayout> {
         BusLayout::stereo_and_mono_output()
     }
 
-    fn reset(state: &mut ChordDspState, params: &ChordParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
-        let sample_rate = config.sample_rate;
-        state.sample_rate = sample_rate;
-        state.notes = [None; MAX_VOICES];
-        state.phases = [0.0; MAX_VOICES];
-        state.root = None;
+    fn activate(
+        params: &ChordParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<ChordProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        Ok(ChordProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            notes: [None; MAX_VOICES],
+            phases: [0.0; MAX_VOICES],
+            root: None,
+        })
+    }
+
+    fn reset(processor: &mut ChordProcessor, params: &ChordParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
+        processor.notes = [None; MAX_VOICES];
+        processor.phases = [0.0; MAX_VOICES];
+        processor.root = None;
     }
 
     fn process(
-        state: &mut ChordDspState,
+        state: &mut ChordProcessor,
         params: &ChordParams,
         buffer: &mut AudioBuffer,
         events: &EventList,
@@ -256,7 +261,7 @@ impl PluginLogic for Chord {
 }
 
 moose::plugin! {
-    logic: Chord,
+    plugin: Chord,
     params: ChordParams,
 }
 
@@ -271,7 +276,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -288,14 +293,14 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
     fn instrument_emits_midi() {
         use moose_core::info::PluginCategory;
         use moose_core::plugin::PluginRuntime;
-        let info = <Plugin as PluginRuntime>::info();
+        let info = <PluginShell as PluginRuntime>::info();
         assert_eq!(info.category, PluginCategory::Instrument);
         assert!(
             info.emits_midi,
@@ -307,8 +312,12 @@ mod tests {
     fn emits_triad_and_plays_audio() {
         let params = ChordParams::new();
         params.gain.set_value(1.0);
-        let mut state = Chord::init(&params, &InitContext::new(None));
-        Chord::reset(&mut state, &params, &AudioConfig::new(44100.0, 256));
+        let mut state = Chord::activate(
+            &params,
+            &AudioConfig::new(44100.0, 256),
+            &InitContext::new(None),
+        )
+        .expect("activate");
 
         let input_refs: Vec<&[f32]> = Vec::new();
         let mut output = vec![vec![0.0f32; 256]; 2];
@@ -371,13 +380,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/chord_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/chord_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/chord_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/chord_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -385,7 +394,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/chord_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/chord_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

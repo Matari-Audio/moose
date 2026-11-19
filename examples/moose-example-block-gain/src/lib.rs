@@ -44,14 +44,17 @@ pub struct GainParams {
     pub meter_right: MeterSlot,
 }
 
-/// Descriptor that is its own DSP state: holds the SIMD scratch, sized to
-/// the host's max block in `reset` so the envelope precompute never assumes
-/// a fixed block length.
+/// Stateless descriptor - the SIMD scratch lives in [`GainProcessor`].
+pub struct Gain;
+
+/// The SIMD scratch, sized to the host's max block in `activate`, so the
+/// envelope precompute never assumes a fixed block length.
 // `gain_db` is named for the `gain` param, not redundantly for the struct.
 #[allow(clippy::struct_field_names)]
-#[derive(Default)]
-pub struct Gain {
+pub struct GainProcessor {
     smoothing: Smoothing,
+    /// Rate the processor was activated at, for re-seating the ramps in `reset`.
+    sample_rate: f64,
     gain_db: Vec<f32>,
     pan: Vec<f32>,
     lin: Vec<f32>,
@@ -77,52 +80,57 @@ impl Smoothing {
     }
 }
 
-impl PluginLogic for Gain {
-    type Params = GainParams;
-    type DspState = Self;
+impl Plugin for Gain {
+    type Shared = GainParams;
+    type MainThread = ();
+    type Processor = GainProcessor;
+
+    fn main_thread(_shared: &Arc<GainParams>) {}
 
     /// Size the scratch to the host's max block, off the audio thread.
-    fn prepare(
-        state: &mut Self,
+    fn activate(
         params: &GainParams,
-        config: &moose::core::plugin::PreparationConfig,
-    ) -> Result<(), moose::core::plugin::PreparationError> {
-        config.validate()?;
-        for buf in [
-            &mut state.gain_db,
-            &mut state.pan,
-            &mut state.lin,
-            &mut state.g_l,
-            &mut state.g_r,
-        ] {
-            buf.resize(config.audio.max_block_size, 0.0);
-        }
-        <Self as PluginLogic>::reset(state, params, &config.audio);
-        Ok(())
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<GainProcessor, PreparationError> {
+        let mut smoothing = Smoothing::default();
+        smoothing.reset(params, config.sample_rate);
+        let n = config.max_block_size;
+        Ok(GainProcessor {
+            smoothing,
+            sample_rate: config.sample_rate,
+            gain_db: vec![0.0; n],
+            pan: vec![0.0; n],
+            lin: vec![0.0; n],
+            g_l: vec![0.0; n],
+            g_r: vec![0.0; n],
+        })
     }
 
     /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut Self, params: &GainParams, config: &AudioConfig) {
-        state.smoothing.reset(params, config.sample_rate);
+    fn reset(processor: &mut GainProcessor, params: &GainParams) {
+        processor.smoothing.reset(params, processor.sample_rate);
         for buf in [
-            &mut state.gain_db,
-            &mut state.pan,
-            &mut state.lin,
-            &mut state.g_l,
-            &mut state.g_r,
+            &mut processor.gain_db,
+            &mut processor.pan,
+            &mut processor.lin,
+            &mut processor.g_l,
+            &mut processor.g_r,
         ] {
             buf.fill(0.0);
         }
     }
 
     fn process(
-        state: &mut Self,
+        state: &mut GainProcessor,
         params: &GainParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
-        if !state.smoothing.gain.is_smoothing(&params.gain) && !state.smoothing.pan.is_smoothing(&params.pan) {
+        if !state.smoothing.gain.is_smoothing(&params.gain)
+            && !state.smoothing.pan.is_smoothing(&params.pan)
+        {
             // Fast path: gain constant for the whole block.
             let gain_db = params.gain.value();
             let pan = params.pan.value();
@@ -142,8 +150,14 @@ impl PluginLogic for Gain {
             // smoother by exactly `n` (matching what we consume), so
             // the gain doesn't step at the next block edge.
             let n = buffer.num_samples();
-            state.smoothing.gain.next_into(&params.gain, &mut state.gain_db[..n]);
-            state.smoothing.pan.next_into(&params.pan, &mut state.pan[..n]);
+            state
+                .smoothing
+                .gain
+                .next_into(&params.gain, &mut state.gain_db[..n]);
+            state
+                .smoothing
+                .pan
+                .next_into(&params.pan, &mut state.pan[..n]);
 
             // Vectorize the transcendental into `lin`. This is the
             // only step in the slow path that doesn't autovectorize
@@ -206,7 +220,7 @@ impl PluginLogic for Gain {
 }
 
 moose::plugin! {
-    logic: Gain,
+    plugin: Gain,
     params: GainParams,
 }
 
@@ -221,7 +235,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -241,7 +255,7 @@ mod tests {
         // A block larger than the former hard-coded 1024 scratch. With a
         // smoother active (the slow path), the envelope apply used to index
         // out of bounds and panic on the audio thread.
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .block_size(2048)
             .duration(Duration::from_millis(100))
             .input(InputSource::Constant(0.5))
@@ -262,7 +276,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -270,7 +284,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(12))
             .input(InputSource::Constant(0.5))
             .run();
@@ -280,32 +294,32 @@ mod tests {
 
     #[test]
     fn has_editor() {
-        moose_test::assert_has_editor::<Plugin>();
+        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]
     fn state_round_trips() {
-        moose_test::assert_state_round_trip::<Plugin>();
+        moose_test::assert_state_round_trip::<PluginShell>();
     }
 
     #[test]
     fn param_defaults_match() {
-        moose_test::assert_param_defaults_match::<Plugin>();
+        moose_test::assert_param_defaults_match::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_clamped() {
-        moose_test::assert_param_normalized_clamped::<Plugin>();
+        moose_test::assert_param_normalized_clamped::<PluginShell>();
     }
 
     #[test]
     fn param_normalized_roundtrip() {
-        moose_test::assert_param_normalized_roundtrip::<Plugin>();
+        moose_test::assert_param_normalized_roundtrip::<PluginShell>();
     }
 
     #[test]
     fn no_duplicate_param_ids() {
-        moose_test::assert_no_duplicate_param_ids::<Plugin>();
+        moose_test::assert_no_duplicate_param_ids::<PluginShell>();
     }
 
     #[test]
@@ -313,7 +327,7 @@ mod tests {
         use moose_test::{InputSource, assertions, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .sample_rate(44_100.0)
             .channels(2)
             .block_size(256)
@@ -333,7 +347,7 @@ mod tests {
         use moose_test::{InputSource, driver};
         use std::time::Duration;
 
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(50))
             .input(InputSource::Constant(0.5))
             .run();
@@ -348,13 +362,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/block_gain_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/block_gain_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/block_gain_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_gain_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -362,7 +376,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/block_gain_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/block_gain_default_windows.png")
             .pixel_threshold(2)
             .run();
     }

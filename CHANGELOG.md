@@ -4,6 +4,12 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Examples on `moose::Plugin`.** Every example under `examples/` now
+  implements `moose::Plugin` and exports with `plugin:` (alias `PluginShell`)
+  instead of `PluginLogic` / `PurePluginLogic` with `logic:`. Left on the
+  legacy trait: `moose-example-sysex-echo` (its `BlockRunner` test cannot
+  activate a processor) and the `Probe` fixture in
+  `moose-example-gain/tests/clap_gui_scale.rs`.
 - **Deprecated: smoothing in shared atomics.** `FloatParamReadF32`/`F64`
   `read`, `read_into`, `read_after` and `current`, and `FloatParam`'s
   `raw_smoothed_*`, `settled_value` and `is_smoothing` keep the ramp inside
