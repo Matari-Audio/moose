@@ -154,7 +154,7 @@ use moose_core::events::{
 };
 use moose_core::export::PluginExport;
 use moose_core::info::{MidiDialect, PluginCategory, PluginInfo, resolve_name_override};
-use moose_core::main_thread::{MainThreadHooks, NoteName};
+use moose_core::main_thread::{HostNotice, HostNotifier, MainThreadHooks, NoteName};
 use moose_core::meters::MeterStore;
 #[cfg(test)]
 use moose_core::midi::per_note_bend_semitones;
@@ -289,6 +289,9 @@ struct ClapPluginData<P: PluginExport> {
     pending_structure: MainThreadCell<Option<Vec<u32>>>,
     /// The plugin's main-thread part (`PluginExport::main_thread`).
     hooks: MainThreadCell<Box<dyn MainThreadHooks>>,
+    /// Note-name / voice-info notices from the plugin. Connected at init,
+    /// closed at destroy; its wake schedules `on_main_thread`.
+    host_notifier: HostNotifier,
     /// The note names taken by the last `note_name.count`.
     note_names: MainThreadCell<Vec<NoteName>>,
     /// Whether the hooks reported voice info at init (`voice_info`).
@@ -873,6 +876,8 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
         // SAFETY: `clap_plugin.init` is [main-thread] (plugin.h).
         let main = MainThread::assume();
         let data = &*data;
+        let notifier = data.host_notifier.clone();
+        data.with_hooks(&main, |hooks| hooks.connect(notifier));
         data.voice_info_supported
             .store(voice_info::query(data, &main).is_some(), Ordering::Relaxed);
         track_info::notify(data, &main);
@@ -904,6 +909,7 @@ unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *const clap_pl
             if let Some(signal) = &(*data_ptr).catalog_signal {
                 signal.close();
             }
+            (*data_ptr).host_notifier.close();
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
         }));
@@ -1141,6 +1147,15 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
         // SAFETY: `clap_plugin.on_main_thread` is [main-thread] (plugin.h).
         let main = MainThread::assume();
         catalog_sync::sync_parameters(data, &main);
+        // After `sync_parameters` cleared the wake flag, so a notice raised
+        // from here on schedules another callback.
+        let notices = data.host_notifier.take();
+        if notices.contains(HostNotice::NOTE_NAMES) {
+            note_name::host_changed(data.host);
+        }
+        if notices.contains(HostNotice::VOICE_INFO) {
+            voice_info::host_changed(data.host);
+        }
 
         if data.latency_dirty.swap(false, Ordering::Relaxed) && !data.host.is_null() {
             if data.active.load(Ordering::Relaxed) {
@@ -5311,6 +5326,7 @@ unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginC
         )
         .with_tasks(task_spawner_for_ctx)
         .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedEdits)
+        .with_host_notifier(data.host_notifier.clone())
         .with_mark_dirty({
             // `state.mark_dirty` is [main-thread]: flag it and ask for
             // `on_main_thread` (`request_callback` is thread-safe).
@@ -6066,6 +6082,18 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let hooks = MainThreadCell::new(instance.main_thread());
+        let presentation_pending = Arc::new(AtomicBool::new(false));
+        let host_notifier = HostNotifier::new({
+            let pending = Arc::clone(&presentation_pending);
+            // SAFETY: the host outlives the instance, and its
+            // `request_callback` is [thread-safe] (host.h).
+            let host = unsafe { SendPtr::new(host) };
+            move || {
+                // SAFETY: `destroy` closes the notifier before the instance
+                // and its host pointer go away.
+                unsafe { request_presentation_refresh(&pending, host.as_ptr()) };
+            }
+        });
         let exposed = Mutex::new(catalog_sync::ExposedParams::new(
             Arc::clone(&param_infos),
             params_arc.as_ref(),
@@ -6116,6 +6144,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             catalog_signal: None,
             pending_structure: MainThreadCell::new(None),
             hooks,
+            host_notifier,
             note_names: MainThreadCell::new(Vec::new()),
             voice_info_supported: AtomicBool::new(false),
             info,
@@ -6138,7 +6167,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             floating_closed: Arc::new(AtomicBool::new(false)),
             dirty_pending: Arc::new(AtomicBool::new(false)),
             presentation_revision: AtomicU64::new(0),
-            presentation_pending: Arc::new(AtomicBool::new(false)),
+            presentation_pending,
             remote_pages,
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),

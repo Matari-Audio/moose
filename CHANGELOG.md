@@ -4,6 +4,21 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Host notices.** `moose_core::main_thread::{HostNotice, HostNotifier}`:
+  `MainThreadHooks::connect(&mut self, HostNotifier)` (default no-op) hands
+  the hooks a notifier once, and `PluginContext::notify_host(HostNotice)`
+  sends through the same one. `notify` works from any non-audio thread and
+  coalesces until the host's next main-thread callback. CLAP calls
+  `note_name.changed` / `voice_info.changed`; VST3 has no matching call and
+  drops them.
+- **MIDI 2 learn (breaking for hook implementers).** `MainThreadHooks::midi_learn`
+  takes `source: LearnSource` (`Midi1(MidiSource)` or
+  `Midi2(Midi2Controller { kind: Registered | Assignable, bank, index })`)
+  in place of `MidiSource`. VST3 `IMidiLearn2::onLiveMidi2ControllerInput`
+  now forwards; out-of-range input is rejected with `kInvalidArgument`.
+- VST3 `setComponentHandler` finishes an open group edit on the old handler
+  and restarts it on the new one, before the reopened gestures.
+
 - **`Plugin` trait gaps closed; `plugin:` key.** `moose::plugin! { plugin:
   MyPlugin, params: MyParams }` exports an `impl moose::Plugin` and names the
   wrapper `PluginShell` only, so the prelude's `Plugin` trait is usable in

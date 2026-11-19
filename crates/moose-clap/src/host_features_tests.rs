@@ -9,6 +9,7 @@ use clap_sys::ext::context_menu::{
     clap_context_menu_builder, clap_context_menu_check_entry, clap_context_menu_entry,
     clap_context_menu_item_kind, clap_context_menu_target,
 };
+use clap_sys::ext::note_name::clap_host_note_name;
 use clap_sys::ext::note_name::clap_note_name;
 use clap_sys::ext::param_indication::CLAP_PARAM_INDICATION_AUTOMATION_RECORDING;
 use clap_sys::ext::params::CLAP_PARAM_CLEAR_ALL;
@@ -16,10 +17,11 @@ use clap_sys::ext::track_info::{
     CLAP_TRACK_INFO_HAS_AUDIO_CHANNEL, CLAP_TRACK_INFO_HAS_TRACK_COLOR,
     CLAP_TRACK_INFO_HAS_TRACK_NAME, CLAP_TRACK_INFO_IS_FOR_BUS, clap_track_info,
 };
+use clap_sys::ext::voice_info::clap_host_voice_info;
 use clap_sys::ext::voice_info::{CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_voice_info};
 use moose_core::main_thread::{
-    AutomationState, HostColor, HostMapping, MenuItem, MenuTarget, ParamIndication, TrackInfo,
-    TrackKind, VoiceInfo,
+    AutomationState, HostColor, HostMapping, HostNotice, HostNotifier, MenuItem, MenuTarget,
+    ParamIndication, TrackInfo, TrackKind, VoiceInfo,
 };
 use moose_core::process::ProcessContext;
 use moose_params::{DynamicParams, FloatParam, SlotDef, SlotRange};
@@ -44,6 +46,7 @@ enum Seen {
 
 thread_local! {
     static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    static NOTIFIER: RefCell<Option<HostNotifier>> = const { RefCell::new(None) };
 }
 
 fn seen() -> Vec<Seen> {
@@ -53,6 +56,9 @@ fn seen() -> Vec<Seen> {
 struct Recorder;
 
 impl MainThreadHooks for Recorder {
+    fn connect(&mut self, notifier: HostNotifier) {
+        NOTIFIER.with(|n| *n.borrow_mut() = Some(notifier));
+    }
     fn track_info_changed(&mut self, _: &MainThread, info: &TrackInfo) {
         SEEN.with(|s| s.borrow_mut().push(Seen::Track(info.clone())));
     }
@@ -160,6 +166,8 @@ struct HostLog {
     restarts: AtomicU32,
     rescans: Mutex<Vec<u32>>,
     clears: Mutex<Vec<(u32, u32)>>,
+    note_names_changed: AtomicU32,
+    voice_info_changed: AtomicU32,
 }
 
 impl HostLog {
@@ -204,6 +212,20 @@ unsafe extern "C" fn clear(host: *const clap_host, id: clap_id, flags: u32) {
     log.clears.lock().expect("clears").push((id, flags));
 }
 
+unsafe extern "C" fn note_names_changed(host: *const clap_host) {
+    // SAFETY: called by the plugin with the test host.
+    unsafe { log(host) }
+        .note_names_changed
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn voice_info_changed(host: *const clap_host) {
+    // SAFETY: called by the plugin with the test host.
+    unsafe { log(host) }
+        .voice_info_changed
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 unsafe extern "C" fn track_get(_: *const clap_host, info: *mut clap_track_info) -> bool {
     // SAFETY: the plugin passes a writable info.
     let info = unsafe { &mut *info };
@@ -231,12 +253,22 @@ unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *
     static TRACK: clap_host_track_info = clap_host_track_info {
         get: Some(track_get),
     };
+    static NOTE_NAME: clap_host_note_name = clap_host_note_name {
+        changed: Some(note_names_changed),
+    };
+    static VOICE_INFO: clap_host_voice_info = clap_host_voice_info {
+        changed: Some(voice_info_changed),
+    };
     // SAFETY: the plugin passes a NUL-terminated id.
     let id = unsafe { CStr::from_ptr(id) };
     if id == CLAP_EXT_PARAMS {
         (&raw const PARAMS).cast()
     } else if id == CLAP_EXT_TRACK_INFO {
         (&raw const TRACK).cast()
+    } else if id == CLAP_EXT_NOTE_NAME {
+        (&raw const NOTE_NAME).cast()
+    } else if id == CLAP_EXT_VOICE_INFO {
+        (&raw const VOICE_INFO).cast()
     } else {
         ptr::null()
     }
@@ -420,6 +452,35 @@ fn note_names_and_voice_info_come_from_the_hooks() {
         assert!((*voices).get.unwrap()(plugin, &raw mut info));
         assert_eq!((info.voice_count, info.voice_capacity), (4, 16));
         assert_eq!(info.flags, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES);
+    });
+}
+
+#[test]
+fn host_notices_reach_the_host_on_the_main_thread() {
+    with_modular(|plugin, log, _| unsafe {
+        let notifier = NOTIFIER
+            .with(|n| n.borrow().clone())
+            .expect("connected at init");
+        let callbacks = log.callbacks.load(Ordering::Relaxed);
+        notifier.notify(HostNotice::NOTE_NAMES);
+        notifier.notify(HostNotice::VOICE_INFO);
+        assert_eq!(
+            log.callbacks.load(Ordering::Relaxed),
+            callbacks + 1,
+            "one main-thread callback for both"
+        );
+        assert_eq!(log.note_names_changed.load(Ordering::Relaxed), 0);
+
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.note_names_changed.load(Ordering::Relaxed), 1);
+        assert_eq!(log.voice_info_changed.load(Ordering::Relaxed), 1);
+
+        // The editor's context sends through the same notifier.
+        editor_context::<Plugin>(plugin).notify_host(HostNotice::VOICE_INFO);
+        assert_eq!(log.callbacks.load(Ordering::Relaxed), callbacks + 2);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.note_names_changed.load(Ordering::Relaxed), 1);
+        assert_eq!(log.voice_info_changed.load(Ordering::Relaxed), 2);
     });
 }
 

@@ -142,6 +142,20 @@ pub struct Vst3TrackInfo {
     pub has_color: bool,
 }
 
+/// A controller from MIDI learn.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vst3LearnSource {
+    /// A VST3 `ControllerNumbers` value (`IMidiLearn`).
+    Midi1(i16),
+    /// A MIDI 2 controller (`IMidiLearn2`); `bank` and `index` are 7-bit.
+    Midi2 {
+        registered: bool,
+        bank: u8,
+        index: u8,
+    },
+}
+
 /// Transport info for one block.
 #[repr(C)]
 pub struct Vst3Transport {
@@ -377,11 +391,15 @@ pub struct Vst3Callbacks {
     pub take_catalog_changes: unsafe extern "C" fn(ctx: *mut c_void) -> u8,
     /// `MainThreadHooks::track_info_changed` (`IInfoListener`). UI thread.
     pub track_info_changed: unsafe extern "C" fn(ctx: *mut c_void, info: *const Vst3TrackInfo),
-    /// `MainThreadHooks::midi_learn` (`IMidiLearn`): a VST3 controller
-    /// number on `bus` / `channel`. Returns 1 when the plugin bound it. UI
-    /// thread.
-    pub midi_learn:
-        unsafe extern "C" fn(ctx: *mut c_void, bus: u32, channel: u8, controller: i16) -> i32,
+    /// `MainThreadHooks::midi_learn` (`IMidiLearn`, `IMidiLearn2`): a
+    /// controller on `bus` / `channel` (`0..=15`). Returns 1 when the plugin
+    /// bound it. UI thread.
+    pub midi_learn: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        bus: u32,
+        channel: u8,
+        source: Vst3LearnSource,
+    ) -> i32,
     /// `IAudioProcessor::setProcessing`. `false` also resets the plugin
     /// (what the shim used to do through `reset`).
     pub set_processing: unsafe extern "C" fn(

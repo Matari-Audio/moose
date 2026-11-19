@@ -23,7 +23,8 @@ use vst3::{Class, ComPtr, ComRef};
 use super::view::View;
 use super::{Registration, cstr, retain, utf16_from, utf16_into};
 use crate::ffi::{
-    PRESENTATION_HIDDEN, PRESENTATION_UNAVAILABLE, Vst3NativeEvent, Vst3TrackInfo, Vst3Transport,
+    PRESENTATION_HIDDEN, PRESENTATION_UNAVAILABLE, Vst3LearnSource, Vst3NativeEvent, Vst3TrackInfo,
+    Vst3Transport,
 };
 
 /// A wake's drain makes at most this many host calls; the rest wait for the
@@ -114,11 +115,19 @@ enum ParamList {
     Available(Vec<usize>),
 }
 
+/// What [`Host::close_open_gestures`] closed on the old handler.
+struct OpenEdits {
+    gestures: Vec<u32>,
+    group: bool,
+}
+
 #[derive(Default)]
 struct Edits {
     pending: VecDeque<EditOp>,
     /// Gestures begun on the current handler and not yet ended.
     open_gestures: Vec<u32>,
+    /// A group edit started on the current handler and not yet finished.
+    group_open: bool,
     /// Teardown: no more queueing.
     closed: bool,
     /// A drain is making calls with the lock released; callbacks may
@@ -642,22 +651,34 @@ impl Host {
         e
     }
 
-    /// End every open gesture on the current handler; returns their ids.
+    /// End every open gesture, then an open group edit, on the current
+    /// handler; returns what was open so a new handler can reopen it.
     fn close_open_gestures<'a>(
         &'a self,
         mut e: MutexGuard<'a, Edits>,
-    ) -> (MutexGuard<'a, Edits>, Vec<u32>) {
-        let open = std::mem::take(&mut e.open_gestures);
+    ) -> (MutexGuard<'a, Edits>, OpenEdits) {
+        let open = OpenEdits {
+            gestures: std::mem::take(&mut e.open_gestures),
+            group: std::mem::take(&mut e.group_open),
+        };
         let Some(handler) = self.handler() else {
             return (e, open);
         };
-        if open.is_empty() {
+        if open.gestures.is_empty() && !open.group {
             return (e, open);
         }
         e.draining = true;
         drop(e);
-        for &id in &open {
+        for &id in &open.gestures {
+            // SAFETY: `handler` is the host's live, retained handler, called
+            // on the UI thread like every other handler call here.
             unsafe { handler.endEdit(id) };
+        }
+        if open.group
+            && let Some(handler) = handler.cast::<IComponentHandler2>()
+        {
+            // SAFETY: as above; `cast` returned a retained interface.
+            unsafe { handler.finishGroupEdit() };
         }
         let mut e = lock(&self.edits);
         e.draining = false;
@@ -708,6 +729,7 @@ impl Host {
                         EditGroup::Begin => unsafe { h.startGroupEdit() },
                         EditGroup::End => unsafe { h.finishGroupEdit() },
                     };
+                    lock(&self.edits).group_open = edge == EditGroup::Begin;
                 }
                 1
             }
@@ -2044,13 +2066,16 @@ impl IEditControllerTrait for Component {
         let e = h.drain_locked(lock(&h.edits), true);
         // A submitter that never stopped: its gestures end on the old handler
         // and continue in fresh ones on the new.
-        let (mut e, mut reopen) = h.close_open_gestures(e);
+        // An open group edit finishes there too and restarts first.
+        let (mut e, reopen) = h.close_open_gestures(e);
         let previous = std::mem::replace(&mut *lock(&h.handler), handler);
-        if !has_handler {
-            reopen.clear();
-        }
-        for &id in reopen.iter().rev() {
-            e.pending.push_front(EditOp::Begin(id));
+        if has_handler {
+            for &id in reopen.gestures.iter().rev() {
+                e.pending.push_front(EditOp::Begin(id));
+            }
+            if reopen.group {
+                e.pending.push_front(EditOp::Group(EditGroup::Begin));
+            }
         }
         if !e.pending.is_empty() {
             h.wake_edits(&e);
@@ -2241,12 +2266,14 @@ impl IInfoListenerTrait for Component {
 }
 
 impl Component {
-    fn midi_learn(&self, bus: int32, channel: i16, controller: CtrlNumber) -> tresult {
+    fn midi_learn(&self, bus: int32, channel: i16, source: Vst3LearnSource) -> tresult {
         let (Ok(bus), Ok(channel @ 0..=15)) = (u32::try_from(bus), u8::try_from(channel)) else {
             return kInvalidArgument;
         };
         let h = &self.host;
-        if unsafe { (h.reg.cb.midi_learn)(h.ctx, bus, channel, controller) } != 0 {
+        // SAFETY: `ctx` is this component's live plugin instance, and the
+        // learn interfaces are UI-thread calls, as the callback requires.
+        if unsafe { (h.reg.cb.midi_learn)(h.ctx, bus, channel, source) } != 0 {
             kResultTrue
         } else {
             kResultFalse
@@ -2261,20 +2288,36 @@ impl IMidiLearnTrait for Component {
         channel: int16,
         controller: CtrlNumber,
     ) -> tresult {
-        self.midi_learn(bus, channel, controller)
+        self.midi_learn(bus, channel, Vst3LearnSource::Midi1(controller))
     }
 }
 
-/// MIDI 2 controllers (RPN / NRPN banks) have no `MidiSource`; only the
-/// MIDI 1 form learns.
+/// Decode a VST3 `Midi2Controller`. The SDK struct is two bytes: `byte1`
+/// holds the bank in bits 0-6 and "registered" (RPN) in bit 7, `byte2` the
+/// index in bits 0-6 (`ivstmidimapping2.h`). The `vst3` crate binds it as
+/// four bytes named `bank, registered, index, reserved`, so the host's
+/// `byte1` lands in `bank` and its `byte2` in `registered`; the other two
+/// fields are padding. `None` when the index's reserved bit 7 is set.
+fn midi2_source(controller: Midi2Controller) -> Option<Vst3LearnSource> {
+    let (byte1, byte2) = (controller.bank, controller.registered);
+    (byte2 <= 0x7F).then_some(Vst3LearnSource::Midi2 {
+        registered: byte1 & 0x80 != 0,
+        bank: byte1 & 0x7F,
+        index: byte2,
+    })
+}
+
 impl IMidiLearn2Trait for Component {
     unsafe fn onLiveMidi2ControllerInput(
         &self,
-        _bus: BusIndex,
-        _channel: MidiChannel,
-        _controller: Midi2Controller,
+        bus: BusIndex,
+        channel: MidiChannel,
+        controller: Midi2Controller,
     ) -> tresult {
-        kResultFalse
+        let Some(source) = midi2_source(controller) else {
+            return kInvalidArgument;
+        };
+        self.midi_learn(bus, channel.into(), source)
     }
 
     unsafe fn onLiveMidi1ControllerInput(
@@ -2283,7 +2326,7 @@ impl IMidiLearn2Trait for Component {
         channel: MidiChannel,
         controller: CtrlNumber,
     ) -> tresult {
-        self.midi_learn(bus, channel.into(), controller)
+        self.midi_learn(bus, channel.into(), Vst3LearnSource::Midi1(controller))
     }
 }
 

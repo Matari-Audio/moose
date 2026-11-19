@@ -33,7 +33,10 @@ use moose_core::events::{
 };
 use moose_core::export::PluginExport;
 use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
-use moose_core::main_thread::{HostColor, MainThreadHooks, TrackInfo};
+use moose_core::main_thread::{
+    HostColor, HostNotifier, LearnSource, MainThreadHooks, Midi2Controller, Midi2ControllerKind,
+    TrackInfo,
+};
 use moose_core::meters::MeterStore;
 use moose_core::midi::{
     denorm_7bit, denorm_pitch_bend, per_note_bend_semitones, pitch_bend_to_bytes,
@@ -625,7 +628,11 @@ unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
                 .collect();
             midi_maps.sort_by_key(|(id, _)| *id);
             let params_arc = plugin.params_arc();
-            let main_thread = MainThreadCell::new(plugin.main_thread());
+            let mut hooks = plugin.main_thread();
+            // VST3 has no note-name / voice-info changed call, so notices
+            // wake nothing; the hooks still get a notifier to keep.
+            hooks.connect(HostNotifier::new(|| {}));
+            let main_thread = MainThreadCell::new(hooks);
             let meter_store = plugin.meter_store();
             let snapshot = plugin.snapshot_slot();
             let task_spawner = plugin.task_spawner();
@@ -876,13 +883,28 @@ unsafe extern "C" fn cb_midi_learn<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     bus: u32,
     channel: u8,
-    controller: i16,
+    source: ffi::Vst3LearnSource,
 ) -> i32 {
     run_extern_callback_with::<P, i32>("vst3", "midi_learn", 0, || unsafe {
-        let (Some(inst), Some(source)) = (
-            ctx.cast::<Vst3Instance<P>>().as_ref(),
-            vst3_midi_source(controller),
-        ) else {
+        let source = match source {
+            ffi::Vst3LearnSource::Midi1(controller) => {
+                vst3_midi_source(controller).map(LearnSource::Midi1)
+            }
+            ffi::Vst3LearnSource::Midi2 {
+                registered,
+                bank,
+                index,
+            } => Some(LearnSource::Midi2(Midi2Controller {
+                kind: if registered {
+                    Midi2ControllerKind::Registered
+                } else {
+                    Midi2ControllerKind::Assignable
+                },
+                bank,
+                index,
+            })),
+        };
+        let (Some(inst), Some(source)) = (ctx.cast::<Vst3Instance<P>>().as_ref(), source) else {
             return 0;
         };
         // SAFETY: the COM layer calls this only from
@@ -4974,13 +4996,13 @@ mod main_thread_tests {
             _: &MainThread,
             bus: u32,
             channel: u8,
-            source: MidiSource,
+            source: LearnSource,
         ) -> bool {
             self.0
                 .lock()
                 .unwrap()
                 .push(format!("{bus} {channel} {source:?}"));
-            matches!(source, MidiSource::Cc(_))
+            !matches!(source, LearnSource::Midi1(MidiSource::PitchBend))
         }
     }
 
@@ -4999,19 +5021,27 @@ mod main_thread_tests {
                 has_color: true,
             };
             cb_track_info_changed::<TestPlugin>(ctx, &raw const info);
-            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 1, 2, 74), 1);
-            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 0, 0, 129), 0);
+            let midi1 = ffi::Vst3LearnSource::Midi1;
+            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 1, 2, midi1(74)), 1);
+            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 0, 0, midi1(129)), 0);
             assert_eq!(
-                cb_midi_learn::<TestPlugin>(ctx, 0, 0, 131),
+                cb_midi_learn::<TestPlugin>(ctx, 0, 0, midi1(131)),
                 0,
                 "not a controller"
             );
+            let nrpn = ffi::Vst3LearnSource::Midi2 {
+                registered: false,
+                bank: 5,
+                index: 9,
+            };
+            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 0, 3, nrpn), 1);
             assert_eq!(
                 *seen.0.lock().unwrap(),
                 [
                     r#"Some("Bass") Some(HostColor { r: 255, g: 32, b: 16, a: 128 })"#,
-                    "1 2 Cc(74)",
-                    "0 0 PitchBend",
+                    "1 2 Midi1(Cc(74))",
+                    "0 0 Midi1(PitchBend)",
+                    "0 3 Midi2(Midi2Controller { kind: Assignable, bank: 5, index: 9 })",
                 ]
             );
             cb_destroy::<TestPlugin>(ctx);

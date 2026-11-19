@@ -2,12 +2,16 @@
 //! [`MainThreadHooks::note_names`]. `count` takes a fresh list and `get`
 //! reads that list, so one host scan sees one consistent set.
 //!
-//! The host re-reads only after `clap_host_note_name.changed`; plugins
-//! can't request that yet (follow-up: a main-thread request channel).
+//! The host re-reads after `clap_host_note_name.changed`, which
+//! [`host_changed`] sends for a [`HostNotice::NOTE_NAMES`].
 //!
+//! [`HostNotice::NOTE_NAMES`]: moose_core::main_thread::HostNotice::NOTE_NAMES
 //! [`MainThreadHooks::note_names`]: moose_core::main_thread::MainThreadHooks::note_names
 
-use clap_sys::ext::note_name::{clap_note_name, clap_plugin_note_name};
+use clap_sys::ext::note_name::{
+    CLAP_EXT_NOTE_NAME, clap_host_note_name, clap_note_name, clap_plugin_note_name,
+};
+use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use moose_core::cast::len_u32;
@@ -22,6 +26,28 @@ pub(crate) fn make_extension<P: PluginExport>() -> clap_plugin_note_name {
     clap_plugin_note_name {
         count: Some(count::<P>),
         get: Some(get::<P>),
+    }
+}
+
+/// [main-thread] Tell the host the note names changed, if it listens.
+///
+/// # Safety
+/// `host` is null or the instance's live host.
+pub(crate) unsafe fn host_changed(host: *const clap_host) {
+    // SAFETY: forwarded caller contract; `get_extension` is [thread-safe].
+    unsafe {
+        if host.is_null() {
+            return;
+        }
+        let Some(get) = (*host).get_extension else {
+            return;
+        };
+        let ext = get(host, CLAP_EXT_NOTE_NAME.as_ptr()).cast::<clap_host_note_name>();
+        if !ext.is_null()
+            && let Some(changed) = (*ext).changed
+        {
+            changed(host);
+        }
     }
 }
 

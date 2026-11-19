@@ -5,6 +5,7 @@ use moose_params::Params;
 use moose_params::sample::Float;
 
 use crate::events::TransportInfo;
+use crate::main_thread::{HostNotice, HostNotifier};
 use crate::tasks::{AnyTaskSpawner, TaskSpawner};
 
 /// A lock-free editor factory bound to a plugin's param store.
@@ -675,6 +676,9 @@ pub struct PluginContext<P: ?Sized = dyn Params> {
     /// Brackets several edits into one host undo step (see
     /// [`Self::begin_group`]). `None` where the format has no such API.
     group_edits: Option<GroupEdits>,
+    /// Tells the host note names or voice info changed (see
+    /// [`Self::notify_host`]). `None` until a wrapper installs one.
+    host_notifier: Option<HostNotifier>,
     params: Arc<P>,
 }
 
@@ -701,6 +705,7 @@ impl<P: ?Sized> Clone for PluginContext<P> {
             tasks: self.tasks.clone(),
             mark_dirty: self.mark_dirty.clone(),
             group_edits: self.group_edits.clone(),
+            host_notifier: self.host_notifier.clone(),
             params: Arc::clone(&self.params),
         }
     }
@@ -717,6 +722,7 @@ impl<P: ?Sized> PluginContext<P> {
             tasks: None,
             mark_dirty: None,
             group_edits: None,
+            host_notifier: None,
             params,
         }
     }
@@ -764,6 +770,22 @@ impl<P: ?Sized> PluginContext<P> {
     pub fn end_group(&self) {
         if let Some(f) = &self.group_edits {
             f(EditGroup::End);
+        }
+    }
+
+    /// Install the wrapper's [`HostNotifier`]. Format wrappers call this.
+    #[must_use]
+    pub fn with_host_notifier(mut self, notifier: HostNotifier) -> Self {
+        self.host_notifier = Some(notifier);
+        self
+    }
+
+    /// Tell the host `notice` changed (CLAP `note_name.changed`,
+    /// `voice_info.changed`). A no-op on formats without the API. Any
+    /// thread except the audio thread.
+    pub fn notify_host(&self, notice: HostNotice) {
+        if let Some(notifier) = &self.host_notifier {
+            notifier.notify(notice);
         }
     }
 
@@ -832,6 +854,7 @@ impl<P: ?Sized> PluginContext<P> {
             tasks: self.tasks.clone(),
             mark_dirty: self.mark_dirty.clone(),
             group_edits: self.group_edits.clone(),
+            host_notifier: self.host_notifier.clone(),
             params,
         }
     }
@@ -912,6 +935,7 @@ impl PluginContext<dyn Params> {
             tasks: None,
             mark_dirty: None,
             group_edits: None,
+            host_notifier: None,
             params,
         }
     }
@@ -928,6 +952,7 @@ impl<P: Params + 'static> PluginContext<P> {
             tasks: self.tasks,
             mark_dirty: self.mark_dirty,
             group_edits: self.group_edits,
+            host_notifier: self.host_notifier,
             params: self.params as Arc<dyn Params>,
         }
     }

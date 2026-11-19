@@ -2159,6 +2159,7 @@ name = "moose-core"
 version = "7.0.0"
 dependencies = [
  "backtrace",
+ "bitflags 2.13.0",
  "crossbeam-queue",
  "crossbeam-utils",
  "loom",

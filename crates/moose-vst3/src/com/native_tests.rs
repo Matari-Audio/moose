@@ -15,8 +15,8 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 use super::component::{Component, Host};
 use super::{Registration, build_units};
 use crate::ffi::{
-    ProcessFn, Vst3Callbacks, Vst3NativeEvent, Vst3ParamDescriptor, Vst3PluginDescriptor,
-    Vst3TrackInfo, Vst3Transport,
+    ProcessFn, Vst3Callbacks, Vst3LearnSource, Vst3NativeEvent, Vst3ParamDescriptor,
+    Vst3PluginDescriptor, Vst3TrackInfo, Vst3Transport,
 };
 
 // ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ unsafe extern "C" fn no_changes(_: *mut c_void) -> u8 {
     0
 }
 unsafe extern "C" fn no_track(_: *mut c_void, _: *const Vst3TrackInfo) {}
-unsafe extern "C" fn no_learn(_: *mut c_void, _: u32, _: u8, _: i16) -> i32 {
+unsafe extern "C" fn no_learn(_: *mut c_void, _: u32, _: u8, _: Vst3LearnSource) -> i32 {
     0
 }
 
@@ -2246,11 +2246,27 @@ mod host_features {
 
     // --- MIDI learn -------------------------------------------------------------
 
-    static LEARNED: Mutex<Vec<(u32, u8, i16)>> = Mutex::new(Vec::new());
+    static LEARNED: Mutex<Vec<(u32, u8, Vst3LearnSource)>> = Mutex::new(Vec::new());
 
-    unsafe extern "C" fn learn_cc(_: *mut c_void, bus: u32, channel: u8, controller: i16) -> i32 {
-        LEARNED.lock().unwrap().push((bus, channel, controller));
-        i32::from(controller < 128)
+    unsafe extern "C" fn learn_cc(
+        _: *mut c_void,
+        bus: u32,
+        channel: u8,
+        source: Vst3LearnSource,
+    ) -> i32 {
+        LEARNED.lock().unwrap().push((bus, channel, source));
+        i32::from(!matches!(source, Vst3LearnSource::Midi1(129)))
+    }
+
+    /// A `Midi2Controller` as a host passes it: the SDK's two bytes land in
+    /// the crate's first two fields (see `midi2_source`).
+    fn midi2(registered: bool, bank: u8, index: u8) -> Midi2Controller {
+        Midi2Controller {
+            bank: bank | if registered { 0x80 } else { 0 },
+            registered: index,
+            index: 0xAA,
+            reserved: 0xAA,
+        }
     }
 
     #[test]
@@ -2274,17 +2290,48 @@ mod host_features {
             );
             assert_eq!(learn.onLiveMIDIControllerInput(0, 16, 1), kInvalidArgument);
             assert_eq!(learn2.onLiveMidi1ControllerInput(2, 15, 7), kResultTrue);
-            let rpn = Midi2Controller {
-                bank: 0,
-                registered: 1,
-                index: 0,
-                reserved: 0,
-            };
-            assert_eq!(learn2.onLiveMidi2ControllerInput(0, 0, rpn), kResultFalse);
+            let rpn = midi2(true, 3, 7);
+            assert_eq!(learn2.onLiveMidi2ControllerInput(1, 4, rpn), kResultTrue);
+            let nrpn = midi2(false, 127, 127);
+            assert_eq!(learn2.onLiveMidi2ControllerInput(0, 15, nrpn), kResultTrue);
+            let mut bad = midi2(false, 0, 0);
+            bad.registered = 0x80;
+            assert_eq!(
+                learn2.onLiveMidi2ControllerInput(0, 0, bad),
+                kInvalidArgument,
+                "index past 7 bits"
+            );
+            assert_eq!(
+                learn2.onLiveMidi2ControllerInput(0, 16, rpn),
+                kInvalidArgument
+            );
         }
+        let midi1 = Vst3LearnSource::Midi1;
         assert_eq!(
             *LEARNED.lock().unwrap(),
-            [(0, 3, 74), (1, 0, 129), (2, 15, 7)]
+            [
+                (0, 3, midi1(74)),
+                (1, 0, midi1(129)),
+                (2, 15, midi1(7)),
+                (
+                    1,
+                    4,
+                    Vst3LearnSource::Midi2 {
+                        registered: true,
+                        bank: 3,
+                        index: 7
+                    }
+                ),
+                (
+                    0,
+                    15,
+                    Vst3LearnSource::Midi2 {
+                        registered: false,
+                        bank: 127,
+                        index: 127
+                    }
+                ),
+            ]
         );
     }
 
@@ -2319,5 +2366,36 @@ mod host_features {
                 "group end"
             ],
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn handler_swap_moves_an_open_group_to_the_new_handler() {
+        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let com = component(reg);
+        let old = attach(&com);
+        let ctx = com.host.ctx;
+        crate::com::group_edit(ctx, EditGroup::Begin);
+        crate::com::begin_edit(ctx, 1);
+        let new = attach(&com);
+        crate::com::perform_edit(ctx, 1, 0.5);
+        crate::com::end_edit(ctx, 1);
+        crate::com::group_edit(ctx, EditGroup::End);
+        assert_eq!(old.take(), ["group", "begin 1", "end 1", "group end"]);
+        assert_eq!(
+            new.take(),
+            ["group", "begin 1", "perform 1", "end 1", "group end"]
+        );
+
+        // Dropping the handler finishes the group and reopens nothing.
+        crate::com::group_edit(ctx, EditGroup::Begin);
+        assert_eq!(
+            unsafe { com.setComponentHandler(std::ptr::null_mut()) },
+            kResultOk
+        );
+        assert_eq!(new.take(), ["group", "group end"]);
+        let last = attach(&com);
+        crate::com::begin_edit(ctx, 2);
+        assert_eq!(last.take(), ["begin 2"]);
     }
 }

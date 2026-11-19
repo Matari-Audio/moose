@@ -30,6 +30,8 @@ backtrace = { version = "0.3", optional = true }
 # with existing `moose_core::cast::*` and `moose_core::slugify` callers.
 moose-utils = { workspace = true }
 png = "0.18"
+# `HostNotice` (main_thread): independent host-notice flags.
+bitflags = "2"
 # `AtomicCell<T>` backs the lock-free `#[persist]` path for `Copy`
 # config fields (re-exported from the prelude). Small types stay
 # genuinely atomic; larger ones fall back to a private lock.

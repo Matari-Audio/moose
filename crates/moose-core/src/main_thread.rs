@@ -7,10 +7,117 @@
 //! A wrapper maps each method to whatever its format offers (CLAP
 //! `track-info`, `note-name`, `voice-info`, `param-indication`,
 //! `context-menu`; VST3 `IInfoListener`, `IMidiLearn2`).
+//!
+//! The plugin tells the host its note names or voice info changed through a
+//! [`HostNotifier`], handed to [`MainThreadHooks::connect`] and installed on
+//! the editor's [`PluginContext`](crate::editor::PluginContext).
 
-use moose_params::MidiSource;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use moose_params::{MidiSource, PersistChangeSignal};
 
 use crate::thread::MainThread;
+
+bitflags::bitflags! {
+    /// What the plugin tells the host changed, so it re-reads it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct HostNotice: u8 {
+        /// [`MainThreadHooks::note_names`] changed (CLAP
+        /// `note_name.changed`).
+        const NOTE_NAMES = 0b01;
+        /// [`MainThreadHooks::voice_info`] changed (CLAP
+        /// `voice_info.changed`).
+        const VOICE_INFO = 0b10;
+    }
+}
+
+/// Sends [`HostNotice`]s to the host. Cloning shares one notifier.
+///
+/// Notices coalesce: several before the wrapper's next main-thread callback
+/// reach the host once. Formats without a matching call drop them.
+#[derive(Clone)]
+pub struct HostNotifier(Arc<NotifierInner>);
+
+struct NotifierInner {
+    pending: AtomicU8,
+    wake: PersistChangeSignal,
+}
+
+impl HostNotifier {
+    /// A notifier whose `wake` asks the host for a main-thread callback,
+    /// where the wrapper calls [`Self::take`]. `wake` runs on the notifying
+    /// thread. Format wrappers build this.
+    #[doc(hidden)]
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(NotifierInner {
+            pending: AtomicU8::new(0),
+            wake: PersistChangeSignal::new(wake),
+        }))
+    }
+
+    /// Tell the host `notice` changed. Callable from any thread except the
+    /// audio thread: the wake may lock and call into the host.
+    pub fn notify(&self, notice: HostNotice) {
+        self.0.pending.fetch_or(notice.bits(), Ordering::AcqRel);
+        self.0.wake.notify();
+    }
+
+    /// The notices since the last call. Wrappers call this on the host's
+    /// main thread.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take(&self) -> HostNotice {
+        HostNotice::from_bits_truncate(self.0.pending.swap(0, Ordering::AcqRel))
+    }
+
+    /// Stop waking the host, after any wake in flight returns. Wrappers
+    /// call this before the instance is freed; later notices stay pending.
+    #[doc(hidden)]
+    pub fn close(&self) {
+        self.0.wake.close();
+    }
+}
+
+impl fmt::Debug for HostNotifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostNotifier")
+            .field(
+                "pending",
+                &HostNotice::from_bits_truncate(self.0.pending.load(Ordering::Relaxed)),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// A MIDI 2 per-note-agnostic controller (VST3 `Midi2Controller`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Midi2ControllerKind {
+    /// A registered controller (RPN).
+    Registered,
+    /// An assignable controller (NRPN).
+    Assignable,
+}
+
+/// One MIDI 2 controller. `bank` and `index` are 7-bit (`0..=127`); the
+/// wrappers drop input outside that range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Midi2Controller {
+    pub kind: Midi2ControllerKind,
+    pub bank: u8,
+    pub index: u8,
+}
+
+/// The controller a host reports during MIDI learn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LearnSource {
+    /// A MIDI 1 controller (VST3 `IMidiLearn`).
+    Midi1(MidiSource),
+    /// A MIDI 2 controller (VST3 `IMidiLearn2`).
+    Midi2(Midi2Controller),
+}
 
 /// A colour the host shows for a track or a parameter mapping.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -145,28 +252,34 @@ pub enum MenuItem {
 
 /// The main-thread part of a plugin. See the module docs.
 pub trait MainThreadHooks: Send + 'static {
+    /// The wrapper's [`HostNotifier`], passed once after the hooks are
+    /// built. Keep it to tell the host when note names or voice info change.
+    fn connect(&mut self, _notifier: HostNotifier) {}
+
     /// The host's track changed (name, colour, channel count).
     fn track_info_changed(&mut self, _cx: &MainThread, _info: &TrackInfo) {}
 
     /// Key names for the host's note editor. Ask the host to re-read them
-    /// with the wrapper's note-name changed notice.
+    /// with [`HostNotice::NOTE_NAMES`].
     fn note_names(&self, _cx: &MainThread) -> Vec<NoteName> {
         Vec::new()
     }
 
-    /// Voice usage; `None` when the plugin doesn't report it.
+    /// Voice usage; `None` when the plugin doesn't report it. Tell the host
+    /// it changed with [`HostNotice::VOICE_INFO`].
     fn voice_info(&self, _cx: &MainThread) -> Option<VoiceInfo> {
         None
     }
 
-    /// Live MIDI controller input while the host is in MIDI-learn mode.
-    /// Return `true` if the plugin bound it to something (VST3 `IMidiLearn2`).
+    /// Live MIDI controller input on `channel` (`0..=15`) while the host is
+    /// in MIDI-learn mode. Return `true` if the plugin bound it to something
+    /// (VST3 `IMidiLearn2`).
     fn midi_learn(
         &mut self,
         _cx: &MainThread,
         _bus: u32,
         _channel: u8,
-        _source: MidiSource,
+        _source: LearnSource,
     ) -> bool {
         false
     }
@@ -188,3 +301,33 @@ pub trait MainThreadHooks: Send + 'static {
 
 /// No main-thread part.
 impl MainThreadHooks for () {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    #[test]
+    fn notices_coalesce_and_wake_until_closed() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let notifier = HostNotifier::new({
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let clone = notifier.clone();
+        notifier.notify(HostNotice::NOTE_NAMES);
+        clone.notify(HostNotice::VOICE_INFO);
+        clone.notify(HostNotice::NOTE_NAMES);
+        assert_eq!(wakes.load(Ordering::Relaxed), 3);
+        assert_eq!(notifier.take(), HostNotice::all());
+        assert_eq!(notifier.take(), HostNotice::empty());
+
+        notifier.close();
+        clone.notify(HostNotice::VOICE_INFO);
+        assert_eq!(wakes.load(Ordering::Relaxed), 3, "a closed notifier wakes");
+        assert_eq!(notifier.take(), HostNotice::VOICE_INFO);
+    }
+}
