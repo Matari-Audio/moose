@@ -498,6 +498,23 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
         self.set_plain(id, value);
     }
 
+    /// Set the mono modulation offset of `id` in plain units (CLAP
+    /// `CLAP_EVENT_PARAM_MOD` with no note). Non-destructive: the stored
+    /// value, the edit counter and saved state never move; only
+    /// `FloatParam::modulated_value` (and `DynamicParams::modulated_plain`)
+    /// read it. Non-finite amounts are dropped. The chunker calls this at
+    /// the event's sub-block boundary on the audio thread, so it must not
+    /// allocate, lock or block. Unknown ids and parameters that can't be
+    /// modulated (bool, int, enum, list, projected views) ignore it.
+    /// Default: no-op (`#[derive(Params)]` implements it).
+    fn set_modulation(&self, _id: u32, _amount: f64) {}
+
+    /// Zero every modulation offset in this store, including nested
+    /// groups. Same real-time contract as [`Self::set_modulation`];
+    /// wrappers call it on reset / deactivate, where the host's modulation
+    /// stream restarts. Default: no-op.
+    fn clear_modulations(&self) {}
+
     /// Format a value in the parameter's declared plain/storage range.
     /// `#[params(value_format = "method")]` first calls an instance method
     /// `fn(&self, id: u32, value: f64) -> Option<String>`. Returning `None`

@@ -147,9 +147,25 @@ impl AtomicF64 {
 /// a pointer, an id, an atomic and an optional box. Plugins with
 /// hundreds of params (or pools of nested groups) stay inside a host's
 /// stack budget for the state struct.
+///
+/// # Modulation
+///
+/// A CLAP host can modulate a parameter without automating it
+/// (`CLAP_EVENT_PARAM_MOD`): the effective value is
+/// `(base + offset).clamp(min, max)` and the stored base never moves.
+/// The offset lives beside the base in its own slot, so [`Self::set_value`],
+/// the prelude's `value()` / `read()`, saved state and the host-visible
+/// value all stay on the base. Read the effective value with
+/// [`Self::modulated_value`], or smooth it with
+/// [`ParamSmoother::next_modulated`]. Plugins that read
+/// `EventBody::ParamMod` themselves never see the offset applied twice.
 pub struct FloatParam {
     info: &'static ParamInfo,
     id: u32,
+    /// Mono modulation offset in plain units, as `f32` bits. `f32` fills
+    /// the padding after `id`, so the offset costs no space; the sum with
+    /// the `f64` base is formed in `f64`.
+    modulation: AtomicU32,
     edit_epoch: Arc<AtomicU64>,
     value: AtomicF64,
     smoother: Option<Box<Smoother>>,
@@ -196,9 +212,33 @@ impl FloatParam {
         Self {
             info,
             id: info.id,
+            modulation: AtomicU32::new(0f32.to_bits()),
             edit_epoch: own_edit_epoch(),
             value: AtomicF64::new(default),
             smoother,
+        }
+    }
+
+    /// Clamp `v` into the declared range and snap it onto a stepped
+    /// range's grid. Shared by base writes and modulated reads.
+    #[inline]
+    fn contain(&self, v: f64) -> f64 {
+        // Normalize the bounds before clamping: `f64::clamp` panics if
+        // `min > max`, and `range.min()`/`max()` return the stored fields,
+        // so a mis-ordered range would otherwise panic on every write (on
+        // whatever thread the host calls the setter from). `new` debug-
+        // asserts the ordering; this keeps release safe regardless.
+        let (lo, hi) = (self.info.range.min(), self.info.range.max());
+        let clamped = v.clamp(lo.min(hi), lo.max(hi));
+        if matches!(
+            self.info.range.base(),
+            crate::range::ParamRange::Stepped { .. }
+        ) {
+            self.info
+                .range
+                .denormalize(self.info.range.normalize(clamped))
+        } else {
+            clamped
         }
     }
 
@@ -237,24 +277,66 @@ impl FloatParam {
         if !v.is_finite() {
             return;
         }
-        // Normalize the bounds before clamping: `f64::clamp` panics if
-        // `min > max`, and `range.min()`/`max()` return the stored fields,
-        // so a mis-ordered range would otherwise panic on every write (on
-        // whatever thread the host calls the setter from). `new` debug-
-        // asserts the ordering; this keeps release safe regardless.
-        let (lo, hi) = (self.info.range.min(), self.info.range.max());
-        let clamped = v.clamp(lo.min(hi), lo.max(hi));
-        let value = if matches!(
-            self.info.range.base(),
-            crate::range::ParamRange::Stepped { .. }
-        ) {
-            self.info
-                .range
-                .denormalize(self.info.range.normalize(clamped))
-        } else {
-            clamped
-        };
+        let value = self.contain(v);
         self.note_edit(self.value.bits.swap(value.to_bits(), Ordering::Relaxed) != value.to_bits());
+    }
+
+    /// The mono modulation offset in plain units (`0.0` when unmodulated).
+    /// Lock-free; safe on any thread.
+    #[must_use]
+    #[inline]
+    pub fn modulation(&self) -> f64 {
+        f64::from(self.modulation_f32())
+    }
+
+    /// [`Self::modulation`] at the offset's stored `f32` precision.
+    #[must_use]
+    #[inline]
+    pub fn modulation_f32(&self) -> f32 {
+        f32::from_bits(self.modulation.load(Ordering::Relaxed))
+    }
+
+    /// The effective value: the base plus the modulation offset, clamped
+    /// to the declared range (and snapped to a stepped range's grid).
+    /// Exactly the base while the offset is zero. Lock-free.
+    #[must_use]
+    #[inline]
+    pub fn modulated_value(&self) -> f64 {
+        let base = self.value.load();
+        let offset = self.modulation();
+        if offset == 0.0 {
+            base
+        } else {
+            self.contain(base + offset)
+        }
+    }
+
+    /// Set the mono modulation offset in plain units (CLAP
+    /// `CLAP_EVENT_PARAM_MOD` with no note). Non-destructive: the base,
+    /// the edit counter, saved state and the smoother's snap generation
+    /// are untouched. A non-finite amount is dropped; an offset beyond the
+    /// range's span saturates there, where the clamped sum already lands.
+    /// One relaxed atomic store, so it's safe on the audio thread.
+    #[inline]
+    pub fn set_modulation(&self, amount: f64) {
+        if !amount.is_finite() {
+            return;
+        }
+        let (lo, hi) = (self.info.range.min(), self.info.range.max());
+        let span = (hi - lo).abs().min(f64::from(f32::MAX));
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "bounded by f32::MAX above; the offset is stored at f32"
+        )]
+        let stored = amount.clamp(-span, span) as f32;
+        self.modulation.store(stored.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Drop the modulation offset (host reset, deactivate, or a modulator
+    /// that ended).
+    #[inline]
+    pub fn clear_modulation(&self) {
+        self.modulation.store(0f32.to_bits(), Ordering::Relaxed);
     }
 
     /// Internal: raw target value at `f64` precision (host-side
@@ -758,6 +840,83 @@ impl ParamSmoother {
     pub fn next_into_f64(&mut self, param: &FloatParam, out: &mut [f64]) {
         let target = self.target(param);
         self.state.next_into_f64(target, out);
+    }
+
+    /// The param's modulated target ([`FloatParam::modulated_value`]),
+    /// after jumping to it if the host snapped the param since the last
+    /// step. A snap lands on the modulated value, so the ramp never glides
+    /// in from the bare base after a state load.
+    #[inline]
+    fn modulated_target(&mut self, param: &FloatParam) -> f64 {
+        if let Some(shared) = param.smoother() {
+            let generation = shared.snap_generation();
+            if generation != self.seen_snap {
+                self.seen_snap = generation;
+                self.state.snap(param.modulated_value());
+            }
+        }
+        param.modulated_value()
+    }
+
+    /// [`Self::next`] toward the modulated value, so a host modulation
+    /// step glides at the param's declared smoothing instead of clicking.
+    /// Use one smoother per param for either the base or the modulated
+    /// value, not both.
+    #[inline]
+    pub fn next_modulated(&mut self, param: &FloatParam) -> f32 {
+        let target = self.modulated_target(param);
+        self.state.next(target)
+    }
+
+    /// [`Self::next_modulated`] at `f64`.
+    #[inline]
+    pub fn next_modulated_f64(&mut self, param: &FloatParam) -> f64 {
+        let target = self.modulated_target(param);
+        self.state.next_f64(target)
+    }
+
+    /// [`Self::next_after`] toward the modulated value.
+    #[inline]
+    pub fn next_modulated_after(&mut self, param: &FloatParam, n_samples: usize) -> f32 {
+        let target = self.modulated_target(param);
+        self.state.next_after(target, n_samples)
+    }
+
+    /// [`Self::next_modulated_after`] at `f64`.
+    #[inline]
+    pub fn next_modulated_after_f64(&mut self, param: &FloatParam, n_samples: usize) -> f64 {
+        let target = self.modulated_target(param);
+        self.state.next_after_f64(target, n_samples)
+    }
+
+    /// [`Self::next_into`] toward the modulated value.
+    #[inline]
+    pub fn next_modulated_into(&mut self, param: &FloatParam, out: &mut [f32]) {
+        let target = self.modulated_target(param);
+        self.state.next_into(target, out);
+    }
+
+    /// [`Self::next_modulated_into`] at `f64`.
+    #[inline]
+    pub fn next_modulated_into_f64(&mut self, param: &FloatParam, out: &mut [f64]) {
+        let target = self.modulated_target(param);
+        self.state.next_into_f64(target, out);
+    }
+
+    /// Jump to `param`'s modulated value (the modulated twin of
+    /// [`Self::reset`]'s jump, for a smoother stepped with
+    /// [`Self::next_modulated`]).
+    pub fn reset_modulated(&mut self, param: &FloatParam, sample_rate: f64) {
+        self.reset(param, sample_rate);
+        self.state.snap(param.modulated_value());
+    }
+
+    /// True while the ramp is still moving toward `param`'s modulated
+    /// value.
+    #[inline]
+    #[must_use]
+    pub fn is_smoothing_modulated(&self, param: &FloatParam) -> bool {
+        !self.state.is_converged(param.modulated_value())
     }
 
     /// Current smoothed value without advancing.
@@ -1718,6 +1877,46 @@ mod tests {
         assert_eq!(p.raw_target(), 6.0, "clamps above max");
         p.set_value(-1e308);
         assert_eq!(p.raw_target(), -60.0, "clamps below min");
+    }
+
+    /// Mono modulation is an offset beside the base: no edit, exact base
+    /// at zero, clamped and stepped like a write, and no extra space.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact representable values
+    fn modulation_is_a_non_destructive_contained_offset() {
+        assert!(
+            std::mem::size_of::<FloatParam>() <= 40,
+            "offset fits padding"
+        );
+        let p = float(0.0, 1.0);
+        p.set_value(0.3);
+        let epoch = p.parameter_edit_epoch();
+        p.set_modulation(0.0);
+        assert_eq!(p.modulated_value().to_bits(), 0.3_f64.to_bits());
+        p.set_modulation(0.5);
+        assert_eq!(p.modulated_value(), 0.3 + f64::from(0.5_f32));
+        assert_eq!(p.raw_target(), 0.3, "base untouched");
+        assert_eq!(p.parameter_edit_epoch(), epoch, "not an edit");
+        p.set_modulation(f64::MAX);
+        assert_eq!(p.modulation(), 1.0, "saturates at the span, stays finite");
+        assert_eq!(p.modulated_value(), 1.0);
+        p.clear_modulation();
+        assert_eq!(p.modulated_value(), 0.3);
+
+        let stepped = FloatParam::new(
+            info(
+                "Steps",
+                ParamRange::Stepped {
+                    min: 0.0,
+                    max: 4.0,
+                    step: 1.0,
+                },
+                1.0,
+            ),
+            SmoothingStyle::None,
+        );
+        stepped.set_modulation(1.4);
+        assert_eq!(stepped.modulated_value(), 2.0, "snapped to the grid");
     }
 
     /// A mis-ordered range (`min > max`) is a bug caught at construction in

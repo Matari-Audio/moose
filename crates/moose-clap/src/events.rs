@@ -1424,7 +1424,23 @@ pub(crate) unsafe fn convert_input_events<P: PluginExport>(
                     let mod_event = &*header_ptr.cast::<clap_event_param_mod>();
                     if mod_event.param_id == CLAP_INVALID_ID
                         || mod_event.note_id < -1
+                        || mod_event.port_index < -1
+                        || mod_event.channel < -1
+                        || mod_event.key < -1
                         || !mod_event.amount.is_finite()
+                    {
+                        continue;
+                    }
+                    // Moose advertises only global (`CLAP_PARAM_IS_MODULATABLE`)
+                    // and per-note-id (`CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID`)
+                    // modulation, never per-port / per-channel / per-key. A
+                    // wildcard `note_id == -1` with a specific port/channel/key
+                    // is scoped rather than global mono and must not overwrite
+                    // the global mono modulation slot.
+                    if mod_event.note_id == -1
+                        && (mod_event.port_index != -1
+                            || mod_event.channel != -1
+                            || mod_event.key != -1)
                     {
                         continue;
                     }

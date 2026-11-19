@@ -841,6 +841,23 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // --- set_modulation / clear_modulations (CLAP mono mod, D3) ---
+    // Only `FloatParam` carries an offset; other kinds and unknown ids fall
+    // through to the nested groups, which ignore ids they don't own.
+    let modulation_bodies: Vec<_> = param_fields
+        .iter()
+        .filter(|f| f.kind == ParamKind::Float)
+        .map(|f| {
+            let ident = f.access();
+            (ident.clone(), quote! { self.#ident.set_modulation(amount) })
+        })
+        .collect();
+    let modulation_arms = id_arms(&modulation_bodies);
+    let clear_modulation_stmts: Vec<_> = modulation_bodies
+        .iter()
+        .map(|(ident, _)| quote! { self.#ident.clear_modulation(); })
+        .collect();
+
     // --- set_sample_rate ---
     let sr_stmts: Vec<_> = param_fields
         .iter()
@@ -1775,6 +1792,20 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                     #(#parse_value_by_index_arms)*
                     #parse_by_index_fallthrough
                 }
+            }
+
+            fn set_modulation(&self, id: u32, amount: f64) {
+                match id {
+                    #(#modulation_arms)*
+                    _ => {
+                        #(self.#nested_idents.set_modulation(id, amount);)*
+                    }
+                }
+            }
+
+            fn clear_modulations(&self) {
+                #(#clear_modulation_stmts)*
+                #(self.#nested_idents.clear_modulations();)*
             }
 
             fn snap_smoothers(&self) {
