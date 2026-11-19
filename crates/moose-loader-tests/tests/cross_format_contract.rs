@@ -337,6 +337,10 @@ mod fixture {
                 return Err(StateLoadError::Other("poisoned custom state".into()));
             }
             data.clone_into(&mut self.extra);
+            // AU saves from the published slot even while idle. Keep the
+            // fixture's snapshot consistent with its plugin-owned payload.
+            self.snapshot
+                .store_inline(|buf| buf.extend_from_slice(data));
             LOADED_EXTRA.with(|e| data.clone_into(&mut e.borrow_mut()));
             Ok(())
         }
@@ -708,9 +712,9 @@ mod clap_host_harness {
 
     /// A real `clap_host` plus one plugin instance created through it.
     pub struct Clap {
-        pub log: Box<HostLog>,
-        host: Box<clap_host>,
-        _descriptor: Box<DescriptorHolder>,
+        pub log: std::sync::Arc<HostLog>,
+        host: *mut clap_host,
+        descriptor: *mut DescriptorHolder,
         _strings: [CString; 4],
         pub plugin: *const clap_plugin,
         pub active: bool,
@@ -720,16 +724,16 @@ mod clap_host_harness {
 
     impl Clap {
         pub fn new() -> Self {
-            let log = Box::<HostLog>::default();
+            let log = std::sync::Arc::<HostLog>::default();
             let strings = [
                 CString::new("contract-host").unwrap(),
                 CString::new("moose").unwrap(),
                 CString::new("https://example.com").unwrap(),
                 CString::new("1.0").unwrap(),
             ];
-            let host = Box::new(clap_host {
+            let host = Box::into_raw(Box::new(clap_host {
                 clap_version: clap_sys::version::CLAP_VERSION,
-                host_data: ptr::from_ref::<HostLog>(&log).cast_mut().cast(),
+                host_data: std::sync::Arc::as_ptr(&log).cast_mut().cast(),
                 name: strings[0].as_ptr(),
                 vendor: strings[1].as_ptr(),
                 url: strings[2].as_ptr(),
@@ -738,19 +742,19 @@ mod clap_host_harness {
                 request_restart: Some(request_restart),
                 request_process: Some(request_process),
                 request_callback: Some(request_callback),
-            });
-            let descriptor = Box::new(DescriptorHolder::new(&Contract::info()));
+            }));
+            let descriptor = Box::into_raw(Box::new(DescriptorHolder::new(&Contract::info())));
             let plugin = unsafe {
                 moose_clap::create_plugin_instance::<Contract>(
-                    &raw const descriptor.descriptor,
-                    &raw const *host,
+                    &raw const (*descriptor).descriptor,
+                    host,
                 )
             };
             assert!(!plugin.is_null(), "CLAP create_plugin_instance");
             let owner = Self {
                 log,
                 host,
-                _descriptor: descriptor,
+                descriptor,
                 _strings: strings,
                 plugin,
                 active: false,
@@ -912,8 +916,11 @@ mod clap_host_harness {
                 self.deactivate();
             }
             unsafe { (*self.plugin).destroy.unwrap()(self.plugin) };
-            // The host must outlive the plugin.
-            let _ = &self.host;
+            // Reclaim ABI allocations only after the plugin stops using them.
+            unsafe {
+                drop(Box::from_raw(self.host));
+                drop(Box::from_raw(self.descriptor));
+            }
         }
     }
 }
@@ -1924,6 +1931,12 @@ mod state_custom_state_applied_before_load_returns_when_idle {
 fn state_saved_by_each_format_restores_identically_in_every_format() {
     fn saved_by<H: Harness>() -> Vec<u8> {
         let mut h = H::create();
+        let payload = format!("custom-state-{}", H::NAME);
+        let seed = serialize_state_v2(hash(), 2, &[], payload.as_bytes(), &[]);
+        assert!(h.load(&seed), "{}: seed custom state", H::NAME);
+        h.start(48_000.0);
+        let _ = h.process(32, 1.0, &[]);
+        h.stop();
         h.suspended_param_flush(&[(MIX, 0.125), (CUTOFF, 4321.0), (GAIN, 0.75), (BANK, 1.0)]);
         fixture::live().set_label(H::NAME);
         let blob = h.save();
@@ -1939,7 +1952,17 @@ fn state_saved_by_each_format_restores_identically_in_every_format() {
     fn restore<H: Harness>(blob: &[u8], from: &str) {
         let mut h = H::create();
         let _ = fixture::take_migrations();
+        fixture::LOADED_EXTRA.with(|e| e.borrow_mut().clear());
         assert!(h.load(blob), "{} <- {from}", H::NAME);
+        h.start(48_000.0);
+        let _ = h.process(32, 1.0, &[]);
+        h.stop();
+        assert_eq!(
+            fixture::LOADED_EXTRA.with(|e| e.borrow().clone()),
+            format!("custom-state-{from}").as_bytes(),
+            "{} <- {from}: custom state",
+            H::NAME
+        );
         assert!(
             fixture::take_migrations().is_empty(),
             "{}: same schema, no migration",
@@ -2321,10 +2344,16 @@ fn zero_audio_thread_allocations_clap() {
         .map(clap_host_harness::ClapEvent::from_host)
         .collect();
     let mut inputs = [vec![1.0; 256], vec![1.0; 256]];
-    let mut outputs = [vec![0.0; 256], vec![0.0; 256]];
+    let mut outputs = [vec![f32::NAN; 256], vec![f32::NAN; 256]];
     fixture::SEEN.with(|_| {});
     let (status, ops) = heap_ops(|| clap.process_raw(256, &mut inputs, &mut outputs, &events));
     assert!(status >= 1);
+    for channel in &outputs {
+        assert!(
+            channel.iter().all(|sample| sample.is_finite()),
+            "measured call renders every output sample"
+        );
+    }
     assert_eq!(ops, 0, "CLAP process heap operations");
 }
 
@@ -2334,7 +2363,7 @@ fn zero_audio_thread_allocations_vst3() {
     vst3.start(48_000.0);
     let (notes, changes) = vst3.host_blocks(&dense_block());
     let mut inputs = [vec![1.0; 256], vec![1.0; 256]];
-    let mut outputs = [vec![0.0; 256], vec![0.0; 256]];
+    let mut outputs = [vec![f32::NAN; 256], vec![f32::NAN; 256]];
     fixture::SEEN.with(|_| {});
     let (result, ops) = heap_ops(|| {
         vst3.process_raw(
@@ -2347,6 +2376,12 @@ fn zero_audio_thread_allocations_vst3() {
         )
     });
     assert_eq!(result, vst3::Steinberg::kResultOk);
+    for channel in &outputs {
+        assert!(
+            channel.iter().all(|sample| sample.is_finite()),
+            "measured call renders every output sample"
+        );
+    }
     assert_eq!(ops, 0, "VST3 process heap operations");
 }
 
@@ -2611,6 +2646,12 @@ mod clap_spec {
             // calls stay on the thread that created the instance.
             struct AudioThread<'a>(&'a ClapH);
             unsafe impl Send for AudioThread<'_> {}
+            struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
             impl AudioThread<'_> {
                 fn render_until(
                     &self,
@@ -2632,6 +2673,7 @@ mod clap_spec {
             let done_ref = &done;
             let started_ref = &started;
             let handle = s.spawn(move || audio.render_until(started_ref, done_ref));
+            let _stop_render = StopOnDrop(&done);
             // Exercise rendering before recall; overlap with the load remains
             // timing-dependent. A worker panic must also release this wait.
             while !started.load(Ordering::Acquire) && !handle.is_finished() {
@@ -2670,16 +2712,29 @@ mod clap_spec {
         let mut empty_inputs = [Vec::new(), Vec::new()];
         let mut empty_outputs = [Vec::new(), Vec::new()];
         assert_eq!(
-            clap.process_raw(0, &mut empty_inputs, &mut empty_outputs, &Vec::new()),
+            clap.process_raw(
+                0,
+                &mut empty_inputs,
+                &mut empty_outputs,
+                &vec![clap_host_harness::ClapEvent::param(
+                    0,
+                    GAIN,
+                    0.875,
+                    std::ptr::null_mut()
+                )]
+            ),
             clap_sys::process::CLAP_PROCESS_CONTINUE
         );
         assert_eq!(fixture::PROCESS_CALLS.with(Cell::get), calls);
+        assert_eq!(clap.get_plain(GAIN), 0.875);
         // Frames beyond the activated maximum are refused, not overrun.
         let mut inputs = [vec![1.0; 1024], vec![1.0; 1024]];
         let mut outputs = [vec![0.0; 1024], vec![0.0; 1024]];
         let events = Vec::new();
+        let calls = fixture::PROCESS_CALLS.with(Cell::get);
         let status = clap.process_raw(1024, &mut inputs, &mut outputs, &events);
         assert_eq!(status, clap_sys::process::CLAP_PROCESS_ERROR);
+        assert_eq!(fixture::PROCESS_CALLS.with(Cell::get), calls);
     }
 }
 
@@ -2704,6 +2759,27 @@ mod divergences {
     #[test]
     #[ignore = "moose-vst3: value-list range is fixed at registration (see report)"]
     fn vst3_value_list_growth() {
-        value_list_grown_range_reaches_new_index::<Vst3H>();
+        use vst3::Steinberg::Vst::IEditControllerTrait;
+        let mut h = Vst3H::new();
+        let step_count = |h: &Vst3H| {
+            (0..unsafe { h.controller.getParameterCount() })
+                .find_map(|index| {
+                    let mut info =
+                        unsafe { std::mem::zeroed::<vst3::Steinberg::Vst::ParameterInfo>() };
+                    assert_eq!(
+                        unsafe { h.controller.getParameterInfo(index, &raw mut info) },
+                        vst3::Steinberg::kResultOk
+                    );
+                    (info.id == BANK).then_some(info.stepCount)
+                })
+                .expect("BANK metadata")
+        };
+        assert_eq!(step_count(&h), 2);
+        let params = fixture::live();
+        assert!(params.bank.set_labels(["Sine", "Saw", "Square", "Noise"]));
+        assert_eq!(step_count(&h), 3);
+        h.suspended_param_flush(&[(BANK, 3.0)]);
+        assert_eq!(h.get_plain(BANK), 3.0, "VST3: index 3 after growth");
+        assert_eq!(params.bank.index(), 3);
     }
 }
