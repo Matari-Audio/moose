@@ -3175,6 +3175,34 @@ mod input_merge {
     }
 
     #[test]
+    fn full_typed_lane_keeps_later_exact_only_note_offs() {
+        let mut on = note_on(0, 60);
+        on.__field0.noteOn.noteId = 7;
+        let mut off = note_on(450, 60);
+        off.r#type = Event_::EventTypes_::kNoteOffEvent as u16;
+        off.__field0.noteOff = NoteOffEvent {
+            channel: 0,
+            pitch: 60,
+            tuning: 0.0,
+            velocity: 1.0,
+            noteId: 7,
+        };
+        // Automation can consume all the typed headroom before the next note.
+        let gain: Vec<(i32, f64)> = (1..=300).map(|offset| (offset, 0.5)).collect();
+        let (seen, heap) = run_block(vec![on, note_on(400, 61), off], &[(0, &gain)], 512);
+        assert_eq!(seen.events.len(), seen.capacity);
+        assert!(
+            seen.events
+                .iter()
+                .all(|event| matches!(event, Seen::Param(..)))
+        );
+        assert_eq!(seen.overflow, Some(PushError::EventFull));
+        assert_eq!(seen.exact_offsets, [0, 450]);
+        assert!(seen.sorted);
+        assert_eq!(heap, 0);
+    }
+
+    #[test]
     fn exact_exhaustion_stops_the_host_note_prefix() {
         let notes: Vec<Event> = (0..500)
             .map(|i| {

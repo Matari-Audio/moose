@@ -24,7 +24,7 @@ pub(crate) const VST3_EVENT_EMITTED: u32 = 1;
 pub(crate) const VST3_EVENT_UNSUPPORTED: u32 = 2;
 pub(crate) const VST3_EVENT_INVALID: u32 = 3;
 pub(crate) const VST3_EVENT_QUEUE_FULL: u32 = 4;
-/// The typed/exact pair was refused to preserve automation headroom.
+/// The typed/exact pair was refused, but later exact-only events may still fit.
 pub(crate) const VST3_EVENT_RESERVED: u32 = 5;
 pub(crate) const VST3_EVENT_IS_LIVE: u32 = 1;
 
@@ -184,9 +184,10 @@ fn input_event_lane_full(list: &mut EventList) -> bool {
     true
 }
 
-/// Classify a typed refusal separately from exhaustion of either lane.
+/// Classify a typed refusal by whether later exact-only events can fit.
+/// Only exact-lane exhaustion stops host traversal after a typed refusal.
 fn input_refusal_status(list: &EventList) -> u32 {
-    if list.len() < list.capacity() && list.exact_len() < list.exact_capacity() {
+    if list.exact_len() < list.exact_capacity() {
         VST3_EVENT_RESERVED
     } else {
         VST3_EVENT_QUEUE_FULL
