@@ -240,32 +240,45 @@ impl ShapeCell {
 
     fn load(&self) -> Shape {
         loop {
-            let before = self.seq.load(Ordering::Acquire);
-            if before & 1 == 0 {
-                let tag = self.tag.load(Ordering::Relaxed);
-                let a = f64::from_bits(self.a.load(Ordering::Relaxed));
-                let b = f64::from_bits(self.b.load(Ordering::Relaxed));
-                fence(Ordering::Acquire);
-                if self.seq.load(Ordering::Relaxed) == before {
-                    return Shape {
-                        tag: Tag::from_u8(tag).unwrap_or(Tag::Linear),
-                        a,
-                        b,
-                    };
-                }
+            if let Some((shape, ())) = self.try_read(|| ()) {
+                return shape;
             }
             std::hint::spin_loop();
         }
     }
 
-    /// Caller holds the layout lock (one writer).
-    fn store(&self, shape: Shape) {
+    /// Read associated atomics under the same sequence as the shape.
+    /// A failed attempt leaves the caller free to use a bounded fallback.
+    fn try_read<T>(&self, read: impl FnOnce() -> T) -> Option<(Shape, T)> {
+        let before = self.seq.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return None;
+        }
+        let tag = self.tag.load(Ordering::Relaxed);
+        let a = f64::from_bits(self.a.load(Ordering::Relaxed));
+        let b = f64::from_bits(self.b.load(Ordering::Relaxed));
+        let value = read();
+        fence(Ordering::Acquire);
+        (self.seq.load(Ordering::Relaxed) == before).then_some((
+            Shape {
+                tag: Tag::from_u8(tag).unwrap_or(Tag::Linear),
+                a,
+                b,
+            },
+            value,
+        ))
+    }
+
+    /// Caller holds the layout lock (one writer). Associated binding
+    /// atomics must change before the sequence becomes readable again.
+    fn store(&self, shape: Shape, update: impl FnOnce()) {
         let seq = self.seq.load(Ordering::Relaxed);
         self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
         fence(Ordering::Release);
         self.tag.store(shape.tag as u8, Ordering::Relaxed);
         self.a.store(shape.a.to_bits(), Ordering::Relaxed);
         self.b.store(shape.b.to_bits(), Ordering::Relaxed);
+        update();
         self.seq.store(seq.wrapping_add(2), Ordering::Release);
     }
 }
@@ -438,16 +451,25 @@ impl<const N: usize> DynamicParams<N> {
 
     /// The effective value of a bound slot: plain value plus modulation,
     /// clamped and stepped into its current range. A free slot, or an
-    /// unmodulated one, reads its plain value. Lock-free.
+    /// unmodulated one, reads its plain value. If a binding edit overlaps
+    /// the read, returns the base value without waiting for the editor.
     #[must_use]
     pub fn modulated_plain(&self, slot: Slot) -> f64 {
         let cell = &self.slots[slot.0];
-        let plain = f64::from_bits(cell.value.load(Ordering::Relaxed));
-        let offset = f64::from_bits(cell.modulation.load(Ordering::Relaxed));
-        if offset == 0.0 || !cell.bound.load(Ordering::Relaxed) {
+        let snapshot = cell.shape.try_read(|| {
+            (
+                f64::from_bits(cell.value.load(Ordering::Relaxed)),
+                f64::from_bits(cell.modulation.load(Ordering::Relaxed)),
+                cell.bound.load(Ordering::Relaxed),
+            )
+        });
+        let Some((shape, (plain, offset, bound))) = snapshot else {
+            return self.plain(slot);
+        };
+        if offset == 0.0 || !bound {
             return plain;
         }
-        let range = cell.shape.load().param_range();
+        let range = shape.param_range();
         range.denormalize(range.normalize(plain + offset))
     }
 
@@ -510,23 +532,24 @@ impl<const N: usize> DynamicParams<N> {
                 if old.is_some() {
                     layout.removed.push(cell.id);
                 }
-                cell.shape.store(new_shape);
-                cell.bound.store(new.is_some(), Ordering::Relaxed);
-                // An offset in the old shape's units means nothing in the new.
-                cell.modulation.store(0f64.to_bits(), Ordering::Relaxed);
-                let range = new_shape.param_range();
-                let plain = match &new {
-                    Some(def) if reset_values => def.default,
-                    _ => f64::from_bits(cell.value.load(Ordering::Relaxed)),
-                };
-                let plain = if new.is_some() {
-                    range.denormalize(range.normalize(plain))
-                } else {
-                    plain
-                };
-                if cell.value.swap(plain.to_bits(), Ordering::Relaxed) != plain.to_bits() {
-                    change |= CatalogChange::VALUES;
-                }
+                cell.shape.store(new_shape, || {
+                    cell.bound.store(new.is_some(), Ordering::Relaxed);
+                    // An offset in the old shape's units means nothing in the new.
+                    cell.modulation.store(0f64.to_bits(), Ordering::Relaxed);
+                    let range = new_shape.param_range();
+                    let plain = match &new {
+                        Some(def) if reset_values => def.default,
+                        _ => f64::from_bits(cell.value.load(Ordering::Relaxed)),
+                    };
+                    let plain = if new.is_some() {
+                        range.denormalize(range.normalize(plain))
+                    } else {
+                        plain
+                    };
+                    if cell.value.swap(plain.to_bits(), Ordering::Relaxed) != plain.to_bits() {
+                        change |= CatalogChange::VALUES;
+                    }
+                });
             } else {
                 change |= CatalogChange::INFO;
             }
@@ -1111,6 +1134,91 @@ mod tests {
     }
 
     #[test]
+    fn modulated_read_does_not_wait_for_binding_writer() {
+        let params = DynamicParams::<1>::new();
+        let slot = Slot(0);
+        params.edit(|tx| {
+            tx.bind(
+                slot,
+                SlotDef::new(
+                    "Gain",
+                    SlotRange::Linear {
+                        min: 0.0,
+                        max: 10.0,
+                    },
+                ),
+            );
+        });
+        params.set_plain(params.id(slot), 4.0);
+        params.set_modulation(params.id(slot), 2.0);
+        assert_eq!(params.modulated_plain(slot), 6.0);
+
+        let cell = &params.slots[0];
+        cell.shape.store(Shape::FREE, || {
+            // The writer cannot finish until this read returns.
+            assert_eq!(params.modulated_plain(slot), 4.0);
+            cell.bound.store(false, Ordering::Relaxed);
+            cell.modulation.store(0f64.to_bits(), Ordering::Relaxed);
+        });
+        assert_eq!(params.modulated_plain(slot), 4.0);
+    }
+
+    #[test]
+    fn snapshot_rejects_a_binding_changed_during_the_read() {
+        let cell = ShapeCell::new(Shape::FREE);
+        let snapshot = cell.try_read(|| {
+            cell.store(
+                Shape {
+                    tag: Tag::Int,
+                    a: 100.0,
+                    b: 200.0,
+                },
+                || {},
+            );
+            42
+        });
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn modulated_reads_do_not_mix_bindings() {
+        let params = Arc::new(DynamicParams::<1>::new());
+        let writer = {
+            let params = Arc::clone(&params);
+            std::thread::spawn(move || {
+                let cell = &params.slots[0];
+                for i in 0..20_000 {
+                    let (a, b, plain, offset) = if i % 2 == 0 {
+                        (0.0_f64, 10.0_f64, 1.0_f64, 2.0_f64)
+                    } else {
+                        (100.0, 200.0, 150.0, 5.0)
+                    };
+                    cell.shape.store(
+                        Shape {
+                            tag: Tag::Linear,
+                            a,
+                            b,
+                        },
+                        || {
+                            cell.bound.store(true, Ordering::Relaxed);
+                            cell.value.store(plain.to_bits(), Ordering::Relaxed);
+                            cell.modulation.store(offset.to_bits(), Ordering::Relaxed);
+                        },
+                    );
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            let value = params.modulated_plain(Slot(0));
+            assert!(
+                [0.0, 1.0, 3.0, 150.0, 155.0].contains(&value),
+                "mixed binding: {value}"
+            );
+        }
+        writer.join().expect("writer");
+    }
+
+    #[test]
     fn shape_reads_never_tear() {
         let cell = Arc::new(ShapeCell::new(Shape {
             tag: Tag::Linear,
@@ -1122,11 +1230,14 @@ mod tests {
             std::thread::spawn(move || {
                 for i in 0..20_000u32 {
                     let v = f64::from(i);
-                    cell.store(Shape {
-                        tag: Tag::Linear,
-                        a: v,
-                        b: v,
-                    });
+                    cell.store(
+                        Shape {
+                            tag: Tag::Linear,
+                            a: v,
+                            b: v,
+                        },
+                        || {},
+                    );
                 }
             })
         };
