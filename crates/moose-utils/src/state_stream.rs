@@ -497,7 +497,7 @@ mod prepared_tests {
         let StreamState::Envelope(StateParse::WrongPlugin { state, .. }) = state else {
             panic!()
         };
-        assert!(state.persist.is_empty());
+        assert_eq!(state.persist, [] as [u8; 0]);
         assert_eq!(state.params, [(7, 0.25)]);
     }
     #[test]

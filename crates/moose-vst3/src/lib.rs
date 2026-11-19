@@ -4954,10 +4954,6 @@ mod tests {
 #[cfg(test)]
 extern crate self as moose;
 #[cfg(test)]
-use moose_core as core;
-#[cfg(test)]
-use moose_params as params;
-#[cfg(test)]
 use moose_test_fixtures::host_value_fixture;
 
 #[cfg(test)]

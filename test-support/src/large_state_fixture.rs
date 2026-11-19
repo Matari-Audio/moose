@@ -115,6 +115,7 @@ impl<const LIMIT: usize> PluginExport for LargePlugin<LIMIT> {
         Arc::clone(&self.snapshot)
     }
 }
+#[must_use]
 pub fn payload() -> Vec<u8> {
     (0_u8..251).cycle().take(33 * 1024 * 1024).collect()
 }

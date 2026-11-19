@@ -114,16 +114,22 @@ pub struct Completion {
     reported: AtomicU64,
 }
 impl Completion {
+    /// # Panics
+    ///
+    /// If the signal lock is poisoned.
     pub fn complete(&self, value: u64) {
         self.content.store(value, Ordering::Release);
         self.pending.store(true, Ordering::Release);
-        let signal = self.signal.lock().unwrap().upgrade();
+        let signal = self.signal.lock().expect("lock poisoned").upgrade();
         if let Some(signal) = signal {
             signal.notify();
         }
     }
+    /// # Panics
+    ///
+    /// If the signal lock is poisoned.
     pub fn signal(&self) -> Option<Arc<moose_params::PersistChangeSignal>> {
-        self.signal.lock().unwrap().upgrade()
+        self.signal.lock().expect("lock poisoned").upgrade()
     }
 }
 impl moose_core::custom_state::PersistField for Completion {
