@@ -235,15 +235,15 @@ mod plugin_cell {
     use std::cell::UnsafeCell;
     use std::marker::PhantomData;
     use std::ops::{Deref, DerefMut};
+    use crate::sync::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread::{self, Thread};
-    use std::time::Duration;
 
     /// Longest a waiting [`PluginCell::enter`] parks before it re-checks the
     /// cell on its own. The releasing owner unparks the waiter, so this only
     /// bounds a wake-up lost to a `try_lock` race on the waker slot.
-    const WAKE_BACKSTOP: Duration = Duration::from_millis(2);
+    #[cfg(not(all(test, feature = "loom")))]
+    const WAKE_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(2);
 
     pub struct PluginCell<T> {
         data: UnsafeCell<T>,
@@ -268,10 +268,15 @@ mod plugin_cell {
     /// A never-zero per-thread token. `0` is reserved for "cell free", so
     /// the counter starts at 1.
     fn thread_token() -> u64 {
+        // loom runs its model threads on one OS thread, so the token must
+        // be per loom thread there or every thread would look like the owner.
+        #[cfg(all(test, feature = "loom"))]
+        use loom::thread_local;
         thread_local! {
             static TOKEN: u64 = {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
+                static NEXT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             };
         }
         TOKEN.with(|&t| t)
@@ -334,6 +339,11 @@ mod plugin_cell {
             // `waiting` after clearing `held`, or this load sees `held` clear.
             self.waiting.store(true, Ordering::SeqCst);
             if self.held.load(Ordering::SeqCst) {
+                // loom threads can't OS-park; yielding lets the model run
+                // the owner to its release.
+                #[cfg(all(test, feature = "loom"))]
+                loom::thread::yield_now();
+                #[cfg(not(all(test, feature = "loom")))]
                 thread::park_timeout(WAKE_BACKSTOP);
             }
             self.waiting.store(false, Ordering::Relaxed);
@@ -979,5 +989,59 @@ mod panic_latch_tests {
         }
         latch.clear();
         assert!(!latch.is_failed() && latch.message.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod plugin_cell_loom_tests {
+    use super::PluginCell;
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Two owners take turns through `enter`. The plugin state is a loom
+    /// `UnsafeCell`, so loom reports any interleaving where the handoff
+    /// fails to order one owner's writes before the other's access, and the
+    /// final count proves neither increment was lost.
+    #[test]
+    fn loom_handoff_orders_each_owners_writes() {
+        loom::model(|| {
+            let cell = Arc::new(PluginCell::new(UnsafeCell::new(0u32)));
+            let other = Arc::clone(&cell);
+            let audio = thread::spawn(move || {
+                let guard = other.enter();
+                // SAFETY: the guard is the only access to the state.
+                guard.with_mut(|n| unsafe { *n += 1 });
+            });
+            {
+                let guard = cell.enter();
+                // SAFETY: as above.
+                guard.with_mut(|n| unsafe { *n += 1 });
+            }
+            audio.join().unwrap();
+            let guard = cell.enter();
+            // SAFETY: both other owners have released.
+            assert_eq!(guard.with(|n| unsafe { *n }), 2);
+        });
+    }
+
+    /// `try_enter` never hands out a second guard while one is live.
+    #[test]
+    fn loom_try_enter_admits_one_owner() {
+        loom::model(|| {
+            let cell = Arc::new(PluginCell::new(UnsafeCell::new(0u32)));
+            let other = Arc::clone(&cell);
+            let audio = thread::spawn(move || {
+                if let Some(guard) = other.try_enter() {
+                    // SAFETY: the guard is the only access to the state.
+                    guard.with_mut(|n| unsafe { *n += 1 });
+                }
+            });
+            if let Some(guard) = cell.try_enter() {
+                // SAFETY: as above.
+                guard.with_mut(|n| unsafe { *n += 1 });
+            }
+            audio.join().unwrap();
+        });
     }
 }

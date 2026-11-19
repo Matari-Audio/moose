@@ -16,7 +16,8 @@
 
 set -euo pipefail
 
-cd "$(git rev-parse --show-toplevel)"
+# The moose root, whether checked out alone or inside the monorepo.
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 if command -v cargo >/dev/null 2>&1; then
     CARGO=cargo
@@ -45,7 +46,9 @@ echo "rt-paranoid: checking ${#pkgs[@]} example crates"
 fail=0
 for pkg in "${pkgs[@]}"; do
     echo "::group::rt-paranoid $pkg"
-    if ! "$CARGO" test -p "$pkg" --features rt-paranoid --lib; then
+    # The generated screenshot tests need a GPU adapter, which headless CI
+    # runners lack; they check the editor, not the audio thread.
+    if ! "$CARGO" test -p "$pkg" --features rt-paranoid --lib -- --skip gui_screenshot; then
         echo "::error::$pkg allocates on the audio thread in process()"
         fail=1
     fi

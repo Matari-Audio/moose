@@ -20,6 +20,7 @@ pub mod rt;
 pub mod screenshot;
 pub mod snapshot;
 pub mod state;
+mod sync;
 pub mod tasks;
 pub mod thread;
 pub mod transport;

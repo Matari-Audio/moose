@@ -629,4 +629,36 @@ mod state_handoff_tests {
         drop(audio);
         assert_eq!(queue.owners.lock().unwrap().len(), 1);
     }
+
+    /// The host pushes while an audio thread pops and applies, as in a live
+    /// session. Under Miri this checks the handoff for data races and that
+    /// every recalled state is freed (leak check) once both sides finish.
+    #[test]
+    fn concurrent_push_and_apply_frees_every_state() {
+        let queue = std::sync::Arc::new(StateLoadQueue::new(1));
+        let audio = {
+            let queue = std::sync::Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let mut applied = 0;
+                while applied < 3 {
+                    if let Some(state) = queue.pop() {
+                        assert!(state.persist.is_empty(), "persist stays on the host");
+                        queue.mark_applied(&state, true);
+                        applied = state.extra.as_ref().map_or(0, |e| e[0]);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        for value in 1..3 {
+            queue.force_push(state(value));
+        }
+        let last = queue.push_tracked(state(3));
+        audio.join().unwrap();
+        assert_eq!(
+            queue.wait_applied(&last, std::time::Duration::ZERO),
+            Some(true)
+        );
+        assert!(queue.unapplied().is_none());
+    }
 }

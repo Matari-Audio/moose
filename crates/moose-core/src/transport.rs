@@ -16,7 +16,7 @@
 //! visualizer drift from real transport state.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use crate::sync::{AtomicU64, Ordering, fence};
 
 use crate::events::TransportInfo;
 
@@ -78,6 +78,7 @@ impl TransportSlot {
     /// load and an eight-word copy. A writer scheduled out mid-update
     /// could make the reader spin, so this gives up after 8 attempts
     /// and returns `None`; the editor reads again next frame.
+    #[must_use]
     pub fn read(&self) -> Option<TransportInfo> {
         for _ in 0..8 {
             let s1 = self.seq.load(Ordering::Acquire);
@@ -85,7 +86,10 @@ impl TransportSlot {
                 return None;
             }
             if s1 & 1 == 1 {
+                #[cfg(not(all(test, feature = "loom")))]
                 std::hint::spin_loop();
+                #[cfg(all(test, feature = "loom"))]
+                loom::thread::yield_now();
                 continue;
             }
             let words: [u64; WORDS] =
@@ -260,5 +264,58 @@ mod tests {
         for r in readers {
             r.join().unwrap();
         }
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::TransportSlot;
+    use crate::events::TransportInfo;
+    use loom::thread;
+
+    #[allow(clippy::cast_precision_loss, reason = "small test counters")]
+    fn info(n: i64) -> TransportInfo {
+        let f = n as f64;
+        TransportInfo {
+            playing: n % 2 == 0,
+            recording: false,
+            tempo: f,
+            time_sig_num: 0,
+            time_sig_den: 0,
+            position_samples: n,
+            position_seconds: f,
+            position_beats: f,
+            bar_start_beats: f,
+            loop_active: false,
+            loop_start_beats: f,
+            loop_end_beats: f,
+        }
+    }
+
+    /// A reader racing two writes sees nothing, the first write or the
+    /// second, whole: never fields from both. Loom explores the
+    /// interleavings, including the weak-memory reorderings the seqlock's
+    /// fences exist to rule out.
+    #[test]
+    fn loom_reader_never_sees_a_torn_write() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let slot = TransportSlot::new();
+            let writer = {
+                let slot = std::sync::Arc::clone(&slot);
+                thread::spawn(move || {
+                    slot.write(&info(1));
+                    slot.write(&info(2));
+                })
+            };
+            let seen = slot.read();
+            writer.join().unwrap();
+            assert!(
+                seen.is_none() || seen == Some(info(1)) || seen == Some(info(2)),
+                "torn read: {seen:?}"
+            );
+            assert_eq!(slot.read(), Some(info(2)));
+        });
     }
 }
