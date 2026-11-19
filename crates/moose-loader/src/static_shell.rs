@@ -57,17 +57,6 @@ pub struct StaticShell<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample =
     _sample: std::marker::PhantomData<fn() -> S>,
 }
 
-// SAFETY: `StaticShell` owns `Arc<P>` (params, `Sync` by the
-// `Params` trait contract), `L::DspState` (`Send + 'static` per the
-// `PluginLogicCore` bound), an atomic-slot `MeterStore`, and a
-// `PhantomData<fn() -> S>`. No raw pointers, no `!Send` fields, no
-// interior mutability that escapes the shell's own `&mut` borrows. The
-// host contract that format wrappers invoke methods on a single thread
-// at a time per instance is what keeps the embedded state safe to
-// access without an inner mutex - same model `HotShell` uses through
-// `parking_lot::Mutex`.
-unsafe impl<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample> Send for StaticShell<P, L, S> {}
-
 impl<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample> Drop for StaticShell<P, L, S> {
     fn drop(&mut self) {
         if let Some(tasks) = &self.tasks {
@@ -307,6 +296,13 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         <L as PluginLogicCore<S>>::migrate_state(foreign)
     }
 
+    fn validate_state(data: &[u8]) -> Result<(), StateLoadError>
+    where
+        Self: Sized,
+    {
+        <L as PluginLogicCore<S>>::validate_state(data)
+    }
+
     fn latency(&self) -> u32 {
         L::latency(&self.state)
     }
@@ -544,6 +540,15 @@ macro_rules! export_static {
                 Self: Sized,
             {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::migrate_state(foreign)
+            }
+
+            fn validate_state(
+                data: &[u8],
+            ) -> Result<(), $crate::__macro_deps::moose_core::state::StateLoadError>
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::validate_state(data)
             }
 
             fn latency(&self) -> u32 {

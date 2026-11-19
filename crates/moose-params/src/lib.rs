@@ -22,10 +22,10 @@ pub use persist_write::{KeyedPersistWrite, PreparedPersistWrite, write_prepared_
 pub use projection::{ParamProjection, ProjectedValue, append_projected_infos};
 pub use range::ParamRange;
 pub use sample::{Float, Sample};
-pub use smooth::{Smoother, SmoothingStyle};
+pub use smooth::{SmoothState, Smoother, SmoothingStyle};
 pub use types::{
     BoolParam, EnumParam, FloatParam, FloatParamReadF32, FloatParamReadF64, IntParam, MeterSlot,
-    ParamEnum, bump_edit_epoch, custom_edit_epoch, edit_epoch,
+    ParamEnum, ParamSmoother, bump_edit_epoch, custom_edit_epoch, edit_epoch,
 };
 
 /// Largest host-visible parameter ID. The signed-positive 31-bit

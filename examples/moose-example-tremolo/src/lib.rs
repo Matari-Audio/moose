@@ -112,13 +112,16 @@ pub struct Tremolo {
     /// Advances at 2 Hz so the effect stays visibly active offline.
     free_phase: f64,
     sample_rate: f64,
+    /// The depth ramp, stepped here rather than in the shared params.
+    depth: ParamSmoother,
 }
 
 impl Default for Tremolo {
     fn default() -> Self {
         Tremolo {
             free_phase: 0.0,
-            sample_rate: 44100.0,
+            sample_rate: 44_100.0,
+            depth: ParamSmoother::default(),
         }
     }
 }
@@ -130,10 +133,11 @@ impl PluginLogic for Tremolo {
     type Params = TremoloParams;
     type DspState = Self;
 
-    fn reset(state: &mut Self, _params: &TremoloParams, config: &AudioConfig) {
+    fn reset(state: &mut Self, params: &TremoloParams, config: &AudioConfig) {
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.free_phase = 0.0;
+        state.depth.reset(&params.depth, sample_rate);
     }
 
     fn process(
@@ -165,7 +169,7 @@ impl PluginLogic for Tremolo {
         let mut free_phase = state.free_phase;
 
         for i in 0..buffer.num_samples() {
-            let depth = params.depth.read();
+            let depth = state.depth.next(&params.depth);
             let phase = if host_sync { host_phase } else { free_phase };
             let lfo = shape.at(phase); // in [0, 1]
             // `lfo` is in [0, 1]; the f32 cast is exact for that range.

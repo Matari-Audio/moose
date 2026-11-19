@@ -79,6 +79,12 @@ impl PluginRuntime for Probe {
         self.custom = data.to_vec();
         Ok(())
     }
+    fn validate_state(data: &[u8]) -> Result<(), moose_core::state::StateLoadError> {
+        if data == b"invalid" {
+            return Err(moose_core::state::StateLoadError::Other("invalid framing".into()));
+        }
+        Ok(())
+    }
     fn process(
         &mut self,
         audio: &mut AudioBuffer,
@@ -705,6 +711,38 @@ fn rejected_load_fails_and_keeps_the_previous_state() {
             }
         });
     }
+}
+
+/// A load queued for an audio thread that isn't running yet still fails
+/// when the plugin's `validate_state` rejects it on the host thread, and
+/// leaves params as they were (step 2's `validate` hook).
+#[test]
+fn validate_state_rejects_a_queued_load_up_front() {
+    use moose_params::Params;
+    with_probe(|plugin| {
+        // SAFETY: serial lifecycle calls on a live instance; the stream's
+        // context outlives the call that reads it.
+        unsafe {
+            let callbacks = &*plugin;
+            assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
+            // Processing, but the host sends no blocks: the load is queued.
+            assert!(callbacks.start_processing.unwrap()(plugin));
+            let state_ext = make_state_extension::<Probe>();
+            let data = data_from_plugin::<Probe>(plugin);
+            let before = data.params_arc.get_plain(0);
+            let blob = state::serialize_state(data.plugin_id_hash, &[0], &[-30.0], b"invalid", &[]);
+            let mut cursor = (blob, 0_usize);
+            let input = clap_istream {
+                ctx: (&raw mut cursor).cast(),
+                read: Some(read_cursor),
+            };
+            // Without the hook this load would time out queued and report success.
+            assert!(!state_ext.load.unwrap()(plugin, &raw const input), "invalid state reports failure");
+            assert_eq!(data.params_arc.get_plain(0), before, "params kept");
+            callbacks.stop_processing.unwrap()(plugin);
+            callbacks.deactivate.unwrap()(plugin);
+        }
+    });
 }
 
 /// CLAP `reset` is [audio-thread]: the author's `reset` runs in an

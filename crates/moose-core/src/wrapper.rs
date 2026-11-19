@@ -115,7 +115,9 @@ pub fn apply_queued_state<P: PluginExport>(
 /// Params and `#[persist]` must already be applied (`read_and_apply_params`
 /// / `apply_params`); `backup` is what they were before. When the plugin's
 /// `load_state` rejects the state, they are restored from it, so the load
-/// fails as a unit and the error is returned for the host. A load still
+/// fails as a unit and the error is returned for the host. The plugin's
+/// [`validate_state`](crate::plugin::PluginRuntime::validate_state) runs
+/// first, on this thread, and can reject the state up front. A load still
 /// queued when the wait ends returns `Ok`: its envelope already parsed on
 /// the host thread, and saves until it lands report its custom bytes (see
 /// [`custom_state_view`]).
@@ -146,6 +148,11 @@ fn apply_or_queue_inner<P: PluginExport>(
     state: crate::state::DeserializedState,
     can_own: bool,
 ) -> Result<(), crate::state::StateLoadError> {
+    // Host thread, before anything is applied or queued: a queued load may
+    // answer the host before `load_state` runs, so this is where it can fail.
+    if let Some(extra) = &state.extra {
+        P::validate_state(extra)?;
+    }
     // `try_enter`: a CLAP `reset` may hold the cell on the audio thread
     // while stopped; then queue instead of panicking on an overlap.
     if can_own && let Some(mut instance) = plugin.try_enter() {
@@ -218,41 +225,48 @@ pub fn custom_state_view(
     }
 }
 
-/// Lock-free plugin ownership cell, uniform across platforms. Holds no
-/// OS mutex: the audio thread owns the plugin while processing, the host
-/// thread while stopped, and a spec-compliant host never overlaps the
-/// two. Ownership handoff is a release-acquire edge, not a lock, so
-/// `enter` never blocks and there is no poison, no priority inversion,
-/// and no per-platform variant.
+/// Plugin ownership cell, uniform across platforms: the audio thread owns
+/// the plugin while processing, the host thread while stopped. Ownership
+/// is one atomic flag plus a release-acquire handoff, so an uncontended
+/// `enter` takes no OS lock. A spec-compliant host never overlaps the two
+/// owners; when one does, `enter` parks until the other releases rather
+/// than dropping the call (audit finding 8).
 mod plugin_cell {
     use std::cell::UnsafeCell;
     use std::marker::PhantomData;
     use std::ops::{Deref, DerefMut};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread::{self, Thread};
+    use std::time::Duration;
+
+    /// Longest a waiting [`PluginCell::enter`] parks before it re-checks the
+    /// cell on its own. The releasing owner unparks the waiter, so this only
+    /// bounds a wake-up lost to a `try_lock` race on the waker slot.
+    const WAKE_BACKSTOP: Duration = Duration::from_millis(2);
 
     pub struct PluginCell<T> {
         data: UnsafeCell<T>,
         /// Release-acquire handoff counter. Each owner `Acquire`s on
         /// entry (observing the previous owner's writes) and `Release`s
         /// on exit (publishing its own), carrying the happens-before edge
-        /// between the audio thread and the host thread. Mutual exclusion
-        /// comes from the host contract - `process` never overlaps a
-        /// lifecycle callback - not from this counter.
+        /// between the audio thread and the host thread.
         handoff: AtomicU64,
-        /// Atomic ownership flag. Acquire and release synchronize successive
-        /// owners, and both entry paths reject overlapping mutable access.
+        /// Ownership flag; the only arbiter of who holds the cell.
         held: AtomicBool,
-        /// Token of the thread currently holding the cell, for an accurate
-        /// debug overlap message: same-thread re-entry (author code reached
-        /// back into the cell) reads differently than a cross-thread overlap
-        /// (a genuine host contract violation). Debug-only.
-        #[cfg(debug_assertions)]
+        /// Token of the thread holding the cell (0 when free), so `enter`
+        /// can tell same-thread re-entry (a bug that would deadlock) from
+        /// another thread's overlap (worth waiting out).
         owner: AtomicU64,
+        /// A thread is parked in `enter` waiting for the cell.
+        waiting: AtomicBool,
+        /// The parked thread to wake. Written by waiters; the releasing
+        /// owner only `try_lock`s it, so release never blocks.
+        waker: Mutex<Option<Thread>>,
     }
 
-    /// A never-zero per-thread token for the debug overlap detector. `0` is
-    /// reserved for "cell free", so the counter starts at 1.
-    #[cfg(debug_assertions)]
+    /// A never-zero per-thread token. `0` is reserved for "cell free", so
+    /// the counter starts at 1.
     fn thread_token() -> u64 {
         thread_local! {
             static TOKEN: u64 = {
@@ -263,9 +277,9 @@ mod plugin_cell {
         TOKEN.with(|&t| t)
     }
 
-    // SAFETY: `T` is reached only through a guard, and the host contract
-    // hands it to one owner at a time - the same guarantee `Mutex<T>`
-    // leans on, so `Send`/`Sync` need only `T: Send`.
+    // SAFETY: `T` is reached only through a guard, and `held` admits one
+    // guard at a time - the same guarantee `Mutex<T>` gives, so
+    // `Send`/`Sync` need only `T: Send`.
     unsafe impl<T: Send> Send for PluginCell<T> {}
     unsafe impl<T: Send> Sync for PluginCell<T> {}
 
@@ -275,55 +289,61 @@ mod plugin_cell {
                 data: UnsafeCell::new(value),
                 handoff: AtomicU64::new(0),
                 held: AtomicBool::new(false),
-                #[cfg(debug_assertions)]
                 owner: AtomicU64::new(0),
+                waiting: AtomicBool::new(false),
+                waker: Mutex::new(None),
             }
         }
 
-        /// Take ownership without blocking.
+        /// Take ownership, waiting while another thread holds the cell.
+        ///
+        /// A spec-compliant host never overlaps the audio thread and a
+        /// lifecycle callback, so this normally returns at once. When a
+        /// host does overlap them, the caller parks until the other owner
+        /// releases (one block or one callback) instead of failing the
+        /// call. The wait is event-driven: the releasing owner unparks it.
         ///
         /// # Panics
-        /// Panics when another owner holds the cell.
+        /// Panics when this thread already holds the cell: author code
+        /// (e.g. `request_resize` from `set_size` / `state_changed`) reached
+        /// back into it while the wrapper held it, which can never be
+        /// waited out. Use [`Self::try_enter`] on such paths.
         pub fn enter(&self) -> PluginGuard<'_, T> {
-            self.handoff.load(Ordering::Acquire);
-            let was_held = self.held.swap(true, Ordering::Acquire);
-            #[cfg(debug_assertions)]
-            {
-                let me = thread_token();
-                let prev = self.owner.swap(me, Ordering::Relaxed);
-                assert!(
-                    !was_held,
-                    "{}",
-                    if prev == me {
-                        "plugin ownership cell re-entered on the same thread: \
-                         author editor code (e.g. request_resize called from \
-                         set_size / state_changed) reached back into the cell \
-                         while the wrapper still held it"
-                    } else {
-                        "plugin ownership cell entered from another thread while \
-                         held: the host overlapped process() with a lifecycle \
-                         callback"
-                    }
+            let me = thread_token();
+            loop {
+                if let Some(guard) = self.try_enter() {
+                    return guard;
+                }
+                assert_ne!(
+                    self.owner.load(Ordering::Relaxed),
+                    me,
+                    "plugin ownership cell re-entered on the same thread: author \
+                     editor code (e.g. request_resize called from set_size / \
+                     state_changed) reached back into the cell while the wrapper \
+                     still held it"
                 );
+                self.park_until_released();
             }
-            #[cfg(not(debug_assertions))]
-            assert!(!was_held, "plugin ownership cell is already held");
-            PluginGuard {
-                cell: self,
-                _not_send: PhantomData,
+        }
+
+        /// Park this thread until the current owner releases (or the
+        /// backstop elapses). Spurious returns are fine: `enter` re-checks.
+        fn park_until_released(&self) {
+            *self.waker.lock().expect("plugin cell waker slot poisoned") = Some(thread::current());
+            // SeqCst pairs with the guard's drop: either the owner sees
+            // `waiting` after clearing `held`, or this load sees `held` clear.
+            self.waiting.store(true, Ordering::SeqCst);
+            if self.held.load(Ordering::SeqCst) {
+                thread::park_timeout(WAKE_BACKSTOP);
             }
+            self.waiting.store(false, Ordering::Relaxed);
         }
 
         /// Take ownership only if the cell is free, returning `None` when it
-        /// is already held. Unlike [`Self::enter`] this never asserts and
-        /// never hands out a second `&mut` - it is the safe primitive for
-        /// paths where author code may re-enter the cell (a `request_resize`
-        /// closure invoked synchronously from within an `Editor` method the
-        /// wrapper called while holding the guard). Callers defer the work
-        /// (stash it and apply on the next entry) when they get `None`.
-        ///
-        /// All acquisitions arbitrate through the same atomic flag. An
-        /// overlapping `enter` panics rather than creating a mutable alias.
+        /// is already held. Never waits and never asserts: the primitive for
+        /// paths where author code may re-enter the cell, and for the audio
+        /// thread's lock-free checks. Callers defer the work (stash it and
+        /// apply on the next entry) when they get `None`.
         pub fn try_enter(&self) -> Option<PluginGuard<'_, T>> {
             self.handoff.load(Ordering::Acquire);
             if self
@@ -333,12 +353,22 @@ mod plugin_cell {
             {
                 return None;
             }
-            #[cfg(debug_assertions)]
             self.owner.store(thread_token(), Ordering::Relaxed);
             Some(PluginGuard {
                 cell: self,
                 _not_send: PhantomData,
             })
+        }
+
+        /// Wake a thread parked in [`Self::enter`], if any. Never blocks:
+        /// a waiter still registering is caught by its own `held` re-check.
+        fn wake_waiter(&self) {
+            if self.waiting.load(Ordering::SeqCst)
+                && let Ok(slot) = self.waker.try_lock()
+                && let Some(waiter) = slot.as_ref()
+            {
+                waiter.unpark();
+            }
         }
     }
 
@@ -354,9 +384,8 @@ mod plugin_cell {
     impl<T> Deref for PluginGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
-            // SAFETY: this thread solely owns the cell for the guard's
-            // lifetime (host exclusion contract), so no other reference
-            // to `data` exists.
+            // SAFETY: `held` admits one guard at a time, so no other
+            // reference to `data` exists while this guard lives.
             unsafe { &*self.cell.data.get() }
         }
     }
@@ -370,11 +399,11 @@ mod plugin_cell {
 
     impl<T> Drop for PluginGuard<'_, T> {
         fn drop(&mut self) {
-            #[cfg(debug_assertions)]
             self.cell.owner.store(0, Ordering::Relaxed);
-            self.cell.held.store(false, Ordering::Release);
             // Release: publish this owner's writes to the next `Acquire`.
             self.cell.handoff.fetch_add(1, Ordering::Release);
+            self.cell.held.store(false, Ordering::SeqCst);
+            self.cell.wake_waiter();
         }
     }
 }
@@ -480,39 +509,14 @@ pub fn run_register<P>(format: &str, body: impl FnOnce()) {
     }
 }
 
-/// Run a per-block audio-thread `body` under
-/// [`std::panic::catch_unwind`].
-///
-/// Format wrappers call this around the `cb_process` body so a panic
-/// from user `process()` can't unwind across the `extern "C"` FFI
-/// boundary into the host (UB on most toolchains; abort on others).
-/// Returns `true` on clean exit, `false` if the body panicked - the
-/// caller should zero output buffers on `false` so the host doesn't
-/// keep playing whatever happened to be in those slots.
-///
-/// Panic logging is one short `eprintln!` per occurrence; the audio
-/// thread should never panic, so the I/O is rare and acceptable.
-#[must_use]
-pub fn run_audio_block<P>(format: &str, body: impl FnOnce()) -> bool {
-    let result = catch_unwind(AssertUnwindSafe(body));
-    if let Err(payload) = result {
-        eprintln!(
-            "[moose {format}] panic in process() for {}: {}",
-            type_name::<P>(),
-            extract_panic_msg(&payload),
-        );
-        return false;
-    }
-    true
-}
-
 /// Bytes kept of a `process` panic message; the slot never grows.
 const PANIC_MESSAGE_CAP: usize = 256;
 
 /// Per-instance "process panicked" latch (audit finding 5). After the
 /// first caught panic the wrapper stops calling the plugin, outputs
 /// silence and reports the error status once; the next successful
-/// prepare / activate clears it. The message goes into a preallocated
+/// prepare / activate clears it. Creating a latch installs a chained panic
+/// hook that keeps `process` panics off stderr. The message goes into a preallocated
 /// slot on the audio thread and is printed from a host thread
 /// ([`Self::report`], [`Self::clear`], or drop).
 pub struct PanicLatch {
@@ -529,6 +533,7 @@ impl Default for PanicLatch {
 impl PanicLatch {
     #[must_use]
     pub fn new() -> Self {
+        quiet_panic_hook::install();
         Self {
             failed: std::sync::atomic::AtomicBool::new(false),
             message: std::sync::Mutex::new(String::with_capacity(PANIC_MESSAGE_CAP)),
@@ -594,38 +599,112 @@ pub fn run_audio_block_latched<P, R>(
     format: &str,
     body: impl FnOnce() -> R,
 ) -> Option<R> {
-    match catch_unwind(AssertUnwindSafe(body)) {
+    let result = quiet_panic_hook::silenced(|| catch_unwind(AssertUnwindSafe(body)));
+    match result {
         Ok(r) => Some(r),
         Err(payload) => {
-            latch.record(&[
-                "[moose ",
-                format,
-                "] panic in process() for ",
-                type_name::<P>(),
-                ": ",
-                extract_panic_msg(&payload),
-                " (plugin silenced until the next activate)",
-            ]);
+            quiet_panic_hook::with_location(|location| {
+                latch.record(&[
+                    "[moose ",
+                    format,
+                    "] panic in process() for ",
+                    type_name::<P>(),
+                    location,
+                    ": ",
+                    extract_panic_msg(&payload),
+                    " (plugin silenced until the next activate)",
+                ]);
+            });
             None
         }
     }
 }
 
-/// Like [`run_audio_block`] but for callbacks that return a status
-/// code. Returns `body`'s value on a clean exit, `fallback` if the
-/// body panicked. Used by the CLAP wrapper, whose process callback
-/// returns a `clap_process_status` `i32`.
-pub fn run_audio_block_with<P, R>(format: &str, fallback: R, body: impl FnOnce() -> R) -> R {
-    match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(r) => r,
-        Err(payload) => {
-            eprintln!(
-                "[moose {format}] panic in process() for {}: {}",
-                type_name::<P>(),
-                extract_panic_msg(&payload),
-            );
-            fallback
+/// A process-wide panic hook that keeps `process` panics off stderr.
+///
+/// std's default hook formats and prints the panic on the panicking thread,
+/// which for `process` is the audio thread. The hook installed here wraps
+/// whatever hook was set before it: outside [`silenced`] it calls that hook
+/// unchanged, inside it only copies the panic location into a fixed
+/// thread-local buffer, which [`PanicLatch::report`] later prints from a
+/// host thread together with the message.
+///
+/// A host or plugin that replaces the hook afterwards wins; then its hook
+/// prints, as before this existed.
+mod quiet_panic_hook {
+    use std::cell::{Cell, RefCell};
+    use std::fmt::Write as _;
+    use std::sync::Once;
+
+    /// Bytes kept of `" at <file>:<line>:<col>"`; longer paths are cut.
+    const LOCATION_CAP: usize = 160;
+
+    /// A fixed-capacity, non-allocating text buffer.
+    struct Location {
+        bytes: [u8; LOCATION_CAP],
+        len: usize,
+    }
+
+    impl Location {
+        fn as_str(&self) -> &str {
+            // Only `write_str` fills the buffer, and it cuts on char boundaries.
+            std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
         }
+    }
+
+    impl std::fmt::Write for Location {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let mut end = s.len().min(LOCATION_CAP - self.len);
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.bytes[self.len..self.len + end].copy_from_slice(&s.as_bytes()[..end]);
+            self.len += end;
+            Ok(())
+        }
+    }
+
+    thread_local! {
+        static SILENCED: Cell<bool> = const { Cell::new(false) };
+        static LOCATION: RefCell<Location> =
+            const { RefCell::new(Location { bytes: [0; LOCATION_CAP], len: 0 }) };
+    }
+
+    /// Install the hook once per process. Host thread only: it allocates.
+    pub(super) fn install() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if SILENCED.get() {
+                    LOCATION.with_borrow_mut(|buf| {
+                        buf.len = 0;
+                        if let Some(at) = info.location() {
+                            let _ = write!(buf, " at {}:{}:{}", at.file(), at.line(), at.column());
+                        }
+                    });
+                } else {
+                    previous(info);
+                }
+            }));
+        });
+    }
+
+    /// Run `f` with this thread's panics kept off stderr.
+    pub(super) fn silenced<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SILENCED.set(self.0);
+            }
+        }
+        let _restore = Restore(SILENCED.replace(true));
+        f()
+    }
+
+    /// The location of this thread's last silenced panic (empty if none).
+    pub(super) fn with_location<R>(f: impl FnOnce(&str) -> R) -> R {
+        LOCATION.with_borrow(|buf| f(buf.as_str()))
     }
 }
 
@@ -633,16 +712,14 @@ pub fn run_audio_block_with<P, R>(format: &str, fallback: R, body: impl FnOnce()
 /// [`std::panic::catch_unwind`]. Returns `body`'s value on a clean
 /// exit, `fallback` if the body panicked.
 ///
-/// Same shape as [`run_audio_block_with`] but parameterized on
-/// `action` (e.g. `"save_state"`, `"load_state"`) so the panic log
+/// Parameterized on `action` (e.g. `"save_state"`, `"load_state"`) so the panic log
 /// pinpoints which callback boundary fired. Use this for non-process
 /// FFI surfaces - state save / load, param formatting, anything the
 /// host calls through an `extern "C" fn` where a panic would unwind
 /// across an ABI that doesn't promise abort-on-unwind.
 ///
-/// Audio-thread process bodies should keep using
-/// [`run_audio_block`] / [`run_audio_block_with`] - the hardcoded
-/// `"process()"` label there keeps existing log lines stable.
+/// Audio-thread process bodies use [`run_audio_block_latched`] instead,
+/// which never prints on the audio thread.
 pub fn run_extern_callback_with<P, R>(
     format: &str,
     action: &str,
@@ -725,7 +802,6 @@ mod plugin_cell_tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "re-entered on the same thread")]
     fn enter_while_held_reports_same_thread_reentry() {
         // Author editor code calling back into the cell (request_resize from
@@ -733,6 +809,27 @@ mod plugin_cell_tests {
         let cell = PluginCell::new(0u32);
         let _held = cell.enter();
         let _reenter = cell.enter();
+    }
+
+    /// A host that overlaps two owners gets the call served late, not
+    /// dropped: `enter` from another thread waits for the release.
+    #[test]
+    fn enter_from_another_thread_waits_for_the_owner() {
+        let cell = std::sync::Arc::new(PluginCell::new(0u32));
+        let mut held = cell.enter();
+        let waiter = {
+            let cell = std::sync::Arc::clone(&cell);
+            std::thread::spawn(move || {
+                let mut guard = cell.enter();
+                *guard += 1;
+                *guard
+            })
+        };
+        // The waiter can't get in while this thread holds the cell.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        *held = 41;
+        drop(held);
+        assert_eq!(waiter.join().expect("waiter finished"), 42, "saw the owner's write");
     }
 
     #[test]
@@ -876,6 +973,8 @@ mod panic_latch_tests {
         {
             let slot = latch.message.lock().unwrap();
             assert!(slot.len() <= PANIC_MESSAGE_CAP && slot.starts_with("[moose TEST]"));
+            // The quiet hook kept the panic off stderr and handed its location to the latch.
+            assert!(slot.contains(" at ") && slot.contains("wrapper.rs:"), "{slot}");
             assert_eq!(slot.capacity(), PANIC_MESSAGE_CAP, "the slot never grows");
         }
         latch.clear();

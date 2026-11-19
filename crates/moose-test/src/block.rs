@@ -150,3 +150,41 @@ impl<L: PluginLogicCore<S>, S: Sample> BlockRunner<L, S> {
         }
     }
 }
+
+/// Assert that `L::reset` is real-time safe once `L::prepare` has run.
+///
+/// Builds the DSP state from `params`, runs `prepare` at `config` (which may
+/// allocate), then calls `reset` with the same config inside a real-time
+/// section, the way CLAP `reset` and VST3 `setProcessing(false)` call it on
+/// the audio thread. Any allocation or free in `reset` fails the assertion.
+///
+/// Meaningful only with the checker installed (`moose::enable_rt_paranoid!()`
+/// plus the `rt-paranoid` feature); without it this passes vacuously.
+///
+/// # Panics
+///
+/// Panics if `prepare` fails, or if `reset` allocated or freed memory.
+pub fn assert_reset_realtime<L: PluginLogicCore<S>, S: Sample>(
+    params: &L::Params,
+    config: &moose_core::config::AudioConfig,
+) {
+    use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
+    use moose_core::rt;
+
+    let mut state = L::init(params, &InitContext::new(None));
+    let prepared = PreparationConfig::new(*config, PreparationFrameBound::NegotiatedHost);
+    if let Err(e) = L::prepare(&mut state, params, &prepared) {
+        panic!("prepare failed at {config:?}: {e:?}");
+    }
+    let prev = rt::check_dealloc();
+    rt::set_check_dealloc(true);
+    let ((), violations) = rt::audit(|| {
+        let _rt = rt::RtSection::enter();
+        L::reset(&mut state, params, config);
+    });
+    rt::set_check_dealloc(prev);
+    assert_eq!(
+        violations, 0,
+        "reset allocated or freed {violations} time(s) after prepare at {config:?}; size buffers in prepare"
+    );
+}

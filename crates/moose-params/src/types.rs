@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use crate::info::ParamInfo;
 use crate::range::ParamRange;
 use crate::sample::Float;
-use crate::smooth::{Smoother, SmoothingStyle};
+use crate::smooth::{SmoothState, Smoother, SmoothingStyle};
 
 /// Metadata accessors shared by every parameter type.
 ///
@@ -27,13 +27,16 @@ macro_rules! shared_param_meta {
             self.edit_epoch = Some(epoch);
         }
 
+        /// Count a changed value on the owning tree's counter, or on the
+        /// process-wide one for a standalone field. A field in a tree never
+        /// touches the shared counter, so instances don't contend on it.
         #[inline]
         fn note_edit(&self, changed: bool) {
             if changed {
-                EDIT_EPOCH.fetch_add(1, Ordering::Release);
-                if let Some(epoch) = &self.edit_epoch {
-                    epoch.fetch_add(1, Ordering::Release);
-                }
+                self.edit_epoch
+                    .as_deref()
+                    .unwrap_or(&EDIT_EPOCH)
+                    .fetch_add(1, Ordering::Release);
             }
         }
 
@@ -76,12 +79,15 @@ macro_rules! shared_param_meta {
     };
 }
 
-/// Process-wide signal that at least one stored parameter value changed.
+/// Process-wide edit counter for standalone fields (not in a derived tree)
+/// and for custom-state edits. Fields in a derived tree count on their
+/// tree's own counter instead (`parameter_edit_epoch`).
 static EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static CUSTOM_EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// Equal reads mean no parameter setter (or explicit custom-state edit) ran.
-/// The counter is shared by all plugin instances in this process.
+/// Equal reads mean no standalone-field setter (or explicit custom-state
+/// edit) ran. Shared by all plugin instances in this process; a derived
+/// parameter tree's edits show in its `Params::parameter_edit_epoch`.
 #[inline]
 pub fn edit_epoch() -> u64 {
     EDIT_EPOCH.load(Ordering::Acquire)
@@ -548,6 +554,143 @@ impl FloatParamReadF64 for FloatParam {
     }
 }
 
+/// One [`FloatParam`]'s smoothing, owned by the processor.
+///
+/// Keep one per smoothed parameter in your DSP state and step it in
+/// `process`. The ramp is plain `f64` state in the processor; the only
+/// shared memory a step reads is the parameter's atomic target and its
+/// snap generation (so a host preset load still jumps the ramp instead of
+/// gliding to it). The prelude's `params.x.read()` gives the same values,
+/// bit for bit, but keeps the ramp in atomics inside the shared params.
+///
+/// ```ignore
+/// #[derive(Default)]
+/// struct Dsp { gain: ParamSmoother }
+/// fn reset(dsp: &mut Dsp, params: &MyParams, config: &AudioConfig) {
+///     dsp.gain.reset(&params.gain, config.sample_rate);
+/// }
+/// // process: let g = dsp.gain.next(&params.gain);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct ParamSmoother {
+    state: SmoothState,
+    /// The param's snap generation this ramp last followed.
+    seen_snap: u32,
+}
+
+impl Default for ParamSmoother {
+    /// An unsmoothed ramp at `0.0`; [`Self::reset`] gives it a param.
+    fn default() -> Self {
+        Self {
+            state: SmoothState::new(SmoothingStyle::None, 44_100.0),
+            seen_snap: 0,
+        }
+    }
+}
+
+impl ParamSmoother {
+    /// A ramp at rest on `param`'s current target, following its declared
+    /// smoothing style. Call [`Self::reset`] with the real sample rate
+    /// before processing.
+    #[must_use]
+    pub fn new(param: &FloatParam) -> Self {
+        let mut smoother = Self::default();
+        smoother.reset(param, 44_100.0);
+        smoother
+    }
+
+    /// Follow `param`'s smoothing style at `sample_rate` and jump to its
+    /// target. Doesn't allocate; call it from the plugin's `reset`. A
+    /// `Default` smoother does nothing useful until this runs.
+    pub fn reset(&mut self, param: &FloatParam, sample_rate: f64) {
+        let style = param.smoother().map_or(SmoothingStyle::None, Smoother::style);
+        self.state = SmoothState::new(style, sample_rate);
+        self.jump_to(param);
+    }
+
+    fn jump_to(&mut self, param: &FloatParam) {
+        self.seen_snap = param.smoother().map_or(0, Smoother::snap_generation);
+        self.state.snap(param.raw_target());
+    }
+
+    /// The param's target, after jumping to it if the host snapped the
+    /// param (a state load) since the last step.
+    #[inline]
+    fn target(&mut self, param: &FloatParam) -> f64 {
+        if let Some(shared) = param.smoother() {
+            let generation = shared.snap_generation();
+            if generation != self.seen_snap {
+                self.seen_snap = generation;
+                self.state.snap(param.raw_target());
+            }
+        }
+        param.raw_target()
+    }
+
+    /// Next smoothed value, advancing one sample.
+    #[inline]
+    pub fn next(&mut self, param: &FloatParam) -> f32 {
+        let target = self.target(param);
+        self.state.next(target)
+    }
+
+    /// [`Self::next`] at `f64`.
+    #[inline]
+    pub fn next_f64(&mut self, param: &FloatParam) -> f64 {
+        let target = self.target(param);
+        self.state.next_f64(target)
+    }
+
+    /// Advance `n_samples`, returning only the last value.
+    #[inline]
+    pub fn next_after(&mut self, param: &FloatParam, n_samples: usize) -> f32 {
+        let target = self.target(param);
+        self.state.next_after(target, n_samples)
+    }
+
+    /// [`Self::next_after`] at `f64`.
+    #[inline]
+    pub fn next_after_f64(&mut self, param: &FloatParam, n_samples: usize) -> f64 {
+        let target = self.target(param);
+        self.state.next_after_f64(target, n_samples)
+    }
+
+    /// Fill `out` with the next `out.len()` smoothed values.
+    #[inline]
+    pub fn next_into(&mut self, param: &FloatParam, out: &mut [f32]) {
+        let target = self.target(param);
+        self.state.next_into(target, out);
+    }
+
+    /// [`Self::next_into`] at `f64`.
+    #[inline]
+    pub fn next_into_f64(&mut self, param: &FloatParam, out: &mut [f64]) {
+        let target = self.target(param);
+        self.state.next_into_f64(target, out);
+    }
+
+    /// Current smoothed value without advancing.
+    #[inline]
+    #[must_use]
+    pub fn current(&self) -> f32 {
+        self.state.current()
+    }
+
+    /// [`Self::current`] at `f64`.
+    #[inline]
+    #[must_use]
+    pub fn current_f64(&self) -> f64 {
+        self.state.current_f64()
+    }
+
+    /// True while the ramp is still moving toward `param`'s target.
+    #[inline]
+    #[must_use]
+    pub fn is_smoothing(&self, param: &FloatParam) -> bool {
+        !self.state.is_converged(param.raw_target())
+    }
+}
+
 /// A boolean parameter.
 pub struct BoolParam {
     info: &'static ParamInfo,
@@ -929,6 +1072,46 @@ mod tests {
         let mut out = [0.0_f32; 4];
         p.raw_smoothed_next_into(&mut out);
         assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
+    }
+
+    /// A field in a tree counts on the tree's counter (finding 13). That it
+    /// skips the process-wide one can't be asserted here: other tests in
+    /// this binary edit standalone fields concurrently.
+    #[test]
+    fn tree_field_edits_skip_the_process_wide_epoch() {
+        let mut p = float(0.0, 1.0);
+        let tree = Arc::new(AtomicU64::new(0));
+        p.set_edit_epoch(Arc::clone(&tree));
+        p.set_value(0.5);
+        assert_eq!(tree.load(Ordering::Acquire), 1);
+    }
+
+    /// A processor-owned smoother gives the shared read path's values,
+    /// and follows a host snap (state load) through the snap generation.
+    #[test]
+    fn param_smoother_matches_shared_reads_and_follows_snaps() {
+        let info = info("Gain", ParamRange::Linear { min: 0.0, max: 10.0 }, 1.0);
+        let shared = FloatParam::new(info, SmoothingStyle::Exponential(5.0));
+        shared.set_sample_rate(48_000.0);
+        let owned_param = FloatParam::new(info, SmoothingStyle::Exponential(5.0));
+        let mut owned = ParamSmoother::new(&owned_param);
+        owned.reset(&owned_param, 48_000.0);
+        for (k, target) in [8.0, 2.0, 9.5].into_iter().enumerate() {
+            shared.set_value(target);
+            owned_param.set_value(target);
+            if k == 2 {
+                shared.snap_smoother();
+                owned_param.snap_smoother();
+            }
+            for _ in 0..300 {
+                assert_eq!(
+                    FloatParamReadF32::read(&shared).to_bits(),
+                    owned.next(&owned_param).to_bits(),
+                    "target {target}"
+                );
+            }
+        }
+        assert!(!owned.is_smoothing(&owned_param));
     }
 
     #[test]

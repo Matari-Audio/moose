@@ -54,7 +54,7 @@ pub use moose_driver::{
 pub mod assertions;
 
 pub mod block;
-pub use block::{BlockOutput, BlockRunner};
+pub use block::{BlockOutput, BlockRunner, assert_reset_realtime};
 
 /// Re-export of [`moose_core::editor::for_test_params`]
 /// for plugin authors who want to drive snapshot tests directly

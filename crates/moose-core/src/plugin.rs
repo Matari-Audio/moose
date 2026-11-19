@@ -277,6 +277,28 @@ pub trait PluginRuntime: Send + 'static {
         None
     }
 
+    /// Check custom state bytes before a load is applied or queued.
+    ///
+    /// Runs on the host thread inside the wrapper's state callback, before
+    /// [`Self::load_state`]. While the plugin is processing, a load is queued
+    /// for the audio thread and the host may get its answer before
+    /// `load_state` runs; rejecting bad bytes here is the only way that load
+    /// can still fail. Receiverless for the same reason as
+    /// [`Self::migrate_state`]: it can't alias the audio thread's `&mut self`.
+    ///
+    /// Default: accept everything, leaving the verdict to `load_state`.
+    ///
+    /// # Errors
+    ///
+    /// The state is not one this plugin can load; the whole load fails and
+    /// params stay as they were.
+    fn validate_state(_data: &[u8]) -> Result<(), crate::state::StateLoadError>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+
     /// Processing latency in samples. Host uses this for delay compensation.
     /// Return 0 if the plugin adds no latency (default).
     fn latency(&self) -> u32 {

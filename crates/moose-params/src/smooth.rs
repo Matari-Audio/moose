@@ -1,7 +1,9 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::types::AtomicF64;
 
 /// Smoothing style for a parameter.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SmoothingStyle {
     None,
     /// Straight-line ramp over the given milliseconds: a constant
@@ -23,96 +25,72 @@ pub enum SmoothingStyle {
     Logarithmic(f64),
 }
 
-/// Per-parameter smoother. All methods take `&self` for interior
-/// mutability, enabling use through `Arc<Params>`.
+/// One parameter's smoothing ramp as plain data, stepped through `&mut self`.
 ///
-/// **Threading.** `current` is advanced by the audio thread via
-/// [`Self::next`] (a `Relaxed` load-modify-store) and jumped via
-/// [`Self::snap`] from whichever thread applies a value: the audio
-/// thread on reset / state restore, and the main thread on activate
-/// and on a host state load (`snap_smoothers` under `apply_params`).
-/// The `Relaxed` accesses can't tear, but a main-thread `snap` racing
-/// an audio-thread `next` can be lost - so a preset load may ramp
-/// toward the restored target over the next block instead of jumping
-/// to it. That's benign: the target itself is already published, so
-/// the value still converges within the smoothing window. `coeff` is
-/// read only by the audio thread; the main thread writes `sample_rate`
-/// and `coeff` via [`Self::set_sample_rate`], which computes the new
-/// coefficient locally from the supplied `sr` before storing - so a
-/// concurrent audio block sees either the old (`sample_rate`, `coeff`)
-/// pair or the new one, never a mid-update split. The stored
-/// `sample_rate` field is informational; it isn't read in the audio
-/// path, only by future writers as a freshness check.
+/// This is the smoothing rule itself. A processor owns one per smoothed
+/// value (usually through [`crate::ParamSmoother`]), so stepping it touches
+/// no shared memory. [`Smoother`] is the same rule behind atomics, for
+/// reads through a shared `&FloatParam`; both give the same values, bit for
+/// bit.
 ///
-/// **Linear ramp state.** `Linear` needs a *constant* per-sample
-/// increment to trace a straight line, but this smoother is handed the
-/// target afresh each call rather than owning it, so it caches the
-/// increment (`ramp_step`) and the target it was armed for
-/// (`ramp_target`). A step re-arms only when the incoming target differs
-/// from `ramp_target`, so a ramp spanning several blocks stays straight;
-/// `snap` / `set_sample_rate` store `NaN` into `ramp_target` to force a
-/// re-arm. These are touched only by the stepping methods (audio thread)
-/// and invalidated from the writer thread - a lost race just re-arms one
-/// step later, the same benign outcome as a lost `snap`.
-pub struct Smoother {
+/// **Linear ramp state.** `Linear` needs a *constant* per-sample increment
+/// to trace a straight line, but the target is handed in afresh on each
+/// call, so the increment (`ramp_step`) and the target it was armed for
+/// (`ramp_target`) are cached. A step re-arms only when the incoming target
+/// differs from `ramp_target`, so a ramp spanning several blocks stays
+/// straight; [`Self::snap`] and [`Self::set_sample_rate`] set `ramp_target`
+/// to `NaN` to force a re-arm.
+#[derive(Clone, Copy, Debug)]
+pub struct SmoothState {
     style: SmoothingStyle,
-    current: AtomicF64,
-    coeff: AtomicF64,
-    sample_rate: AtomicF64,
+    current: f64,
+    coeff: f64,
     /// Constant per-sample increment for the active `Linear` ramp.
-    ramp_step: AtomicF64,
+    ramp_step: f64,
     /// Target `ramp_step` was armed against; `NaN` forces a re-arm.
-    ramp_target: AtomicF64,
+    ramp_target: f64,
 }
 
-impl Smoother {
+impl SmoothState {
+    /// A ramp at rest on `0.0`, with coefficients for `sample_rate`.
     #[must_use]
-    pub fn new(style: SmoothingStyle) -> Self {
-        // Pre-compute the coefficient against a placeholder sample
-        // rate so unit tests that exercise `FloatParam` / `Smoother`
-        // directly (without calling `set_sample_rate` first) still
-        // produce non-zero output. The host re-runs this when it
-        // calls `set_sample_rate(sr)` at activate time.
-        let coeff = compute_coeff(style, 44100.0);
+    pub fn new(style: SmoothingStyle, sample_rate: f64) -> Self {
         Self {
             style,
-            current: AtomicF64::new(0.0),
-            coeff: AtomicF64::new(coeff),
-            sample_rate: AtomicF64::new(44100.0),
-            ramp_step: AtomicF64::new(0.0),
+            current: 0.0,
+            coeff: compute_coeff(style, sample_rate),
+            ramp_step: 0.0,
             // NaN so the first Linear step arms the ramp from live state.
-            ramp_target: AtomicF64::new(f64::NAN),
+            ramp_target: f64::NAN,
         }
     }
 
-    pub fn set_sample_rate(&self, sr: f64) {
-        // Compute coeff from the local `sr` (not from a re-loaded
-        // `self.sample_rate`) so the (sample_rate, coeff) pair the
-        // audio thread observes via `coeff` is always self-consistent -
-        // even if a second `set_sample_rate` from a different thread
-        // races. Order: stash the informational sample_rate first,
-        // then publish the audio-visible coeff last.
-        let new_coeff = compute_coeff(self.style, sr);
-        self.sample_rate.store(sr);
-        self.coeff.store(new_coeff);
-        // The coefficient (and thus the Linear step size) just changed;
-        // force the next step to re-arm the ramp against the new rate.
-        self.ramp_target.store(f64::NAN);
+    /// The smoothing style this ramp follows.
+    #[must_use]
+    pub fn style(&self) -> SmoothingStyle {
+        self.style
     }
 
-    /// Snap to a value immediately (used on reset/init).
-    pub fn snap(&self, value: f64) {
-        self.current.store(value);
-        // Jumping `current` invalidates any in-flight Linear ramp: the
-        // next step must re-arm from the new position, not keep the old
-        // increment (which was sized for a different start).
-        self.ramp_target.store(f64::NAN);
+    /// Re-derive the per-sample coefficient for `sample_rate`. Doesn't
+    /// allocate; safe on the audio thread (e.g. from `reset`).
+    pub fn set_sample_rate(&mut self, sample_rate: f64) {
+        self.coeff = compute_coeff(self.style, sample_rate);
+        // The Linear step size just changed: re-arm on the next step.
+        self.ramp_target = f64::NAN;
     }
 
-    /// Whether this smoother holds the target exactly, with no work left.
+    /// Jump to `value` with no ramp.
+    pub fn snap(&mut self, value: f64) {
+        self.current = value;
+        // The in-flight Linear increment was sized for another start.
+        self.ramp_target = f64::NAN;
+    }
+
+    /// Whether the ramp holds `target` exactly, with no work left.
     #[inline]
+    #[must_use]
     pub(crate) fn settled_at(&self, target: f64) -> bool {
-        self.current.load().to_bits() == target.to_bits()
+        self.current.to_bits() == target.to_bits()
     }
 
     /// Arm (or re-arm) the `Linear` ramp toward `target` and return its
@@ -122,43 +100,36 @@ impl Smoother {
     /// each sample (`coeff == 1/N`), where `start` is where the ramp
     /// began - *not* the shrinking `diff * coeff`, which decays
     /// geometrically and is indistinguishable from `Exponential`. The
-    /// increment is cached in `ramp_step` and reused until the target
-    /// changes (or `snap` / `set_sample_rate` store `NaN` into
-    /// `ramp_target`), so a ramp that spans several process blocks stays
-    /// straight and still lands on `target` in `N` samples total.
+    /// increment is reused until the target changes, so a ramp that spans
+    /// several process blocks stays straight and still lands on `target`
+    /// in `N` samples total.
     #[inline]
-    fn arm_linear_ramp(&self, target: f64, current: f64, coeff: f64) -> f64 {
+    fn arm_linear_ramp(&mut self, target: f64) -> f64 {
         // Exact compare on purpose: an unchanged target is bit-identical
-        // across calls, and a `NaN` armed target never matches, forcing
-        // the re-arm.
+        // across calls, and a `NaN` armed target never matches.
         #[allow(clippy::float_cmp)]
-        if self.ramp_target.load() == target {
-            self.ramp_step.load()
-        } else {
-            let step = (target - current) * coeff;
-            self.ramp_step.store(step);
-            self.ramp_target.store(target);
-            step
+        if self.ramp_target != target {
+            self.ramp_step = (target - self.current) * self.coeff;
+            self.ramp_target = target;
         }
+        self.ramp_step
     }
 
     /// Short-circuit for any advance that can't step normally. `None` means
     /// proceed. Returns `Some(v)`:
-    /// - when `target` is non-finite: `v = current`, and the accumulator
-    ///   is left untouched - the `Smoother` is public through the prelude,
-    ///   so an author can call `next()` with their own NaN/Inf, and letting
-    ///   it reach `current` would latch (or make the self-heal below
-    ///   re-latch it every sample);
+    /// - when `target` is non-finite: `v = current`, and the ramp is left
+    ///   untouched - an author can call `next()` with their own NaN/Inf, and
+    ///   letting it reach `current` would latch it;
     /// - else when `current` is non-finite: `v = target` after snapping to
     ///   it, self-healing a NaN/Inf that slipped in (e.g. a corrupt preset).
     ///   It would otherwise latch forever, since `NaN + coeff * (target -
-    ///   NaN)` stays NaN and every arm's comparisons are false against NaN.
+    ///   NaN)` stays NaN and every comparison is false against NaN.
     #[inline]
-    fn advance_guard(&self, target: f64) -> Option<f64> {
+    fn advance_guard(&mut self, target: f64) -> Option<f64> {
         if !target.is_finite() {
-            return Some(self.current.load());
+            return Some(self.current);
         }
-        if !self.current.load().is_finite() {
+        if !self.current.is_finite() {
             self.snap(target);
             return Some(target);
         }
@@ -170,34 +141,33 @@ impl Smoother {
     /// step `n` samples toward `target`, calling `emit(i, value)` for each,
     /// and land exactly on `target` once the remaining distance is below
     /// f32 resolution (after every sample, so a per-sample caller and a
-    /// block caller snap on the same sample). One atomic load / store pair
-    /// per call.
+    /// block caller snap on the same sample).
     #[inline]
-    fn advance(&self, target: f64, n: usize, mut emit: impl FnMut(usize, f64)) -> f64 {
+    fn advance(&mut self, target: f64, n: usize, mut emit: impl FnMut(usize, f64)) -> f64 {
         if let Some(v) = self.advance_guard(target) {
             (0..n).for_each(|i| emit(i, v));
             return v;
         }
-        let mut current = self.current.load();
-        if current.to_bits() == target.to_bits() {
+        if self.settled_at(target) {
             (0..n).for_each(|i| emit(i, target));
             return target;
         }
-        let coeff = self.coeff.load();
+        let coeff = self.coeff;
         // Linear: scale the convergence threshold to the value magnitude
         // so very-small-range params don't snap prematurely and very
         // large ones (20 kHz cutoffs) don't step through differences
         // nobody hears. Floor at 1e-8 for targets near zero.
         let threshold = (target.abs() * 1e-6).max(1e-8);
         let step = if matches!(self.style, SmoothingStyle::Linear(_)) {
-            self.arm_linear_ramp(target, current, coeff)
+            self.arm_linear_ramp(target)
         } else {
             0.0
         };
         // One-pole ramps otherwise approach forever: once the difference
         // is below f32 resolution, land on the exact target so later
-        // blocks take the constant path above.
+        // blocks take the settled path above.
         let land = (target.abs() * 1e-7).max(1e-12);
+        let mut current = self.current;
         for i in 0..n {
             current = match self.style {
                 SmoothingStyle::None => target,
@@ -225,125 +195,259 @@ impl Smoother {
                 break;
             }
         }
-        self.current.store(current);
+        self.current = current;
         current
     }
 
-    /// Get next smoothed value, advancing one sample.
+    /// Next smoothed value, advancing one sample.
     // Smoothed param values stay in `[-1e10, 1e10]`; f32 precision
     // is enough for the per-sample DSP path. `next_f64` keeps f64.
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
-    pub fn next(&self, target: f64) -> f32 {
+    pub fn next(&mut self, target: f64) -> f32 {
         self.next_f64(target) as f32
     }
 
     /// [`Self::next`] at `f64`, with no `f32` rounding anywhere.
     #[inline]
-    pub fn next_f64(&self, target: f64) -> f64 {
+    pub fn next_f64(&mut self, target: f64) -> f64 {
         self.advance(target, 1, |_, _| {})
     }
 
-    /// Current smoothed value without advancing.
-    // See `next` for why narrowing to f32 here is invisible.
+    /// Advance by `n_samples` in one call, returning only the final
+    /// value: exactly what `n_samples` calls to [`Self::next`] return
+    /// last. For block-rate consumers (gates, mode switches).
     #[allow(clippy::cast_possible_truncation)]
     #[inline]
-    pub fn current(&self) -> f32 {
-        self.current.load() as f32
+    pub fn next_after(&mut self, target: f64, n_samples: usize) -> f32 {
+        self.next_after_f64(target, n_samples) as f32
     }
 
-    /// True when the smoother's internal state matches `target`
-    /// closely enough that further smoothing would be a no-op.
-    ///
-    /// `SmoothingStyle::None` always returns `true`. For `Linear`
-    /// / `Exponential`, the comparison uses the same snap threshold
-    /// `next()` applies: `(target.abs() * 1e-6).max(1e-8)`.
-    /// Exponential smoothing asymptotes but never lands exactly
-    /// on `target`; the threshold gates "close enough that any
-    /// further step is denormal-territory".
-    ///
-    /// `Logarithmic` is multiplicative, so it converges on a *ratio*:
-    /// the log-domain distance `|ln(current) - ln(target)|` against the
-    /// same `1e-6` relative tolerance (equivalent to the linear check
-    /// near convergence, but in the spirit of the log-domain step). It
-    /// falls back to the linear threshold for a non-positive endpoint,
-    /// which `next()` snaps rather than steps.
-    ///
-    /// Costs one atomic load. Plugin authors typically reach this
-    /// through [`crate::types::FloatParam::is_smoothing`] which
-    /// loads the target and inverts the answer.
+    /// [`Self::next_after`] at `f64`.
+    #[inline]
+    pub fn next_after_f64(&mut self, target: f64, n_samples: usize) -> f64 {
+        if n_samples == 0 {
+            return self.current;
+        }
+        self.advance(target, n_samples, |_, _| {})
+    }
+
+    /// Advance by `out.len()` samples, writing each value: the values
+    /// `out.len()` calls to [`Self::next`] would return.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    pub fn next_into(&mut self, target: f64, out: &mut [f32]) {
+        self.advance(target, out.len(), |i, v| out[i] = v as f32);
+    }
+
+    /// [`Self::next_into`] at `f64`.
+    #[inline]
+    pub fn next_into_f64(&mut self, target: f64, out: &mut [f64]) {
+        self.advance(target, out.len(), |i, v| out[i] = v);
+    }
+
+    /// Current smoothed value without advancing.
+    #[allow(clippy::cast_possible_truncation)]
     #[inline]
     #[must_use]
-    pub fn is_converged(&self, target: f64) -> bool {
-        let current = self.current.load();
-        let linear_converged = || {
-            let threshold = (target.abs() * 1e-6).max(1e-8);
-            (target - current).abs() < threshold
-        };
-        match self.style {
-            SmoothingStyle::None => true,
-            SmoothingStyle::Linear(_) | SmoothingStyle::Exponential(_) => linear_converged(),
-            SmoothingStyle::Logarithmic(_) => {
-                if current > 0.0 && target > 0.0 {
-                    (current.ln() - target.ln()).abs() < 1e-6
-                } else {
-                    linear_converged()
-                }
-            }
-        }
+    pub fn current(&self) -> f32 {
+        self.current as f32
     }
 
     /// [`Self::current`] at `f64`.
     #[inline]
     #[must_use]
     pub fn current_f64(&self) -> f64 {
+        self.current
+    }
+
+    /// True when further smoothing toward `target` would be a no-op.
+    ///
+    /// `SmoothingStyle::None` always returns `true`. For `Linear` /
+    /// `Exponential`, the comparison uses the convergence threshold
+    /// `(target.abs() * 1e-6).max(1e-8)`. `Logarithmic` converges on a
+    /// ratio: `|ln(current) - ln(target)| < 1e-6`, falling back to the
+    /// linear threshold for a non-positive endpoint, which steps snap.
+    #[inline]
+    #[must_use]
+    pub fn is_converged(&self, target: f64) -> bool {
+        converged(self.style, self.current, target)
+    }
+}
+
+/// [`SmoothState::is_converged`] on loose values, shared with [`Smoother`].
+#[inline]
+fn converged(style: SmoothingStyle, current: f64, target: f64) -> bool {
+    let linear_converged = || {
+        let threshold = (target.abs() * 1e-6).max(1e-8);
+        (target - current).abs() < threshold
+    };
+    match style {
+        SmoothingStyle::None => true,
+        SmoothingStyle::Linear(_) | SmoothingStyle::Exponential(_) => linear_converged(),
+        SmoothingStyle::Logarithmic(_) => {
+            if current > 0.0 && target > 0.0 {
+                (current.ln() - target.ln()).abs() < 1e-6
+            } else {
+                linear_converged()
+            }
+        }
+    }
+}
+
+/// [`SmoothState`] behind atomics, for smoothed reads through a shared
+/// `&FloatParam` (the prelude's `read` / `read_into` / `read_after`).
+///
+/// Prefer [`crate::ParamSmoother`] in new code: it keeps this state in the
+/// processor as plain data. Here every advance loads the state from
+/// atomics, steps a [`SmoothState`] copy, and stores it back, so the
+/// values match `ParamSmoother`'s bit for bit; the cost is one atomic
+/// load/store set per call, which the block paths amortize.
+///
+/// **Threading.** The audio thread advances it; [`Self::snap`] jumps it
+/// from whichever thread applies a value (audio thread on reset / state
+/// restore, main thread on activate and host state load). A main-thread
+/// `snap` racing an audio-thread advance can be lost, so a preset load may
+/// ramp toward the restored target over the next block instead of
+/// jumping. That's benign: the target is already published.
+pub struct Smoother {
+    style: SmoothingStyle,
+    current: AtomicF64,
+    coeff: AtomicF64,
+    sample_rate: AtomicF64,
+    ramp_step: AtomicF64,
+    ramp_target: AtomicF64,
+    /// Bumped by every [`Self::snap`], so a [`crate::ParamSmoother`]
+    /// reading the same param knows to jump too.
+    snap_generation: AtomicU32,
+}
+
+impl Smoother {
+    #[must_use]
+    pub fn new(style: SmoothingStyle) -> Self {
+        // A placeholder sample rate keeps tests that never call
+        // `set_sample_rate` producing output; the host sets the real one
+        // at activate.
+        let state = SmoothState::new(style, 44_100.0);
+        Self {
+            style,
+            current: AtomicF64::new(state.current),
+            coeff: AtomicF64::new(state.coeff),
+            sample_rate: AtomicF64::new(44_100.0),
+            ramp_step: AtomicF64::new(state.ramp_step),
+            ramp_target: AtomicF64::new(state.ramp_target),
+            snap_generation: AtomicU32::new(0),
+        }
+    }
+
+    pub fn set_sample_rate(&self, sr: f64) {
+        // Compute from the local `sr` and publish `coeff` once, so a
+        // concurrent block sees the old coefficient or the new one.
+        self.sample_rate.store(sr);
+        self.coeff.store(compute_coeff(self.style, sr));
+        self.ramp_target.store(f64::NAN);
+    }
+
+    /// Snap to a value immediately (used on reset/init and state loads).
+    pub fn snap(&self, value: f64) {
+        self.current.store(value);
+        self.ramp_target.store(f64::NAN);
+        self.snap_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many times [`Self::snap`] has run. A processor-owned smoother
+    /// compares it with the last value it saw to follow host jumps.
+    #[inline]
+    #[must_use]
+    pub fn snap_generation(&self) -> u32 {
+        self.snap_generation.load(Ordering::Acquire)
+    }
+
+    /// The smoothing style.
+    #[must_use]
+    pub fn style(&self) -> SmoothingStyle {
+        self.style
+    }
+
+    /// Whether this smoother holds the target exactly, with no work left.
+    #[inline]
+    pub(crate) fn settled_at(&self, target: f64) -> bool {
+        self.current.load().to_bits() == target.to_bits()
+    }
+
+    #[inline]
+    fn load(&self) -> SmoothState {
+        SmoothState {
+            style: self.style,
+            current: self.current.load(),
+            coeff: self.coeff.load(),
+            ramp_step: self.ramp_step.load(),
+            ramp_target: self.ramp_target.load(),
+        }
+    }
+
+    #[inline]
+    fn store(&self, state: &SmoothState) {
+        self.current.store(state.current);
+        self.ramp_step.store(state.ramp_step);
+        self.ramp_target.store(state.ramp_target);
+    }
+
+    /// Step a plain copy and publish the result.
+    #[inline]
+    fn step<R>(&self, f: impl FnOnce(&mut SmoothState) -> R) -> R {
+        let mut state = self.load();
+        let r = f(&mut state);
+        self.store(&state);
+        r
+    }
+
+    /// See [`SmoothState::next`].
+    #[inline]
+    pub fn next(&self, target: f64) -> f32 {
+        self.step(|s| s.next(target))
+    }
+
+    /// See [`SmoothState::next_f64`].
+    #[inline]
+    pub fn next_f64(&self, target: f64) -> f64 {
+        self.step(|s| s.next_f64(target))
+    }
+
+    /// See [`SmoothState::current`].
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    pub fn current(&self) -> f32 {
+        self.current.load() as f32
+    }
+
+    /// See [`SmoothState::is_converged`]. Costs one atomic load.
+    #[inline]
+    #[must_use]
+    pub fn is_converged(&self, target: f64) -> bool {
+        converged(self.style, self.current.load(), target)
+    }
+
+    /// See [`SmoothState::current_f64`].
+    #[inline]
+    #[must_use]
+    pub fn current_f64(&self) -> f64 {
         self.current.load()
     }
 
-    /// Advance the smoother by `n_samples` samples in one call,
-    /// returning only the final value. Use for **block-rate**
-    /// consumers (hard gates, mode switches, anything that needs a
-    /// single smoothed value per audio block).
-    ///
-    /// Identical to calling `next(target)` `n_samples` times and
-    /// returning the last result (same stepping and snapping, bit for
-    /// bit), with one atomic load and store instead of one per sample.
-    /// Steps per sample rather than in closed form so it can't drift
-    /// from `next`; the loop stops costing once the ramp lands.
-    // Smoother state stays in `[-1e10, 1e10]`; the f32 narrowing
-    // matches `next`.
-    #[allow(clippy::cast_possible_truncation)]
+    /// See [`SmoothState::next_after`].
     #[inline]
     pub fn next_after(&self, target: f64, n_samples: usize) -> f32 {
-        self.next_after_f64(target, n_samples) as f32
+        self.step(|s| s.next_after(target, n_samples))
     }
 
-    /// [`Self::next_after`] at `f64`.
+    /// See [`SmoothState::next_after_f64`].
     #[inline]
     pub fn next_after_f64(&self, target: f64, n_samples: usize) -> f64 {
-        if n_samples == 0 {
-            return self.current.load();
-        }
-        self.advance(target, n_samples, |_, _| {})
+        self.step(|s| s.next_after_f64(target, n_samples))
     }
 
-    /// Advance the smoother by `N` samples in one call, returning the
-    /// intermediate per-sample values as a stack-allocated array.
-    ///
-    /// Issues exactly **one** atomic load and **one** atomic store
-    /// against `current`, regardless of `N`. The inner stepping runs
-    /// in a register-resident loop the optimizer can unroll and (for
-    /// `Exponential` / `None`) vectorize. Compare with [`Self::next`]
-    /// which costs one load + one store *per sample* and therefore
-    /// forces the compiler to keep `current` in memory across
-    /// iterations.
-    ///
-    /// Semantics match `next` step-for-step: the i-th element of the
-    /// returned array is what `next(target)` would have produced if
-    /// called for the i-th time in sequence.
-    // Smoother state stays in `[-1e10, 1e10]`; the f32 narrowing
-    // matches the per-sample `next()` contract.
-    #[allow(clippy::cast_possible_truncation)]
+    /// Advance by `N` samples, returning each value in a stack array.
     #[inline]
     pub fn next_block<const N: usize>(&self, target: f64) -> [f32; N] {
         let mut out = [0.0_f32; N];
@@ -351,22 +455,16 @@ impl Smoother {
         out
     }
 
-    /// Advance the smoother by `out.len()` samples in one call,
-    /// writing each intermediate value to `out`. Slice-based variant
-    /// of [`Self::next_block`] - same single-atomic-pair amortization,
-    /// runtime length, and the same values `next` would give, bit for
-    /// bit. Use this when the chunk size depends on `process()`'s
-    /// actual block.
-    #[allow(clippy::cast_possible_truncation)]
+    /// See [`SmoothState::next_into`].
     #[inline]
     pub fn next_into(&self, target: f64, out: &mut [f32]) {
-        self.advance(target, out.len(), |i, v| out[i] = v as f32);
+        self.step(|s| s.next_into(target, out));
     }
 
-    /// [`Self::next_into`] at `f64`.
+    /// See [`SmoothState::next_into_f64`].
     #[inline]
     pub fn next_into_f64(&self, target: f64, out: &mut [f64]) {
-        self.advance(target, out.len(), |i, v| out[i] = v);
+        self.step(|s| s.next_into_f64(target, out));
     }
 }
 
@@ -744,6 +842,54 @@ mod tests {
     /// `next`, `next_into` and `next_after` (f32 and f64) step the same
     /// rule: driven through the same targets in different block shapes,
     /// they produce identical bits on every sample (finding 7).
+    /// The processor-owned `SmoothState` and the shared atomic `Smoother`
+    /// step the same rule: every path agrees bit for bit across styles,
+    /// block shapes, changing targets and a mid-run snap.
+    #[test]
+    fn owned_state_matches_the_atomic_smoother_bit_for_bit() {
+        let styles = [
+            SmoothingStyle::None,
+            SmoothingStyle::Linear(20.0),
+            SmoothingStyle::Exponential(20.0),
+            SmoothingStyle::Logarithmic(20.0),
+        ];
+        let blocks = [1_usize, 7, 64, 3, 512, 1, 128, 1000, 33, 2048];
+        for style in styles {
+            let shared = Smoother::new(style);
+            shared.set_sample_rate(48_000.0);
+            shared.snap(100.0);
+            let mut owned = SmoothState::new(style, 48_000.0);
+            owned.snap(100.0);
+            for (k, &n) in blocks.iter().enumerate() {
+                let target = [2_000.0, 0.5, 18_000.0, 440.0][k % 4];
+                if k == 5 {
+                    shared.snap(7.0);
+                    owned.snap(7.0);
+                }
+                let (mut a, mut b) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+                match k % 3 {
+                    0 => {
+                        shared.next_into(target, &mut a);
+                        owned.next_into(target, &mut b);
+                    }
+                    1 => {
+                        for i in 0..n {
+                            a[i] = shared.next(target);
+                            b[i] = owned.next(target);
+                        }
+                    }
+                    _ => {
+                        a[n - 1] = shared.next_after(target, n);
+                        b[n - 1] = owned.next_after(target, n);
+                    }
+                }
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&a), bits(&b), "{style:?} block {k}");
+                assert_eq!(shared.current_f64().to_bits(), owned.current_f64().to_bits());
+            }
+        }
+    }
+
     #[test]
     fn every_advance_path_matches_next_bit_for_bit() {
         let styles = [

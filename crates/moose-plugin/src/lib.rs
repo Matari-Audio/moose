@@ -187,6 +187,16 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         let _ = foreign;
         None
     }
+    /// Check custom state on the host thread before it is applied. See
+    /// [`PluginLogic::validate_state`].
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not a state this plugin can load.
+    fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
+        let _ = data;
+        Ok(())
+    }
     fn state_changed(state: &mut Self::DspState, params: &Self::Params) {
         let _ = (state, params);
     }
@@ -520,6 +530,27 @@ macro_rules! plugin_logic_leaf_trait {
                 None
             }
 
+            /// Check custom state bytes on the host thread, before
+            /// `load_state` sees them.
+            ///
+            /// While the plugin is processing, a host load is queued for
+            /// the audio thread and the host may get its answer before
+            /// `load_state` runs. Reject a state here when you can tell
+            /// from the bytes alone that `load_state` would fail (wrong
+            /// version, bad framing), so the host sees the failure and
+            /// params stay as they were. No state access: this runs
+            /// while the audio thread owns it.
+            ///
+            /// # Errors
+            ///
+            /// The bytes are not a state this plugin can load.
+            fn validate_state(
+                data: &[u8],
+            ) -> Result<(), $crate::__plugin_logic_deps::StateLoadError> {
+                let _ = data;
+                Ok(())
+            }
+
             /// Report latency in samples for plugin delay compensation.
             /// May change at runtime - return a new value and the host is
             /// notified (see the wrapper latency-change path).
@@ -700,6 +731,19 @@ macro_rules! pure_plugin_leaf_trait {
                 None
             }
 
+            /// Check custom state on the host thread. Same contract as
+            /// the stateful leaf's `validate_state`.
+            ///
+            /// # Errors
+            ///
+            /// The bytes are not a state this plugin can load.
+            fn validate_state(
+                data: &[u8],
+            ) -> Result<(), crate::__plugin_logic_deps::StateLoadError> {
+                let _ = data;
+                Ok(())
+            }
+
             /// Construct the editor for this plugin. Required. Same
             /// contract as the stateful leaf's `editor`.
             fn editor(
@@ -742,6 +786,12 @@ macro_rules! pure_plugin_leaf_trait {
                 foreign: &crate::__plugin_logic_deps::ForeignState,
             ) -> Option<crate::__plugin_logic_deps::MigratedState> {
                 <T as $name>::migrate_state(foreign)
+            }
+
+            fn validate_state(
+                data: &[u8],
+            ) -> Result<(), crate::__plugin_logic_deps::StateLoadError> {
+                <T as $name>::validate_state(data)
             }
 
             fn editor(
@@ -1000,6 +1050,10 @@ macro_rules! plugin_logic_bridge {
 
             fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
                 <Self as $leaf>::migrate_state(foreign)
+            }
+
+            fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
+                <Self as $leaf>::validate_state(data)
             }
 
             fn latency(state: &Self::DspState) -> u32 {

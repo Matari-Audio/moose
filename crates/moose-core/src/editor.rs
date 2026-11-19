@@ -79,7 +79,13 @@ impl<T> Clone for SendPtr<T> {
 
 impl<T> Copy for SendPtr<T> {}
 
-// SAFETY: justified at each `unsafe SendPtr::new(...)` call site.
+// SAFETY: no bound on `T` on purpose. A `SendPtr` exists only through
+// `unsafe fn new`, whose caller promises that sharing `*ptr` across threads
+// is sound (a `Sync` pointee, external synchronization, or a host handle
+// documented as callable from those threads), and the pointee is reached
+// only through `unsafe fn get`. Safe code can copy the address around but
+// never dereference it. A `T: Sync` bound would reject the FFI host
+// handles (`clap_host` holds raw pointers), which are the main use.
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
