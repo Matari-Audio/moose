@@ -4,6 +4,11 @@ Notable changes per release.
 
 ## Unreleased
 
+- **`BlockRunner` prepares before the first block.** `moose_test::BlockRunner`
+  now calls `prepare` at its sample rate (max block at least 4096) on the
+  first `run`, as a host activates before processing, so a `moose::Plugin`
+  processor exists from the first block. The sysex-echo example uses
+  `moose::Plugin`.
 - **Examples on `moose::Plugin`.** Every example under `examples/` now
   implements `moose::Plugin` and exports with `plugin:` (alias `PluginShell`)
   instead of `PluginLogic` / `PurePluginLogic` with `logic:`. Left on the

@@ -38,7 +38,9 @@ pub struct BlockOutput<S> {
 ///
 /// Build with [`Self::new`] (which inits DSP state from params), tune
 /// the block shape with the builder methods, then call [`Self::run`]
-/// once per block. The runner keeps its DSP state between calls, so
+/// once per block. The first [`Self::run`] prepares the plugin at the
+/// configured sample rate, as a host activates it before processing, so a
+/// `moose::Plugin` processor exists from the first block. The runner keeps its DSP state between calls, so
 /// consecutive blocks see the filter memory / voice state the previous
 /// block left behind.
 pub struct BlockRunner<L: PluginLogicCore<S>, S: Sample = f32> {
@@ -48,6 +50,8 @@ pub struct BlockRunner<L: PluginLogicCore<S>, S: Sample = f32> {
     out_channels: Option<usize>,
     frames: Option<usize>,
     out_event_capacity: usize,
+    /// `prepare` has run (on the first block).
+    prepared: bool,
     _sample: PhantomData<fn() -> S>,
 }
 
@@ -64,6 +68,7 @@ impl<L: PluginLogicCore<S>, S: Sample> BlockRunner<L, S> {
             out_channels: None,
             frames: None,
             out_event_capacity: EVENT_LIST_PREALLOC,
+            prepared: false,
             _sample: PhantomData,
         }
     }
@@ -113,6 +118,10 @@ impl<L: PluginLogicCore<S>, S: Sample> BlockRunner<L, S> {
 
     /// Process one block: feed `inputs` (per-channel slices) and
     /// `events`, return the rendered audio plus any emitted events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the first block's `prepare` fails.
     pub fn run(
         &mut self,
         params: &L::Params,
@@ -123,6 +132,9 @@ impl<L: PluginLogicCore<S>, S: Sample> BlockRunner<L, S> {
             .frames
             .unwrap_or_else(|| inputs.iter().map(|c| c.len()).max().unwrap_or(0));
         let channels = self.out_channels.unwrap_or(inputs.len());
+        if !self.prepared {
+            self.prepare(params, frames);
+        }
 
         let mut output: Vec<Vec<S>> = (0..channels).map(|_| vec![S::default(); frames]).collect();
         let mut out_refs: Vec<&mut [S]> = output.iter_mut().map(Vec::as_mut_slice).collect();
@@ -149,7 +161,27 @@ impl<L: PluginLogicCore<S>, S: Sample> BlockRunner<L, S> {
             status,
         }
     }
+
+    /// Prepare at the runner's sample rate with room for `frames` (at
+    /// least [`MIN_PREPARED_BLOCK`]) per block.
+    fn prepare(&mut self, params: &L::Params, frames: usize) {
+        use moose_core::config::AudioConfig;
+        use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
+
+        let config = PreparationConfig::new(
+            AudioConfig::new(self.sample_rate, frames.max(MIN_PREPARED_BLOCK)),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        if let Err(e) = L::prepare(&mut self.state, params, &config) {
+            panic!("prepare failed at {:?}: {e:?}", config.audio);
+        }
+        self.prepared = true;
+    }
 }
+
+/// Smallest maximum block size [`BlockRunner`] prepares for, so later
+/// blocks up to this size fit without re-preparing.
+const MIN_PREPARED_BLOCK: usize = 4096;
 
 /// Assert that `L::reset` is real-time safe once `L::prepare` has run.
 ///

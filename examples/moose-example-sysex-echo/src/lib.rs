@@ -21,8 +21,20 @@ pub struct SysexEchoParams {
 /// Stateless descriptor - the echo carries no DSP state, only params.
 pub struct SysexEcho;
 
-impl PurePluginLogic for SysexEcho {
-    type Params = SysexEchoParams;
+impl Plugin for SysexEcho {
+    type Shared = SysexEchoParams;
+    type MainThread = ();
+    type Processor = ();
+
+    fn main_thread(_shared: &Arc<SysexEchoParams>) {}
+
+    fn activate(
+        _shared: &SysexEchoParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<(), PreparationError> {
+        Ok(())
+    }
 
     fn bus_layouts() -> Vec<BusLayout> {
         // MIDI effect: no audio I/O.
@@ -30,6 +42,7 @@ impl PurePluginLogic for SysexEcho {
     }
 
     fn process(
+        _processor: &mut (),
         params: &SysexEchoParams,
         _buffer: &mut AudioBuffer,
         events: &EventList,
@@ -59,7 +72,7 @@ impl PurePluginLogic for SysexEcho {
 }
 
 moose::plugin! {
-    logic: SysexEcho,
+    plugin: SysexEcho,
     params: SysexEchoParams,
 }
 
@@ -74,7 +87,7 @@ mod tests {
         use moose_test::{InputSource, assert_no_audio_alloc, driver};
         use std::time::Duration;
         assert_no_audio_alloc(|| {
-            driver!(Plugin)
+            driver!(PluginShell)
                 .duration(Duration::from_millis(40))
                 .input(InputSource::Constant(0.25))
                 .script(|s| {
@@ -92,7 +105,7 @@ mod tests {
 
     #[test]
     fn info_is_valid() {
-        moose_test::assert_valid_info::<Plugin>();
+        moose_test::assert_valid_info::<PluginShell>();
     }
 
     #[test]
@@ -107,7 +120,7 @@ mod tests {
         events.push_sysex(0, &payload).expect("pool has room");
 
         // MIDI effect: no audio buses, so pin an empty output shape.
-        let out = BlockRunner::<SysexEcho>::new(&params)
+        let out = BlockRunner::<Lifecycle<SysexEcho>>::new(&params)
             .outputs(0, 64)
             .run(&params, &[], &events);
 
@@ -125,7 +138,7 @@ mod tests {
         use std::time::Duration;
 
         let payload = [0x7e, 0x00, 0x06, 0x01];
-        let result = driver!(Plugin)
+        let result = driver!(PluginShell)
             .duration(Duration::from_millis(5))
             .capture_output_events(true)
             .script(|s| {
@@ -141,13 +154,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn gui_screenshot_macos() {
-        moose_test::screenshot!(Plugin, "screenshots/sysex_echo_default_macos.png").run();
+        moose_test::screenshot!(PluginShell, "screenshots/sysex_echo_default_macos.png").run();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gui_screenshot_linux() {
-        moose_test::screenshot!(Plugin, "screenshots/sysex_echo_default_linux.png")
+        moose_test::screenshot!(PluginShell, "screenshots/sysex_echo_default_linux.png")
             .pixel_threshold(2)
             .run();
     }
@@ -155,7 +168,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn gui_screenshot_windows() {
-        moose_test::screenshot!(Plugin, "screenshots/sysex_echo_default_windows.png")
+        moose_test::screenshot!(PluginShell, "screenshots/sysex_echo_default_windows.png")
             .pixel_threshold(2)
             .run();
     }
