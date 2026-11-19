@@ -7,10 +7,14 @@ use {struct_name}ParamsParamId as P;
 
 {descriptor_block | unescaped}{struct_decl | unescaped}
 
-impl {impl_trait} for {struct_name} \{
-    type Params = {struct_name}Params;
-{dsp_state_type | unescaped}
-{bus_layouts_method | unescaped}{process_body | unescaped}
+impl Plugin for {struct_name} \{
+    type Shared = {struct_name}Params;
+    type MainThread = ();
+    type Processor = {processor_type | unescaped};
+
+    fn main_thread(_shared: &Arc<{struct_name}Params>) \{}
+
+{activate_method | unescaped}{reset_method | unescaped}{bus_layouts_method | unescaped}{process_body | unescaped}
 
     fn editor(params: Arc<{struct_name}Params>) -> Box<dyn Editor> \{
         moose_gui::default_editor(

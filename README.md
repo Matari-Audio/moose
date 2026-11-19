@@ -62,24 +62,37 @@ pub struct GainParams {
 
 use GainParamsParamId as P;
 
-// The DSP state owns the gain ramp; only the knob's target is shared.
-#[derive(Default)]
-pub struct Gain {
+pub struct Gain;
+
+// The processor owns the gain ramp; only the knob's target is shared.
+pub struct GainProcessor {
     gain: ParamSmoother,
+    sample_rate: f64,
 }
 
-impl PluginLogic for Gain {
-    type Params = GainParams;
-    type DspState = Self;
+impl Plugin for Gain {
+    type Shared = GainParams;
+    type MainThread = ();
+    type Processor = GainProcessor;
 
-    fn reset(state: &mut Self, params: &GainParams, config: &AudioConfig) {
-        state.gain.reset(&params.gain, config.sample_rate);
+    fn main_thread(_shared: &Arc<GainParams>) {}
+
+    fn activate(shared: &GainParams, config: &AudioConfig, _cx: &InitContext)
+        -> Result<GainProcessor, PreparationError>
+    {
+        let mut gain = ParamSmoother::default();
+        gain.reset(&shared.gain, config.sample_rate);
+        Ok(GainProcessor { gain, sample_rate: config.sample_rate })
     }
 
-    fn process(state: &mut Self, params: &GainParams, buffer: &mut AudioBuffer,
+    fn reset(processor: &mut GainProcessor, shared: &GainParams) {
+        processor.gain.reset(&shared.gain, processor.sample_rate);
+    }
+
+    fn process(processor: &mut GainProcessor, params: &GainParams, buffer: &mut AudioBuffer,
                _events: &EventList, _ctx: &mut ProcessContext) -> ProcessStatus {
         for i in 0..buffer.num_samples() {
-            let gain = db_to_linear(state.gain.next(&params.gain));
+            let gain = db_to_linear(processor.gain.next(&params.gain));
             for ch in 0..buffer.channels() {
                 let (inp, out) = buffer.io(ch);
                 out[i] = inp[i] * gain;
@@ -94,13 +107,13 @@ impl PluginLogic for Gain {
     }
 }
 
-moose::plugin! { logic: Gain, params: GainParams }
+moose::plugin! { plugin: Gain, params: GainParams }
 ```
 
 > Switch the import to `moose::prelude64::*` to write `f64` DSP
 > instead — step the ramp with `smoother.next_f64(&param)`, the audio buffer is
 > `f64`, and the format wrapper widens/narrows at the block
-> boundary. Same `impl PluginLogic` header on both precisions.
+> boundary. Use `impl Plugin<f64> for Gain` (or `Plugin<Sample>`) for the `f64` processor.
 
 ## Formats and GUI backends
 

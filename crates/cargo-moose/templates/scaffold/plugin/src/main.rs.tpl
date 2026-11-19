@@ -6,12 +6,12 @@
 //! Safe to delete this file (and the `standalone` feature + bin
 //! entry in Cargo.toml) if you don't want a standalone build.
 
-use {crate_lib}::Plugin;
+use {crate_lib}::PluginShell;
 
 fn main() \{
-    // `run::<Plugin>()` parses argv + `MOOSE_STANDALONE_*` env vars
+    // `run::<PluginShell>()` parses argv + `MOOSE_STANDALONE_*` env vars
     // and dispatches. To pin launch defaults (e.g. mic on at start
-    // for an effect demo) call `run_with::<Plugin>(Defaults \{ … })`
+    // for an effect demo) call `run_with::<PluginShell>(Defaults \{ … })`
     // - argv / env still take precedence over the values you pass.
-    moose_standalone::run::<Plugin>();
+    moose_standalone::run::<PluginShell>();
 }

@@ -12,6 +12,11 @@ Notable changes per release.
   whose activation can fail or whose processor owns worker threads returns
   `true` (default `false`), and `Lifecycle` forwards it, so hot loaders still
   refuse it and the standalone still re-prepares on each device open.
+- **`cargo moose new` scaffolds `moose::Plugin`.** `--stateful` (default)
+  emits a descriptor plus a `<Name>Processor` built in `activate`; `--pure`
+  emits `type Processor = ()`. Both export with `plugin:`, so generated
+  `main.rs` runs `PluginShell`. No scaffold names `PluginLogic` or
+  `PurePluginLogic` any more.
 - **A re-activation the processor still fits keeps it.** `Lifecycle` keeps
   the current `moose::Plugin` processor and calls `reset` when the host
   prepares again at the same sample rate and process mode with a max block

@@ -8,8 +8,8 @@ use super::{PluginKind, Statefulness};
 pub struct PluginSpec {
     pub name: String,
     pub kind: PluginKind,
-    /// Whether the plugin implements `PurePluginLogic` (params-only)
-    /// or `PluginLogic` with an explicit DSP-state struct.
+    /// Whether the plugin's `moose::Plugin` has `type Processor = ()`
+    /// (params-only) or a `<Name>Processor` struct for its DSP state.
     pub statefulness: Statefulness,
 }
 

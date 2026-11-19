@@ -770,11 +770,11 @@ fn single_plugin_clippy_clean() {
     s.cargo_clippy().unwrap();
 }
 
-// `--stateful` (the default) emits `impl PluginLogic` where the plugin
-// struct is its own DSP state (`type DspState = Self`, empty for a fresh
-// scaffold) with a `_state` argument. Clippy -D warnings on the result
+// `--stateful` (the default) emits `impl Plugin` with a separate
+// `<Name>Processor` struct built in `activate` (empty for non-effect
+// kinds, a gain smoother for an effect). Clippy -D warnings on the result
 // guards that path: a scaffold mustn't inherit a warning from the empty
-// state or the unused `_state`.
+// processor or an unused `_processor`.
 #[test]
 fn single_plugin_stateful_clippy_clean() {
     let s = Scaffold::new("single-stateful", "demo_stateful").arg("--stateful");
@@ -783,8 +783,8 @@ fn single_plugin_stateful_clippy_clean() {
     s.cargo_clippy().unwrap();
 }
 
-// `--pure` emits `impl PurePluginLogic` - no DSP-state struct, no `state`
-// argument. The non-default path, so give it its own lint-clean guard.
+// `--pure` emits `impl Plugin` with `type Processor = ()` - no processor
+// struct, `process` takes `_processor: &mut ()`. The non-default path, so give it its own lint-clean guard.
 #[test]
 fn single_plugin_pure_clippy_clean() {
     let s = Scaffold::new("single-pure", "demo_pure").arg("--pure");

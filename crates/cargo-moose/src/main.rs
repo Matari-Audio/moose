@@ -81,9 +81,9 @@ Scaffold:
       Scaffold a new single-plugin project. Defaults include the
       `standalone` feature + `src/main.rs` host; pass --no-standalone
       to skip those (saves the bin entry, the dep, and the file).
-      `--stateful` (default) implements `PluginLogic` where the plugin
-      struct is its own DSP state (`type DspState = Self`), pre-wired;
-      `--pure` implements the stateless `PurePluginLogic`.
+      `--stateful` (default) implements `moose::Plugin` with a
+      `<Name>Processor` struct for the DSP state, built in `activate`;
+      `--pure` implements it with `type Processor = ()`.
       `--vendor` / `--vendor-id` populate `moose.toml` directly;
       omit them to get a `My Company` / `com.mycompany` placeholder
       to edit by hand.
@@ -98,7 +98,7 @@ Scaffold:
         --vendor-id <id>            Reverse-domain vendor ID (defaults to com.<name>)
         --instrument                Default all plugins to instrument type
         --midi                      Default all plugins to midi type
-        --pure | --stateful         PurePluginLogic vs PluginLogic (type DspState = Self) (default)
+        --pure | --stateful         Processor = () vs a <Name>Processor struct (default)
         --no-standalone             Skip the standalone feature + host bin in every plugin
         --type:<plugin>=<kind>      Per-plugin type override (effect, instrument, midi)
 
@@ -302,11 +302,11 @@ Workspace mode (--workspace):
 Options:
   --instrument            Default plugin kind is `instrument` (synth).
   --midi                  Default plugin kind is `midi`.
-  --pure                  Implement `PurePluginLogic` - params only, no
-                          DSP state.
-  --stateful              Implement `PluginLogic` where the plugin struct
-                          is its own DSP state (`type DspState = Self`)
-                          with a `state` argument on `process`, pre-wired.
+  --pure                  Implement `moose::Plugin` with `type Processor
+                          = ()` - params only, no DSP state.
+  --stateful              Implement `moose::Plugin` with a `<Name>Processor`
+                          struct for the DSP state, built in `activate`
+                          and passed to `process`, pre-wired.
                           This is the default.
   --no-standalone         Skip generating a standalone runner crate.
   --workspace             Multi-plugin workspace mode (positional args
@@ -352,9 +352,8 @@ struct NewArgs {
     name: String,
     plugin_names: Vec<String>,
     default_kind: PluginKind,
-    /// `PluginLogic` where the plugin struct is its own DSP state
-    /// (`type DspState = Self`, default) vs the stateless
-    /// `PurePluginLogic`. Set by `--stateful` / `--pure`; applies to
+    /// A `<Name>Processor` struct for the DSP state (default) vs
+    /// `type Processor = ()`. Set by `--stateful` / `--pure`; applies to
     /// every plugin in the scaffold.
     default_statefulness: Statefulness,
     vendor_name: Option<String>,

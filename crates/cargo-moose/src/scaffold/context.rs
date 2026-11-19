@@ -57,18 +57,17 @@ pub(crate) struct PluginScaffoldingContext {
     pub dep_args: String,
 
     pub params_struct: String,
-    /// Leaf trait the `impl ... for` header names (`PurePluginLogic`
-    /// or `PluginLogic`).
-    pub impl_trait: &'static str,
     /// Descriptor doc comment emitted above the descriptor struct.
     pub descriptor_block: String,
-    /// The descriptor struct declaration: a unit struct for a pure
-    /// plugin, or a `#[derive(Default)]` struct that is its own DSP state
-    /// (`type DspState = Self`) for a stateful one.
+    /// The struct declarations: a unit descriptor for a pure plugin, or a
+    /// unit descriptor plus its `<Name>Processor` for a stateful one.
     pub struct_decl: String,
-    /// `type DspState = ...;` line inside the impl block; empty for a
-    /// pure plugin.
-    pub dsp_state_type: String,
+    /// Right-hand side of `type Processor = ...;` (`()` for pure).
+    pub processor_type: String,
+    /// `activate` method text, ending in a blank line.
+    pub activate_method: String,
+    /// `reset` method text, or empty to keep the trait default.
+    pub reset_method: &'static str,
     pub process_body: String,
     pub bus_layouts_method: &'static str,
     pub layout_knob: &'static str,
@@ -102,11 +101,12 @@ impl PluginScaffoldingContext {
             default_features: default_features(features),
             dep_args: dep_args(dep_form, pins.tag, pins.version),
             params_struct: kind.params_struct(&struct_name),
-            impl_trait: statefulness.impl_trait(),
             descriptor_block: statefulness.descriptor_block(),
             struct_decl: statefulness.struct_decl(&struct_name, kind.state_fields()),
-            dsp_state_type: statefulness.dsp_state_type(kind.reset_method()),
-            process_body: statefulness.wrap_process(kind.process_body(statefulness)),
+            processor_type: statefulness.processor_type(&struct_name),
+            activate_method: kind.activate_method(statefulness, &struct_name),
+            reset_method: kind.reset_method(statefulness),
+            process_body: kind.process_body(statefulness),
             bus_layouts_method: kind.bus_layouts_method(),
             layout_knob: kind.layout_knob(),
             plugin_macro: kind.plugin_macro(&struct_name),

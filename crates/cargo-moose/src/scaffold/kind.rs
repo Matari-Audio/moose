@@ -70,7 +70,7 @@ impl PluginKind {
         }
     }
 
-    /// `PluginLogic::bus_layouts()` method body for non-stereo
+    /// `Plugin::bus_layouts()` method body for non-stereo
     /// kinds. Empty string for stereo (the trait default), so
     /// the scaffold doesn't emit a redundant override.
     #[must_use]
@@ -104,51 +104,97 @@ impl PluginKind {
     }
 
     /// Per-kind `process` body. A stateful effect ramps its gain with
-    /// the `ParamSmoother` it owns; a pure one has nowhere to keep a ramp
-    /// and reads the target.
+    /// the `ParamSmoother` its processor owns; a pure one has nowhere to
+    /// keep a ramp and reads the target.
     #[must_use]
-    pub fn process_body(self, statefulness: Statefulness) -> &'static str {
-        match (self, statefulness) {
+    pub fn process_body(self, statefulness: Statefulness) -> String {
+        let processor_arg = match (self, statefulness) {
+            (_, Statefulness::Pure) => "_processor: &mut ()",
+            (Self::Effect, Statefulness::Stateful) => "processor: &mut Self::Processor",
+            (_, Statefulness::Stateful) => "_processor: &mut Self::Processor",
+        };
+        let body = match (self, statefulness) {
             (Self::Instrument, _) => INSTRUMENT_PROCESS_BODY,
             (Self::Midi, _) => MIDI_PROCESS_BODY,
             (Self::Effect, Statefulness::Pure) => PURE_EFFECT_PROCESS_BODY,
             (Self::Effect, Statefulness::Stateful) => STATEFUL_EFFECT_PROCESS_BODY,
-        }
+        };
+        body.replace("{processor_arg}", processor_arg)
     }
 
-    /// Fields of a stateful plugin's DSP state: the effect's gain
-    /// smoother, nothing for the other kinds.
+    /// Fields of a stateful plugin's processor: the effect's gain
+    /// smoother and the rate to re-seat it at, nothing for the other kinds.
     #[must_use]
     pub fn state_fields(self) -> &'static str {
         match self {
-            Self::Effect => "    gain: ParamSmoother,\n",
-            Self::Instrument | Self::Midi => "",
+            Self::Effect => {
+                "    gain: ParamSmoother,\n    \
+                 /// Rate the processor was activated at, for re-seating `gain` in `reset`.\n    \
+                 sample_rate: f64,\n"
+            }
+            Self::Instrument | Self::Midi => "    // Voices, filters and ramps go here.\n",
         }
     }
 
-    /// `reset` for a stateful plugin: jumps the effect's gain ramp to
-    /// its target. Empty (the trait default) for the other kinds.
+    /// `activate`, ending in a blank line. A pure plugin builds nothing;
+    /// a stateful one builds its processor (the place to size buffers).
     #[must_use]
-    pub fn reset_method(self) -> &'static str {
-        match self {
-            Self::Effect => {
-                "\n    fn reset(state: &mut Self, params: &Self::Params, config: &AudioConfig) {\n        \
-                 state.gain.reset(&params.gain, config.sample_rate);\n    \
-                 }\n"
+    pub fn activate_method(self, statefulness: Statefulness, struct_name: &str) -> String {
+        let (shared, config, ret, body) = match (self, statefulness) {
+            (_, Statefulness::Pure) => {
+                ("_shared", "_config", "()".to_string(), "Ok(())".to_string())
             }
-            Self::Instrument | Self::Midi => "",
+            (Self::Effect, Statefulness::Stateful) => (
+                "shared",
+                "config",
+                format!("{struct_name}Processor"),
+                format!(
+                    "let mut gain = ParamSmoother::default();\n        \
+                     gain.reset(&shared.gain, config.sample_rate);\n        \
+                     Ok({struct_name}Processor {{\n            \
+                     gain,\n            \
+                     sample_rate: config.sample_rate,\n        }})"
+                ),
+            ),
+            (_, Statefulness::Stateful) => (
+                "_shared",
+                "_config",
+                format!("{struct_name}Processor"),
+                format!("Ok({struct_name}Processor {{}})"),
+            ),
+        };
+        format!(
+            "    fn activate(\n        {shared}: &Self::Shared,\n        \
+             {config}: &AudioConfig,\n        \
+             _cx: &InitContext,\n    ) -> Result<{ret}, PreparationError> {{\n        \
+             {body}\n    }}\n\n"
+        )
+    }
+
+    /// `reset` for a stateful plugin: jumps the effect's gain ramp to
+    /// its target. Audio-thread code, so it only writes existing fields.
+    /// Empty (the trait default) for the other kinds and for pure.
+    #[must_use]
+    pub fn reset_method(self, statefulness: Statefulness) -> &'static str {
+        match (self, statefulness) {
+            (Self::Effect, Statefulness::Stateful) => {
+                "    fn reset(processor: &mut Self::Processor, shared: &Self::Shared) {\n        \
+                 processor.gain.reset(&shared.gain, processor.sample_rate);\n    \
+                 }\n\n"
+            }
+            _ => "",
         }
     }
 
     /// `moose::plugin!` invocation. Same shape across kinds; bus
-    /// layouts come from `PluginLogic::bus_layouts()` (see
+    /// layouts come from `Plugin::bus_layouts()` (see
     /// [`Self::bus_layouts_method`]).
     #[must_use]
     pub fn plugin_macro(self, struct_name: &str) -> String {
         let _ = self;
         format!(
             "moose::plugin! {{\n    \
-             logic: {struct_name},\n    \
+             plugin: {struct_name},\n    \
              params: {struct_name}Params,\n\
              }}"
         )
@@ -177,7 +223,8 @@ pub struct {struct_name}Params {
 }"#;
 
 const PURE_EFFECT_PROCESS_BODY: &str = r"    fn process(
-        params: &Self::Params,
+        {processor_arg},
+        params: &Self::Shared,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         _context: &mut ProcessContext,
@@ -195,14 +242,14 @@ const PURE_EFFECT_PROCESS_BODY: &str = r"    fn process(
     }";
 
 const STATEFUL_EFFECT_PROCESS_BODY: &str = r"    fn process(
-        state: &mut Self::DspState,
-        params: &Self::Params,
+        {processor_arg},
+        params: &Self::Shared,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         _context: &mut ProcessContext,
     ) -> ProcessStatus {
         for i in 0..buffer.num_samples() {
-            let gain = db_to_linear(state.gain.next(&params.gain));
+            let gain = db_to_linear(processor.gain.next(&params.gain));
             for ch in 0..buffer.channels() {
                 let (inp, out) = buffer.io(ch);
                 out[i] = inp[i] * gain;
@@ -212,7 +259,8 @@ const STATEFUL_EFFECT_PROCESS_BODY: &str = r"    fn process(
     }";
 
 const INSTRUMENT_PROCESS_BODY: &str = r"    fn process(
-        _params: &Self::Params,
+        {processor_arg},
+        _params: &Self::Shared,
         buffer: &mut AudioBuffer,
         events: &EventList,
         _context: &mut ProcessContext,
@@ -244,7 +292,8 @@ const INSTRUMENT_PROCESS_BODY: &str = r"    fn process(
     }";
 
 const MIDI_PROCESS_BODY: &str = r"    fn process(
-        params: &Self::Params,
+        {processor_arg},
+        params: &Self::Shared,
         _buffer: &mut AudioBuffer,
         events: &EventList,
         context: &mut ProcessContext,
