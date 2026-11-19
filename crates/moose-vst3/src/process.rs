@@ -232,9 +232,12 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
             }
         }
 
-        // Single stable sort across the merged MIDI + param-change
-        // streams. Stable sort preserves the within-group order each
-        // section already pushed in.
+        // The COM layer already merged notes and parameter points by sample
+        // offset, so this is normally the O(1) already-sorted check. Otherwise
+        // (an unsorted host list, a `PerSample` ramp starting before earlier
+        // events) it runs an allocation-free `sort_unstable_by_key` on
+        // `(sample_offset, push sequence)`: the unique sequence keeps
+        // equal-offset events in push order, as a stable sort would.
         scr.event_list.ensure_sorted_by_offset();
 
         let transport = if transport_ptr.is_null() {
