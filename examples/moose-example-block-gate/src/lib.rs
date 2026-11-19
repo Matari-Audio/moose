@@ -40,23 +40,43 @@ pub struct GateParams {
     pub meter_right: MeterSlot,
 }
 
-/// Stateless descriptor - the gate carries no DSP state, only params.
+/// The plugin descriptor; its DSP state is the parameter smoothing.
 pub struct Gate;
 
-impl PurePluginLogic for Gate {
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    threshold: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &GateParams, sample_rate: f64) {
+        self.threshold.reset(&params.threshold, sample_rate);
+    }
+}
+
+impl PluginLogic for Gate {
     type Params = GateParams;
+    type DspState = Smoothing;
+
+    fn reset(state: &mut Smoothing, params: &GateParams, config: &AudioConfig) {
+        state.reset(params, config.sample_rate);
+    }
 
     fn process(
+        state: &mut Smoothing,
         params: &GateParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
-        // `read_after(n)` advances the smoother by the whole block
+        // `next_after(n)` advances the smoother by the whole block
         // in one atomic pair, so the threshold's `exp(20)` smoothing
         // settles in ~20 ms wall-clock instead of ~20 blocks (which
-        // a per-block `.read()` would silently downsample to).
-        let threshold_lin = db_to_linear(params.threshold.read_after(buffer.num_samples()));
+        // a per-block `.next()` would silently downsample to).
+        let threshold_lin = db_to_linear(state.threshold.next_after(&params.threshold, buffer.num_samples()));
         let nch = buffer.channels();
 
         // Detect: peak over every input channel. The gate opens

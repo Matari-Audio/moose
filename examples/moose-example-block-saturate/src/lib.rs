@@ -55,12 +55,29 @@ pub struct Saturate;
 /// tanh input, so a distinct scratch pair is the cleanest shape.
 #[derive(Default)]
 pub struct SaturateDsp {
+    smoothing: Smoothing,
     sx: Vec<f32>,
     sy: Vec<f32>,
     drive_db: Vec<f32>,
     output_db: Vec<f32>,
     drive_lin_buf: Vec<f32>,
     output_lin_buf: Vec<f32>,
+}
+
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    drive: ParamSmoother,
+    output: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &SaturateParams, sample_rate: f64) {
+        self.drive.reset(&params.drive, sample_rate);
+        self.output.reset(&params.output, sample_rate);
+    }
 }
 
 impl PluginLogic for Saturate {
@@ -89,7 +106,8 @@ impl PluginLogic for Saturate {
     }
 
     /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut SaturateDsp, _params: &SaturateParams, _config: &AudioConfig) {
+    fn reset(state: &mut SaturateDsp, params: &SaturateParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         for buf in [
             &mut state.sx,
             &mut state.sy,
@@ -109,7 +127,7 @@ impl PluginLogic for Saturate {
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
-        if !params.drive.is_smoothing() && !params.output.is_smoothing() {
+        if !state.smoothing.drive.is_smoothing(&params.drive) && !state.smoothing.output.is_smoothing(&params.output) {
             // Fast path: constant drive + output gains.
             let drive_lin = db_to_linear(params.drive.value());
             let output_lin = db_to_linear(params.output.value());
@@ -125,11 +143,11 @@ impl PluginLogic for Saturate {
             }
         } else {
             // Slow path: per-sample drive + output envelopes.
-            // `read_into` advances each smoother by exactly `n`, so the
+            // `next_into` advances each smoother by exactly `n`, so the
             // value doesn't step at the next block edge.
             let n = buffer.num_samples();
-            params.drive.read_into(&mut state.drive_db[..n]);
-            params.output.read_into(&mut state.output_db[..n]);
+            state.smoothing.drive.next_into(&params.drive, &mut state.drive_db[..n]);
+            state.smoothing.output.next_into(&params.output, &mut state.output_db[..n]);
             math::db_to_linear_block(&mut state.drive_lin_buf[..n], &state.drive_db[..n]);
             math::db_to_linear_block(&mut state.output_lin_buf[..n], &state.output_db[..n]);
 

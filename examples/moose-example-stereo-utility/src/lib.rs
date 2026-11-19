@@ -48,6 +48,7 @@ pub struct StereoUtility;
 
 /// Per-instance DSP state: the delay lines and their write heads.
 pub struct StereoUtilityDspState {
+    smoothing: Smoothing,
     /// One delay line per channel, sized in `prepare()` for `MAX_DELAY_MS`.
     lines: [Vec<f32>; 2],
     write_pos: [usize; 2],
@@ -58,6 +59,7 @@ pub struct StereoUtilityDspState {
 impl Default for StereoUtilityDspState {
     fn default() -> Self {
         Self {
+            smoothing: Smoothing::default(),
             lines: [Vec::new(), Vec::new()],
             write_pos: [0; 2],
             line_len: 0,
@@ -82,6 +84,22 @@ fn ms_to_samples(ms: f64, sr: f64, line_len: usize) -> usize {
         0
     } else {
         (s as usize).min(line_len - 1)
+    }
+}
+
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    left_gain: ParamSmoother,
+    right_gain: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &StereoUtilityParams, sample_rate: f64) {
+        self.left_gain.reset(&params.left.gain, sample_rate);
+        self.right_gain.reset(&params.right.gain, sample_rate);
     }
 }
 
@@ -110,9 +128,10 @@ impl PluginLogic for StereoUtility {
     /// Clear the delay lines; may run on the audio thread, so no allocation.
     fn reset(
         state: &mut StereoUtilityDspState,
-        _params: &StereoUtilityParams,
-        _config: &AudioConfig,
+        params: &StereoUtilityParams,
+        config: &AudioConfig,
     ) {
+        state.smoothing.reset(params, config.sample_rate);
         for line in &mut state.lines {
             line.fill(0.0);
         }
@@ -142,7 +161,12 @@ impl PluginLogic for StereoUtility {
             for i in 0..inp.len() {
                 line[wp] = inp[i];
                 let read = (wp + len - delay_samples) % len;
-                let gain = db_to_linear(strip.gain.read());
+                let smoother = if ch == 0 {
+                    &mut state.smoothing.left_gain
+                } else {
+                    &mut state.smoothing.right_gain
+                };
+                let gain = db_to_linear(smoother.next(&strip.gain));
                 out[i] = line[read] * gain * sign;
                 wp = (wp + 1) % len;
             }

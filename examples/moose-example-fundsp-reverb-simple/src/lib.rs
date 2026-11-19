@@ -94,6 +94,7 @@ pub struct FundspReverbSimple;
 /// Per-instance DSP state: the fundsp graph, the atomic cells it
 /// reads, and the inputs the current graph was built with.
 pub struct FundspReverbSimpleDspState {
+    smoothing: Smoothing,
     // Atomic cells the fundsp graph reads each sample via `var()`.
     low_cut_shared: Shared,
     high_cut_shared: Shared,
@@ -108,6 +109,7 @@ pub struct FundspReverbSimpleDspState {
 impl Default for FundspReverbSimpleDspState {
     fn default() -> Self {
         Self {
+            smoothing: Smoothing::default(),
             low_cut_shared: shared(DEFAULT_LOW_CUT_HZ),
             high_cut_shared: shared(DEFAULT_HIGH_CUT_HZ),
             mix_shared: shared(DEFAULT_REVERB_MIX),
@@ -152,6 +154,24 @@ impl FundspReverbSimpleDspState {
     }
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    high_cut: ParamSmoother,
+    low_cut: ParamSmoother,
+    mix: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &FundspReverbSimpleParams, sample_rate: f64) {
+        self.high_cut.reset(&params.high_cut, sample_rate);
+        self.low_cut.reset(&params.low_cut, sample_rate);
+        self.mix.reset(&params.mix, sample_rate);
+    }
+}
+
 impl PluginLogic for FundspReverbSimple {
     type Params = FundspReverbSimpleParams;
     type DspState = FundspReverbSimpleDspState;
@@ -171,6 +191,7 @@ impl PluginLogic for FundspReverbSimple {
         params: &FundspReverbSimpleParams,
         config: &AudioConfig,
     ) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         let time_s = params.time.value();
         // SR is a discrete host setting, not a measurement.
@@ -208,9 +229,9 @@ impl PluginLogic for FundspReverbSimple {
         // both graph inputs (the stereo->stereo bus maps 1:1), so no
         // per-width branch is needed.
         buffer.for_each_stereo_frame(|frame_in, frame_out| {
-            state.low_cut_shared.set_value(params.low_cut.read());
-            state.high_cut_shared.set_value(params.high_cut.read());
-            state.mix_shared.set_value(params.mix.read());
+            state.low_cut_shared.set_value(state.smoothing.low_cut.next(&params.low_cut));
+            state.high_cut_shared.set_value(state.smoothing.high_cut.next(&params.high_cut));
+            state.mix_shared.set_value(state.smoothing.mix.next(&params.mix));
             state.graph.tick(frame_in, frame_out);
         });
 

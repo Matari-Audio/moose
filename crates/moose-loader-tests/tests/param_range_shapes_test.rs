@@ -4,6 +4,7 @@
 //! derive arms expand and, for `reversed`, that the `&'static ParamRange`
 //! promotion compiles in both the runtime `FloatParam` constructor and
 //! the `param_infos_static` `LazyLock` path.
+#![expect(deprecated, reason = "steps the shared smoother to reach the settled value")]
 
 // The point of the assertions below is exact mapped values (0.5, 25.0,
 // endpoints), so float equality is the contract being checked.

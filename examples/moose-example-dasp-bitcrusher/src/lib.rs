@@ -34,6 +34,10 @@ pub struct BitcrusherProcessor {
     held: [f32; 2],
     /// Frame counter for the hold ratio.
     hold_counter: usize,
+    /// The mix ramp. The processor owns it; only the target is shared.
+    mix: ParamSmoother,
+    /// Rate the processor was activated at, for re-seating `mix` in `reset`.
+    sample_rate: f64,
 }
 
 /// Quantize a `[-1.0, 1.0]` sample to `bits` bits of resolution. Routes
@@ -60,19 +64,24 @@ impl Plugin for Bitcrusher {
     fn main_thread(_shared: &Arc<BitcrusherParams>) {}
 
     fn activate(
-        _shared: &BitcrusherParams,
-        _config: &AudioConfig,
+        shared: &BitcrusherParams,
+        config: &AudioConfig,
         _cx: &InitContext,
     ) -> Result<BitcrusherProcessor, PreparationError> {
+        let mut mix = ParamSmoother::default();
+        mix.reset(&shared.mix, config.sample_rate);
         Ok(BitcrusherProcessor {
             held: [0.0; 2],
             hold_counter: 0,
+            mix,
+            sample_rate: config.sample_rate,
         })
     }
 
-    fn reset(state: &mut BitcrusherProcessor, _params: &BitcrusherParams) {
+    fn reset(state: &mut BitcrusherProcessor, params: &BitcrusherParams) {
         state.held = [0.0; 2];
         state.hold_counter = 0;
+        state.mix.reset(&params.mix, state.sample_rate);
     }
 
     fn process(
@@ -86,7 +95,8 @@ impl Plugin for Bitcrusher {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let bits = params.bits.value() as u8;
         let hold = params.hold.value_usize().max(1);
-        let mix = params.mix.read();
+        // Block-constant mix: advance the ramp by the whole block.
+        let mix = state.mix.next_after(&params.mix, buffer.num_samples());
 
         let channels = buffer.channels().min(2);
         for i in 0..buffer.num_samples() {

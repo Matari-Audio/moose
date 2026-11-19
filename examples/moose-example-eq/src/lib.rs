@@ -168,6 +168,7 @@ pub struct Eq;
 /// Per-instance DSP state: one stereo filter per band plus the
 /// sample rate cached at `reset()`.
 pub struct EqDspState {
+    smoothing: Smoothing,
     /// One stereo filter per band; L and R advance through the
     /// same coefficients in parallel `f64x2` lanes. Mono input
     /// feeds both lanes and the L lane is the sole output.
@@ -192,6 +193,7 @@ impl Default for EqDspState {
     fn default() -> Self {
         let id = identity_coeffs();
         EqDspState {
+            smoothing: Smoothing::default(),
             bands: [
                 StereoBiquad::new(id),
                 StereoBiquad::new(id),
@@ -199,6 +201,38 @@ impl Default for EqDspState {
             ],
             sample_rate: 44100.0,
         }
+    }
+}
+
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    low_freq: ParamSmoother,
+    low_gain: ParamSmoother,
+    low_q: ParamSmoother,
+    mid_freq: ParamSmoother,
+    mid_gain: ParamSmoother,
+    mid_q: ParamSmoother,
+    high_freq: ParamSmoother,
+    high_gain: ParamSmoother,
+    high_q: ParamSmoother,
+    output: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &EqParams, sample_rate: f64) {
+        self.low_freq.reset(&params.low.freq, sample_rate);
+        self.low_gain.reset(&params.low.gain, sample_rate);
+        self.low_q.reset(&params.low.q, sample_rate);
+        self.mid_freq.reset(&params.mid.freq, sample_rate);
+        self.mid_gain.reset(&params.mid.gain, sample_rate);
+        self.mid_q.reset(&params.mid.q, sample_rate);
+        self.high_freq.reset(&params.high.freq, sample_rate);
+        self.high_gain.reset(&params.high.gain, sample_rate);
+        self.high_q.reset(&params.high.q, sample_rate);
+        self.output.reset(&params.output, sample_rate);
     }
 }
 
@@ -246,7 +280,8 @@ impl PluginLogic for Eq {
         })
     }
 
-    fn reset(state: &mut EqDspState, _params: &EqParams, config: &AudioConfig) {
+    fn reset(state: &mut EqDspState, params: &EqParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         for band in &mut state.bands {
@@ -290,20 +325,20 @@ impl PluginLogic for Eq {
             // Slice-based read advances each smoother by exactly `n`
             // - one atomic-pair per param (10 pairs total) regardless
             // of chunk length, vs one pair per param per sample if we
-            // called `.read()` in the inner loop. Coefficient updates
+            // called `.next()` in the inner loop. Coefficient updates
             // still happen per sample so a fast knob sweep stays
             // click-free; only the smoother traffic moves out of the
             // inner loop.
-            params.low.freq.read_into(&mut low_freq[..n]);
-            params.low.gain.read_into(&mut low_gain[..n]);
-            params.low.q.read_into(&mut low_q[..n]);
-            params.mid.freq.read_into(&mut mid_freq[..n]);
-            params.mid.gain.read_into(&mut mid_gain[..n]);
-            params.mid.q.read_into(&mut mid_q[..n]);
-            params.high.freq.read_into(&mut high_freq[..n]);
-            params.high.gain.read_into(&mut high_gain[..n]);
-            params.high.q.read_into(&mut high_q[..n]);
-            params.output.read_into(&mut output[..n]);
+            state.smoothing.low_freq.next_into_f64(&params.low.freq, &mut low_freq[..n]);
+            state.smoothing.low_gain.next_into_f64(&params.low.gain, &mut low_gain[..n]);
+            state.smoothing.low_q.next_into_f64(&params.low.q, &mut low_q[..n]);
+            state.smoothing.mid_freq.next_into_f64(&params.mid.freq, &mut mid_freq[..n]);
+            state.smoothing.mid_gain.next_into_f64(&params.mid.gain, &mut mid_gain[..n]);
+            state.smoothing.mid_q.next_into_f64(&params.mid.q, &mut mid_q[..n]);
+            state.smoothing.high_freq.next_into_f64(&params.high.freq, &mut high_freq[..n]);
+            state.smoothing.high_gain.next_into_f64(&params.high.gain, &mut high_gain[..n]);
+            state.smoothing.high_q.next_into_f64(&params.high.q, &mut high_q[..n]);
+            state.smoothing.output.next_into_f64(&params.output, &mut output[..n]);
 
             // Vectorize the output dB → linear conversion once per
             // chunk. f64::powf is opaque to LLVM's autovectorizer;

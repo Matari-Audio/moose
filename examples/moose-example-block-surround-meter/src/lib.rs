@@ -64,7 +64,7 @@ pub struct SurroundMeterParams {
     pub ch_rs: MeterSlot,
 }
 
-/// Stateless descriptor - the meter carries no DSP state, only params.
+/// The plugin descriptor; its DSP state is the parameter smoothing.
 pub struct SurroundMeter;
 
 const METER_IDS: [P; CHANS] = [P::ChL, P::ChR, P::ChC, P::ChLfe, P::ChLs, P::ChRs];
@@ -73,8 +73,27 @@ const METER_IDS: [P; CHANS] = [P::ChL, P::ChR, P::ChC, P::ChLfe, P::ChLs, P::ChR
 /// "empty" on the widget.
 const METER_FLOOR_DB: f32 = -60.0;
 
-impl PurePluginLogic for SurroundMeter {
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    trim: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &SurroundMeterParams, sample_rate: f64) {
+        self.trim.reset(&params.trim, sample_rate);
+    }
+}
+
+impl PluginLogic for SurroundMeter {
     type Params = SurroundMeterParams;
+    type DspState = Smoothing;
+
+    fn reset(state: &mut Smoothing, params: &SurroundMeterParams, config: &AudioConfig) {
+        state.reset(params, config.sample_rate);
+    }
 
     fn bus_layouts() -> Vec<BusLayout> {
         // CHANS is a compile-time constant (6) that fits trivially
@@ -92,16 +111,17 @@ impl PurePluginLogic for SurroundMeter {
     }
 
     fn process(
+        state: &mut Smoothing,
         params: &SurroundMeterParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
         // Trim is applied block-constant via `scale_block`;
-        // `read_after(n)` advances the smoother by the whole block
+        // `next_after(n)` advances the smoother by the whole block
         // so the declared exp(10) settling actually completes in
         // ~10 ms wall-clock instead of ~10 blocks.
-        let trim_lin = db_to_linear(params.trim.read_after(buffer.num_samples()));
+        let trim_lin = db_to_linear(state.trim.next_after(&params.trim, buffer.num_samples()));
         let nch = buffer.channels().min(CHANS);
 
         // Apply trim and collect per-channel linear peaks. One

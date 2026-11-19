@@ -59,10 +59,27 @@ pub struct DryWet;
 /// Per-instance SIMD scratch, sized to the host's max block in `reset`.
 #[derive(Default)]
 pub struct DryWetDsp {
+    smoothing: Smoothing,
     /// Holds the saturated signal; `tanh_block` wants distinct in/out,
     /// then `mix_block` folds wet and dry into out in one SIMD pass.
     wet: Vec<f32>,
     driven: Vec<f32>,
+}
+
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    drive: ParamSmoother,
+    mix: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &DryWetParams, sample_rate: f64) {
+        self.drive.reset(&params.drive, sample_rate);
+        self.mix.reset(&params.mix, sample_rate);
+    }
 }
 
 impl PluginLogic for DryWet {
@@ -84,7 +101,8 @@ impl PluginLogic for DryWet {
     }
 
     /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut DryWetDsp, _params: &DryWetParams, _config: &AudioConfig) {
+    fn reset(state: &mut DryWetDsp, params: &DryWetParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         state.wet.fill(0.0);
         state.driven.fill(0.0);
     }
@@ -97,12 +115,12 @@ impl PluginLogic for DryWet {
         context: &mut ProcessContext,
     ) -> ProcessStatus {
         // Both mix and drive are applied block-constant, so
-        // `read_after(n)` advances each smoother by the whole block
+        // `next_after(n)` advances each smoother by the whole block
         // in one atomic pair - matching the per-block consumption
         // pattern instead of silently downsampling smoother
         // convergence to once-per-block.
         let n = buffer.num_samples();
-        let mix = params.mix.read_after(n);
+        let mix = state.smoothing.mix.next_after(&params.mix, n);
         let dry_g = 1.0 - mix;
         let wet_g = mix;
 
@@ -110,7 +128,7 @@ impl PluginLogic for DryWet {
         // mix_block, the dB → linear conversion is a one-line
         // call; envelope precompute is over-engineering for two
         // gain stages.
-        let drive_lin = db_to_linear(params.drive.read_after(n));
+        let drive_lin = db_to_linear(state.smoothing.drive.next_after(&params.drive, n));
 
         for ch in 0..buffer.channels() {
             let (inp, out) = buffer.io(ch);

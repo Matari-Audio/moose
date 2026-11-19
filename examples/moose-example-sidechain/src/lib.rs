@@ -42,15 +42,33 @@ pub struct SidechainParams {
     pub sc_r: MeterSlot,
 }
 
-/// Stateless descriptor - metering + a block-constant blend keep nothing
-/// between blocks.
+/// The plugin descriptor; its DSP state is the mix smoothing.
 pub struct Sidechain;
 
 const IN_METERS: [P; 2] = [P::InL, P::InR];
 const SC_METERS: [P; 2] = [P::ScL, P::ScR];
 
-impl PurePluginLogic for Sidechain {
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    mix: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &SidechainParams, sample_rate: f64) {
+        self.mix.reset(&params.mix, sample_rate);
+    }
+}
+
+impl PluginLogic for Sidechain {
     type Params = SidechainParams;
+    type DspState = Smoothing;
+
+    fn reset(state: &mut Smoothing, params: &SidechainParams, config: &AudioConfig) {
+        state.reset(params, config.sample_rate);
+    }
 
     fn bus_layouts() -> Vec<BusLayout> {
         vec![
@@ -62,6 +80,7 @@ impl PurePluginLogic for Sidechain {
     }
 
     fn process(
+        state: &mut Smoothing,
         params: &SidechainParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -82,9 +101,9 @@ impl PurePluginLogic for Sidechain {
         let sc_r = if has_sc { peak(buffer.input(3)) } else { 0.0 };
 
         // Blend main and sidechain into the stereo output. Block-constant:
-        // `read_after` advances the smoother by the whole block so the
+        // `next_after` advances the smoother by the whole block so the
         // exp(10) settling completes in ~10 ms rather than ~10 blocks.
-        let wet = params.mix.read_after(buffer.num_samples());
+        let wet = state.mix.next_after(&params.mix, buffer.num_samples());
         let dry = 1.0 - wet;
         for ch in 0..buffer.num_output_channels().min(2) {
             {
@@ -151,7 +170,7 @@ mod tests {
 
     #[test]
     fn declares_a_separate_sidechain_bus() {
-        let layout = <Sidechain as PurePluginLogic>::bus_layouts()
+        let layout = <Sidechain as PluginLogic>::bus_layouts()
             .into_iter()
             .next()
             .unwrap();

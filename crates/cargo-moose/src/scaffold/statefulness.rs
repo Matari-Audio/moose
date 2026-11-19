@@ -42,20 +42,22 @@ impl Statefulness {
     /// (`type DspState = Self`), so the struct carries `#[derive(Default)]`
     /// and a field block. No trailing newline - the template supplies it.
     #[must_use]
-    pub fn struct_decl(self, struct_name: &str) -> String {
+    pub fn struct_decl(self, struct_name: &str, fields: &str) -> String {
         match self {
             Self::Pure => format!("pub struct {struct_name};"),
-            Self::Stateful => STATEFUL_STRUCT.replace("{struct_name}", struct_name),
+            Self::Stateful => STATEFUL_STRUCT
+                .replace("{struct_name}", struct_name)
+                .replace("{fields}", fields),
         }
     }
 
     /// The `type DspState = ...;` line inside the impl block, or empty
     /// for a pure plugin. Ends in a newline when present.
     #[must_use]
-    pub fn dsp_state_type(self) -> String {
+    pub fn dsp_state_type(self, reset_method: &str) -> String {
         match self {
             Self::Pure => String::new(),
-            Self::Stateful => "    type DspState = Self;\n".to_string(),
+            Self::Stateful => format!("    type DspState = Self;\n{reset_method}"),
         }
     }
 
@@ -66,6 +68,7 @@ impl Statefulness {
     #[must_use]
     pub fn wrap_process(self, body: &str) -> String {
         match self {
+            Self::Stateful if body.contains("state: &mut Self::DspState") => body.to_string(),
             Self::Pure => body.to_string(),
             Self::Stateful => body.replacen(
                 "fn process(\n",
@@ -93,6 +96,6 @@ const STATEFUL_DESCRIPTOR: &str = "\
 const STATEFUL_STRUCT: &str = "\
 #[derive(Default)]
 pub struct {struct_name} {
-    // Per-instance DSP state - filters, delay lines, phase counters.
-    // Fields need `Default`. Add them as your DSP grows.
-}";
+    // Per-instance DSP state - filters, delay lines, phase counters,
+    // parameter ramps. Fields need `Default`. Add them as your DSP grows.
+{fields}}";

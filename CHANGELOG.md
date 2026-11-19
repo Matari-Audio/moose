@@ -4,6 +4,15 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Deprecated: smoothing in shared atomics.** `FloatParamReadF32`/`F64`
+  `read`, `read_into`, `read_after` and `current`, and `FloatParam`'s
+  `raw_smoothed_*`, `settled_value` and `is_smoothing` keep the ramp inside
+  the parameter, so two readers advance one ramp and `reset` writes shared
+  state. Keep a `ParamSmoother` per parameter in the DSP state, reset it in
+  `reset`, and step it in `process` (`next`, `next_after`, `next_into`, and
+  the `_f64` forms). `value()` (the target) is unchanged. Every example now
+  uses the owned smoother; the deprecated path will be removed in 8.0.
+
 - **Host notices.** `moose_core::main_thread::{HostNotice, HostNotifier}`:
   `MainThreadHooks::connect(&mut self, HostNotifier)` (default no-op) hands
   the hooks a notifier once, and `PluginContext::notify_host(HostNotice)`
@@ -40,6 +49,7 @@ Notable changes per release.
   plugin outputs silence, and a state load is kept until a processor
   exists. `PreparationError` is in the prelude. `PluginLogic` and
   friends are unchanged. The bitcrusher example uses the new trait.
+
 - **Runtime parameters.** `DynamicParams<N>` (a `#[nested]` field) is a pool
   of `N` host slots with stable ids. `edit(|tx| ..)` binds, renames and frees
   slots (`SlotDef`: name, group, `SlotRange` of linear / log / int / toggle /

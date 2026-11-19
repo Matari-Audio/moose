@@ -32,7 +32,7 @@ slices, `wide::f64x4` lanes; chunk granularity is 4 vs 8 for f32.
 
 All ops are pure math - no atomics, no parameter reads, no
 audio-thread allocation. They're the inner-loop complement to a
-`moose_params::FloatParam::read_into(&mut buf)` /
+`moose_params::ParamSmoother::next_into(&param, &mut buf)` /
 `moose_core::AudioBuffer::chunks_mut::<N>()` driver. See the
 [block-gain example](https://github.com/Matari-Audio/moose/tree/main/examples/moose-example-block-gain)
 for the canonical fast-path / slow-path shape.

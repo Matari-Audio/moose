@@ -146,6 +146,7 @@ struct Voice {
 pub struct Multiport;
 
 pub struct MultiportDspState {
+    smoothing: Smoothing,
     sample_rate: f64,
     voices: [Voice; NUM_VOICES],
 }
@@ -153,6 +154,7 @@ pub struct MultiportDspState {
 impl Default for MultiportDspState {
     fn default() -> Self {
         MultiportDspState {
+            smoothing: Smoothing::default(),
             sample_rate: 44100.0,
             voices: [Voice::default(); NUM_VOICES],
         }
@@ -243,6 +245,26 @@ struct Lane {
     rel_step: f32,
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    port0_cutoff: ParamSmoother,
+    port0_volume: ParamSmoother,
+    port1_cutoff: ParamSmoother,
+    port1_volume: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &MultiportParams, sample_rate: f64) {
+        self.port0_cutoff.reset(&params.port0.cutoff, sample_rate);
+        self.port0_volume.reset(&params.port0.volume, sample_rate);
+        self.port1_cutoff.reset(&params.port1.cutoff, sample_rate);
+        self.port1_volume.reset(&params.port1.volume, sample_rate);
+    }
+}
+
 impl PluginLogic for Multiport {
     type Params = MultiportParams;
     type DspState = MultiportDspState;
@@ -251,7 +273,8 @@ impl PluginLogic for Multiport {
         BusLayout::stereo_and_mono_output()
     }
 
-    fn reset(state: &mut MultiportDspState, _params: &MultiportParams, config: &AudioConfig) {
+    fn reset(state: &mut MultiportDspState, params: &MultiportParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.voices = [Voice::default(); NUM_VOICES];
@@ -270,20 +293,20 @@ impl PluginLogic for Multiport {
         let atk_step = (1.0 / (0.005 * sample_rate)) as f32; // ~5 ms attack
         let p0 = &params.port0;
         let p1 = &params.port1;
-        // `read_after(n)` advances the smoother by the block and hands
-        // back the settled value - `raw_smoothed_current()` alone never
+        // `next_after(n)` advances the smoother by the block and hands
+        // back the settled value - `current()` alone never
         // advances, freezing the knob at its reset-time snapshot.
         let lanes = [
             Lane {
                 wave: p0.wave.value(),
-                cutoff: p0.cutoff.read_after(n).clamp(0.002, 1.0),
-                volume: db_to_linear(p0.volume.read_after(n)),
+                cutoff: state.smoothing.port0_cutoff.next_after(&p0.cutoff, n).clamp(0.002, 1.0),
+                volume: db_to_linear(state.smoothing.port0_volume.next_after(&p0.volume, n)),
                 rel_step: (1.0 / (p0.release.raw_target().max(0.01) * sample_rate)) as f32,
             },
             Lane {
                 wave: p1.wave.value(),
-                cutoff: p1.cutoff.read_after(n).clamp(0.002, 1.0),
-                volume: db_to_linear(p1.volume.read_after(n)),
+                cutoff: state.smoothing.port1_cutoff.next_after(&p1.cutoff, n).clamp(0.002, 1.0),
+                volume: db_to_linear(state.smoothing.port1_volume.next_after(&p1.volume, n)),
                 rel_step: (1.0 / (p1.release.raw_target().max(0.01) * sample_rate)) as f32,
             },
         ];

@@ -43,8 +43,23 @@ pub struct Widen;
 /// Per-instance mid/side scratch, sized to the host's max block in `reset`.
 #[derive(Default)]
 pub struct WidenDsp {
+    smoothing: Smoothing,
     mid: Vec<f32>,
     side: Vec<f32>,
+}
+
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    width: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &WidenParams, sample_rate: f64) {
+        self.width.reset(&params.width, sample_rate);
+    }
 }
 
 impl PluginLogic for Widen {
@@ -66,7 +81,8 @@ impl PluginLogic for Widen {
     }
 
     /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut WidenDsp, _params: &WidenParams, _config: &AudioConfig) {
+    fn reset(state: &mut WidenDsp, params: &WidenParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         state.mid.fill(0.0);
         state.side.fill(0.0);
     }
@@ -90,10 +106,10 @@ impl PluginLogic for Widen {
         }
 
         let n = buffer.num_samples();
-        // Width is applied block-constant; `read_after(n)` advances
+        // Width is applied block-constant; `next_after(n)` advances
         // the smoother by the whole block so the wall-clock
         // convergence time matches the smoother declaration.
-        let width = params.width.read_after(n);
+        let width = state.smoothing.width.next_after(&params.width, n);
 
         // Build mid + side from input. Scalar loop autovectorizes
         // (LLVM packs the four ops per iteration into NEON / AVX).

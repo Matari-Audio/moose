@@ -80,6 +80,7 @@ struct Voice {
 pub struct Synth;
 
 pub struct SynthDspState {
+    smoothing: Smoothing,
     sample_rate: f64,
     voices: [Voice; NUM_VOICES],
     /// Channel-wide pitch bend, semitones, indexed by channel.
@@ -89,6 +90,7 @@ pub struct SynthDspState {
 impl Default for SynthDspState {
     fn default() -> Self {
         SynthDspState {
+            smoothing: Smoothing::default(),
             sample_rate: 44100.0,
             voices: [Voice::default(); NUM_VOICES],
             channel_bend: [0.0; 16],
@@ -261,6 +263,22 @@ fn osc(phase: f64) -> f32 {
     (2.0 * phase - 1.0) as f32
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    master_cutoff: ParamSmoother,
+    volume: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &SynthParams, sample_rate: f64) {
+        self.master_cutoff.reset(&params.master_cutoff, sample_rate);
+        self.volume.reset(&params.volume, sample_rate);
+    }
+}
+
 impl PluginLogic for Synth {
     type Params = SynthParams;
     type DspState = SynthDspState;
@@ -271,7 +289,8 @@ impl PluginLogic for Synth {
         vec![BusLayout::new().with_output("Main", ChannelConfig::Stereo)]
     }
 
-    fn reset(state: &mut SynthDspState, _params: &SynthParams, config: &AudioConfig) {
+    fn reset(state: &mut SynthDspState, params: &SynthParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.voices = [Voice::default(); NUM_VOICES];
@@ -287,10 +306,10 @@ impl PluginLogic for Synth {
         _context: &mut ProcessContext,
     ) -> ProcessStatus {
         let n = buffer.num_samples();
-        // Advance the smoothers by the block (`raw_smoothed_current()`
+        // Advance the smoothers by the block (`current()`
         // alone never advances - the knobs would freeze at reset).
-        let master = params.master_cutoff.read_after(n);
-        let volume = db_to_linear(params.volume.read_after(n));
+        let master = state.smoothing.master_cutoff.next_after(&params.master_cutoff, n);
+        let volume = db_to_linear(state.smoothing.volume.next_after(&params.volume, n));
         let rel_s = params.release.raw_target().max(0.01);
         let atk_step = (1.0 / (0.005 * state.sample_rate)) as f32; // ~5 ms attack
         let rel_step = (1.0 / (rel_s * state.sample_rate)) as f32;

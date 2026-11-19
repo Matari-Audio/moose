@@ -17,7 +17,7 @@ import path for everything.
   preludes (`AudioBuffer` is a per-prelude precision-pinned type alias
   rather than a plain re-export)
 - `FloatParam`, `IntParam`, `BoolParam`, `EnumParam`, `Smoother` from moose-params
-- `FloatParamReadF32` / `FloatParamReadF64` extension traits, bringing `param.read()` into scope at the prelude's precision
+- `ParamSmoother`, the processor-owned ramp: keep one per smoothed parameter in the DSP state and step it in `process` (`next` for `f32`, `next_f64` for `f64`)
 - `#[derive(Params)]`, `#[derive(ParamEnum)]`, `#[derive(State)]` from moose-derive (at the crate root); `plugin_info!()` is available via the preludes
 - `PluginLogic` from moose-plugin (the user-facing leaf trait. `PluginLogic` for `f32`, `PluginLogic64` for `f64`; the prelude aliases the right one as `PluginLogic`)
 - The `moose::plugin!` macro generates all the format-export glue from one declaration
@@ -26,7 +26,7 @@ import path for everything.
 
 Four flavors, each pinning a different precision combination:
 
-| Prelude | Audio buffer | `param.read()` returns | When to pick |
+| Prelude | Audio buffer | DSP math in | When to pick |
 |---|---|---|---|
 | `prelude` / `prelude32` | `f32` | `f32` | Default - host wire is `f32` everywhere |
 | `prelude64m` | `f32` | `f64` | Stable `f64` intermediate math, narrow on buffer write |

@@ -6,6 +6,8 @@
 //! a fourth variant (or tweaking one variant's `process` template)
 //! is a one-place change.
 
+use super::statefulness::Statefulness;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum PluginKind {
     Effect,
@@ -101,12 +103,40 @@ impl PluginKind {
         }
     }
 
+    /// Per-kind `process` body. A stateful effect ramps its gain with
+    /// the `ParamSmoother` it owns; a pure one has nowhere to keep a ramp
+    /// and reads the target.
     #[must_use]
-    pub fn process_body(self) -> &'static str {
+    pub fn process_body(self, statefulness: Statefulness) -> &'static str {
+        match (self, statefulness) {
+            (Self::Instrument, _) => INSTRUMENT_PROCESS_BODY,
+            (Self::Midi, _) => MIDI_PROCESS_BODY,
+            (Self::Effect, Statefulness::Pure) => PURE_EFFECT_PROCESS_BODY,
+            (Self::Effect, Statefulness::Stateful) => STATEFUL_EFFECT_PROCESS_BODY,
+        }
+    }
+
+    /// Fields of a stateful plugin's DSP state: the effect's gain
+    /// smoother, nothing for the other kinds.
+    #[must_use]
+    pub fn state_fields(self) -> &'static str {
         match self {
-            Self::Instrument => INSTRUMENT_PROCESS_BODY,
-            Self::Midi => MIDI_PROCESS_BODY,
-            Self::Effect => EFFECT_PROCESS_BODY,
+            Self::Effect => "    gain: ParamSmoother,\n",
+            Self::Instrument | Self::Midi => "",
+        }
+    }
+
+    /// `reset` for a stateful plugin: jumps the effect's gain ramp to
+    /// its target. Empty (the trait default) for the other kinds.
+    #[must_use]
+    pub fn reset_method(self) -> &'static str {
+        match self {
+            Self::Effect => {
+                "\n    fn reset(state: &mut Self, params: &Self::Params, config: &AudioConfig) {\n        \
+                 state.gain.reset(&params.gain, config.sample_rate);\n    \
+                 }\n"
+            }
+            Self::Instrument | Self::Midi => "",
         }
     }
 
@@ -146,14 +176,33 @@ pub struct {struct_name}Params {
     pub semitones: IntParam,
 }"#;
 
-const EFFECT_PROCESS_BODY: &str = r"    fn process(
+const PURE_EFFECT_PROCESS_BODY: &str = r"    fn process(
+        params: &Self::Params,
+        buffer: &mut AudioBuffer,
+        _events: &EventList,
+        _context: &mut ProcessContext,
+    ) -> ProcessStatus {
+        // A pure plugin has no state to keep a ramp in, so the gain
+        // steps at block edges. Scaffold with `--stateful` to smooth it.
+        let gain = db_to_linear(params.gain.value());
+        for i in 0..buffer.num_samples() {
+            for ch in 0..buffer.channels() {
+                let (inp, out) = buffer.io(ch);
+                out[i] = inp[i] * gain;
+            }
+        }
+        ProcessStatus::Normal
+    }";
+
+const STATEFUL_EFFECT_PROCESS_BODY: &str = r"    fn process(
+        state: &mut Self::DspState,
         params: &Self::Params,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         _context: &mut ProcessContext,
     ) -> ProcessStatus {
         for i in 0..buffer.num_samples() {
-            let gain = db_to_linear(params.gain.read());
+            let gain = db_to_linear(state.gain.next(&params.gain));
             for ch in 0..buffer.channels() {
                 let (inp, out) = buffer.io(ch);
                 out[i] = inp[i] * gain;

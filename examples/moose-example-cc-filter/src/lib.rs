@@ -42,6 +42,7 @@ pub struct CcFilter;
 /// Per-instance DSP state: the one-pole filter memory and the
 /// CC-driven cutoff.
 pub struct CcFilterDspState {
+    smoothing: Smoothing,
     sample_rate: f64,
     /// One-pole state per channel.
     z1: [f64; 2],
@@ -52,6 +53,7 @@ pub struct CcFilterDspState {
 impl Default for CcFilterDspState {
     fn default() -> Self {
         Self {
+            smoothing: Smoothing::default(),
             sample_rate: 44100.0,
             z1: [0.0; 2],
             cutoff_hz: 1000.0,
@@ -72,15 +74,30 @@ fn one_pole_a(cutoff: f64, sr: f64) -> f64 {
     1.0 - (-std::f64::consts::TAU * fc / sr).exp()
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    cutoff: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &CcFilterParams, sample_rate: f64) {
+        self.cutoff.reset(&params.cutoff, sample_rate);
+    }
+}
+
 impl PluginLogic for CcFilter {
     type Params = CcFilterParams;
     type DspState = CcFilterDspState;
 
     fn reset(state: &mut CcFilterDspState, params: &CcFilterParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.z1 = [0.0; 2];
-        state.cutoff_hz = f64::from(params.cutoff.read());
+        state.cutoff_hz = f64::from(state.smoothing.cutoff.next(&params.cutoff));
     }
 
     fn process(

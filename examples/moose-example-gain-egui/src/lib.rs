@@ -54,21 +54,43 @@ pub struct GainParams {
 
 // --- Plugin ---
 
-/// Stateless descriptor - carries no DSP state, only params.
+/// The plugin descriptor; its DSP state is the parameter smoothing.
 pub struct GainEgui;
 
-impl PurePluginLogic for GainEgui {
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    gain: ParamSmoother,
+    pan: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &GainParams, sample_rate: f64) {
+        self.gain.reset(&params.gain, sample_rate);
+        self.pan.reset(&params.pan, sample_rate);
+    }
+}
+
+impl PluginLogic for GainEgui {
     type Params = GainParams;
+    type DspState = Smoothing;
+
+    fn reset(state: &mut Smoothing, params: &GainParams, config: &AudioConfig) {
+        state.reset(params, config.sample_rate);
+    }
 
     fn process(
+        state: &mut Smoothing,
         params: &GainParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
         for i in 0..buffer.num_samples() {
-            let gain_db = params.gain.read();
-            let pan = params.pan.read();
+            let gain_db = state.gain.next(&params.gain);
+            let pan = state.pan.next(&params.pan);
             let gain_linear = db_to_linear(gain_db);
 
             let gain_l = gain_linear * (1.0 - pan.max(0.0));

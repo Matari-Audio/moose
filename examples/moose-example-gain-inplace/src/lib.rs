@@ -62,11 +62,32 @@ fn channel_gain(ch: usize, gain_lin: f32, pan: f32) -> f32 {
     }
 }
 
-/// Stateless descriptor - gain carries no DSP state, only params.
+/// The plugin descriptor; its DSP state is the parameter smoothing.
 pub struct GainInPlace;
 
-impl PurePluginLogic for GainInPlace {
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    gain: ParamSmoother,
+    pan: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &GainInPlaceParams, sample_rate: f64) {
+        self.gain.reset(&params.gain, sample_rate);
+        self.pan.reset(&params.pan, sample_rate);
+    }
+}
+
+impl PluginLogic for GainInPlace {
     type Params = GainInPlaceParams;
+    type DspState = Smoothing;
+
+    fn reset(state: &mut Smoothing, params: &GainInPlaceParams, config: &AudioConfig) {
+        state.reset(params, config.sample_rate);
+    }
 
     /// Opt into zero-copy in-place I/O. EXPERIMENTAL and NOT RECOMMENDED
     /// (see the module docs); the default `false` is the right choice for
@@ -77,6 +98,7 @@ impl PurePluginLogic for GainInPlace {
     }
 
     fn process(
+        state: &mut Smoothing,
         params: &GainInPlaceParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -88,7 +110,7 @@ impl PurePluginLogic for GainInPlace {
         // "read the smoother once, apply across every channel" loop. To
         // keep per-sample smoothing anyway, read each smoother's ramp into
         // a small stack scratch once per chunk and reuse it for every
-        // channel. A `PurePluginLogic` leaf has no DspState for a
+        // channel. The DSP state holds only the smoothing, not a
         // block-length buffer, so long blocks are sliced into `CHUNK`s.
         const CHUNK: usize = 64;
         let mut gain_lin = [0.0f32; CHUNK];
@@ -102,11 +124,11 @@ impl PurePluginLogic for GainInPlace {
             // Advance both smoothers by `len` exactly once, then reuse the
             // ramps for every channel below - the smoother must not be
             // re-advanced per channel.
-            params.gain.read_into(&mut gain_lin[..len]);
+            state.gain.next_into(&params.gain, &mut gain_lin[..len]);
             for g in &mut gain_lin[..len] {
                 *g = db_to_linear(*g);
             }
-            params.pan.read_into(&mut pan[..len]);
+            state.pan.next_into(&params.pan, &mut pan[..len]);
 
             for ch in 0..channels {
                 // The in-place contract: branch on `is_in_place(ch)`. For a

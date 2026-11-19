@@ -26,10 +26,12 @@ types inside your `Params` struct, then derive with `#[derive(Params)]`.
   `from_f32`, `from_f64`, plus `exp`, `log10`, `powf`). `Sample`
   is `Float + Default + Send + Sync + 'static` - the audio buffer
   element bound.
-- **`FloatParamReadF32` / `FloatParamReadF64`** -- precision-routed
-  read traits. The prelude brings one of them into scope as `_`;
-  `param.read()` then returns `f32` or `f64` directly without
-  per-call-site annotation.
+- **`ParamSmoother`** -- the processor-owned ramp. Keep one per smoothed
+  parameter in the DSP state, `reset` it in `reset`, and step it in
+  `process` with `next`, `next_after` or `next_into` (`_f64` forms for
+  `f64` DSP). Only the parameter's target crosses threads.
+- **`FloatParamReadF32` / `FloatParamReadF64`** -- deprecated
+  precision-routed reads that keep the ramp in shared atomics.
 
 ## Example
 

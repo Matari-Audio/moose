@@ -40,6 +40,7 @@ pub struct EnvelopeParams {
 pub struct Envelope;
 
 pub struct EnvelopeDspState {
+    smoothing: Smoothing,
     sample_rate: f64,
     /// Follower state, peak-tracked with instant attack and a
     /// parameterised release.
@@ -52,6 +53,7 @@ pub struct EnvelopeDspState {
 impl Default for EnvelopeDspState {
     fn default() -> Self {
         EnvelopeDspState {
+            smoothing: Smoothing::default(),
             sample_rate: 44100.0,
             env: 0.0,
             last_sent: None,
@@ -72,11 +74,26 @@ fn level_to_cc(level: f32) -> u8 {
     (level.clamp(0.0, 1.0) * 127.0).round() as u8
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    release: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &EnvelopeParams, sample_rate: f64) {
+        self.release.reset(&params.release, sample_rate);
+    }
+}
+
 impl PluginLogic for Envelope {
     type Params = EnvelopeParams;
     type DspState = EnvelopeDspState;
 
-    fn reset(state: &mut EnvelopeDspState, _params: &EnvelopeParams, config: &AudioConfig) {
+    fn reset(state: &mut EnvelopeDspState, params: &EnvelopeParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.env = 0.0;
@@ -103,7 +120,7 @@ impl PluginLogic for Envelope {
         // 0` - keeps the stream smooth and tracks rises/falls within a
         // block; the old block-rate form showed up in a MIDI monitor as
         // a delayed `@0` burst once per block.
-        let coeff = release_coeff(params.release.read(), state.sample_rate);
+        let coeff = release_coeff(state.smoothing.release.next(&params.release), state.sample_rate);
         let cc = params.cc.value_u8();
         let nch = buffer.channels();
         for i in 0..buffer.num_samples() {

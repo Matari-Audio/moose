@@ -62,15 +62,24 @@ pub struct GainParams {
 
 use GainParamsParamId as P;
 
-pub struct Gain;
+// The DSP state owns the gain ramp; only the knob's target is shared.
+#[derive(Default)]
+pub struct Gain {
+    gain: ParamSmoother,
+}
 
-impl PurePluginLogic for Gain {
+impl PluginLogic for Gain {
     type Params = GainParams;
+    type DspState = Self;
 
-    fn process(params: &GainParams, buffer: &mut AudioBuffer,
+    fn reset(state: &mut Self, params: &GainParams, config: &AudioConfig) {
+        state.gain.reset(&params.gain, config.sample_rate);
+    }
+
+    fn process(state: &mut Self, params: &GainParams, buffer: &mut AudioBuffer,
                _events: &EventList, _ctx: &mut ProcessContext) -> ProcessStatus {
         for i in 0..buffer.num_samples() {
-            let gain = db_to_linear(params.gain.read());
+            let gain = db_to_linear(state.gain.next(&params.gain));
             for ch in 0..buffer.channels() {
                 let (inp, out) = buffer.io(ch);
                 out[i] = inp[i] * gain;
@@ -89,7 +98,7 @@ moose::plugin! { logic: Gain, params: GainParams }
 ```
 
 > Switch the import to `moose::prelude64::*` to write `f64` DSP
-> instead — `param.read()` returns `f64`, the audio buffer is
+> instead — step the ramp with `smoother.next_f64(&param)`, the audio buffer is
 > `f64`, and the format wrapper widens/narrows at the block
 > boundary. Same `impl PluginLogic` header on both precisions.
 

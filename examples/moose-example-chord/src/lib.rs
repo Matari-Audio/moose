@@ -82,6 +82,7 @@ const _: () = assert!(MAX_VOICES == 4, "one level per voice");
 pub struct Chord;
 
 pub struct ChordDspState {
+    smoothing: Smoothing,
     sample_rate: f64,
     /// Notes currently sounding (and emitted), one per voice.
     notes: [Option<u8>; MAX_VOICES],
@@ -93,6 +94,7 @@ pub struct ChordDspState {
 impl Default for ChordDspState {
     fn default() -> Self {
         ChordDspState {
+            smoothing: Smoothing::default(),
             sample_rate: 44100.0,
             notes: [None; MAX_VOICES],
             phases: [0.0; MAX_VOICES],
@@ -140,6 +142,24 @@ fn sine_f32(phase: f64) -> f32 {
     (phase * std::f64::consts::TAU).sin() as f32
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    gain: ParamSmoother,
+    levels: [ParamSmoother; MAX_VOICES],
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &ChordParams, sample_rate: f64) {
+        self.gain.reset(&params.gain, sample_rate);
+        for (smoother, level) in self.levels.iter_mut().zip(&params.levels) {
+            smoother.reset(level, sample_rate);
+        }
+    }
+}
+
 impl PluginLogic for Chord {
     type Params = ChordParams;
     type DspState = ChordDspState;
@@ -148,7 +168,8 @@ impl PluginLogic for Chord {
         BusLayout::stereo_and_mono_output()
     }
 
-    fn reset(state: &mut ChordDspState, _params: &ChordParams, config: &AudioConfig) {
+    fn reset(state: &mut ChordDspState, params: &ChordParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.notes = [None; MAX_VOICES];
@@ -203,11 +224,11 @@ impl PluginLogic for Chord {
             }
         }
 
-        let gain = params.gain.read() * VOICE_MIX;
+        let gain = state.smoothing.gain.next(&params.gain) * VOICE_MIX;
         for i in 0..buffer.num_samples() {
             let mut sample = 0.0f32;
             for voice in 0..MAX_VOICES {
-                let level = params.levels[voice].read();
+                let level = state.smoothing.levels[voice].next(&params.levels[voice]);
                 if let Some(note) = state.notes[voice] {
                     sample += sine_f32(state.phases[voice]) * level;
                     let inc = note_hz(note) / state.sample_rate;

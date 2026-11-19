@@ -28,6 +28,7 @@
 //! `cargo bench -p moose-simd --no-default-features` rebuilds the
 //! `_block` variants as scalar loops; the bench then measures the
 //! scalar inner loop alone.
+#![expect(deprecated, reason = "benchmarks the shared-atomic reads it compares against")]
 
 #![allow(clippy::cast_precision_loss)]
 

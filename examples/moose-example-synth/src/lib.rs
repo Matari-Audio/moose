@@ -158,6 +158,7 @@ const VIBRATO_DEPTH_SEMITONES: f64 = 0.5;
 pub struct Synth;
 
 pub struct SynthDspState {
+    smoothing: Smoothing,
     voices: Vec<Voice>,
     sample_rate: f64,
     /// Channel pitch bend as a frequency multiplier. `1.0` is centered.
@@ -171,6 +172,7 @@ pub struct SynthDspState {
 impl Default for SynthDspState {
     fn default() -> Self {
         SynthDspState {
+            smoothing: Smoothing::default(),
             // Pre-sized so `process` never grows the pool on the
             // audio thread.
             voices: Vec::with_capacity(MAX_VOICES),
@@ -223,6 +225,24 @@ impl SynthDspState {
     }
 }
 
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    cutoff: ParamSmoother,
+    resonance: ParamSmoother,
+    volume: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &SynthParams, sample_rate: f64) {
+        self.cutoff.reset(&params.filter.cutoff, sample_rate);
+        self.resonance.reset(&params.filter.resonance, sample_rate);
+        self.volume.reset(&params.volume, sample_rate);
+    }
+}
+
 impl PluginLogic for Synth {
     type Params = SynthParams;
     type DspState = SynthDspState;
@@ -231,7 +251,8 @@ impl PluginLogic for Synth {
         BusLayout::stereo_and_mono_output()
     }
 
-    fn reset(state: &mut SynthDspState, _params: &SynthParams, config: &AudioConfig) {
+    fn reset(state: &mut SynthDspState, params: &SynthParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         let sample_rate = config.sample_rate;
         state.sample_rate = sample_rate;
         state.voices.clear();
@@ -273,9 +294,9 @@ impl PluginLogic for Synth {
             }
 
             let waveform_idx = params.waveform.index();
-            let cutoff = params.filter.cutoff.read();
-            let resonance = params.filter.resonance.read();
-            let volume = db_to_linear(params.volume.read());
+            let cutoff = state.smoothing.cutoff.next_f64(&params.filter.cutoff);
+            let resonance = state.smoothing.resonance.next_f64(&params.filter.resonance);
+            let volume = db_to_linear(state.smoothing.volume.next_f64(&params.volume));
 
             // Advance the shared vibrato LFO and fold it into the
             // channel pitch bend, so every voice gets one combined

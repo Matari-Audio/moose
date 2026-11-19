@@ -28,10 +28,30 @@ use GainParamsParamId as P;
 
 pub struct GainMui;
 
-impl PurePluginLogic for GainMui {
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    gain: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &GainParams, sample_rate: f64) {
+        self.gain.reset(&params.gain, sample_rate);
+    }
+}
+
+impl PluginLogic for GainMui {
     type Params = GainParams;
+    type DspState = Smoothing;
+
+    fn reset(state: &mut Smoothing, params: &GainParams, config: &AudioConfig) {
+        state.reset(params, config.sample_rate);
+    }
 
     fn process(
+        state: &mut Smoothing,
         params: &GainParams,
         buffer: &mut AudioBuffer,
         _events: &EventList,
@@ -43,7 +63,7 @@ impl PurePluginLogic for GainMui {
             let gain = if bypass {
                 1.0
             } else {
-                db_to_linear(params.gain.read())
+                db_to_linear(state.gain.next(&params.gain))
             };
             for ch in 0..buffer.channels() {
                 let (inp, out) = buffer.io(ch);

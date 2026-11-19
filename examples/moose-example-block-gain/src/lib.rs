@@ -51,6 +51,7 @@ pub struct GainParams {
 #[allow(clippy::struct_field_names)]
 #[derive(Default)]
 pub struct Gain {
+    smoothing: Smoothing,
     gain_db: Vec<f32>,
     pan: Vec<f32>,
     lin: Vec<f32>,
@@ -59,6 +60,22 @@ pub struct Gain {
 }
 
 const N: usize = 32;
+
+/// The processor's ramp for each smoothed parameter. Plain state owned by
+/// the audio side: only each parameter's target crosses threads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Smoothing {
+    gain: ParamSmoother,
+    pan: ParamSmoother,
+}
+
+impl Smoothing {
+    /// Jumps every ramp to its target at `sample_rate`. Never allocates.
+    fn reset(&mut self, params: &GainParams, sample_rate: f64) {
+        self.gain.reset(&params.gain, sample_rate);
+        self.pan.reset(&params.pan, sample_rate);
+    }
+}
 
 impl PluginLogic for Gain {
     type Params = GainParams;
@@ -85,7 +102,8 @@ impl PluginLogic for Gain {
     }
 
     /// Zero the scratch; may run on the audio thread, so no allocation.
-    fn reset(state: &mut Self, _params: &GainParams, _config: &AudioConfig) {
+    fn reset(state: &mut Self, params: &GainParams, config: &AudioConfig) {
+        state.smoothing.reset(params, config.sample_rate);
         for buf in [
             &mut state.gain_db,
             &mut state.pan,
@@ -104,7 +122,7 @@ impl PluginLogic for Gain {
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
-        if !params.gain.is_smoothing() && !params.pan.is_smoothing() {
+        if !state.smoothing.gain.is_smoothing(&params.gain) && !state.smoothing.pan.is_smoothing(&params.pan) {
             // Fast path: gain constant for the whole block.
             let gain_db = params.gain.value();
             let pan = params.pan.value();
@@ -120,12 +138,12 @@ impl PluginLogic for Gain {
             }
         } else {
             // Slow path: vectorized envelope precompute, then SIMD
-            // apply via chunks_mut. `read_into` advances each
+            // apply via chunks_mut. `next_into` advances each
             // smoother by exactly `n` (matching what we consume), so
             // the gain doesn't step at the next block edge.
             let n = buffer.num_samples();
-            params.gain.read_into(&mut state.gain_db[..n]);
-            params.pan.read_into(&mut state.pan[..n]);
+            state.smoothing.gain.next_into(&params.gain, &mut state.gain_db[..n]);
+            state.smoothing.pan.next_into(&params.pan, &mut state.pan[..n]);
 
             // Vectorize the transcendental into `lin`. This is the
             // only step in the slow path that doesn't autovectorize
