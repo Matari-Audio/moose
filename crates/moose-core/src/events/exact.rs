@@ -2,7 +2,7 @@
 
 use super::{
     Event, EventBody, ExactDeliveryCarrier, ExactDeliveryError, ExactPendingDelivery, RawMidi1,
-    RawUmp,
+    RawUmp, StoredTypedEvent,
 };
 
 /// One component of a host-native event address.
@@ -321,9 +321,8 @@ pub struct ExactEventPayload<'a> {
     pub(super) exact: &'a ExactEvent,
     pub(super) fallback: Option<&'a Event>,
     pub(super) sysex_range: Option<(u32, u32)>,
-    pub(super) events: &'a [Event],
-    pub(super) companion_next: &'a [Option<usize>],
-    pub(super) first_companion: Option<usize>,
+    pub(super) typed: &'a [StoredTypedEvent],
+    pub(super) first_companion: Option<u32>,
     pub(super) sysex_pool: &'a [u8],
     pub(super) emittable: bool,
 }
@@ -386,9 +385,10 @@ impl<'a> ExactEventPayload<'a> {
     pub fn companions(self) -> impl Iterator<Item = &'a Event> {
         let mut next = self.first_companion;
         core::iter::from_fn(move || {
-            let index = next?;
-            next = self.companion_next.get(index).copied().flatten();
-            self.events.get(index)
+            let index = next? as usize;
+            let stored = self.typed.get(index)?;
+            next = stored.companion_next;
+            Some(&stored.event)
         })
     }
 
@@ -417,7 +417,7 @@ impl<'a> ExactEventPayload<'a> {
     }
 
     /// Effective timestamp. A linked exact payload follows the fallback's
-    /// timestamp, including mutations made through [`super::EventList::events_mut`].
+    /// timestamp.
     #[must_use]
     pub fn sample_offset(self) -> u32 {
         self.fallback

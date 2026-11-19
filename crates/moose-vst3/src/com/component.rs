@@ -6,7 +6,8 @@
 //! the COM shell the host holds.
 
 use std::cell::{Cell, UnsafeCell};
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -167,6 +168,218 @@ struct Scratch {
     /// One discard block per output channel for missing outputs, so no two
     /// output slices alias.
     trash: Vec<f64>,
+    /// Per-queue state for merging the host's parameter queues with its
+    /// note events. Capacity is fixed at construction; queues past it are
+    /// ingested after the merge (correct, but the list then needs a sort).
+    param_cursors: Vec<ParamCursor>,
+    /// Min-heap of `(next point offset, cursor index)`: at most one entry
+    /// per cursor, so it never grows past its construction capacity.
+    param_heap: BinaryHeap<Reverse<(i32, u32)>>,
+}
+
+/// Room for this many host queues beyond the declared parameter count
+/// (hosts may split one parameter across several queues).
+const PARAM_CURSOR_SLACK: usize = 32;
+
+/// One host parameter queue being walked point by point.
+struct ParamCursor {
+    queue: *mut IParamValueQueue,
+    id: u32,
+    count: i32,
+    /// Index of the next point to read.
+    next: i32,
+    /// The parameter's value at block start.
+    prev: f64,
+    /// The previous point (offset, plain), or `(0, prev)`; the start of the
+    /// segment the next point ends.
+    from: (i32, f64),
+    /// The read-but-not-yet-delivered point (offset, normalized value).
+    pending: (i32, f64),
+    /// The last delivered plain value.
+    last: Option<f64>,
+    /// Every point so far reached the plugin's event list.
+    pushed_all: bool,
+}
+
+impl ParamCursor {
+    /// A cursor over `queue`, or `None` when the host gave a null queue.
+    unsafe fn new(host: &Host, queue: *mut IParamValueQueue, will_process: bool) -> Option<Self> {
+        let q = unsafe { ComRef::from_raw(queue) }?;
+        let id = unsafe { q.getParameterId() };
+        let prev = unsafe { (host.reg.cb.param_get_value)(host.ctx, id) };
+        Some(Self {
+            queue,
+            id,
+            count: unsafe { q.getPointCount() },
+            next: 0,
+            prev,
+            from: (0, prev),
+            pending: (0, 0.0),
+            last: None,
+            pushed_all: will_process,
+        })
+    }
+
+    /// Read the next valid point into `pending`; false when exhausted.
+    /// Points the host refuses to return are skipped.
+    unsafe fn advance(&mut self) -> bool {
+        let Some(q) = (unsafe { ComRef::from_raw(self.queue) }) else {
+            return false;
+        };
+        while self.next < self.count {
+            let j = self.next;
+            self.next += 1;
+            let (mut offset, mut value) = (0, 0.0);
+            if unsafe { q.getPoint(j, &raw mut offset, &raw mut value) } == kResultOk {
+                self.pending = (offset, value);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Deliver `pending` to the plugin. Returns true when the event list
+    /// refused it (the queue's final value is then committed directly).
+    unsafe fn emit(&mut self, host: &Host) -> bool {
+        let cb = host.reg.cb;
+        let (offset, value) = self.pending;
+        let plain = unsafe { (cb.param_denormalize)(host.ctx, self.id, value) };
+        // The first point ramps from an implicit point at sample -1 holding
+        // the last value (VST3 SDK), so sample 0 is already one step along.
+        if self.last.is_none() {
+            self.from.1 = self.prev + (plain - self.prev) / (f64::from(offset) + 1.0);
+        }
+        self.last = Some(plain);
+        let mut dropped = false;
+        if self.pushed_all
+            && unsafe {
+                (cb.push_param_change)(host.ctx, self.id, offset, plain, self.from.0, self.from.1)
+            } == 0
+        {
+            self.pushed_all = false;
+            dropped = true;
+        }
+        self.from = (offset, plain);
+        dropped
+    }
+
+    /// Commit the final value when no sub-block apply will, and tell the
+    /// edit controller the parameter moved.
+    unsafe fn finish(&self, host: &Host) {
+        let cb = host.reg.cb;
+        if let Some(plain) = self.last
+            && !(self.pushed_all && unsafe { (cb.param_is_chunked)(host.ctx, self.id) } != 0)
+        {
+            unsafe { (cb.param_set_value)(host.ctx, self.id, plain) };
+        }
+        if self.last.is_some() {
+            host.note_param_change(self.id);
+        }
+    }
+
+    /// Walk the whole queue at once (no merge). Returns true on overflow.
+    unsafe fn drain(&mut self, host: &Host) -> bool {
+        let mut dropped = false;
+        while unsafe { self.advance() } {
+            dropped |= unsafe { self.emit(host) };
+        }
+        unsafe { self.finish(host) };
+        dropped
+    }
+}
+
+/// The host's input event list, read one event ahead for the merge.
+struct NoteCursor<'a> {
+    list: Option<ComRef<'a, IEventList>>,
+    count: i32,
+    next: i32,
+    /// The next event, converted; `None` once the list is exhausted, the
+    /// host refused an event, or the plugin's queue filled.
+    pending: Option<Vst3NativeEvent>,
+}
+
+impl NoteCursor<'_> {
+    unsafe fn new(list: *mut IEventList) -> Self {
+        let list = unsafe { ComRef::from_raw(list) };
+        let mut cursor = Self {
+            count: list.map_or(0, |l| unsafe { l.getEventCount() }),
+            list,
+            next: 0,
+            pending: None,
+        };
+        unsafe { cursor.advance() };
+        cursor
+    }
+
+    /// Read the next event into `pending`. A refused `getEvent` ends the
+    /// stream, so the plugin sees one in-order prefix.
+    unsafe fn advance(&mut self) {
+        self.pending = None;
+        let Some(list) = self.list else {
+            return;
+        };
+        if self.next >= self.count {
+            return;
+        }
+        let i = self.next;
+        self.next += 1;
+        let mut ev: Event = unsafe { std::mem::zeroed() };
+        if unsafe { list.getEvent(i, &raw mut ev) } != kResultOk {
+            self.count = self.next;
+            return;
+        }
+        let mut n = Vst3NativeEvent {
+            kind: u32::from(ev.r#type),
+            sample_offset: ev.sampleOffset,
+            bus_index: ev.busIndex,
+            flags: u32::from(ev.flags),
+            ppq_position: ev.ppqPosition,
+            note_id: -1,
+            ..Vst3NativeEvent::default()
+        };
+        unsafe {
+            match n.kind {
+                NOTE_ON => {
+                    let e = ev.__field0.noteOn;
+                    n.channel = e.channel;
+                    n.pitch = e.pitch;
+                    n.note_id = e.noteId;
+                    n.length = e.length;
+                    n.velocity = e.velocity;
+                    n.tuning = e.tuning;
+                }
+                NOTE_OFF => {
+                    let e = ev.__field0.noteOff;
+                    n.channel = e.channel;
+                    n.pitch = e.pitch;
+                    n.note_id = e.noteId;
+                    n.velocity = e.velocity;
+                    n.tuning = e.tuning;
+                }
+                DATA => {
+                    let e = ev.__field0.data;
+                    n.type_id = e.r#type;
+                    n.bytes = e.bytes;
+                    n.len = e.size;
+                }
+                POLY_PRESSURE => {
+                    let e = ev.__field0.polyPressure;
+                    n.channel = e.channel;
+                    n.pitch = e.pitch;
+                    n.note_id = e.noteId;
+                    n.velocity = e.pressure;
+                }
+                NOTE_EXPRESSION => {
+                    let e = ev.__field0.noteExpressionValue;
+                    n.type_id = e.typeId;
+                    n.note_id = e.noteId;
+                    n.value = e.value;
+                }
+                _ => {}
+            }
+        }
+        self.pending = Some(n);
+    }
 }
 
 #[derive(Default)]
@@ -339,6 +552,8 @@ impl Host {
                 out_ptrs: vec![std::ptr::null_mut(); desc.max_outputs as usize],
                 silence: Vec::new(),
                 trash: Vec::new(),
+                param_cursors: Vec::with_capacity(reg.params.len() + PARAM_CURSOR_SLACK),
+                param_heap: BinaryHeap::with_capacity(reg.params.len() + PARAM_CURSOR_SLACK),
             }),
             in_active: AtomicU32::new(default_active_mask(
                 desc.num_input_buses,
@@ -988,62 +1203,101 @@ impl Host {
 
     // --- Processing -----------------------------------------------------------
 
-    /// Walk the host's parameter queues. Every point goes to the plugin's
-    /// event list when the block renders; a queue's final value is also
-    /// committed here when no sub-block apply will (a flush, a non-chunked
-    /// parameter, or an event list that ran out of room). Returns true on
-    /// an overflow: the caller then commits final values again after the
-    /// block, so earlier queued points can't win.
-    unsafe fn read_param_changes(
+    /// Ingest the host's note events and parameter queues as one stream in
+    /// non-decreasing sample-offset order, so the plugin's event list stays
+    /// on its already-sorted fast path. A k-way merge over the note list and
+    /// one cursor per queue; ties go to notes first, then queues in host
+    /// order. All merge state lives in preallocated `scratch`, so this never
+    /// allocates. Merge keys are the host's point offsets: a `PerSample`
+    /// plugin's linear `ParamRamp` starts at the previous point instead and
+    /// may still need the list's sort pass.
+    ///
+    /// Every point goes to the plugin's event list when the block renders; a
+    /// queue's final value is also committed here when no sub-block apply
+    /// will (a flush, a non-chunked parameter, or an event list that ran out
+    /// of room). Returns true on an overflow: the caller then commits final
+    /// values again after the block, so earlier queued points can't win.
+    unsafe fn ingest_inputs(
         &self,
+        events: *mut IEventList,
         changes: *mut IParameterChanges,
         will_process: bool,
     ) -> bool {
-        let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
-            return false;
-        };
+        let changes = unsafe { ComRef::from_raw(changes) };
+        let queue_count = changes.map_or(0, |c| unsafe { c.getParameterCount() });
         let mut dropped = false;
-        let cb = self.reg.cb;
-        for i in 0..unsafe { changes.getParameterCount() } {
-            let Some(queue) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else {
+        if !will_process {
+            // A flush: nothing is queued, every final value commits now.
+            for i in 0..queue_count {
+                let queue =
+                    changes.map_or(std::ptr::null_mut(), |c| unsafe { c.getParameterData(i) });
+                if let Some(mut cursor) = unsafe { ParamCursor::new(self, queue, false) } {
+                    dropped |= unsafe { cursor.drain(self) };
+                }
+            }
+            return dropped;
+        }
+
+        // SAFETY: `scratch` is only touched by `process` and
+        // `setupProcessing`, which the host never runs concurrently; this
+        // borrow ends before `process` takes its own.
+        let scratch = unsafe { &mut *self.scratch.get() };
+        let (cursors, heap) = (&mut scratch.param_cursors, &mut scratch.param_heap);
+        cursors.clear();
+        heap.clear();
+        let mut overflow_from = queue_count;
+        for i in 0..queue_count {
+            let queue = changes.map_or(std::ptr::null_mut(), |c| unsafe { c.getParameterData(i) });
+            if cursors.len() == cursors.capacity() {
+                overflow_from = i;
+                break;
+            }
+            let Some(mut cursor) = (unsafe { ParamCursor::new(self, queue, true) }) else {
                 continue;
             };
-            let id = unsafe { queue.getParameterId() };
-            let mut pushed_all = will_process;
-            let mut last = None;
-            // A queue's first segment ramps from the value at block start.
-            let prev = unsafe { (cb.param_get_value)(self.ctx, id) };
-            let mut from = (0, prev);
-            for j in 0..unsafe { queue.getPointCount() } {
-                let (mut offset, mut value) = (0, 0.0);
-                if unsafe { queue.getPoint(j, &raw mut offset, &raw mut value) } != kResultOk {
-                    continue;
-                }
-                let plain = unsafe { (cb.param_denormalize)(self.ctx, id, value) };
-                // The first point ramps from an implicit point at sample
-                // -1 holding the last value (VST3 SDK), so sample 0 is
-                // already one step along.
-                if last.is_none() {
-                    from.1 = prev + (plain - prev) / (f64::from(offset) + 1.0);
-                }
-                last = Some(plain);
-                if pushed_all
-                    && unsafe {
-                        (cb.push_param_change)(self.ctx, id, offset, plain, from.0, from.1)
-                    } == 0
-                {
-                    pushed_all = false;
-                    dropped = true;
-                }
-                from = (offset, plain);
+            // A queue without a readable point changes nothing.
+            if unsafe { cursor.advance() } {
+                #[allow(clippy::cast_possible_truncation)]
+                heap.push(Reverse((cursor.pending.0, cursors.len() as u32)));
+                cursors.push(cursor);
             }
-            if let Some(plain) = last
-                && !(pushed_all && unsafe { (cb.param_is_chunked)(self.ctx, id) } != 0)
-            {
-                unsafe { (cb.param_set_value)(self.ctx, id, plain) };
+        }
+
+        let mut notes = unsafe { NoteCursor::new(events) };
+        loop {
+            let note_offset = notes.pending.as_ref().map(|n| n.sample_offset);
+            let next_param = heap.peek().map(|&Reverse(key)| key);
+            let take_note = match (note_offset, next_param) {
+                (None, None) => break,
+                (Some(n), Some((p, _))) => n <= p,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+            };
+            if take_note {
+                let Some(event) = notes.pending.take() else {
+                    break;
+                };
+                // Actual exhaustion ends the note prefix. A reserve refusal
+                // drops the whole pair but continues to later exact-only events.
+                // Parameter points continue using their reserved headroom.
+                let status = unsafe { (self.reg.cb.push_input_event)(self.ctx, &raw const event) };
+                if status != OUTPUT_QUEUE_FULL {
+                    unsafe { notes.advance() };
+                }
+            } else if let Some(Reverse((_, index))) = heap.pop() {
+                let cursor = &mut cursors[index as usize];
+                dropped |= unsafe { cursor.emit(self) };
+                if unsafe { cursor.advance() } {
+                    heap.push(Reverse((cursor.pending.0, index)));
+                } else {
+                    unsafe { cursor.finish(self) };
+                }
             }
-            if last.is_some() {
-                self.note_param_change(id);
+        }
+        for i in overflow_from..queue_count {
+            let queue = changes.map_or(std::ptr::null_mut(), |c| unsafe { c.getParameterData(i) });
+            if let Some(mut cursor) = unsafe { ParamCursor::new(self, queue, true) } {
+                dropped |= unsafe { cursor.drain(self) };
             }
         }
         dropped
@@ -1100,74 +1354,6 @@ impl Host {
             // kCycleActive is "loop engaged"; kCycleValid only says the
             // markers are readable.
             cycle_active: i32::from(has(kCycleActive)),
-        }
-    }
-
-    /// Pass the host's input events on in their original order.
-    unsafe fn push_input_events(&self, list: *mut IEventList) {
-        let Some(list) = (unsafe { ComRef::from_raw(list) }) else {
-            return;
-        };
-        let cb = self.reg.cb;
-        for i in 0..unsafe { list.getEventCount() } {
-            let mut ev: Event = unsafe { std::mem::zeroed() };
-            if unsafe { list.getEvent(i, &raw mut ev) } != kResultOk {
-                break;
-            }
-            let mut n = Vst3NativeEvent {
-                kind: u32::from(ev.r#type),
-                sample_offset: ev.sampleOffset,
-                bus_index: ev.busIndex,
-                flags: u32::from(ev.flags),
-                ppq_position: ev.ppqPosition,
-                note_id: -1,
-                ..Vst3NativeEvent::default()
-            };
-            unsafe {
-                match n.kind {
-                    NOTE_ON => {
-                        let e = ev.__field0.noteOn;
-                        n.channel = e.channel;
-                        n.pitch = e.pitch;
-                        n.note_id = e.noteId;
-                        n.length = e.length;
-                        n.velocity = e.velocity;
-                        n.tuning = e.tuning;
-                    }
-                    NOTE_OFF => {
-                        let e = ev.__field0.noteOff;
-                        n.channel = e.channel;
-                        n.pitch = e.pitch;
-                        n.note_id = e.noteId;
-                        n.velocity = e.velocity;
-                        n.tuning = e.tuning;
-                    }
-                    DATA => {
-                        let e = ev.__field0.data;
-                        n.type_id = e.r#type;
-                        n.bytes = e.bytes;
-                        n.len = e.size;
-                    }
-                    POLY_PRESSURE => {
-                        let e = ev.__field0.polyPressure;
-                        n.channel = e.channel;
-                        n.pitch = e.pitch;
-                        n.note_id = e.noteId;
-                        n.velocity = e.pressure;
-                    }
-                    NOTE_EXPRESSION => {
-                        let e = ev.__field0.noteExpressionValue;
-                        n.type_id = e.typeId;
-                        n.note_id = e.noteId;
-                        n.value = e.value;
-                    }
-                    _ => {}
-                }
-            }
-            // Queue full: keep one ordered prefix.
-            if unsafe { (cb.push_input_event)(self.ctx, &raw const n) } == OUTPUT_QUEUE_FULL {
-                break;
-            }
         }
     }
 
@@ -1305,12 +1491,15 @@ impl Host {
         let will_process = data.numSamples > 0 && !suspended_flush;
         let frames = data.numSamples.max(0) as u32;
 
-        // Notes first: automation can only take what capacity they leave.
+        // Notes and automation interleave by sample offset; each has its own
+        // capacity (the plugin side reserves event-list headroom for
+        // parameter points). Automation can still exceed that capacity.
         if will_process {
             unsafe { (cb.begin_input_events)(self.ctx, frames) };
-            unsafe { self.push_input_events(data.inputEvents) };
         }
-        let dropped = unsafe { self.read_param_changes(data.inputParameterChanges, will_process) };
+        let dropped = unsafe {
+            self.ingest_inputs(data.inputEvents, data.inputParameterChanges, will_process)
+        };
         if !will_process {
             return kResultOk;
         }

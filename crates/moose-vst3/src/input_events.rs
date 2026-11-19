@@ -6,8 +6,8 @@ use crate::output_events::midi_event_from_map;
 
 use crate::ffi::Vst3NativeEvent;
 use moose_core::events::{
-    Event, EventBody, ExactEvent, ExactEventBody, ExactEventMetadata, ExactEventQualifiers,
-    ExactNoteAddress, ExactNoteKind, PushError, Vst3EventMetadata,
+    Event, EventBody, EventList, ExactEvent, ExactEventBody, ExactEventMetadata,
+    ExactEventQualifiers, ExactNoteAddress, ExactNoteKind, PushError, Vst3EventMetadata,
 };
 use moose_core::export::PluginExport;
 use moose_params::ParamRange;
@@ -24,6 +24,8 @@ pub(crate) const VST3_EVENT_EMITTED: u32 = 1;
 pub(crate) const VST3_EVENT_UNSUPPORTED: u32 = 2;
 pub(crate) const VST3_EVENT_INVALID: u32 = 3;
 pub(crate) const VST3_EVENT_QUEUE_FULL: u32 = 4;
+/// The typed/exact pair was refused to preserve automation headroom.
+pub(crate) const VST3_EVENT_RESERVED: u32 = 5;
 pub(crate) const VST3_EVENT_IS_LIVE: u32 = 1;
 
 pub(crate) unsafe extern "C" fn cb_begin_input_events<P: PluginExport>(
@@ -135,7 +137,17 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
     // delivers a bus-less change with no originating port to recover.
     let mapped = inst.midi_maps.binary_search_by_key(&id, |(id, _)| *id).ok();
     if list.len() + 1 + usize::from(mapped.is_some()) > list.capacity() {
+        // Not silent: the plugin sees the overflow, and the COM layer
+        // commits the queue's final value directly.
+        list.record_overflow(PushError::EventFull);
         return false;
+    }
+    let point = param_point_event(inst.automation, id, sample_offset, value, ramp_from);
+    // A `ParamRamp` starts at the previous point, before the bridged MIDI
+    // event: push it first so the pair stays in offset order.
+    let point_first = point.sample_offset < sample_offset;
+    if point_first {
+        list.push(point);
     }
     if let Some(idx) = mapped {
         list.push(Event {
@@ -144,14 +156,56 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
             body: midi_event_from_map(&inst.midi_maps[idx].1, value),
         });
     }
-    list.push(param_point_event(
-        inst.automation,
-        id,
-        sample_offset,
-        value,
-        ramp_from,
-    ));
+    if !point_first {
+        list.push(point);
+    }
     true
+}
+
+/// Host input events (notes, pressure, `SysEx`) may fill the typed event
+/// lane only up to `capacity - capacity / VST3_AUTOMATION_RESERVE_DIVISOR`.
+/// The rest is reserved for parameter automation, which the COM layer
+/// interleaves with notes by sample offset. This reserves capacity, not
+/// delivery: a mapped parameter point can need two typed slots.
+pub(crate) const VST3_AUTOMATION_RESERVE_DIVISOR: usize = 4;
+
+/// Typed-lane slots host input events may use in a list of `capacity`.
+pub(crate) const fn input_event_typed_limit(capacity: usize) -> usize {
+    capacity - capacity / VST3_AUTOMATION_RESERVE_DIVISOR
+}
+
+/// Whether one more typed host input event would eat into the automation
+/// reserve. Records the overflow, so the refusal is never silent.
+fn input_event_lane_full(list: &mut EventList) -> bool {
+    if list.len() < input_event_typed_limit(list.capacity()) {
+        return false;
+    }
+    list.record_overflow(PushError::EventFull);
+    true
+}
+
+/// Classify a typed refusal separately from exhaustion of either lane.
+fn input_refusal_status(list: &EventList) -> u32 {
+    if list.len() < list.capacity() && list.exact_len() < list.exact_capacity() {
+        VST3_EVENT_RESERVED
+    } else {
+        VST3_EVENT_QUEUE_FULL
+    }
+}
+
+/// Push an exact host event with its optional typed fallback, keeping the
+/// typed lane's automation reserve. Refuse both halves atomically; never
+/// deliver an exact note whose typed fallback was refused.
+fn push_input_pair(
+    list: &mut EventList,
+    typed: Option<Event>,
+    exact: ExactEvent,
+) -> Result<(), PushError> {
+    match typed {
+        Some(_) if input_event_lane_full(list) => Err(PushError::EventFull),
+        Some(typed) => list.try_push_with_exact(typed, exact),
+        None => list.try_push_exact(exact),
+    }
 }
 
 /// The event for one host queue point. `PerSample` plugins ramp
@@ -234,10 +288,7 @@ pub(crate) fn push_vst3_input_event<P: PluginExport>(
             .with_metadata(ExactEventMetadata::Vst3(metadata));
             let typed = faithful_typed_note(event, channel, pitch, kind)
                 .map(|body| Event::on_port(sample_offset, port, body));
-            match typed {
-                Some(typed) => audio.event_list.try_push_with_exact(typed, exact),
-                None => audio.event_list.try_push_exact(exact),
-            }
+            push_input_pair(&mut audio.event_list, typed, exact)
         }
         VST3_EVENT_POLY_PRESSURE => {
             let Some((channel, pitch)) = valid_note_axes(event.channel, event.pitch) else {
@@ -276,10 +327,7 @@ pub(crate) fn push_vst3_input_event<P: PluginExport>(
                         },
                     )
                 });
-            match typed {
-                Some(typed) => audio.event_list.try_push_with_exact(typed, exact),
-                None => audio.event_list.try_push_exact(exact),
-            }
+            push_input_pair(&mut audio.event_list, typed, exact)
         }
         VST3_EVENT_NOTE_EXPRESSION => {
             if !valid_unit_f64(event.value) || event.note_id == -1 {
@@ -306,6 +354,9 @@ pub(crate) fn push_vst3_input_event<P: PluginExport>(
             if event.type_id != 0 || (event.len > 0 && event.bytes.is_null()) {
                 return VST3_EVENT_INVALID;
             }
+            if input_event_lane_full(&mut audio.event_list) {
+                return input_refusal_status(&audio.event_list);
+            }
             let bytes = if event.len == 0 {
                 &[][..]
             } else {
@@ -328,12 +379,10 @@ pub(crate) fn push_vst3_input_event<P: PluginExport>(
 
     match result {
         Ok(()) => VST3_EVENT_EMITTED,
-        Err(
-            PushError::EventFull
-            | PushError::ExactEventFull
-            | PushError::VoiceTrackerFull
-            | PushError::PoolFull,
-        ) => VST3_EVENT_QUEUE_FULL,
+        Err(PushError::EventFull) => input_refusal_status(&audio.event_list),
+        Err(PushError::ExactEventFull | PushError::VoiceTrackerFull | PushError::PoolFull) => {
+            VST3_EVENT_QUEUE_FULL
+        }
         Err(PushError::UnknownExactEvent) => VST3_EVENT_INVALID,
     }
 }
