@@ -277,6 +277,8 @@ pub struct Vst3Callbacks {
     pub begin_input_events: unsafe extern "C" fn(ctx: *mut c_void, num_frames: u32),
     /// Returns 1=emitted, 2=unsupported, 3=invalid, 4=queue full. Queue-full
     /// tells the COM layer to stop traversing so the retained prefix stays ordered.
+    /// Input-only 5=reserve refusal drops the whole typed/exact pair but allows
+    /// traversal to continue for later exact-only events while capacity remains.
     pub push_input_event:
         unsafe extern "C" fn(ctx: *mut c_void, event: *const Vst3NativeEvent) -> u32,
     /// Begin one globally ordered output traversal over the lossless event

@@ -2707,3 +2707,508 @@ mod wayland_embed {
         assert!(frame.handlers.lock().unwrap().is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// input_merge: notes + parameter queues reach the plugin in offset order
+// ---------------------------------------------------------------------------
+
+mod input_merge {
+    use super::*;
+    use crate::input_events::{
+        cb_begin_input_events, cb_push_input_event, cb_push_param_change, input_event_typed_limit,
+    };
+    use crate::instance::Vst3Instance;
+    use crate::lifecycle::{cb_create, cb_destroy, cb_prepare};
+    use crate::params::{cb_param_denormalize, cb_param_get_value, cb_param_set_value};
+    use moose_core::buffer::AudioBuffer;
+    use moose_core::config::AudioConfig;
+    use moose_core::events::{EventBody, EventList, PushError};
+    use moose_core::export::PluginExport;
+    use moose_core::info::PluginInfo;
+    use moose_core::meters::MeterStore;
+    use moose_core::plugin::PluginRuntime;
+    use moose_core::process::{ProcessContext, ProcessStatus};
+    use moose_core::snapshot::SnapshotSlot;
+    use moose_test_fixtures::host_value_fixture::{TestParams, TestPlugin};
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    // -- Allocation counter: counts this thread's heap traffic while armed.
+
+    struct CountingAlloc;
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static HEAP_OPS: Cell<u32> = const { Cell::new(0) };
+    }
+    fn note_heap_op() {
+        let _ = ARMED.try_with(|armed| {
+            if armed.get() {
+                let _ = HEAP_OPS.try_with(|n| n.set(n.get() + 1));
+            }
+        });
+    }
+    // SAFETY: forwards every call to `System` unchanged.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note_heap_op();
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            note_heap_op();
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            note_heap_op();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+    #[global_allocator]
+    static ALLOC: CountingAlloc = CountingAlloc;
+
+    /// Heap allocations + frees made on this thread inside `f`.
+    fn heap_ops<R>(f: impl FnOnce() -> R) -> (R, u32) {
+        HEAP_OPS.with(|n| n.set(0));
+        ARMED.with(|a| a.set(true));
+        let r = f();
+        ARMED.with(|a| a.set(false));
+        (r, HEAP_OPS.with(Cell::get))
+    }
+
+    // -- A MIDI-in plugin on the real VST3 callbacks.
+
+    struct Probe {
+        inner: TestPlugin,
+    }
+    impl PluginExport for Probe {
+        type Params = TestParams;
+        fn create() -> Self {
+            Self {
+                inner: TestPlugin::create(),
+            }
+        }
+        fn params(&self) -> &TestParams {
+            self.inner.params()
+        }
+        fn params_arc(&self) -> Arc<TestParams> {
+            self.inner.params_arc()
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            self.inner.meter_store()
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            self.inner.snapshot_slot()
+        }
+    }
+    impl PluginRuntime for Probe {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            let mut info = TestPlugin::info();
+            info.accepts_midi_in = true;
+            info.midi_input_ports = 1;
+            info
+        }
+        fn reset(&mut self, _: &AudioConfig) {}
+        fn process(
+            &mut self,
+            _: &mut AudioBuffer,
+            events: &EventList,
+            _: &mut ProcessContext,
+        ) -> ProcessStatus {
+            DELIVERED.with(|seen| {
+                let mut seen = seen.borrow_mut();
+                seen.clear();
+                seen.extend(events.iter().map(|event| event.sample_offset));
+            });
+            ProcessStatus::Normal
+        }
+    }
+
+    /// What the plugin's event list held when `process` began, before the
+    /// adapter's `ensure_sorted_by_offset`.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Note(u32, u8),
+        Param(u32, u32),
+    }
+    struct Snapshot {
+        sorted: bool,
+        overflow: Option<PushError>,
+        capacity: usize,
+        events: Vec<Seen>,
+        exact_offsets: Vec<u32>,
+    }
+    thread_local! {
+        static LAST_READ: Cell<i32> = const { Cell::new(-1) };
+        static DELIVERED: RefCell<Vec<u32>> = RefCell::new(Vec::with_capacity(1024));
+        static SNAPSHOT: RefCell<Snapshot> = RefCell::new(Snapshot {
+            sorted: false,
+            overflow: None,
+            capacity: 0,
+            events: Vec::with_capacity(1024),
+            exact_offsets: Vec::with_capacity(1024),
+        });
+    }
+
+    /// Records the ingested list without allocating (the snapshot vector is
+    /// preallocated), so the heap counter sees only the adapter's work.
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "C" fn snapshot_process(
+        ctx: *mut c_void,
+        inputs: *const *const c_void,
+        outputs: *mut *mut c_void,
+        num_inputs: u32,
+        num_outputs: u32,
+        input_channels: *const u32,
+        input_buses: u32,
+        input_active: u32,
+        output_channels: *const u32,
+        output_buses: u32,
+        output_active: u32,
+        frames: u32,
+        transport: *const Vst3Transport,
+        mode: i32,
+    ) -> u32 {
+        let inst = unsafe { &*ctx.cast::<Vst3Instance<Probe>>() };
+        let audio = inst.audio.enter();
+        let list = &audio.event_list;
+        SNAPSHOT.with(|s| {
+            let mut s = s.borrow_mut();
+            s.sorted = list.is_sorted_by_offset();
+            s.overflow = list.overflow();
+            s.capacity = list.capacity();
+            s.exact_offsets.clear();
+            s.exact_offsets.extend(
+                list.exact_iter()
+                    .map(moose_core::ExactEventRef::sample_offset),
+            );
+            s.events.clear();
+            for event in list.iter() {
+                s.events.push(match event.body {
+                    EventBody::NoteOn { note, .. } => Seen::Note(event.sample_offset, note),
+                    EventBody::ParamChange { id, .. } => Seen::Param(event.sample_offset, id),
+                    ref other => panic!("unexpected event {other:?}"),
+                });
+            }
+        });
+        drop(audio);
+        unsafe {
+            crate::process::cb_process::<Probe>(
+                ctx,
+                inputs,
+                outputs,
+                num_inputs,
+                num_outputs,
+                input_channels,
+                input_buses,
+                input_active,
+                output_channels,
+                output_buses,
+                output_active,
+                frames,
+                transport,
+                mode,
+            )
+        }
+    }
+
+    fn plugin_registration() -> &'static Registration {
+        let mut desc = descriptor();
+        desc.midi_input_ports = 1;
+        registration(
+            desc,
+            Vst3Callbacks {
+                create: cb_create::<Probe>,
+                destroy: cb_destroy::<Probe>,
+                prepare: cb_prepare::<Probe>,
+                process: snapshot_process,
+                begin_input_events: cb_begin_input_events::<Probe>,
+                push_input_event: cb_push_input_event::<Probe>,
+                push_param_change: cb_push_param_change::<Probe>,
+                param_get_value: cb_param_get_value::<Probe>,
+                param_set_value: cb_param_set_value::<Probe>,
+                param_denormalize: cb_param_denormalize::<Probe>,
+                ..callbacks()
+            },
+            Vec::new(),
+        )
+    }
+
+    // -- Fake host objects.
+
+    struct Events(Vec<Event>);
+    impl Class for Events {
+        type Interfaces = (IEventList,);
+    }
+    impl IEventListTrait for Events {
+        unsafe fn getEventCount(&self) -> i32 {
+            self.0.len() as i32
+        }
+        unsafe fn getEvent(&self, index: i32, out: *mut Event) -> tresult {
+            LAST_READ.with(|last| last.set(index));
+            match self.0.get(index as usize) {
+                Some(event) => {
+                    unsafe { out.write(*event) };
+                    kResultOk
+                }
+                None => kResultFalse,
+            }
+        }
+        unsafe fn addEvent(&self, _: *mut Event) -> tresult {
+            kResultFalse
+        }
+    }
+
+    fn note_on(offset: i32, pitch: i16) -> Event {
+        // SAFETY: a plain C struct/union; every field is set below.
+        let mut event: Event = unsafe { std::mem::zeroed() };
+        event.sampleOffset = offset;
+        event.r#type = Event_::EventTypes_::kNoteOnEvent as u16;
+        event.__field0.noteOn = NoteOnEvent {
+            channel: 0,
+            pitch,
+            tuning: 0.0,
+            velocity: 1.0,
+            length: 0,
+            noteId: -1,
+        };
+        event
+    }
+
+    struct Queue {
+        id: u32,
+        points: Vec<(i32, f64)>,
+    }
+    impl Class for Queue {
+        type Interfaces = (IParamValueQueue,);
+    }
+    impl IParamValueQueueTrait for Queue {
+        unsafe fn getParameterId(&self) -> ParamID {
+            self.id
+        }
+        unsafe fn getPointCount(&self) -> i32 {
+            self.points.len() as i32
+        }
+        unsafe fn getPoint(&self, index: i32, offset: *mut i32, value: *mut f64) -> tresult {
+            let Some(&(o, v)) = self.points.get(index as usize) else {
+                return kResultFalse;
+            };
+            unsafe {
+                offset.write(o);
+                value.write(v);
+            }
+            kResultOk
+        }
+        unsafe fn addPoint(&self, _: i32, _: f64, _: *mut i32) -> tresult {
+            kResultFalse
+        }
+    }
+
+    struct Changes(Vec<ComWrapper<Queue>>);
+    impl Class for Changes {
+        type Interfaces = (IParameterChanges,);
+    }
+    impl IParameterChangesTrait for Changes {
+        unsafe fn getParameterCount(&self) -> i32 {
+            self.0.len() as i32
+        }
+        unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
+            self.0
+                .get(index as usize)
+                .and_then(ComWrapper::as_com_ref::<IParamValueQueue>)
+                .map_or(std::ptr::null_mut(), |q| q.as_ptr())
+        }
+        unsafe fn addParameterData(&self, _: *const ParamID, _: *mut i32) -> *mut IParamValueQueue {
+            std::ptr::null_mut()
+        }
+    }
+
+    fn changes(queues: &[(u32, &[(i32, f64)])]) -> ComWrapper<Changes> {
+        ComWrapper::new(Changes(
+            queues
+                .iter()
+                .map(|&(id, points)| {
+                    ComWrapper::new(Queue {
+                        id,
+                        points: points.to_vec(),
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    /// Run one block through the COM `process`; returns the snapshot and
+    /// the heap operations the adapter performed.
+    fn run_block(
+        events: Vec<Event>,
+        queues: &[(u32, &[(i32, f64)])],
+        frames: i32,
+    ) -> (Snapshot, u32) {
+        let com = component(plugin_registration());
+        assert_eq!(unsafe { com.setActive(1) }, kResultOk);
+        let events = ComWrapper::new(Events(events));
+        let changes = changes(queues);
+        let mut data: ProcessData = unsafe { std::mem::zeroed() };
+        data.numSamples = frames;
+        data.inputEvents = events.as_com_ref::<IEventList>().unwrap().as_ptr();
+        data.inputParameterChanges = changes.as_com_ref::<IParameterChanges>().unwrap().as_ptr();
+        // Warm-up block: any lazy first-use initialisation happens here.
+        assert_eq!(unsafe { com.process(&raw mut data) }, kResultOk);
+        let (result, ops) = heap_ops(|| unsafe { com.process(&raw mut data) });
+        assert_eq!(result, kResultOk);
+        let snapshot = SNAPSHOT.with(|s| {
+            let mut s = s.borrow_mut();
+            Snapshot {
+                sorted: s.sorted,
+                overflow: s.overflow,
+                capacity: s.capacity,
+                events: std::mem::take(&mut s.events),
+                exact_offsets: s.exact_offsets.clone(),
+            }
+        });
+        SNAPSHOT.with(|s| s.borrow_mut().events.reserve(1024));
+        (snapshot, ops)
+    }
+
+    #[test]
+    fn notes_and_queues_interleave_on_the_sorted_fast_path() {
+        let notes = vec![
+            note_on(0, 60),
+            note_on(10, 61),
+            note_on(20, 62),
+            note_on(40, 63),
+            note_on(40, 64),
+            note_on(63, 65),
+        ];
+        let gain: &[(i32, f64)] = &[(5, 0.1), (20, 0.5), (40, 0.9)];
+        let slot: &[(i32, f64)] = &[(0, 0.2), (20, 0.3), (63, 0.4)];
+        let (seen, heap) = run_block(notes, &[(0, gain), (1, slot)], 64);
+
+        assert!(
+            seen.sorted,
+            "a merged block must not need EventList's sort pass"
+        );
+        // Ties: notes first, then queues in host order.
+        assert_eq!(
+            seen.events,
+            vec![
+                Seen::Note(0, 60),
+                Seen::Param(0, 1),
+                Seen::Param(5, 0),
+                Seen::Note(10, 61),
+                Seen::Note(20, 62),
+                Seen::Param(20, 0),
+                Seen::Param(20, 1),
+                Seen::Note(40, 63),
+                Seen::Note(40, 64),
+                Seen::Param(40, 0),
+                Seen::Note(63, 65),
+                Seen::Param(63, 1),
+            ]
+        );
+        assert_eq!(heap, 0, "ingestion must not touch the heap");
+    }
+
+    #[test]
+    fn note_burst_cannot_starve_automation() {
+        // One note per sample, far more than the event list holds.
+        let notes: Vec<Event> = (0..400).map(|i| note_on(i, (i % 128) as i16)).collect();
+        let gain: &[(i32, f64)] = &[(100, 0.1), (300, 0.5), (450, 0.9)];
+        let slot: &[(i32, f64)] = &[(0, 0.2), (250, 0.3), (511, 0.4)];
+        let (seen, heap) = run_block(notes, &[(0, gain), (1, slot)], 512);
+
+        let params: Vec<&Seen> = seen
+            .events
+            .iter()
+            .filter(|e| matches!(e, Seen::Param(..)))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                &Seen::Param(0, 1),
+                &Seen::Param(100, 0),
+                &Seen::Param(250, 1),
+                &Seen::Param(300, 0),
+                &Seen::Param(450, 0),
+                &Seen::Param(511, 1),
+            ],
+            "every automation point survives the note burst"
+        );
+        // Notes stop once the typed lane reaches the input-event limit; the
+        // two points before that cutoff (offsets 0 and 100) count toward it.
+        let notes = seen.events.len() - params.len();
+        assert_eq!(notes + 2, input_event_typed_limit(seen.capacity));
+        assert_eq!(
+            seen.overflow,
+            Some(PushError::EventFull),
+            "dropped notes are reported, not silent"
+        );
+        assert!(seen.sorted);
+        assert_eq!(heap, 0, "ingestion must not touch the heap");
+    }
+
+    #[test]
+    fn reserve_refusal_keeps_later_exact_only_note_offs() {
+        let mut notes: Vec<Event> = (0..400).map(|i| note_on(i, 60)).collect();
+        notes[0].__field0.noteOn.noteId = 7;
+        let mut off = note_on(450, 60);
+        off.r#type = Event_::EventTypes_::kNoteOffEvent as u16;
+        off.__field0.noteOff = NoteOffEvent {
+            channel: 0,
+            pitch: 60,
+            tuning: 0.0,
+            velocity: 1.0,
+            noteId: 7,
+        };
+        notes.push(off);
+        let (seen, heap) = run_block(notes, &[], 512);
+        assert_eq!(seen.overflow, Some(PushError::EventFull));
+        assert_eq!(seen.events.len(), input_event_typed_limit(seen.capacity));
+        assert_eq!(seen.exact_offsets.len(), seen.events.len() + 2);
+        assert_eq!(seen.exact_offsets.first(), Some(&0));
+        assert_eq!(seen.exact_offsets.last(), Some(&450));
+        assert!(
+            !seen.exact_offsets.contains(&399),
+            "refused pairs stay atomic"
+        );
+        assert_eq!(heap, 0);
+    }
+
+    #[test]
+    fn exact_exhaustion_stops_the_host_note_prefix() {
+        let notes: Vec<Event> = (0..500)
+            .map(|i| {
+                let mut note = note_on(i, 60);
+                note.__field0.noteOn.noteId = i;
+                note
+            })
+            .collect();
+        let (seen, heap) = run_block(notes, &[], 512);
+        assert_eq!(seen.events, []);
+        assert_eq!(seen.exact_offsets.len(), seen.capacity);
+        assert_eq!(seen.overflow, Some(PushError::ExactEventFull));
+        LAST_READ.with(|last| assert_eq!(last.get() as usize, seen.capacity));
+        assert_eq!(heap, 0);
+    }
+
+    #[test]
+    fn heap_counter_sees_allocations() {
+        let (_, ops) = heap_ops(|| std::hint::black_box(Vec::<u8>::with_capacity(64)));
+        assert!(
+            ops >= 1,
+            "the zero-allocation assertions above must be live"
+        );
+    }
+
+    #[test]
+    fn unsorted_host_notes_still_reach_the_plugin_in_order() {
+        // A host that breaks the sorted-`IEventList` rule: the merge keeps
+        // host order and the adapter's sort pass repairs it.
+        let notes = vec![note_on(30, 60), note_on(10, 61)];
+        let gain: &[(i32, f64)] = &[(20, 0.5)];
+        let (seen, _) = run_block(notes, &[(0, gain)], 64);
+        assert!(!seen.sorted);
+        assert_eq!(seen.events.len(), 3);
+        DELIVERED.with(|events| assert_eq!(*events.borrow(), [10, 20, 30]));
+    }
+}
