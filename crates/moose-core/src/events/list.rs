@@ -890,6 +890,26 @@ impl EventList {
             .map(|stored| &stored.event)
     }
 
+    /// Mutable typed event at the same logical position used by [`Self::get`]
+    /// and [`Self::iter`]. No allocation is required. Sorting is invalidated
+    /// because callers can change the timestamp; linked exact payloads inherit
+    /// their fallback timestamp when observed.
+    ///
+    /// This replaces the former `events_mut()` slice accessor now that events
+    /// are stored with their companion metadata. Migrate slice mutation loops
+    /// to `for index in 0..list.len() { let event = list.get_mut(index).unwrap();
+    /// /* edit event */ }`. Call [`Self::ensure_sorted_by_offset`] after edits
+    /// when timestamp order is required. To shift both lanes, use
+    /// [`Self::shift_offsets_from`].
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Event> {
+        let storage_index = *self.typed_order.get(index)? as usize;
+        self.typed_sorted = false;
+        self.exact_sorted = false;
+        self.typed
+            .get_mut(storage_index)
+            .map(|stored| &mut stored.event)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.typed.len()
@@ -1262,6 +1282,45 @@ mod tests {
             })
             .collect();
         assert_eq!(order, vec![(0, 2), (10, 0), (510, 1), (510, 3)]);
+    }
+
+    #[test]
+    fn mutable_event_access_uses_logical_order_and_invalidates_sorting() {
+        let mut list = EventList::with_capacity(4);
+        let typed = Event::new(
+            20,
+            EventBody::NoteOn {
+                group: 0,
+                channel: 0,
+                note: 60,
+                velocity: 100,
+            },
+        );
+        let exact = ExactEvent::new(20, ExactEventBody::SysEx { port: 0 });
+        list.try_push_with_exact(typed, exact).unwrap();
+        list.push(Event::new(10, typed.body));
+        list.ensure_sorted_by_offset();
+        assert!(list.get_mut(2).is_none());
+        assert!(list.is_sorted_by_offset());
+        let event = list.get_mut(1).unwrap();
+        assert_eq!(event.sample_offset, 20);
+        event.sample_offset = 5;
+        if let EventBody::NoteOn { velocity, .. } = &mut event.body {
+            *velocity = 42;
+        }
+        assert!(!list.is_sorted_by_offset());
+        list.ensure_sorted_by_offset();
+        assert_eq!(
+            list.iter().map(|e| e.sample_offset).collect::<Vec<_>>(),
+            [5, 10]
+        );
+        let linked = list.exact_iter().next().unwrap();
+        assert_eq!(linked.fallback().unwrap().sample_offset, 5);
+        assert!(matches!(
+            linked.fallback().unwrap().body,
+            EventBody::NoteOn { velocity: 42, .. }
+        ));
+        assert!(list.is_sorted_by_offset());
     }
 
     #[test]
