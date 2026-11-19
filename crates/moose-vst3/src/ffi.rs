@@ -409,6 +409,20 @@ pub struct Vst3Callbacks {
         max_frames: u32,
         process_mode: i32,
     ),
+    /// `Editor::supports_wayland_embedding`: answers
+    /// `isPlatformTypeSupported("WaylandSurfaceID")`. UI thread.
+    pub gui_supports_wayland: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
+    /// `IPlugView::attached` with `WaylandSurfaceID`: open on the host's
+    /// `wl_display*` as a subsurface of the parent `wl_surface*`. Both stay
+    /// valid until `gui_close` returns. 1 when the editor opened.
+    pub gui_open_wayland:
+        unsafe extern "C" fn(ctx: *mut c_void, display: *mut c_void, surface: *mut c_void) -> i32,
+    /// `Editor::event_fd` after `gui_open_wayland`, or -1.
+    pub gui_event_fd: unsafe extern "C" fn(ctx: *mut c_void) -> i32,
+    /// `Editor::on_fd`, from the run loop's event handler. UI thread.
+    pub gui_on_fd: unsafe extern "C" fn(ctx: *mut c_void),
+    /// `Editor::on_timer`, from the run loop's 16 ms timer. UI thread.
+    pub gui_on_timer: unsafe extern "C" fn(ctx: *mut c_void),
 }
 
 /// Register the plugin with the COM layer.

@@ -208,6 +208,10 @@ pub(crate) struct Host {
     restart_fd: AtomicI32,
     #[cfg(target_os = "linux")]
     timer: Mutex<Option<super::wake::linux::TimerWake>>,
+    /// The host context (factory `setHostContext`, else `initialize`), for
+    /// `IWaylandHost`.
+    #[cfg(target_os = "linux")]
+    context: std::sync::OnceLock<ComPtr<FUnknown>>,
     #[cfg(target_os = "macos")]
     main_queue: std::sync::OnceLock<super::wake::macos::MainQueueWake>,
     #[cfg(target_os = "windows")]
@@ -366,6 +370,8 @@ impl Host {
             restart_fd: AtomicI32::new(-1),
             #[cfg(target_os = "linux")]
             timer: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            context: std::sync::OnceLock::new(),
             #[cfg(target_os = "macos")]
             main_queue: std::sync::OnceLock::new(),
             #[cfg(target_os = "windows")]
@@ -919,6 +925,22 @@ impl Host {
             e.wake = Some(wake);
         }
         *lock(&self.timer) = TimerWake::bind(rl, Arc::downgrade(self));
+    }
+
+    /// Keep the first host context offered; later ones are ignored.
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_host_context(&self, context: *mut FUnknown) {
+        // SAFETY: `context` is null or a live host object for this call.
+        if self.context.get().is_none()
+            && let Some(c) = unsafe { super::retain(context) }
+        {
+            let _ = self.context.set(c);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn host_context(&self) -> Option<ComPtr<FUnknown>> {
+        self.context.get().cloned()
     }
 
     // --- Views ----------------------------------------------------------------
@@ -1559,6 +1581,8 @@ impl IPluginBaseTrait for Component {
         if let Some(rl) = super::wake::linux::run_loop_of(context) {
             self.host.bind_persist_run_loop(rl);
         }
+        #[cfg(target_os = "linux")]
+        self.host.set_host_context(context);
         if let Some(app) =
             unsafe { ComRef::from_raw(context) }.and_then(|c| c.cast::<IHostApplication>())
         {

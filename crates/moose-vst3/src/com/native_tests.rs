@@ -162,6 +162,12 @@ unsafe extern "C" fn no_track(_: *mut c_void, _: *const Vst3TrackInfo) {}
 unsafe extern "C" fn no_learn(_: *mut c_void, _: u32, _: u8, _: Vst3LearnSource) -> i32 {
     0
 }
+unsafe extern "C" fn no_open_wayland(_: *mut c_void, _: *mut c_void, _: *mut c_void) -> i32 {
+    0
+}
+unsafe extern "C" fn no_fd(_: *mut c_void) -> i32 {
+    -1
+}
 
 fn callbacks() -> Vst3Callbacks {
     let process: ProcessFn = ok_process;
@@ -221,6 +227,11 @@ fn callbacks() -> Vst3Callbacks {
         track_info_changed: no_track,
         midi_learn: no_learn,
         set_processing: no_processing,
+        gui_supports_wayland: zero_i32,
+        gui_open_wayland: no_open_wayland,
+        gui_event_fd: no_fd,
+        gui_on_fd: nop_ctx,
+        gui_on_timer: nop_ctx,
     }
 }
 
@@ -2397,5 +2408,301 @@ mod host_features {
         let last = attach(&com);
         crate::com::begin_edit(ctx, 2);
         assert_eq!(last.take(), ["begin 2"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wayland_embed (Linux: IWaylandHost + IRunLoop)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod wayland_embed {
+    //! `WaylandSurfaceID` views: support follows the editor, `attached` opens
+    //! on the host connection, the fd handler and 16 ms timer drive the
+    //! editor, and teardown runs hooks → editor → connection.
+
+    use std::sync::Mutex;
+
+    use vst3::Steinberg::Linux::{
+        FileDescriptor, IEventHandler, IEventHandlerTrait, IRunLoop, IRunLoopTrait, ITimerHandler,
+        ITimerHandlerTrait, TimerInterval,
+    };
+    use vst3::wl_display;
+
+    use super::*;
+
+    /// The editor's fd as the fake plugin reports it.
+    const EDITOR_FD: i32 = 42;
+
+    static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static SUPPORTS: AtomicBool = AtomicBool::new(false);
+    static DISPLAY_TOKEN: u8 = 0;
+    static SIZE: Mutex<(u32, u32)> = Mutex::new((0, 0));
+
+    fn log(entry: impl Into<String>) {
+        LOG.lock().unwrap().push(entry.into());
+    }
+    fn take_log() -> Vec<String> {
+        std::mem::take(&mut *LOG.lock().unwrap())
+    }
+    fn display() -> *mut c_void {
+        (&raw const DISPLAY_TOKEN).cast_mut().cast()
+    }
+
+    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
+        1
+    }
+    unsafe extern "C" fn supports(_: *mut c_void) -> i32 {
+        i32::from(SUPPORTS.load(SeqCst))
+    }
+    unsafe extern "C" fn native_open(_: *mut c_void, _: *mut c_void) -> i32 {
+        log("native open");
+        1
+    }
+    unsafe extern "C" fn open(_: *mut c_void, display: *mut c_void, surface: *mut c_void) -> i32 {
+        log(format!("open {display:p} {surface:p}"));
+        1
+    }
+    unsafe extern "C" fn event_fd(_: *mut c_void) -> i32 {
+        EDITOR_FD
+    }
+    unsafe extern "C" fn close(_: *mut c_void) {
+        log("editor close");
+    }
+    unsafe extern "C" fn on_fd(_: *mut c_void) {
+        log("on_fd");
+    }
+    unsafe extern "C" fn on_timer(_: *mut c_void) {
+        log("on_timer");
+    }
+    unsafe extern "C" fn set_size(_: *mut c_void, w: u32, h: u32) {
+        *SIZE.lock().unwrap() = (w, h);
+    }
+
+    struct WaylandHost;
+
+    impl Class for WaylandHost {
+        type Interfaces = (IWaylandHost,);
+    }
+
+    impl IWaylandHostTrait for WaylandHost {
+        unsafe fn openWaylandConnection(&self) -> *mut wl_display {
+            log("connection open");
+            display().cast()
+        }
+        unsafe fn closeWaylandConnection(&self, d: *mut wl_display) -> tresult {
+            assert_eq!(d.cast(), display());
+            log("connection close");
+            kResultOk
+        }
+    }
+
+    /// An `IHostApplication` that is not itself an `IWaylandHost`, so the
+    /// view must go through `createInstance`.
+    struct App;
+
+    impl Class for App {
+        type Interfaces = (IHostApplication,);
+    }
+
+    impl IHostApplicationTrait for App {
+        unsafe fn getName(&self, _: *mut String128) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn createInstance(
+            &self,
+            cid: *mut TUID,
+            iid: *mut TUID,
+            obj: *mut *mut c_void,
+        ) -> tresult {
+            let want = IWaylandHost_iid;
+            if unsafe { *cid != want || *iid != want } {
+                return kNoInterface;
+            }
+            let host = ComWrapper::new(WaylandHost)
+                .to_com_ptr::<IWaylandHost>()
+                .unwrap();
+            unsafe { *obj = host.into_raw().cast() };
+            kResultOk
+        }
+    }
+
+    /// A plug frame whose run loop names every registration, and keeps the
+    /// Wayland ones so the test can fire them.
+    #[derive(Default)]
+    struct Frame {
+        handlers: Mutex<Vec<(usize, String)>>,
+        fd_handler: Mutex<Option<ComPtr<IEventHandler>>>,
+        timer: Mutex<Option<ComPtr<ITimerHandler>>>,
+    }
+
+    impl Frame {
+        fn unregister(&self, ptr: usize) {
+            let mut handlers = self.handlers.lock().unwrap();
+            let at = handlers
+                .iter()
+                .position(|(p, _)| *p == ptr)
+                .expect("registered");
+            let (_, name) = handlers.remove(at);
+            log(format!("unregister {name}"));
+        }
+    }
+
+    impl Class for Frame {
+        type Interfaces = (IPlugFrame, IRunLoop);
+    }
+
+    impl IPlugFrameTrait for Frame {
+        unsafe fn resizeView(&self, _: *mut IPlugView, _: *mut ViewRect) -> tresult {
+            kResultOk
+        }
+    }
+
+    impl IRunLoopTrait for Frame {
+        unsafe fn registerEventHandler(
+            &self,
+            handler: *mut IEventHandler,
+            fd: FileDescriptor,
+        ) -> tresult {
+            let name = format!("fd {}", if fd == EDITOR_FD { "editor" } else { "wake" });
+            if fd == EDITOR_FD {
+                *self.fd_handler.lock().unwrap() = unsafe { super::super::retain(handler) };
+                log(format!("register {name}"));
+            }
+            self.handlers.lock().unwrap().push((handler as usize, name));
+            kResultOk
+        }
+        unsafe fn unregisterEventHandler(&self, handler: *mut IEventHandler) -> tresult {
+            self.unregister(handler as usize);
+            kResultOk
+        }
+        unsafe fn registerTimer(&self, handler: *mut ITimerHandler, ms: TimerInterval) -> tresult {
+            let name = format!("timer {ms}");
+            if ms == 16 {
+                *self.timer.lock().unwrap() = unsafe { super::super::retain(handler) };
+                log(format!("register {name}"));
+            }
+            self.handlers.lock().unwrap().push((handler as usize, name));
+            kResultOk
+        }
+        unsafe fn unregisterTimer(&self, handler: *mut ITimerHandler) -> tresult {
+            self.unregister(handler as usize);
+            kResultOk
+        }
+    }
+
+    /// Only the Wayland view's entries: the instance's own edit wake
+    /// (`fd wake`, `timer 30`) shares the run loop.
+    fn wayland_log() -> Vec<String> {
+        take_log()
+            .into_iter()
+            .filter(|e| !e.ends_with("wake") && !e.ends_with("timer 30"))
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn wayland_surface_embedding() {
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                gui_has_editor: has_editor,
+                gui_open: native_open,
+                gui_close: close,
+                gui_set_size: set_size,
+                gui_supports_wayland: supports,
+                gui_open_wayland: open,
+                gui_event_fd: event_fd,
+                gui_on_fd: on_fd,
+                gui_on_timer: on_timer,
+                ..callbacks()
+            },
+            Vec::new(),
+        );
+        let com = component(reg);
+        let app = ComWrapper::new(App);
+        let context = app.as_com_ref::<FUnknown>().unwrap().as_ptr();
+        assert_eq!(unsafe { com.initialize(context) }, kResultOk);
+        let frame = ComWrapper::new(Frame::default());
+        let frame_ptr = frame.as_com_ref::<IPlugFrame>().unwrap().as_ptr();
+        let mut surface_token = 0u8;
+        let surface: *mut c_void = (&raw mut surface_token).cast();
+        let wayland = unsafe { CStr::from_ptr(kPlatformTypeWaylandSurfaceID) };
+        let opened = format!("open {:p} {surface:p}", display());
+        let teardown = [
+            "unregister fd editor",
+            "unregister timer 16",
+            "editor close",
+            "connection close",
+        ];
+
+        let new_view = || {
+            let view =
+                unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("view");
+            assert_eq!(unsafe { view.setFrame(frame_ptr) }, kResultOk);
+            view
+        };
+        let view = new_view();
+        unsafe {
+            // The editor decides; the native type is unaffected.
+            SUPPORTS.store(false, SeqCst);
+            assert_eq!(view.isPlatformTypeSupported(wayland.as_ptr()), kResultFalse);
+            assert_eq!(view.attached(surface, wayland.as_ptr()), kResultFalse);
+            assert_eq!(view.isPlatformTypeSupported(PLATFORM.as_ptr()), kResultOk);
+            SUPPORTS.store(true, SeqCst);
+            assert_eq!(view.isPlatformTypeSupported(wayland.as_ptr()), kResultOk);
+            assert_eq!(
+                view.attached(std::ptr::null_mut(), wayland.as_ptr()),
+                kResultFalse
+            );
+            assert_eq!(wayland_log(), Vec::<String>::new());
+
+            assert_eq!(view.attached(surface, wayland.as_ptr()), kResultOk);
+            assert_eq!(
+                wayland_log(),
+                [
+                    "connection open",
+                    &opened,
+                    "register timer 16",
+                    "register fd editor"
+                ],
+            );
+            // A second attach keeps the first embedding.
+            assert_eq!(view.attached(surface, wayland.as_ptr()), kResultFalse);
+
+            // The host's loop drives the editor through both hooks.
+            let fd_handler = frame.fd_handler.lock().unwrap().clone().unwrap();
+            fd_handler.onFDIsSet(EDITOR_FD);
+            let timer = frame.timer.lock().unwrap().clone().unwrap();
+            timer.onTimer();
+            assert_eq!(wayland_log(), ["on_fd", "on_timer"]);
+
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 640,
+                bottom: 480,
+            };
+            assert_eq!(view.onSize(&raw mut rect), kResultOk);
+            assert_eq!(*SIZE.lock().unwrap(), (640, 480));
+
+            assert_eq!(view.removed(), kResultOk);
+            assert_eq!(wayland_log(), teardown);
+            assert_eq!(view.removed(), kResultOk);
+            assert_eq!(wayland_log(), Vec::<String>::new());
+        }
+        drop(view);
+        take_log();
+
+        // A view released while still attached tears down in the same order.
+        let view = new_view();
+        assert_eq!(
+            unsafe { view.attached(surface, wayland.as_ptr()) },
+            kResultOk
+        );
+        take_log();
+        drop(view);
+        assert_eq!(wayland_log(), teardown);
+        assert!(frame.handlers.lock().unwrap().is_empty());
     }
 }

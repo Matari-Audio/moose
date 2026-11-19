@@ -19,6 +19,10 @@ pub(super) struct Factory {
     /// instances for their persist wake.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     run_loop: Mutex<Option<ComPtr<Linux::IRunLoop>>>,
+    /// Linux: the `setHostContext` object, handed to new instances for
+    /// `IWaylandHost`.
+    #[cfg(target_os = "linux")]
+    context: Mutex<Option<ComPtr<FUnknown>>>,
 }
 
 impl Class for Factory {
@@ -28,6 +32,8 @@ impl Class for Factory {
 pub(super) fn new_factory() -> *mut c_void {
     ComWrapper::new(Factory {
         run_loop: Mutex::new(None),
+        #[cfg(target_os = "linux")]
+        context: Mutex::new(None),
     })
     .to_com_ptr::<IPluginFactory3>()
     .map_or(std::ptr::null_mut(), |p| p.into_raw().cast())
@@ -92,6 +98,10 @@ impl IPluginFactoryTrait for Factory {
         let Some(host) = Host::new(reg, run_loop) else {
             return kResultFalse;
         };
+        #[cfg(target_os = "linux")]
+        if let Some(context) = &*self.context.lock().unwrap_or_else(PoisonError::into_inner) {
+            host.set_host_context(context.as_ptr());
+        }
         let component = ComWrapper::new(Component { host });
         let Some(unknown) = component.to_com_ptr::<FUnknown>() else {
             return kNoInterface;
@@ -160,6 +170,9 @@ impl IPluginFactory3Trait for Factory {
         {
             *self.run_loop.lock().unwrap_or_else(PoisonError::into_inner) =
                 super::wake::linux::run_loop_of(context);
+            // SAFETY: `context` is null or a live host object for this call.
+            *self.context.lock().unwrap_or_else(PoisonError::into_inner) =
+                unsafe { super::retain(context) };
         }
         kResultOk
     }

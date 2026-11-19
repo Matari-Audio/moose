@@ -23,6 +23,8 @@ mod factory;
 mod native_tests;
 mod view;
 mod wake;
+#[cfg(target_os = "linux")]
+mod wayland;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};

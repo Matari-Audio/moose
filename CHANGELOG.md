@@ -27,6 +27,14 @@ Notable changes per release.
   now forwards; out-of-range input is rejected with `kInvalidArgument`.
 - VST3 `setComponentHandler` finishes an open group edit on the old handler
   and restarts it on the new one, before the reopened gestures.
+- **VST3 editors embed in Wayland hosts.** On Linux the VST3 view accepts
+  `WaylandSurfaceID` when the editor's `supports_wayland_embedding()` is
+  true. `attached` gets `IWaylandHost` from the factory's `setHostContext`
+  context (or `initialize`'s, through `IHostApplication::createInstance`),
+  opens the editor on `RawWindowHandle::WaylandSurface { display, surface }`
+  and registers its `event_fd()` (`on_fd`) and a 16 ms timer (`on_timer`)
+  with the plug frame's `IRunLoop`. `removed`, or releasing an attached view,
+  unregisters both, closes the editor, then calls `closeWaylandConnection`.
 
 - **`Plugin` trait gaps closed; `plugin:` key.** `moose::plugin! { plugin:
   MyPlugin, params: MyParams }` exports an `impl moose::Plugin` and names the

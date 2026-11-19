@@ -3677,6 +3677,25 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     parent: *mut std::ffi::c_void,
 ) -> i32 {
+    #[cfg(target_os = "macos")]
+    let handle = RawWindowHandle::AppKit(parent);
+    #[cfg(target_os = "windows")]
+    let handle = RawWindowHandle::Win32(parent);
+    #[cfg(target_os = "linux")]
+    let handle = RawWindowHandle::X11(parent as u64);
+    // SAFETY: forwarded from the shim's own contract for this callback.
+    unsafe { gui_open_with::<P>(ctx, handle) }
+}
+
+/// Open the editor on `handle`; `Editor::is_open` after `open`, 0 when
+/// there is none or it panicked.
+///
+/// # Safety
+/// `ctx` is a live `Vst3Instance<P>`; host UI thread.
+unsafe fn gui_open_with<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    handle: RawWindowHandle,
+) -> i32 {
     // `editor.open` runs author GUI-construction code that can panic;
     // firewall it so the panic can't unwind across the C ABI.
     run_extern_callback_with::<P, i32>("vst3", "gui_open", 0, || unsafe {
@@ -3800,13 +3819,6 @@ unsafe extern "C" fn cb_gui_open<P: PluginExport>(
             .with_group_edits(Arc::new(move |edge| {
                 ffi::moose_vst3_group_edit(ctx_raw.as_ptr().cast_mut(), edge);
             }));
-            #[cfg(target_os = "macos")]
-            let handle = RawWindowHandle::AppKit(parent);
-            #[cfg(target_os = "windows")]
-            let handle = RawWindowHandle::Win32(parent);
-            #[cfg(target_os = "linux")]
-            let handle = RawWindowHandle::X11(parent as u64);
-
             editor.open(handle, context);
             // Re-sync the scale after `open`: on Windows `open` pumps
             // messages, so a re-entrant `setContentScaleFactor` may have
@@ -3829,6 +3841,72 @@ unsafe extern "C" fn cb_gui_close<P: PluginExport>(ctx: *mut std::ffi::c_void) {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         if let Some(ref mut editor) = inst.gui.enter().editor {
             editor.close();
+        }
+    });
+}
+
+/// `Editor::supports_wayland_embedding`; 0 without an editor.
+unsafe extern "C" fn cb_gui_supports_wayland<P: PluginExport>(ctx: *mut std::ffi::c_void) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "gui_supports_wayland", 0, || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        let gui = inst.gui.enter();
+        i32::from(
+            gui.editor
+                .as_ref()
+                .is_some_and(|e| e.supports_wayland_embedding()),
+        )
+    })
+}
+
+/// Open the editor on the host's Wayland `display` as a subsurface of
+/// `surface`. Same result as `cb_gui_open`.
+unsafe extern "C" fn cb_gui_open_wayland<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    display: *mut std::ffi::c_void,
+    surface: *mut std::ffi::c_void,
+) -> i32 {
+    // SAFETY: forwarded from the shim's own contract for this callback.
+    unsafe { gui_open_with::<P>(ctx, RawWindowHandle::WaylandSurface { display, surface }) }
+}
+
+/// `Editor::event_fd` of the open editor, or -1.
+unsafe extern "C" fn cb_gui_event_fd<P: PluginExport>(ctx: *mut std::ffi::c_void) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "gui_event_fd", -1, || unsafe {
+        #[cfg(unix)]
+        {
+            let inst = &*ctx.cast::<Vst3Instance<P>>();
+            let gui = inst.gui.enter();
+            gui.editor.as_ref().and_then(|e| e.event_fd()).unwrap_or(-1)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctx;
+            -1
+        }
+    })
+}
+
+/// `Editor::on_fd`. Skipped while a GUI callback holds the editor; the
+/// 16 ms timer catches up.
+unsafe extern "C" fn cb_gui_on_fd<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    run_extern_callback_with::<P, ()>("vst3", "gui_on_fd", (), || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if let Some(mut gui) = inst.gui.try_enter()
+            && let Some(editor) = gui.editor.as_mut()
+        {
+            editor.on_fd();
+        }
+    });
+}
+
+/// `Editor::on_timer`, skipped like `cb_gui_on_fd`.
+unsafe extern "C" fn cb_gui_on_timer<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    run_extern_callback_with::<P, ()>("vst3", "gui_on_timer", (), || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if let Some(mut gui) = inst.gui.try_enter()
+            && let Some(editor) = gui.editor.as_mut()
+        {
+            editor.on_timer();
         }
     });
 }
@@ -4160,6 +4238,11 @@ fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         track_info_changed: cb_track_info_changed::<P>,
         midi_learn: cb_midi_learn::<P>,
         set_processing: cb_set_processing::<P>,
+        gui_supports_wayland: cb_gui_supports_wayland::<P>,
+        gui_open_wayland: cb_gui_open_wayland::<P>,
+        gui_event_fd: cb_gui_event_fd::<P>,
+        gui_on_fd: cb_gui_on_fd::<P>,
+        gui_on_timer: cb_gui_on_timer::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every

@@ -20,13 +20,23 @@ pub(super) struct View {
     /// This view's own interface pointer, for identity and `resizeView`.
     id: AtomicUsize,
     frame: Mutex<Option<ComPtr<IPlugFrame>>>,
+    /// Set while the editor is embedded in a Wayland surface.
+    #[cfg(target_os = "linux")]
+    wayland: Mutex<Option<WaylandEmbed>>,
+}
+
+/// What a Wayland `attached` holds until `removed`.
+#[cfg(target_os = "linux")]
+struct WaylandEmbed {
+    hooks: super::wayland::LoopHooks,
+    connection: super::wayland::Connection,
 }
 
 impl Class for View {
     type Interfaces = (IPlugView, IPlugViewContentScaleSupport);
 }
 
-/// The platform type this build embeds into.
+/// The native platform type this build embeds into.
 fn platform_type() -> Option<&'static CStr> {
     let t = if cfg!(target_os = "macos") {
         kPlatformTypeNSView
@@ -40,8 +50,31 @@ fn platform_type() -> Option<&'static CStr> {
     Some(unsafe { CStr::from_ptr(t) })
 }
 
-fn supported(kind: FIDString) -> bool {
-    !kind.is_null() && platform_type().is_some_and(|t| unsafe { CStr::from_ptr(kind) } == t)
+/// A platform type `attached` can take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    /// [`platform_type`].
+    Native,
+    /// `kPlatformTypeWaylandSurfaceID`: `parent` is a `wl_surface*`.
+    #[cfg(target_os = "linux")]
+    Wayland,
+}
+
+fn platform(kind: FIDString) -> Option<Platform> {
+    if kind.is_null() {
+        return None;
+    }
+    // SAFETY: hosts pass a NUL-terminated platform type string.
+    let kind = unsafe { CStr::from_ptr(kind) };
+    if platform_type().is_some_and(|t| kind == t) {
+        return Some(Platform::Native);
+    }
+    // SAFETY: an SDK string constant.
+    #[cfg(target_os = "linux")]
+    if kind == unsafe { CStr::from_ptr(kPlatformTypeWaylandSurfaceID) } {
+        return Some(Platform::Wayland);
+    }
+    None
 }
 
 impl View {
@@ -54,6 +87,8 @@ impl View {
             host: host.clone(),
             id: AtomicUsize::new(0),
             frame: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            wayland: Mutex::new(None),
         });
         let Some(ptr) = wrapper.to_com_ptr::<IPlugView>() else {
             return std::ptr::null_mut();
@@ -68,6 +103,64 @@ impl View {
 
     fn id(&self) -> usize {
         self.id.load(Ordering::Relaxed)
+    }
+
+    /// The editor accepts a Wayland parent surface.
+    #[cfg(target_os = "linux")]
+    fn supports_wayland(&self) -> bool {
+        // SAFETY: `ctx` is the live instance; host UI thread.
+        unsafe { (self.host.reg.cb.gui_supports_wayland)(self.host.ctx) != 0 }
+    }
+
+    /// `attached(parent, "WaylandSurfaceID")`: open the editor on the host's
+    /// connection, then drive it from the plug frame's run loop.
+    #[cfg(target_os = "linux")]
+    fn attach_wayland(&self, parent: *mut c_void) -> bool {
+        use super::wayland::{Connection, LoopHooks, wayland_host_of};
+
+        let mut embed = self.wayland.lock().unwrap_or_else(PoisonError::into_inner);
+        if embed.is_some() || !self.supports_wayland() {
+            return false;
+        }
+        // Everything that can fail without side effects comes first: the
+        // editor needs both the host connection and the run loop.
+        let Some(wayland_host) = self.host.host_context().and_then(|c| wayland_host_of(&c)) else {
+            return false;
+        };
+        let run_loop = self
+            .frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|f| super::wake::linux::run_loop_of(f.as_ptr().cast()));
+        let Some(run_loop) = run_loop else {
+            return false;
+        };
+        let Some(connection) = Connection::open(wayland_host) else {
+            return false;
+        };
+        let (ctx, cb) = (self.host.ctx, self.host.reg.cb);
+        self.host.attach_view(self.id());
+        // SAFETY: `ctx` is live; `display` and `parent` stay valid until
+        // `gui_close`, which runs before `connection` drops.
+        if unsafe { (cb.gui_open_wayland)(ctx, connection.display().cast(), parent) } == 0 {
+            self.host.detach_view(self.id());
+            return false;
+        }
+        // SAFETY: `ctx` is live and its editor open.
+        let fd = unsafe { (cb.gui_event_fd)(ctx) };
+        let Some(hooks) = LoopHooks::register(
+            run_loop,
+            Arc::downgrade(&self.host),
+            (fd >= 0).then_some(fd),
+        ) else {
+            self.host.detach_view(self.id());
+            // SAFETY: as above; the connection closes after this.
+            unsafe { (cb.gui_close)(ctx) };
+            return false;
+        };
+        *embed = Some(WaylandEmbed { hooks, connection });
+        true
     }
 
     fn set_frame(&self, frame: Option<ComPtr<IPlugFrame>>) {
@@ -99,17 +192,33 @@ impl Drop for View {
 
 impl IPlugViewTrait for View {
     unsafe fn isPlatformTypeSupported(&self, kind: FIDString) -> tresult {
-        if supported(kind) {
-            kResultOk
-        } else {
-            kResultFalse
-        }
+        let ok = match platform(kind) {
+            Some(Platform::Native) => true,
+            #[cfg(target_os = "linux")]
+            Some(Platform::Wayland) => self.supports_wayland(),
+            None => false,
+        };
+        if ok { kResultOk } else { kResultFalse }
     }
 
     unsafe fn attached(&self, parent: *mut c_void, kind: FIDString) -> tresult {
         // The type says how to read `parent`; check it before Rust does.
-        if parent.is_null() || !supported(kind) {
+        let Some(platform) = platform(kind) else {
             return kResultFalse;
+        };
+        if parent.is_null() {
+            return kResultFalse;
+        }
+        match platform {
+            Platform::Native => {}
+            #[cfg(target_os = "linux")]
+            Platform::Wayland => {
+                return if self.attach_wayland(parent) {
+                    kResultOk
+                } else {
+                    kResultFalse
+                };
+            }
         }
         self.host.attach_view(self.id());
         if unsafe { (self.host.reg.cb.gui_open)(self.host.ctx, parent) } == 0 {
@@ -120,10 +229,24 @@ impl IPlugViewTrait for View {
         kResultOk
     }
 
+    /// Wayland order: run-loop hooks off, editor closed, then the host
+    /// connection closed (the editor's proxies live on it).
     unsafe fn removed(&self) -> tresult {
+        #[cfg(target_os = "linux")]
+        let (hooks, connection) = self
+            .wayland
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .map(|e| (e.hooks, e.connection))
+            .unzip();
+        #[cfg(target_os = "linux")]
+        drop(hooks);
         if self.host.detach_view(self.id()) {
             unsafe { (self.host.reg.cb.gui_close)(self.host.ctx) };
         }
+        #[cfg(target_os = "linux")]
+        drop(connection);
         kResultOk
     }
 
