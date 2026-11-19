@@ -771,14 +771,30 @@ mod tests {
                 for i in 0..n {
                     #[allow(clippy::cast_possible_truncation)]
                     let e32 = expect[i] as f32;
-                    assert_eq!(got[i].to_bits(), e32.to_bits(), "{style:?} block {k} sample {i}");
-                    assert_eq!(got64[i].to_bits(), expect[i].to_bits(), "{style:?} block {k} sample {i}");
+                    assert_eq!(
+                        got[i].to_bits(),
+                        e32.to_bits(),
+                        "{style:?} block {k} sample {i}"
+                    );
+                    assert_eq!(
+                        got64[i].to_bits(),
+                        expect[i].to_bits(),
+                        "{style:?} block {k} sample {i}"
+                    );
                 }
                 let last = expect[n - 1];
                 #[allow(clippy::cast_possible_truncation)]
                 let last32 = last as f32;
-                assert_eq!(after.next_after(target, n).to_bits(), last32.to_bits(), "{style:?} block {k}");
-                assert_eq!(after64.next_after_f64(target, n).to_bits(), last.to_bits(), "{style:?} block {k}");
+                assert_eq!(
+                    after.next_after(target, n).to_bits(),
+                    last32.to_bits(),
+                    "{style:?} block {k}"
+                );
+                assert_eq!(
+                    after64.next_after_f64(target, n).to_bits(),
+                    last.to_bits(),
+                    "{style:?} block {k}"
+                );
             }
         }
     }

@@ -116,6 +116,28 @@ pub enum ParamValueKind {
     Enum,
 }
 
+/// The role a parameter plays, for hosts that drive well-known controls
+/// (a mixer's dry/wet macro, a compressor meter). Maps to VST3
+/// `IParameterFunctionName`. At most one parameter per function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ParamFunction {
+    /// Mix between the dry input and the processed signal.
+    DryWetMix,
+    /// Trade quality for lower latency.
+    LowLatencyMode,
+    /// Randomize the plugin's parameters when it changes.
+    Randomize,
+    /// Current gain reduction (an output meter).
+    GainReduction,
+    /// Maximum gain reduction seen since the last reset.
+    GainReductionMax,
+    /// Peak-held gain reduction.
+    GainReductionPeakHold,
+    /// Resets [`Self::GainReductionMax`].
+    ResetGainReductionMax,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ParamFlags: u32 {

@@ -542,7 +542,9 @@ impl StateLoadQueue {
         owners.push(std::sync::Arc::clone(&state));
         drop(self.ready.force_push(std::sync::Arc::clone(&state)));
         // `> 2`: the ready slot or audio, plus the handle returned below.
-        owners.retain(|s| std::sync::Arc::strong_count(s) > 1 + usize::from(std::sync::Arc::ptr_eq(s, &state)));
+        owners.retain(|s| {
+            std::sync::Arc::strong_count(s) > 1 + usize::from(std::sync::Arc::ptr_eq(s, &state))
+        });
         debug_assert!(owners.len() <= 2, "single audio consumer contract");
         state
     }
@@ -612,7 +614,7 @@ mod state_handoff_tests {
         let queue = StateLoadQueue::new(1);
         queue.force_push(state(1));
         let audio = queue.pop().unwrap();
-        assert!(audio.persist.is_empty());
+        assert_eq!(audio.persist.len(), 0);
         let weak = std::sync::Arc::downgrade(&audio);
         for _ in 0..100 {
             queue.force_push(state(2));

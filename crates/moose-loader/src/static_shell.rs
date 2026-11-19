@@ -637,6 +637,14 @@ macro_rules! export_static {
                 self.inner.task_spawner()
             }
 
+            fn main_thread(
+                &self,
+            ) -> Box<dyn $crate::__macro_deps::moose_core::main_thread::MainThreadHooks> {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::main_thread(
+                    &self.inner.params,
+                )
+            }
+
             fn editor_builder(
                 &self,
             ) -> $crate::__macro_deps::moose_core::editor::EditorBuilder<$params> {

@@ -679,8 +679,7 @@ fn parse_param_attrs(field: &syn::Field) -> ParamAttrs {
             let key = meta
                 .path
                 .get_ident()
-                .map(std::string::ToString::to_string)
-                .unwrap_or_default();
+                .map_or_else(String::new, std::string::ToString::to_string);
             // Two-step pattern for the string-typed keys: parse the
             // literal first, then either assign or stash a
             // compile_error. Avoids needing `&mut attrs` aliased with
@@ -922,6 +921,8 @@ struct ParamsStructAttrs {
     /// Inherent `fn(&self) -> u64`.
     presentation_revision: Option<syn::Ident>,
     presentation_change: Option<syn::Ident>,
+    /// Inherent `fn(&self, u32) -> Option<ParamFunction>`.
+    function: Option<syn::Ident>,
     /// Inherent `fn(&self, u32, f64) -> Option<String>`; None uses static formatting.
     value_format: Option<syn::Ident>,
     /// Inherent `fn(&self, u32, &str) -> Result<Option<f64>, ()>`.
@@ -944,6 +945,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
         presentation: None,
         presentation_revision: None,
         presentation_change: None,
+        function: None,
         value_format: None,
         value_parse: None,
     };
@@ -955,8 +957,7 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
             let key = meta
                 .path
                 .get_ident()
-                .map(ToString::to_string)
-                .unwrap_or_default();
+                .map_or_else(String::new, ToString::to_string);
             let value: syn::LitStr = meta.value()?.parse()?;
             if key == "id_scheme" {
                 parsed.id_scheme = match value.value().as_str() {
@@ -986,13 +987,14 @@ fn parse_params_struct_attrs(attrs: &[syn::Attribute]) -> Result<ParamsStructAtt
                 "presentation" => &mut parsed.presentation,
                 "presentation_revision" => &mut parsed.presentation_revision,
                 "presentation_change" => &mut parsed.presentation_change,
+                "function" => &mut parsed.function,
                 "value_format" => &mut parsed.value_format,
                 "value_parse" => &mut parsed.value_parse,
                 _ => {
                     return Err(meta.error(
                         "unknown `#[params]` key (expected `id_scheme`, `post_load`, `pre_save`, \
                          `validate_persist`, `restore_state`, `persist_changed`, `presentation`, \
-                         `presentation_revision`, `presentation_change`, `projection`, `value_format`, or `value_parse`)",
+                         `presentation_revision`, `presentation_change`, `function`, `projection`, `value_format`, or `value_parse`)",
                     ));
                 }
             };
@@ -3216,20 +3218,66 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             }
         }
     });
-    let presentation_impl = struct_attrs.presentation.as_ref().map(|m| {
-        quote! {
+    // Without a struct-level hook, presentation, revision and function come
+    // from the `#[nested]` groups (a runtime `DynamicParams` answers there).
+    let presentation_impl = match struct_attrs.presentation.as_ref() {
+        Some(m) => Some(quote! {
             fn parameter_presentation(&self, id: u32)
                 -> ::core::option::Option<::moose::params::ParameterPresentation>
             {
                 self.#m(id)
             }
-        }
-    });
-    let presentation_revision_impl = struct_attrs.presentation_revision.as_ref().map(|m| {
-        quote! {
+        }),
+        None if !nested_idents.is_empty() => Some(quote! {
+            fn parameter_presentation(&self, id: u32)
+                -> ::core::option::Option<::moose::params::ParameterPresentation>
+            {
+                #(if let Some(p) = ::moose::params::Params::parameter_presentation(&self.#nested_idents, id) {
+                    return Some(p);
+                })*
+                None
+            }
+        }),
+        None => None,
+    };
+    let presentation_revision_impl = match struct_attrs.presentation_revision.as_ref() {
+        Some(m) => Some(quote! {
             fn parameter_presentation_revision(&self) -> u64 { self.#m() }
+        }),
+        None if !nested_idents.is_empty() => Some(quote! {
+            fn parameter_presentation_revision(&self) -> u64 {
+                0u64 #(.wrapping_add(::moose::params::Params::parameter_presentation_revision(&self.#nested_idents)))*
+            }
+        }),
+        None => None,
+    };
+    let function_impl = if let Some(m) = struct_attrs.function.as_ref() {
+        quote! {
+            fn parameter_function(&self, id: u32) -> Option<::moose::params::ParamFunction> { self.#m(id) }
         }
-    });
+    } else {
+        quote! {
+            fn parameter_function(&self, id: u32) -> Option<::moose::params::ParamFunction> {
+                #(if let Some(f) = ::moose::params::Params::parameter_function(&self.#nested_idents, id) {
+                    return Some(f);
+                })*
+                let _ = id;
+                None
+            }
+        }
+    };
+    let catalog_impl = quote! {
+        fn set_catalog_signal(&self, __signal: ::std::sync::Weak<::moose::params::CatalogSignal>) {
+            #(::moose::params::Params::set_catalog_signal(&self.#nested_idents, __signal.clone());)*
+            let _ = __signal;
+        }
+        fn take_catalog_changes(&self) -> ::moose::params::CatalogChanges {
+            #[allow(unused_mut)]
+            let mut __changes = ::moose::params::CatalogChanges::default();
+            #(__changes.merge(::moose::params::Params::take_catalog_changes(&self.#nested_idents));)*
+            __changes
+        }
+    };
 
     let presentation_change_impl = struct_attrs.presentation_change.as_ref().map(|m| {
         quote! {
@@ -3448,6 +3496,8 @@ pub fn derive_params(input: TokenStream) -> TokenStream {
             #presentation_impl
             #presentation_revision_impl
             #presentation_change_impl
+            #function_impl
+            #catalog_impl
             #validate_impl
             #restore_impl
             #prepare_stream_impl

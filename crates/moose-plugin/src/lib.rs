@@ -109,6 +109,14 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         BusLayout::stereo_and_mono()
     }
 
+    /// The main-thread part. See [`PluginLogic::main_thread`].
+    fn main_thread(
+        params: &std::sync::Arc<Self::Params>,
+    ) -> Box<dyn moose_core::main_thread::MainThreadHooks> {
+        let _ = params;
+        Box::new(())
+    }
+
     /// Build initial state from params. See [`PluginLogic::init`].
     fn init(params: &Self::Params, cx: &InitContext) -> Self::DspState;
 
@@ -295,6 +303,18 @@ macro_rules! plugin_logic_leaf_trait {
             #[must_use]
             fn bus_layouts() -> Vec<$crate::__plugin_logic_deps::BusLayout> {
                 $crate::__plugin_logic_deps::BusLayout::stereo_and_mono()
+            }
+
+            /// The plugin's main-thread part: track info, note names, voice
+            /// info, MIDI learn, parameter indication and context menus
+            /// (see [`moose_core::main_thread::MainThreadHooks`]). Built once
+            /// per instance and called only on the host's main thread, never
+            /// with the audio state. Default: none.
+            fn main_thread(
+                params: &::std::sync::Arc<Self::Params>,
+            ) -> Box<dyn $crate::__plugin_logic_deps::MainThreadHooks> {
+                let _ = params;
+                Box::new(())
             }
 
             /// Build the initial audio state from params. Replaces the
@@ -552,6 +572,7 @@ pub mod __plugin_logic_deps {
     pub use moose_core::config::AudioConfig;
     pub use moose_core::editor::Editor;
     pub use moose_core::events::EventList;
+    pub use moose_core::main_thread::MainThreadHooks;
     pub use moose_core::plugin::{PreparationConfig, PreparationError};
     pub use moose_core::process::{ProcessContext, ProcessStatus};
     pub use moose_core::snapshot::SNAPSHOT_PREALLOC;
@@ -906,6 +927,12 @@ macro_rules! plugin_logic_bridge {
 
             fn bus_layouts() -> Vec<BusLayout> {
                 <Self as $leaf>::bus_layouts()
+            }
+
+            fn main_thread(
+                params: &::std::sync::Arc<Self::Params>,
+            ) -> Box<dyn moose_core::main_thread::MainThreadHooks> {
+                <Self as $leaf>::main_thread(params)
             }
 
             fn init(

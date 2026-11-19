@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod dynamic;
 mod info;
 mod param_text;
 mod persist_write;
@@ -10,8 +11,12 @@ pub mod sample;
 mod smooth;
 mod types;
 
-pub use catalog::ParamCatalog;
-pub use info::{MidiSource, ParamFlags, ParamInfo, ParamUnit, ParamValueKind, map_source_to_param};
+pub use catalog::{CatalogChange, CatalogChanges, CatalogSignal, ParamCatalog};
+pub use dynamic::{DynamicParams, Slot, SlotDef, SlotEdit, SlotRange};
+pub use info::{
+    MidiSource, ParamFlags, ParamFunction, ParamInfo, ParamUnit, ParamValueKind,
+    map_source_to_param,
+};
 pub use param_text::parse_formatted_value;
 pub use persist_write::{KeyedPersistWrite, PreparedPersistWrite, write_prepared_persist};
 pub use projection::{ParamProjection, ProjectedValue, append_projected_infos};
@@ -279,6 +284,23 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Derive: `#[params(presentation_revision = "method")]`.
     fn parameter_presentation_revision(&self) -> u64 {
         0
+    }
+
+    /// The host-known role of `id`, if any (VST3 `IParameterFunctionName`).
+    /// Main thread. Derive: `#[params(function = "method")]`, else the first
+    /// `#[nested]` group that answers.
+    fn parameter_function(&self, _id: u32) -> Option<ParamFunction> {
+        None
+    }
+
+    /// Bound once by the format wrapper. A runtime parameter set (such as
+    /// [`DynamicParams`]) wakes it after every committed change.
+    fn set_catalog_signal(&self, _signal: std::sync::Weak<CatalogSignal>) {}
+
+    /// Main thread, after a catalog wake: what changed since the last call.
+    /// Taking clears it.
+    fn take_catalog_changes(&self) -> CatalogChanges {
+        CatalogChanges::default()
     }
 
     /// Whether a write to this ID can change another parameter's name, group

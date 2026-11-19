@@ -1040,6 +1040,10 @@ impl ExactDeliveryBank {
         if capacity == 0 || Self::required_bytes(capacity)? > payload_budget {
             return Err(ExactDeliveryError::Capacity);
         }
+        #[expect(
+            clippy::incompatible_msrv,
+            reason = "the pinned toolchain has try_update; fetch_update is deprecated"
+        )]
         let owner = NEXT_EXACT_DELIVERY_BANK
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |owner| {
                 owner.checked_add(1)

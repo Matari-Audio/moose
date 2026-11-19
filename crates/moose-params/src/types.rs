@@ -309,7 +309,9 @@ impl FloatParam {
     #[inline]
     pub fn raw_smoothed_next_f64(&self) -> f64 {
         let target = self.value.load();
-        self.smoother.as_ref().map_or(target, |s| s.next_f64(target))
+        self.smoother
+            .as_ref()
+            .map_or(target, |s| s.next_f64(target))
     }
 
     #[doc(hidden)]
@@ -949,11 +951,14 @@ mod tests {
         );
         p.set_sample_rate(48_000.0);
         p.set_value(0.1);
-        let mut out = [0.0_f64; 4096];
+        let mut out = vec![0.0_f64; 4096];
         FloatParamReadF64::read_into(&p, &mut out);
         assert_eq!(out[4095].to_bits(), 0.1_f64.to_bits());
         assert_eq!(FloatParamReadF64::read(&p).to_bits(), 0.1_f64.to_bits());
-        assert_eq!(FloatParamReadF64::read_after(&p, 8).to_bits(), 0.1_f64.to_bits());
+        assert_eq!(
+            FloatParamReadF64::read_after(&p, 8).to_bits(),
+            0.1_f64.to_bits()
+        );
         assert_eq!(FloatParamReadF64::current(&p).to_bits(), 0.1_f64.to_bits());
         // Mid-ramp values aren't f32-quantised either.
         p.set_value(0.3);

@@ -51,6 +51,13 @@ pub trait PluginExport: PluginRuntime + Sized {
         None
     }
 
+    /// The instance's main-thread part. Called once at instantiation; the
+    /// wrapper keeps it in a `MainThreadCell` and calls it only from host
+    /// main-thread callbacks.
+    fn main_thread(&self) -> Box<dyn crate::main_thread::MainThreadHooks> {
+        Box::new(())
+    }
+
     /// Visit the concrete DSP state when this export supports typed access.
     fn with_dsp_state(&mut self, _callback: &mut dyn FnMut(&mut dyn std::any::Any)) -> bool {
         false

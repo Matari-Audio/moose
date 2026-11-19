@@ -283,12 +283,12 @@ fn persistence_only_and_empty_stores_have_no_fake_host_parameters() {
     assert!(!*nested.flag.lock().unwrap());
     let empty = ZeroFields::default();
     assert_eq!(empty.count(), 0);
-    assert!(empty.serialize_persist().is_empty());
+    assert_eq!(empty.serialize_persist().len(), 0);
     assert_eq!(empty.prepare_persist_write().unwrap().byte_len(), 0);
-    assert!(record(&empty).is_empty());
+    assert_eq!(record(&empty).len(), 0);
     let skipped = Empty::default();
     assert_eq!(skipped.count(), 0);
-    assert!(record(&skipped).is_empty());
+    assert_eq!(record(&skipped).len(), 0);
     assert_eq!(skipped.prepares.load(Ordering::Relaxed), 1);
 }
 

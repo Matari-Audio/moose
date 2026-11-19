@@ -200,7 +200,7 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
             if len == 0 {
-                assert!(output.is_empty());
+                assert_eq!(output.len(), 0);
             }
         }
     }

@@ -508,6 +508,13 @@ macro_rules! __plugin_hot_reload {
                 self.inner.task_spawner()
             }
 
+            fn main_thread(&self) -> Box<dyn $crate::core::main_thread::MainThreadHooks> {
+                // The shell's baked-in logic: main-thread hooks don't hot-reload.
+                <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::main_thread(
+                    &self.inner.params,
+                )
+            }
+
             fn editor_builder(&self) -> $crate::core::editor::EditorBuilder<$params> {
                 // Builds from the *reloaded* dylib (not the shell's
                 // baked-in logic), so GUI edits hot-reload - picked up on

@@ -136,8 +136,9 @@ mod prelude_impl {
     pub use moose_gui_types::render::RenderBackend;
     pub use moose_gui_types::theme::{Color, Theme};
     pub use moose_params::{
-        BoolParam, EnumParam, FloatParam, IntParam, MeterSlot, ParamEnum, ParamFlags, ParamInfo,
-        ParamRange, ParamUnit, Params, Smoother, SmoothingStyle,
+        BoolParam, DynamicParams, EnumParam, FloatParam, IntParam, MeterSlot, ParamEnum,
+        ParamFlags, ParamFunction, ParamInfo, ParamRange, ParamUnit, Params, SlotDef, SlotRange,
+        Smoother, SmoothingStyle,
     };
 }
 

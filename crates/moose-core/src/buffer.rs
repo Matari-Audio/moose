@@ -670,13 +670,17 @@ impl<S: Sample> RawBufferScratch<S> {
         }
         unsafe {
             let nf = num_frames as usize;
-            for ch in 0..(num_out as usize) {
+            for (ch, plugin_out) in self
+                .output_buffers
+                .iter()
+                .enumerate()
+                .take(num_out as usize)
+            {
                 let ptr = *outputs.add(ch);
                 if ptr.is_null() {
                     continue;
                 }
                 let host = std::slice::from_raw_parts_mut(ptr, nf);
-                let plugin_out = &self.output_buffers[ch];
                 for (h, &p) in host.iter_mut().zip(plugin_out.iter()) {
                     *h = H::from_f64(p.to_f64());
                 }
