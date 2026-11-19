@@ -1,5 +1,7 @@
 //! The runtime catalog and the main-thread extensions through the real CLAP
 //! callbacks, against a recording host and recording `MainThreadHooks`.
+// The asserted values (0.0, 0.5, 1.0, 100.0) are exact in f32 and f64.
+#![allow(clippy::float_cmp)]
 
 use super::*;
 use clap_sys::color::clap_color;

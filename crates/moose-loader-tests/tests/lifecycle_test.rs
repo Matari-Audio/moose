@@ -1,5 +1,7 @@
 //! `moose::Plugin` through the `Lifecycle` adapter and the static shell:
 //! the processor exists only after a successful activation.
+// The asserted values (0.0, 0.5, 1.0, 100.0) are exact in f32 and f64.
+#![allow(clippy::float_cmp)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
