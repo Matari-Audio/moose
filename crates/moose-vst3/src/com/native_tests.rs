@@ -162,6 +162,9 @@ unsafe extern "C" fn no_track(_: *mut c_void, _: *const Vst3TrackInfo) {}
 unsafe extern "C" fn no_learn(_: *mut c_void, _: u32, _: u8, _: Vst3LearnSource) -> i32 {
     0
 }
+unsafe extern "C" fn no_remap(_: *mut c_void, _: *const u8, _: u32, _: *mut u32) -> i32 {
+    0
+}
 unsafe extern "C" fn no_open_wayland(_: *mut c_void, _: *mut c_void, _: *mut c_void) -> i32 {
     0
 }
@@ -226,6 +229,7 @@ fn callbacks() -> Vst3Callbacks {
         take_catalog_changes: no_changes,
         track_info_changed: no_track,
         midi_learn: no_learn,
+        remap_param_id: no_remap,
         set_processing: no_processing,
         gui_supports_wayland: zero_i32,
         gui_open_wayland: no_open_wayland,
@@ -2149,6 +2153,58 @@ mod host_features {
             assert_eq!(
                 finder.getParameterIDFromFunctionName(5, c"DryWetMix".as_ptr(), &raw mut id),
                 kResultFalse
+            );
+        }
+    }
+
+    #[test]
+    fn remap_param_id_forwards_old_cid_and_handles_nulls() {
+        unsafe extern "C" fn remap_cb(
+            _: *mut c_void,
+            plugin_cid: *const u8,
+            old_id: u32,
+            out_new: *mut u32,
+        ) -> i32 {
+            let mut cid = [0u8; 16];
+            unsafe { std::ptr::copy_nonoverlapping(plugin_cid, cid.as_mut_ptr(), 16) };
+            if cid == [0xAB; 16] && old_id == 7 {
+                unsafe { *out_new = 42 };
+                1
+            } else {
+                0
+            }
+        }
+        let reg = registration(
+            descriptor(),
+            Vst3Callbacks {
+                remap_param_id: remap_cb,
+                ..callbacks()
+            },
+            vec![param(42)],
+        );
+        let com = component(reg);
+        let remap = com.as_com_ref::<IRemapParamID>().expect("IRemapParamID");
+        let cid_match: TUID = [0xABu8 as std::ffi::c_char; 16];
+        let cid_other: TUID = [0x01u8 as std::ffi::c_char; 16];
+        let mut new_id = 0;
+        unsafe {
+            assert_eq!(
+                remap.getCompatibleParamID(&raw const cid_match, 7, &raw mut new_id),
+                kResultOk
+            );
+            assert_eq!(new_id, 42);
+            assert_eq!(
+                remap.getCompatibleParamID(&raw const cid_other, 7, &raw mut new_id),
+                kResultFalse
+            );
+            assert_eq!(new_id, kNoParamId);
+            assert_eq!(
+                remap.getCompatibleParamID(std::ptr::null(), 7, &raw mut new_id),
+                kInvalidArgument
+            );
+            assert_eq!(
+                remap.getCompatibleParamID(&raw const cid_match, 7, std::ptr::null_mut()),
+                kInvalidArgument
             );
         }
     }

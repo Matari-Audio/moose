@@ -53,14 +53,6 @@ mod instance_edit_epoch_tests {
         b.first.value.set_value(0.5);
         assert_eq!(b.parameter_edit_epoch(), 1);
         assert_eq!(a.parameter_edit_epoch(), 3);
-        let custom = moose::params::custom_edit_epoch();
-        moose::params::bump_edit_epoch();
-        assert!(moose::params::custom_edit_epoch() > custom);
-        assert_eq!(
-            a.parameter_edit_epoch(),
-            3,
-            "custom state has a separate counter"
-        );
     }
 }
 

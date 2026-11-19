@@ -11,7 +11,7 @@ pub mod sample;
 mod smooth;
 mod types;
 
-pub use catalog::{CatalogChange, CatalogChanges, CatalogSignal, ParamCatalog};
+pub use catalog::{CatalogChange, CatalogChanges, CatalogError, CatalogSignal, ParamCatalog};
 pub use dynamic::{DynamicParams, Slot, SlotDef, SlotEdit, SlotRange};
 pub use info::{
     MidiSource, ParamFlags, ParamFunction, ParamInfo, ParamUnit, ParamValueKind,
@@ -25,8 +25,37 @@ pub use sample::{Float, Sample};
 pub use smooth::{SmoothState, Smoother, SmoothingStyle};
 pub use types::{
     BoolParam, EnumParam, FloatParam, FloatParamReadF32, FloatParamReadF64, IntParam, MeterSlot,
-    ParamEnum, ParamSmoother, bump_edit_epoch, custom_edit_epoch, edit_epoch,
+    ParamEnum, ParamSmoother, ValueListParam,
 };
+#[expect(deprecated, reason = "re-exported until the 8.0 removal")]
+pub use types::{bump_edit_epoch, custom_edit_epoch, edit_epoch};
+
+/// Deterministically hash a stable parameter string ID (e.g. `"osc1.cutoff"`)
+/// into the host-safe 31-bit parameter ID domain (`0..=PARAM_ID_MAX`).
+///
+/// Uses FNV-1a-32 masked to 31 bits so every plugin format (CLAP, VST3, AU)
+/// accepts the resulting ID.
+///
+/// Moose never uses this to assign host IDs: numeric IDs stay as declared
+/// and string IDs ride beside them in [`ParamCatalog`] and the OAST v2 state
+/// envelope (D9). Re-deriving a shipped plugin's host IDs from string IDs
+/// would orphan every saved host automation lane. Use it only for a new
+/// parameter set that has never shipped, and build its catalog with
+/// [`ParamCatalog::try_new`] so a collision is an error, not a panic.
+#[must_use]
+pub const fn hash_param_id(string_id: &str) -> u32 {
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let bytes = string_id.as_bytes();
+    let mut h = FNV_OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    h & PARAM_ID_MAX
+}
 
 /// Largest host-visible parameter ID. The signed-positive 31-bit
 /// domain is accepted by every supported format, including VST3.
@@ -314,10 +343,11 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     }
 
     /// Stored parameter changes in this instance, including nested groups.
-    /// Custom-state publishers remain separate; use their own generations or
-    /// `custom_edit_epoch`. Changed setters perform only bounded atomic work.
+    /// Equal reads mean no setter changed a value. The counter is per
+    /// instance; custom state keeps its own generation. The default (a
+    /// hand-written impl with no counter) never changes.
     fn parameter_edit_epoch(&self) -> u64 {
-        edit_epoch()
+        0
     }
 
     /// Attach the counter of a containing parameter tree during construction.
@@ -327,11 +357,34 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// All parameter infos, in declaration order.
     fn param_infos(&self) -> Vec<ParamInfo>;
 
+    /// Stable string IDs for parameters in this store (`(numeric_id, "path")`),
+    /// used by OAST v2 state serialization and [`ParamCatalog::by_string_id`].
+    /// `#[derive(Params)]` populates this automatically from field names and
+    /// nested paths (e.g. `"osc1.cutoff"`).
+    fn param_string_ids(&self) -> Vec<(u32, String)> {
+        Vec::new()
+    }
+
+    /// Labelled choices for discrete list parameters (`ValueListParam`,
+    /// `EnumParam`, `DynamicParams` `SlotRange::Choice`), used by host value
+    /// string queries and UI dropdowns.
+    fn value_list_labels(&self, _id: u32) -> Option<Vec<String>> {
+        None
+    }
+
     /// Cached immutable metadata for format adapters. The default builds the
-    /// instance's current table. Root projection stores use one process-shared
-    /// catalog because their complete ID list and ranges are immutable.
+    /// instance's current table with its stable string IDs attached. Root
+    /// projection stores use one process-shared catalog because their complete
+    /// ID list and ranges are immutable.
     fn param_catalog(&self) -> std::sync::Arc<ParamCatalog> {
-        std::sync::Arc::new(ParamCatalog::new(self.param_infos()))
+        // Runtime tables (dynamic slots, runtime string IDs) can be wrong
+        // in ways the derive's compile-time checks cannot see; degrade the
+        // string-ID side map rather than panic inside a host callback.
+        // On a valid table this is identical to `try_with_string_ids`.
+        std::sync::Arc::new(ParamCatalog::with_string_ids_lossy(
+            self.param_infos(),
+            self.param_string_ids(),
+        ))
     }
 
     /// Append parameter infos onto an existing buffer. Default impl
@@ -421,11 +474,29 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Get plain value by ID.
     fn get_plain(&self, id: u32) -> Option<f64>;
 
+    /// Get plain value by dense declaration-order index, validated against `id`.
+    ///
+    /// Format wrappers that already resolved `id` to its dense catalog index
+    /// (via a validated CLAP cookie or VST3 sorted index) call this to avoid
+    /// a second `O(n)` ID-to-field scan.
+    fn get_plain_by_index(&self, index: usize, id: u32) -> Option<f64> {
+        let _ = index;
+        self.get_plain(id)
+    }
+
     /// Set plain value by ID.
     ///
     /// Same `&self` interior-mutability contract as
     /// [`Self::set_normalized`].
     fn set_plain(&self, id: u32, value: f64);
+
+    /// Set plain value by dense declaration-order index, validated against `id`.
+    ///
+    /// Same `&self` interior-mutability contract as [`Self::set_plain`].
+    fn set_plain_by_index(&self, index: usize, id: u32, value: f64) {
+        let _ = index;
+        self.set_plain(id, value);
+    }
 
     /// Format a value in the parameter's declared plain/storage range.
     /// `#[params(value_format = "method")]` first calls an instance method
@@ -435,6 +506,12 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// its range, stored values or automation transport.
     fn format_value(&self, id: u32, value: f64) -> Option<String>;
 
+    /// Format a value by dense declaration-order index, validated against `id`.
+    fn format_value_by_index(&self, index: usize, id: u32, value: f64) -> Option<String> {
+        let _ = index;
+        self.format_value(id, value)
+    }
+
     /// Parse display text into the parameter's declared plain/storage range.
     /// `#[params(value_parse = "method")]` first calls an instance method
     /// `fn(&self, id: u32, text: &str) -> Result<Option<f64>, ()>`.
@@ -442,6 +519,12 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// `Ok(None)` uses generated field/nested parsing, and `Err(())` rejects
     /// input without falling back to a potentially different numeric meaning.
     fn parse_value(&self, id: u32, text: &str) -> Option<f64>;
+
+    /// Parse display text by dense declaration-order index, validated against `id`.
+    fn parse_value_by_index(&self, index: usize, id: u32, text: &str) -> Option<f64> {
+        let _ = index;
+        self.parse_value(id, text)
+    }
 
     /// Reset all smoothers to current values.
     fn snap_smoothers(&self);
@@ -551,7 +634,13 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Called automatically by the derive-generated `Self::new()`.
     /// Plugin code shouldn't need to invoke it directly.
     fn assert_no_id_collisions(&self) {
-        let catalog = self.param_catalog();
+        // Construction-time check of the declared tree, so it is strict;
+        // runtime catalogs go through the non-panicking `param_catalog`.
+        let catalog =
+            match ParamCatalog::try_with_string_ids(self.param_infos(), self.param_string_ids()) {
+                Ok(catalog) => catalog,
+                Err(err) => panic!("{err}"),
+            };
         let mut seen_meters = std::collections::HashSet::new();
         for meter_id in self.meter_ids() {
             if let Some(previous) = catalog.by_id(meter_id) {

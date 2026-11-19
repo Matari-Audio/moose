@@ -338,9 +338,8 @@ pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                             // along: the editor mutates params through
                             // `set_param`.
                             pending_state_for_set.force_push(state::DeserializedState {
-                                params: Vec::new(),
                                 extra: Some(bytes),
-                                persist: Vec::new(),
+                                ..state::DeserializedState::default()
                             });
                         }),
                         transport: Box::new(move || transport_slot.read()),

@@ -13,9 +13,9 @@ use crate::host_state::{
 use crate::input_events::{cb_begin_input_events, cb_push_input_event, cb_push_param_change};
 use crate::lifecycle::{
     cb_create, cb_destroy, cb_layout_bus_channels, cb_match_bus_layout, cb_match_bus_layout_perbus,
-    cb_midi_learn, cb_param_affects_presentation, cb_param_function_name, cb_prepare, cb_reset,
-    cb_set_active, cb_set_catalog_waker, cb_set_persist_waker, cb_set_processing,
-    cb_take_catalog_changes, cb_take_persist_change, cb_track_info_changed,
+    cb_midi_learn, cb_param_affects_presentation, cb_param_function_name, cb_prepare,
+    cb_remap_param_id, cb_reset, cb_set_active, cb_set_catalog_waker, cb_set_persist_waker,
+    cb_set_processing, cb_take_catalog_changes, cb_take_persist_change, cb_track_info_changed,
     cb_wants_persist_notifications, descriptor_buses, vst3_topology_consistent,
 };
 use crate::midi_proxy::{
@@ -375,6 +375,7 @@ pub(crate) fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs:
         take_catalog_changes: cb_take_catalog_changes::<P>,
         track_info_changed: cb_track_info_changed::<P>,
         midi_learn: cb_midi_learn::<P>,
+        remap_param_id: cb_remap_param_id::<P>,
         set_processing: cb_set_processing::<P>,
         gui_supports_wayland: cb_gui_supports_wayland::<P>,
         gui_open_wayland: cb_gui_open_wayland::<P>,

@@ -403,6 +403,36 @@ pub(crate) unsafe extern "C" fn cb_midi_learn<P: PluginExport>(
     })
 }
 
+pub(crate) unsafe extern "C" fn cb_remap_param_id<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    plugin_cid: *const u8,
+    old_id: u32,
+    out_new_id: *mut u32,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "remap_param_id", 0, || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return 0;
+        };
+        if plugin_cid.is_null() || out_new_id.is_null() {
+            return 0;
+        }
+        let mut cid = [0u8; 16];
+        std::ptr::copy_nonoverlapping(plugin_cid, cid.as_mut_ptr(), 16);
+        // SAFETY: `IRemapParamID::getCompatibleParamID` runs on the VST3 UI/main thread.
+        let main = MainThread::assume();
+        let mapped = inst
+            .main_thread
+            .try_borrow_mut(&main)
+            .and_then(|hooks| hooks.remap_param_id(&main, cid, old_id));
+        if let Some(new_id) = mapped {
+            *out_new_id = new_id;
+            1
+        } else {
+            0
+        }
+    })
+}
+
 /// A VST3 `ControllerNumbers` value (`ivstmidicontrollers.h`): 0..=127 are
 /// CCs, then kAfterTouch, kPitchBend, kCtrlProgramChange.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

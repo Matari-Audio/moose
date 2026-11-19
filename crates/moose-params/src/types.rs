@@ -1,6 +1,7 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
+use crate::catalog::{CatalogChange, CatalogChanges, CatalogSignal};
 use crate::info::ParamInfo;
 use crate::range::ParamRange;
 use crate::sample::Float;
@@ -13,30 +14,24 @@ use crate::smooth::{SmoothState, Smoother, SmoothingStyle};
 /// only its own id, which nesting rebases per instance.
 macro_rules! shared_param_meta {
     () => {
-        /// Counter shared by every field in the owning derived parameter tree.
-        /// Standalone fields retain the legacy process-wide counter.
+        /// Changed writes counted on this field's counter: the owning
+        /// derived tree's counter once attached, else the field's own.
         #[doc(hidden)]
         pub fn parameter_edit_epoch(&self) -> u64 {
-            self.edit_epoch
-                .as_ref()
-                .map_or_else(edit_epoch, |epoch| epoch.load(Ordering::Acquire))
+            self.edit_epoch.load(Ordering::Acquire)
         }
 
         #[doc(hidden)]
         pub fn set_edit_epoch(&mut self, epoch: Arc<AtomicU64>) {
-            self.edit_epoch = Some(epoch);
+            self.edit_epoch = epoch;
         }
 
-        /// Count a changed value on the owning tree's counter, or on the
-        /// process-wide one for a standalone field. A field in a tree never
-        /// touches the shared counter, so instances don't contend on it.
+        /// Count a changed value. The counter belongs to one instance, so
+        /// instances never contend on it.
         #[inline]
         fn note_edit(&self, changed: bool) {
             if changed {
-                self.edit_epoch
-                    .as_deref()
-                    .unwrap_or(&EDIT_EPOCH)
-                    .fetch_add(1, Ordering::Release);
+                self.edit_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -79,30 +74,44 @@ macro_rules! shared_param_meta {
     };
 }
 
-/// Process-wide edit counter for standalone fields (not in a derived tree)
-/// and for custom-state edits. Fields in a derived tree count on their
-/// tree's own counter instead (`parameter_edit_epoch`).
-static EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Process-wide custom-state edit counter, kept only for the deprecated
+/// [`bump_edit_epoch`] / [`custom_edit_epoch`] pair. Parameter setters never
+/// touch it.
 static CUSTOM_EDIT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// Equal reads mean no standalone-field setter (or explicit custom-state
-/// edit) ran. Shared by all plugin instances in this process; a derived
-/// parameter tree's edits show in its `Params::parameter_edit_epoch`.
-#[inline]
-pub fn edit_epoch() -> u64 {
-    EDIT_EPOCH.load(Ordering::Acquire)
+/// A fresh per-field edit counter; a derived tree replaces it with its own.
+fn own_edit_epoch() -> Arc<AtomicU64> {
+    Arc::new(AtomicU64::new(0))
 }
 
-/// Mark an edit made outside the parameter setters, such as custom state.
+/// Process-wide custom-state edits.
+#[deprecated(
+    since = "7.1.0",
+    note = "process-wide and shared by every instance; parameter edits count on \
+            `Params::parameter_edit_epoch`, custom state should keep its own generation"
+)]
+#[inline]
+pub fn edit_epoch() -> u64 {
+    CUSTOM_EDIT_EPOCH.load(Ordering::Acquire)
+}
+
+/// Mark a custom-state edit on the process-wide counter.
+#[deprecated(
+    since = "7.1.0",
+    note = "process-wide and shared by every instance; keep a generation on the \
+            custom state itself and call `PluginContext::mark_dirty` for the host"
+)]
 #[inline]
 pub fn bump_edit_epoch() {
-    EDIT_EPOCH.fetch_add(1, Ordering::Release);
     CUSTOM_EDIT_EPOCH.fetch_add(1, Ordering::Release);
 }
 
-/// Process-wide custom-state edits only; ordinary parameter setters do not
-/// move this counter. Combine with `Params::parameter_edit_epoch` when a
-/// legacy custom-state publisher has no instance-local generation.
+/// Process-wide custom-state edits only; parameter setters never move it.
+#[deprecated(
+    since = "7.1.0",
+    note = "process-wide and shared by every instance; keep a generation on the \
+            custom state itself"
+)]
 #[inline]
 pub fn custom_edit_epoch() -> u64 {
     CUSTOM_EDIT_EPOCH.load(Ordering::Acquire)
@@ -141,7 +150,7 @@ impl AtomicF64 {
 pub struct FloatParam {
     info: &'static ParamInfo,
     id: u32,
-    edit_epoch: Option<Arc<AtomicU64>>,
+    edit_epoch: Arc<AtomicU64>,
     value: AtomicF64,
     smoother: Option<Box<Smoother>>,
 }
@@ -187,7 +196,7 @@ impl FloatParam {
         Self {
             info,
             id: info.id,
-            edit_epoch: None,
+            edit_epoch: own_edit_epoch(),
             value: AtomicF64::new(default),
             smoother,
         }
@@ -777,7 +786,7 @@ impl ParamSmoother {
 pub struct BoolParam {
     info: &'static ParamInfo,
     id: u32,
-    edit_epoch: Option<Arc<AtomicU64>>,
+    edit_epoch: Arc<AtomicU64>,
     value: AtomicBool,
 }
 
@@ -804,7 +813,7 @@ impl BoolParam {
         Self {
             info,
             id: info.id,
-            edit_epoch: None,
+            edit_epoch: own_edit_epoch(),
             value: AtomicBool::new(default),
         }
     }
@@ -822,7 +831,7 @@ impl BoolParam {
 pub struct IntParam {
     info: &'static ParamInfo,
     id: u32,
-    edit_epoch: Option<Arc<AtomicU64>>,
+    edit_epoch: Arc<AtomicU64>,
     value: AtomicI64,
 }
 
@@ -876,7 +885,7 @@ impl IntParam {
         Self {
             info,
             id: info.id,
-            edit_epoch: None,
+            edit_epoch: own_edit_epoch(),
             value: AtomicI64::new(truncated),
         }
     }
@@ -951,7 +960,7 @@ pub trait ParamEnum: crate::__private::Sealed + Clone + Copy + Send + Sync + 'st
 pub struct EnumParam<E: ParamEnum> {
     info: &'static ParamInfo,
     id: u32,
-    edit_epoch: Option<Arc<AtomicU64>>,
+    edit_epoch: Arc<AtomicU64>,
     value: AtomicU32,
     _phantom: std::marker::PhantomData<E>,
 }
@@ -1011,7 +1020,7 @@ impl<E: ParamEnum> EnumParam<E> {
         Self {
             info,
             id: info.id,
-            edit_epoch: None,
+            edit_epoch: own_edit_epoch(),
             value: AtomicU32::new(idx),
             _phantom: std::marker::PhantomData,
         }
@@ -1066,6 +1075,304 @@ impl<E: ParamEnum> EnumParam<E> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let idx = value.round() as usize;
         E::from_index(idx).name().to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ValueListParam
+// ---------------------------------------------------------------------------
+
+/// A discrete parameter whose labelled value list can be populated or updated
+/// at runtime (e.g. a sample-bank selector, impulse-response picker, or
+/// dynamic routing target list).
+///
+/// Audio-thread reads (`index`, `len`, `get_plain`, `get_normalized`) and
+/// writes (`set_index`, `set_plain`, `set_normalized`) are 100% lock-free.
+/// Label updates (`set_labels`) run off the audio thread and notify the
+/// wrapper via [`CatalogSignal`] (`CatalogChange::INFO` when only labels
+/// changed; `CatalogChange::STRUCTURE | INFO` when the item count changed).
+pub struct ValueListParam {
+    info: &'static ParamInfo,
+    id: u32,
+    edit_epoch: Arc<AtomicU64>,
+    value: AtomicU32,
+    count: AtomicU32,
+    labels: RwLock<Vec<String>>,
+    catalog_signal: Mutex<Weak<CatalogSignal>>,
+    pending_changes: AtomicU8,
+}
+
+impl ValueListParam {
+    shared_param_meta!();
+
+    /// Construct a `ValueListParam` seeded with default numeric labels sized
+    /// from `info.range` (or 1 entry if the range has fewer than 1 items).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn new(info: &'static ParamInfo) -> Self {
+        let initial_count = match info.range {
+            ParamRange::Enum { count } => count.max(1),
+            ParamRange::Discrete { min, max } if max >= min => {
+                usize::try_from(max - min + 1).unwrap_or(1).max(1)
+            }
+            _ => 1,
+        };
+        let labels: Vec<String> = (0..initial_count).map(|i| i.to_string()).collect();
+        Self::with_labels(info, labels)
+    }
+
+    /// Construct a `ValueListParam` with explicit initial labels. If `labels`
+    /// is empty, a single `"Default"` entry is inserted so the range is always
+    /// non-degenerate.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn with_labels<I, S>(info: &'static ParamInfo, labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut items: Vec<String> = labels.into_iter().map(Into::into).collect();
+        if items.is_empty() {
+            items.push("Default".to_owned());
+        }
+        let count_u32 = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let default = if info.default_plain.is_finite() && info.default_plain >= 0.0 {
+            (info.default_plain.round() as u32).min(count_u32.saturating_sub(1))
+        } else {
+            0
+        };
+        Self {
+            info,
+            id: info.id,
+            edit_epoch: own_edit_epoch(),
+            value: AtomicU32::new(default),
+            count: AtomicU32::new(count_u32),
+            labels: RwLock::new(items),
+            catalog_signal: Mutex::new(Weak::new()),
+            pending_changes: AtomicU8::new(0),
+        }
+    }
+
+    /// Replace the value list on the main thread. Returns `false` if `labels`
+    /// is empty (leaving the existing list untouched). Not real-time safe.
+    pub fn set_labels<I, S>(&self, labels: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let items: Vec<String> = labels.into_iter().map(Into::into).collect();
+        if items.is_empty() {
+            return false;
+        }
+        let new_count = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let mut guard = self.labels.write().unwrap_or_else(PoisonError::into_inner);
+        if *guard == items {
+            return true;
+        }
+        let old_count = self.count.swap(new_count, Ordering::Release);
+        *guard = items;
+        drop(guard);
+
+        let mut flags = CatalogChange::INFO;
+        if old_count != new_count {
+            flags |= CatalogChange::STRUCTURE;
+            let max_idx = new_count.saturating_sub(1);
+            let mut cur = self.value.load(Ordering::Relaxed);
+            while cur > max_idx {
+                match self.value.compare_exchange_weak(
+                    cur,
+                    max_idx,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.note_edit(true);
+                        flags |= CatalogChange::VALUES;
+                        break;
+                    }
+                    Err(observed) => cur = observed,
+                }
+            }
+        }
+        self.pending_changes
+            .fetch_or(flags.bits(), Ordering::Release);
+        if let Some(signal) = self
+            .catalog_signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade()
+        {
+            signal.notify();
+        }
+        true
+    }
+
+    /// Current selected 0-based index. Lock-free on any thread.
+    #[inline]
+    #[must_use]
+    pub fn index(&self) -> u32 {
+        let max = self.count.load(Ordering::Acquire).saturating_sub(1);
+        self.value.load(Ordering::Relaxed).min(max)
+    }
+
+    /// Select a 0-based index, clamping to the current list length. Lock-free.
+    #[inline]
+    pub fn set_index(&self, idx: u32) {
+        let max = self.count.load(Ordering::Acquire).saturating_sub(1);
+        let clamped = idx.min(max);
+        self.note_edit(self.value.swap(clamped, Ordering::Relaxed) != clamped);
+    }
+
+    /// Number of entries currently in the list (always >= 1). Lock-free.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.count.load(Ordering::Acquire) as usize
+    }
+
+    /// Always `false` since a `ValueListParam` holds at least one entry.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Snapshot of all current labels (main thread).
+    #[must_use]
+    pub fn labels(&self) -> Vec<String> {
+        self.labels
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Current label at `index` (main thread).
+    #[must_use]
+    pub fn label_at(&self, index: usize) -> Option<String> {
+        self.labels
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(index)
+            .cloned()
+    }
+
+    /// Currently selected label (main thread).
+    #[must_use]
+    pub fn current_label(&self) -> String {
+        let idx = self.index() as usize;
+        self.label_at(idx).unwrap_or_else(|| idx.to_string())
+    }
+
+    /// Live [`ParamRange::Enum`] reflecting the current entry count. Lock-free.
+    #[inline]
+    #[must_use]
+    pub fn current_range(&self) -> ParamRange {
+        ParamRange::Enum {
+            count: self.len().max(1),
+        }
+    }
+
+    /// Live [`ParamInfo`] with this instance's rebased id and current list count.
+    #[must_use]
+    pub fn current_info(&self) -> ParamInfo {
+        let mut info = self.info();
+        info.range = self.current_range();
+        info
+    }
+
+    /// Current plain value (`0.0..=(len - 1)`). Lock-free.
+    #[inline]
+    #[must_use]
+    pub fn get_plain(&self) -> f64 {
+        f64::from(self.index())
+    }
+
+    /// Set plain value (rounded and clamped to `0..len`). Lock-free.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn set_plain(&self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        let max = self.count.load(Ordering::Acquire).saturating_sub(1);
+        let idx = if value <= 0.0 {
+            0
+        } else {
+            (value.round() as u32).min(max)
+        };
+        self.note_edit(self.value.swap(idx, Ordering::Relaxed) != idx);
+    }
+
+    /// Current normalized value in `0.0..=1.0`. Lock-free.
+    #[inline]
+    #[must_use]
+    pub fn get_normalized(&self) -> f64 {
+        self.current_range().normalize(self.get_plain())
+    }
+
+    /// Set from normalized value in `0.0..=1.0`. Lock-free.
+    #[inline]
+    pub fn set_normalized(&self, norm: f64) {
+        if !norm.is_finite() {
+            return;
+        }
+        let plain = self.current_range().denormalize(norm);
+        self.set_plain(plain);
+    }
+
+    /// Format a plain index into its label (main thread).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn format_value(&self, plain: f64) -> String {
+        let guard = self.labels.read().unwrap_or_else(PoisonError::into_inner);
+        let max = guard.len().saturating_sub(1);
+        let idx = if !plain.is_finite() || plain <= 0.0 {
+            0
+        } else {
+            (plain.round() as usize).min(max)
+        };
+        guard.get(idx).cloned().unwrap_or_else(|| idx.to_string())
+    }
+
+    /// Parse a label (case-insensitive) or 0-based index into a plain value (main thread).
+    #[must_use]
+    pub fn parse_value(&self, text: &str) -> Option<f64> {
+        let needle = text.trim();
+        let guard = self.labels.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(pos) = guard
+            .iter()
+            .position(|label| label.trim().eq_ignore_ascii_case(needle))
+        {
+            #[allow(clippy::cast_precision_loss)]
+            return Some(pos as f64);
+        }
+        let idx: usize = needle.parse().ok()?;
+        if idx < guard.len() {
+            #[allow(clippy::cast_precision_loss)]
+            Some(idx as f64)
+        } else {
+            None
+        }
+    }
+
+    /// Bind the wrapper's [`CatalogSignal`] so `set_labels` wakes the host.
+    #[doc(hidden)]
+    pub fn set_catalog_signal(&self, signal: Weak<CatalogSignal>) {
+        *self
+            .catalog_signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = signal;
+    }
+
+    /// Take pending catalog changes produced by [`Self::set_labels`].
+    #[doc(hidden)]
+    pub fn take_catalog_changes(&self) -> CatalogChanges {
+        let bits = self.pending_changes.swap(0, Ordering::AcqRel);
+        let flags = CatalogChange::from_bits_truncate(bits);
+        CatalogChanges {
+            flags,
+            removed: Vec::new(),
+        }
     }
 }
 
@@ -1148,7 +1455,7 @@ mod tests {
     fn float_param_is_pointer_sized_metadata() {
         // The borrowed-info layout: a param must not carry `ParamInfo`
         // (or an unused smoother) inline.
-        // One optional shared instance-counter pointer, with no per-field allocation.
+        // One edit-counter pointer (the field's own, or its tree's).
         assert!(std::mem::size_of::<FloatParam>() <= 40);
         let p = float(0.0, 1.0);
         assert!(p.smoother().is_none(), "no smoother without a style");
@@ -1160,9 +1467,7 @@ mod tests {
         assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
     }
 
-    /// A field in a tree counts on the tree's counter (finding 13). That it
-    /// skips the process-wide one can't be asserted here: other tests in
-    /// this binary edit standalone fields concurrently.
+    /// A field in a tree counts on the tree's counter (finding 13).
     #[test]
     fn tree_field_edits_skip_the_process_wide_epoch() {
         let mut p = float(0.0, 1.0);
@@ -1208,14 +1513,22 @@ mod tests {
     }
 
     #[test]
-    fn changed_value_advances_edit_epoch() {
+    fn changed_value_advances_only_its_own_edit_epoch() {
         let p = float(0.0, 1.0);
-        let before = edit_epoch();
+        let other = float(0.0, 1.0);
         p.set_value(0.5);
-        assert!(edit_epoch() > before);
-        let before = edit_epoch();
-        bump_edit_epoch();
-        assert!(edit_epoch() > before);
+        assert_eq!(p.parameter_edit_epoch(), 1);
+        p.set_value(0.5);
+        assert_eq!(
+            p.parameter_edit_epoch(),
+            1,
+            "an unchanged write doesn't count"
+        );
+        assert_eq!(
+            other.parameter_edit_epoch(),
+            0,
+            "standalone fields don't share a counter"
+        );
     }
 
     /// The f64 prelude reads without an f32 round trip (finding 6).
@@ -1450,5 +1763,61 @@ mod tests {
             (-60.0..=6.0).contains(&v),
             "clamped to the normalized interval"
         );
+    }
+
+    #[test]
+    fn value_list_param_updates_labels_notifies_catalog_and_clamps() {
+        use std::sync::atomic::AtomicUsize;
+
+        let woken = Arc::new(AtomicUsize::new(0));
+        let woken_cb = Arc::clone(&woken);
+        let signal = Arc::new(CatalogSignal::new(move || {
+            woken_cb.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let p = ValueListParam::with_labels(
+            info("Sample", ParamRange::Enum { count: 3 }, 0.0),
+            ["Kick", "Snare", "Hat"],
+        );
+        p.set_catalog_signal(Arc::downgrade(&signal));
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.current_label(), "Kick");
+        p.set_index(2);
+        assert_eq!(p.current_label(), "Hat");
+        assert_eq!(p.parse_value("snare"), Some(1.0));
+        assert_eq!(p.parse_value("2"), Some(2.0));
+        assert_eq!(p.parse_value("99"), None);
+
+        // Empty list is rejected without mutating state or waking host.
+        assert!(!p.set_labels::<[&str; 0], _>([]));
+        assert_eq!(p.len(), 3);
+        assert_eq!(woken.load(Ordering::Relaxed), 0);
+
+        // Renaming with same count fires CatalogChange::INFO only.
+        assert!(p.set_labels(["808", "909", "CR78"]));
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
+        assert_eq!(p.take_catalog_changes().flags, CatalogChange::INFO);
+        assert_eq!(p.format_value(2.0), "CR78");
+
+        // Shrinking count clamps index and fires STRUCTURE | INFO | VALUES.
+        assert!(p.set_labels(["Solo"]));
+        assert_eq!(woken.load(Ordering::Relaxed), 2);
+        assert_eq!(p.index(), 0);
+        assert_eq!(p.current_label(), "Solo");
+        assert_eq!(
+            p.take_catalog_changes().flags,
+            CatalogChange::STRUCTURE | CatalogChange::INFO | CatalogChange::VALUES
+        );
+    }
+
+    #[test]
+    fn hash_param_id_is_deterministic_and_host_safe() {
+        let a = crate::hash_param_id("osc1.cutoff");
+        let b = crate::hash_param_id("osc1.cutoff");
+        let c = crate::hash_param_id("osc2.cutoff");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a <= crate::PARAM_ID_MAX);
+        assert!(c <= crate::PARAM_ID_MAX);
     }
 }

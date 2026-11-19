@@ -409,6 +409,15 @@ pub struct Vst3Callbacks {
         channel: u8,
         source: Vst3LearnSource,
     ) -> i32,
+    /// `MainThreadHooks::remap_param_id` (`IRemapParamID`): map `old_id` from
+    /// a replaced plugin class (`old_cid`, 16 bytes) to a new parameter ID.
+    /// Returns 1 and writes `*out_new_id` when compatible, 0 otherwise.
+    pub remap_param_id: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        old_cid: *const u8,
+        old_id: u32,
+        out_new_id: *mut u32,
+    ) -> i32,
     /// `IAudioProcessor::setProcessing`. `false` also resets the plugin
     /// (what the shim used to do through `reset`).
     pub set_processing: unsafe extern "C" fn(
