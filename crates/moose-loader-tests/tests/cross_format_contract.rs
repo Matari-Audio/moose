@@ -1213,6 +1213,8 @@ mod vst3_host_harness {
     }
 
     impl Vst3 {
+        // VST3 enum constants are u32 on Unix and i32 on Windows.
+        #[allow(clippy::unnecessary_cast)]
         pub fn new() -> Self {
             ensure_registered();
             let factory = unsafe {
@@ -1256,6 +1258,8 @@ mod vst3_host_harness {
             }
         }
 
+        // VST3 enum constants are u32 on Unix and i32 on Windows.
+        #[allow(clippy::unnecessary_cast)]
         pub fn setup(&mut self, rate: f64) {
             self.rate = rate;
             let mut setup = ProcessSetup {
@@ -1293,6 +1297,8 @@ mod vst3_host_harness {
 
         /// Raw `IAudioProcessor::process`. `buses == false` sends the
         /// Ableton-style suspended flush (zero buses, nonzero samples).
+        // VST3 enum constants are u32 on Unix and i32 on Windows.
+        #[allow(clippy::unnecessary_cast)]
         pub fn process_raw(
             &self,
             frames: u32,
@@ -1382,6 +1388,8 @@ impl Harness for vst3_host_harness::Vst3 {
     fn create() -> Self {
         Self::new()
     }
+    // VST3 enum constants are u32 on Unix and i32 on Windows.
+    #[allow(clippy::unnecessary_cast)]
     fn start(&mut self, rate: f64) {
         use vst3::Steinberg::Vst::{
             BusDirections_::{kInput, kOutput},
@@ -1478,6 +1486,8 @@ impl Harness for vst3_host_harness::Vst3 {
         use vst3::Steinberg::Vst::IAudioProcessorTrait;
         unsafe { self.processor.getTailSamples() }
     }
+    // VST3 enum constants are u32 on Unix and i32 on Windows.
+    #[allow(clippy::unnecessary_cast)]
     fn set_offline(&mut self, offline: bool) {
         use vst3::Steinberg::Vst::ProcessModes_;
         self.mode = if offline {
