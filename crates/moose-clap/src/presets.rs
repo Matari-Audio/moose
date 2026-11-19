@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
 
+use crate::CLAP_VERSION;
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT, CLAP_PRESET_DISCOVERY_IS_USER_CONTENT,
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_factory,
@@ -26,7 +27,6 @@ use clap_sys::factory::preset_discovery::{
     clap_preset_discovery_provider, clap_preset_discovery_provider_descriptor,
 };
 use clap_sys::universal_plugin_id::clap_universal_plugin_id;
-use crate::CLAP_VERSION;
 
 use moose_core::export::PluginExport;
 use moose_core::presets::{PresetRef, PresetScope, read_preset_ref, user_preset_root};

@@ -24,12 +24,21 @@ pub mod __macro_deps {
 /// The CLAP version moose implements. clap-sys 0.5 says 1.2.2; the stable
 /// ABI is unchanged through 1.2.10 (only drafts, docs and two surround
 /// constants were added), so the descriptors report the headers we track.
-pub const CLAP_VERSION: clap_sys::version::clap_version =
-    clap_sys::version::clap_version { major: 1, minor: 2, revision: 10 };
+pub const CLAP_VERSION: clap_sys::version::clap_version = clap_sys::version::clap_version {
+    major: 1,
+    minor: 2,
+    revision: 10,
+};
 
+mod catalog_sync;
+mod context_menu;
 #[cfg(feature = "clap-draft")]
 pub mod draft;
+mod note_name;
+mod param_indication;
 pub mod presets;
+mod track_info;
+mod voice_info;
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
@@ -63,21 +72,29 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::audio_ports_config::{
     CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config,
 };
+use clap_sys::ext::context_menu::{
+    CLAP_EXT_CONTEXT_MENU, CLAP_EXT_CONTEXT_MENU_COMPAT, clap_plugin_context_menu,
+};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
+use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_plugin_note_name};
 #[cfg(feature = "mpe-input")]
 use clap_sys::ext::note_ports::CLAP_NOTE_DIALECT_MIDI_MPE;
 use clap_sys::ext::note_ports::{
     CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI, CLAP_NOTE_DIALECT_MIDI2,
     clap_note_port_info, clap_plugin_note_ports,
 };
+use clap_sys::ext::param_indication::{
+    CLAP_EXT_PARAM_INDICATION, CLAP_EXT_PARAM_INDICATION_COMPAT, clap_plugin_param_indication,
+};
+use clap_sys::ext::params::clap_host_params;
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_ENUM,
     CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
     CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info, clap_plugin_params,
 };
+#[cfg(test)]
 use clap_sys::ext::params::{
-    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
-    CLAP_PARAM_RESCAN_VALUES, clap_host_params,
+    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT, CLAP_PARAM_RESCAN_VALUES,
 };
 use clap_sys::ext::preset_load::{
     CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
@@ -98,6 +115,10 @@ use clap_sys::ext::surround::{
     CLAP_EXT_SURROUND, CLAP_EXT_SURROUND_COMPAT, CLAP_PORT_SURROUND, clap_plugin_surround,
 };
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
+use clap_sys::ext::track_info::{
+    CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, clap_host_track_info, clap_plugin_track_info,
+};
+use clap_sys::ext::voice_info::{CLAP_EXT_VOICE_INFO, clap_plugin_voice_info};
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
 };
@@ -133,6 +154,7 @@ use moose_core::events::{
 };
 use moose_core::export::PluginExport;
 use moose_core::info::{MidiDialect, PluginCategory, PluginInfo, resolve_name_override};
+use moose_core::main_thread::{MainThreadHooks, NoteName};
 use moose_core::meters::MeterStore;
 #[cfg(test)]
 use moose_core::midi::per_note_bend_semitones;
@@ -148,6 +170,7 @@ use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::state::PluginFormat;
 use moose_core::tasks::AnyTaskSpawner;
+use moose_core::thread::{MainThread, MainThreadCell};
 use moose_core::ump::{decode_ump_channel_voice_2, encode_ump_channel_voice_2};
 use moose_core::wrapper::{
     PluginCell, SharedPlugin, apply_or_queue_state, apply_queued_state, copy_c_str,
@@ -253,11 +276,23 @@ struct ClapPluginData<P: PluginExport> {
     /// `process`), `activate` / `deactivate` on the main thread while
     /// stopped - so the cell is never held twice at once.
     audio: PluginCell<ClapAudio<P>>,
-    /// Cached parameter infos (built once at init).
-    param_infos: Arc<moose_params::ParamCatalog>,
-    /// Visible CLAP indices; backing parameter IDs and storage stay fixed.
-    exposed_param_indices: Mutex<Vec<usize>>,
+    /// The parameter list the host sees (main-thread readers). Replaced
+    /// only while inactive, together with `ClapAudio::catalog`; see
+    /// `catalog_sync`.
+    exposed: Mutex<catalog_sync::ExposedParams>,
     parameter_restart_pending: AtomicBool,
+    /// The parameter set's change signal, bound at init and closed at
+    /// destroy. Its wake schedules `on_main_thread`.
+    catalog_signal: Option<Arc<moose_params::CatalogSignal>>,
+    /// A structure change the host hasn't seen yet, with the ids it
+    /// removed or retyped. Published at the next inactive sync.
+    pending_structure: MainThreadCell<Option<Vec<u32>>>,
+    /// The plugin's main-thread part (`PluginExport::main_thread`).
+    hooks: MainThreadCell<Box<dyn MainThreadHooks>>,
+    /// The note names taken by the last `note_name.count`.
+    note_names: MainThreadCell<Vec<NoteName>>,
+    /// Whether the hooks reported voice info at init (`voice_info`).
+    voice_info_supported: AtomicBool,
     /// Cached plugin info. Read by the chunker each block for
     /// `automation.min_subblock_samples` and otherwise unused; the
     /// rest of the wrapper consumes `PluginInfo` from the C ABI
@@ -279,6 +314,8 @@ struct ClapPluginData<P: PluginExport> {
     /// Host tail extension (for `changed`). Null if the host doesn't
     /// expose `clap.tail`.
     host_tail: *const clap_host_tail,
+    /// Host track-info extension. Null if the host doesn't expose it.
+    host_track_info: *const clap_host_track_info,
     /// Set on the audio thread when `latency()` changes; drained on the
     /// main thread, which notifies the host. Coalesces a burst of
     /// changes into one host notification per main-thread callback.
@@ -418,6 +455,9 @@ struct ClapAudio<P: PluginExport> {
     /// Selected layout's structural bus order and flattened ranges. Built at
     /// activate; CLAP exposes no truthful per-block connection state.
     bus_routing: BusRouting,
+    /// The audio thread's parameter catalog. Replaced only while inactive
+    /// (see `catalog_sync`), so `process` reads it without a lock.
+    catalog: Arc<moose_params::ParamCatalog>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,6 +511,17 @@ impl<P: PluginExport> ClapPluginData<P> {
 
     fn set_host_scale(&self, scale: f64) {
         self.host_scale.store(scale.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Run `f` on the plugin's main-thread hooks. `None` on a re-entrant
+    /// host call that arrives while the hooks are already in use.
+    fn with_hooks<R>(
+        &self,
+        main: &MainThread,
+        f: impl FnOnce(&mut dyn MainThreadHooks) -> R,
+    ) -> Option<R> {
+        let mut hooks = self.hooks.try_borrow_mut(main)?;
+        Some(f(hooks.as_mut()))
     }
 }
 
@@ -766,17 +817,20 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
     run_extern_callback_with::<P, bool>("CLAP", "init", false, || unsafe {
         // `init` runs once on the main thread before the host publishes the
         // instance to any audio thread, so an exclusive `&mut` to the whole
-        // struct is sound here - the write-once fields below (`param_infos`,
+        // struct is sound here - the write-once fields below (`exposed`,
         // the host extension pointers) have no concurrent reader yet.
         let data = &mut *(*plugin).plugin_data.cast::<ClapPluginData<P>>();
-        {
-            let mut instance = enter_plugin(&data.plugin);
-            instance.init();
-            data.param_infos = instance.params().param_catalog();
-            data.exposed_param_indices = Mutex::new(parameter_indices(&data.param_infos, |id| {
-                data.params_arc.parameter_presentation(id)
-            }));
-        }
+        enter_plugin(&data.plugin).init();
+        // Bind the signal first, then drop what `init` changed: the catalog
+        // built next already holds it, and any later edit wakes us.
+        data.catalog_signal = Some(catalog_sync::install_catalog_signal(data));
+        let _ = data.params_arc.take_catalog_changes();
+        let catalog = data.params_arc.param_catalog();
+        data.audio.enter().catalog = Arc::clone(&catalog);
+        data.exposed = Mutex::new(catalog_sync::ExposedParams::new(
+            catalog,
+            data.params_arc.as_ref(),
+        ));
         // Query host params extension for request_flush support
         if !data.host.is_null()
             && let Some(get_ext) = (*data.host).get_extension
@@ -794,6 +848,12 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
             if !tail_ext.is_null() {
                 data.host_tail = tail_ext.cast::<clap_host_tail>();
             }
+            data.host_track_info =
+                get_ext(data.host, CLAP_EXT_TRACK_INFO.as_ptr()).cast::<clap_host_track_info>();
+            if data.host_track_info.is_null() {
+                data.host_track_info = get_ext(data.host, CLAP_EXT_TRACK_INFO_COMPAT.as_ptr())
+                    .cast::<clap_host_track_info>();
+            }
         }
         if data.params_arc.wants_persist_notifications() {
             let host = SendPtr::new(data.host);
@@ -810,6 +870,12 @@ unsafe extern "C" fn clap_plugin_init<P: PluginExport>(plugin: *const clap_plugi
                 .set_persist_change_signal(Arc::downgrade(&signal));
             data.persist_signal = Some(signal);
         }
+        // SAFETY: `clap_plugin.init` is [main-thread] (plugin.h).
+        let main = MainThread::assume();
+        let data = &*data;
+        data.voice_info_supported
+            .store(voice_info::query(data, &main).is_some(), Ordering::Relaxed);
+        track_info::notify(data, &main);
         true
     })
 }
@@ -833,6 +899,9 @@ unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *const clap_pl
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Gate workers before any host/instance handle can be released.
             if let Some(signal) = &(*data_ptr).persist_signal {
+                signal.close();
+            }
+            if let Some(signal) = &(*data_ptr).catalog_signal {
                 signal.close();
             }
             drop(Box::from_raw(data_ptr));
@@ -957,8 +1026,6 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
     run_extern_callback_with::<P, ()>("CLAP", "deactivate", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.active.store(false, Ordering::Relaxed);
-        data.parameter_restart_pending
-            .store(false, Ordering::Relaxed);
         // A `state_load` while active queues its blob for the audio thread
         // to drain at the top of the next block. If the host deactivates
         // before that block runs (sample-rate / buffer change, offline
@@ -974,13 +1041,11 @@ unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(plugin: *const clap
             }
         }
         clap_plugin_reset::<P>(plugin);
-        if refresh_parameter_list(data)
-            && !data.host_params.is_null()
-            && !data.host.is_null()
-            && let Some(rescan) = (*data.host_params).rescan
-        {
-            rescan(data.host, CLAP_PARAM_RESCAN_ALL);
-        }
+        // Inactive now: publish a structure change or list update held back
+        // while active (restart + RESCAN_ALL, CLAP params.h).
+        // SAFETY: `clap_plugin.deactivate` is [main-thread & active] (plugin.h).
+        let main = MainThread::assume();
+        catalog_sync::sync_parameters(data, &main);
     });
 }
 
@@ -1071,34 +1136,11 @@ unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(plugin: *const 
                 }
             }
         }
-        // Runtime presentation metadata is re-read on RESCAN_INFO. A change
-        // to the exposed list requests a restart and is published inactive.
-        data.presentation_pending.store(false, Ordering::Release);
-        let revision = data.params_arc.parameter_presentation_revision();
-        let info_changed = data.presentation_revision.swap(revision, Ordering::Relaxed) != revision;
-        let list_changed = info_changed && refresh_parameter_list(data);
-        if info_changed {
-            refresh_remote_control_pages(data);
-        }
-        let values_changed = data.needs_rescan.swap(false, Ordering::Relaxed);
-        if (values_changed || info_changed)
-            && !data.host_params.is_null()
-            && !data.host.is_null()
-            && let Some(rescan) = (*data.host_params).rescan
-        {
-            let mut flags = if list_changed {
-                CLAP_PARAM_RESCAN_ALL
-            } else {
-                0
-            };
-            if values_changed {
-                flags |= CLAP_PARAM_RESCAN_VALUES;
-            }
-            if info_changed {
-                flags |= CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT;
-            }
-            rescan(data.host, flags);
-        }
+        // Catalog changes, presentation revisions and value rescans. A
+        // structure change requests a restart and is published inactive.
+        // SAFETY: `clap_plugin.on_main_thread` is [main-thread] (plugin.h).
+        let main = MainThread::assume();
+        catalog_sync::sync_parameters(data, &main);
 
         if data.latency_dirty.swap(false, Ordering::Relaxed) && !data.host.is_null() {
             if data.active.load(Ordering::Relaxed) {
@@ -3039,7 +3081,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             params_fn: None,
             meters_fn: None,
             latency_change_request: Some(&request_latency_change),
-            param_infos: &data.param_infos,
+            param_infos: &scr.catalog,
             min_subblock_samples: data.info.automation.min_subblock_samples,
         };
         let status = process_chunked_with_bus_routing_and_catalog(
@@ -3048,7 +3090,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             &mut audio_buffer,
             chunk_args,
             bus_routing,
-            &data.param_infos,
+            &scr.catalog,
         );
 
         // Parameters have reached their sample offsets before discovery is
@@ -3124,7 +3166,7 @@ unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             output_status = preflight_clap_output(
                 &scr.output_events,
                 &data.info,
-                &data.param_infos,
+                &scr.catalog,
                 proc.frames_count,
             );
         }
@@ -3667,62 +3709,10 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
 // Extension: params
 // ---------------------------------------------------------------------------
 
-fn parameter_indices(
-    infos: &[ParamInfo],
-    mut presentation: impl FnMut(u32) -> Option<moose_params::ParameterPresentation>,
-) -> Vec<usize> {
-    infos
-        .iter()
-        .enumerate()
-        .filter_map(|(index, info)| {
-            presentation(info.id)
-                .is_none_or(|p| p.available)
-                .then_some(index)
-        })
-        .collect()
-}
-
-// Main thread only. Active instances keep their published index list until
-// the host restarts them; the parameter IDs and backing storage never change.
-unsafe fn refresh_parameter_list<P: PluginExport>(data: &ClapPluginData<P>) -> bool {
-    let next = parameter_indices(&data.param_infos, |id| {
-        data.params_arc.parameter_presentation(id)
-    });
-    let mut indices = data
-        .exposed_param_indices
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if *indices == next {
-        return false;
-    }
-    if data.active.load(Ordering::Relaxed) {
-        drop(indices);
-        if !data.parameter_restart_pending.swap(true, Ordering::Relaxed)
-            && !data.host.is_null()
-            && let Some(restart) = unsafe { (*data.host).request_restart }
-        {
-            unsafe { restart(data.host) };
-        }
-        return false;
-    }
-    *indices = next;
-    drop(indices);
-    data.parameter_restart_pending
-        .store(false, Ordering::Relaxed);
-    // SAFETY: this helper is called on the host main thread with live instance data.
-    unsafe { refresh_remote_control_pages(data) };
-    true
-}
-
 unsafe extern "C" fn params_count<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        len_u32(
-            data.exposed_param_indices
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-        )
+        len_u32(catalog_sync::lock_exposed(&data.exposed).len())
     }
 }
 
@@ -3733,16 +3723,10 @@ unsafe extern "C" fn params_get_info<P: PluginExport>(
 ) -> bool {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let infos = &data.param_infos;
-
-        let index = data
-            .exposed_param_indices
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(param_index as usize)
-            .copied();
-        let Some(index) = index else { return false };
-        let info = &infos[index];
+        let exposed = catalog_sync::lock_exposed(&data.exposed);
+        let Some(info) = exposed.info(param_index) else {
+            return false;
+        };
         let out = &mut *out;
 
         out.id = info.id;
@@ -4060,15 +4044,11 @@ fn presented_remote_control_pages(
 
 /// Only structural presentation revisions rebuild the cache, never value flushes.
 unsafe fn refresh_remote_control_pages<P: PluginExport>(data: &ClapPluginData<P>) {
-    let indices = data
-        .exposed_param_indices
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let pages =
-        presented_remote_control_pages(indices.iter().map(|&i| &data.param_infos[i]), |id| {
-            data.params_arc.parameter_presentation(id)
-        });
-    drop(indices);
+    let exposed = catalog_sync::lock_exposed(&data.exposed);
+    let pages = presented_remote_control_pages(exposed.infos(), |id| {
+        data.params_arc.parameter_presentation(id)
+    });
+    drop(exposed);
     let mut current = data
         .remote_pages
         .lock()
@@ -5769,6 +5749,11 @@ struct Extensions<P: PluginExport> {
     latency: clap_plugin_latency,
     tail: clap_plugin_tail,
     render: clap_plugin_render,
+    track_info: clap_plugin_track_info,
+    note_name: clap_plugin_note_name,
+    voice_info: clap_plugin_voice_info,
+    param_indication: clap_plugin_param_indication,
+    context_menu: clap_plugin_context_menu,
     _phantom: PhantomData<P>,
 }
 
@@ -5842,6 +5827,11 @@ impl<P: PluginExport> Extensions<P> {
                 has_hard_realtime_requirement: Some(render_has_hard_realtime::<P>),
                 set: Some(render_set::<P>),
             },
+            track_info: track_info::make_extension::<P>(),
+            note_name: note_name::make_extension::<P>(),
+            voice_info: voice_info::make_extension::<P>(),
+            param_indication: param_indication::make_extension::<P>(),
+            context_menu: context_menu::make_extension::<P>(),
             _phantom: PhantomData,
         }
     }
@@ -5857,7 +5847,8 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         }
         let ext_id = CStr::from_ptr(id);
 
-        let extensions = &data_from_plugin::<P>(plugin).extensions;
+        let data = data_from_plugin::<P>(plugin);
+        let extensions = &data.extensions;
 
         if ext_id == CLAP_EXT_PARAMS {
             return (&raw const extensions.params).cast::<c_void>();
@@ -5913,6 +5904,25 @@ unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         }
         if ext_id == CLAP_EXT_RENDER {
             return (&raw const extensions.render).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_TRACK_INFO || ext_id == CLAP_EXT_TRACK_INFO_COMPAT {
+            return (&raw const extensions.track_info).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_NOTE_NAME {
+            return (&raw const extensions.note_name).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_VOICE_INFO {
+            return if data.voice_info_supported.load(Ordering::Relaxed) {
+                (&raw const extensions.voice_info).cast::<c_void>()
+            } else {
+                ptr::null()
+            };
+        }
+        if ext_id == CLAP_EXT_PARAM_INDICATION || ext_id == CLAP_EXT_PARAM_INDICATION_COMPAT {
+            return (&raw const extensions.param_indication).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_CONTEXT_MENU || ext_id == CLAP_EXT_CONTEXT_MENU_COMPAT {
+            return (&raw const extensions.context_menu).cast::<c_void>();
         }
         run_extern_callback_with::<P, *const c_void>(
             "CLAP",
@@ -6055,9 +6065,11 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let param_infos = instance.params().param_catalog();
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
-        let exposed_param_indices = Mutex::new(parameter_indices(&param_infos, |id| {
-            params_arc.parameter_presentation(id)
-        }));
+        let hooks = MainThreadCell::new(instance.main_thread());
+        let exposed = Mutex::new(catalog_sync::ExposedParams::new(
+            Arc::clone(&param_infos),
+            params_arc.as_ref(),
+        ));
         let remote_pages = Mutex::new(presented_remote_control_pages(param_infos.iter(), |id| {
             params_arc.parameter_presentation(id)
         }));
@@ -6099,15 +6111,20 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             latency_cache,
             tail_cache,
             selected_config: AtomicU32::new(0),
-            param_infos,
-            exposed_param_indices,
+            exposed,
             parameter_restart_pending: AtomicBool::new(false),
+            catalog_signal: None,
+            pending_structure: MainThreadCell::new(None),
+            hooks,
+            note_names: MainThreadCell::new(Vec::new()),
+            voice_info_supported: AtomicBool::new(false),
             info,
             plugin_id_hash,
             host,
             host_params: ptr::null(),
             host_latency: ptr::null(),
             host_tail: ptr::null(),
+            host_track_info: ptr::null(),
             latency_dirty: AtomicBool::new(false),
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
             pending_state: Arc::new(StateLoadQueue::new(1)),
@@ -6142,6 +6159,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
                 output_narrow: Vec::with_capacity(max_out),
                 host_out_ptrs: Vec::with_capacity(max_out),
                 bus_routing: BusRouting::new(),
+                catalog: param_infos,
             }),
             gui: PluginCell::new(ClapGui {
                 editor: None,
@@ -6593,9 +6611,10 @@ mod note_address_tests {
 
 #[cfg(test)]
 mod remote_controls_tests {
+    use super::catalog_sync::parameter_indices;
     use super::{
-        ParamFlags, ParamInfo, ParamRange, parameter_indices, remote_control_pages,
-        remote_controls_page_id, split_group,
+        ParamFlags, ParamInfo, ParamRange, remote_control_pages, remote_controls_page_id,
+        split_group,
     };
     use moose_params::{ParamUnit, ParamValueKind, ParameterPresentation};
 
@@ -7588,6 +7607,8 @@ mod large_state_tests {
 #[cfg(test)]
 mod persist_notify_tests;
 
+#[cfg(test)]
+mod host_features_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 

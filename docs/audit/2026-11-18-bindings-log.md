@@ -180,3 +180,43 @@ being static per class**
 - Commands: `build-slot cargo clippy -p moose-clap --all-targets
   --features clap-draft` (clean), `build-slot cargo test -p moose-clap`
   (46 passed).
+
+## Step 5: CLAP on the runtime catalog (branch `bindings/clap-host-features`)
+
+- `crates/moose-clap/src/catalog_sync.rs` owns parameter publishing.
+  `init` binds a `CatalogSignal` whose wake only calls `request_callback`,
+  coalesced on the same flag as presentation refreshes. `on_main_thread`
+  and `deactivate` run `sync_parameters`, which also covers the old
+  presentation-revision and value-rescan paths:
+  - `VALUES`: `RESCAN_VALUES`. `INFO` (or a new presentation revision):
+    `RESCAN_INFO | RESCAN_TEXT`.
+  - `STRUCTURE` while active: one `request_restart`. The removed ids
+    collect in `pending_structure`, and the published list stays as it is.
+  - Inactive (at once, or in `deactivate`): rebuild the catalog with
+    `param_catalog()`, swap it into both owners, `params.clear(id,
+    CLEAR_ALL)` for every removed id, then `RESCAN_ALL`.
+- Catalog ownership: the main-thread list (`ExposedParams`, catalog and
+  visible indices in one value behind the existing mutex) and the audio
+  thread's `Arc<ParamCatalog>` in the audio cell. Both are replaced only
+  while the instance is inactive, when no `process` or audio-thread `flush`
+  can hold the cell. `process` reads its own `Arc` and takes no lock.
+- `MainThreadHooks` from `PluginExport::main_thread()` live in a
+  `MainThreadCell`. A `MainThread` token is minted only inside
+  `[main-thread]` callbacks (init, deactivate, on_main_thread, and the new
+  extension entry points). Re-entrant host calls get the hooks' default
+  instead of panicking (`try_borrow_mut`).
+- Extensions, one module each: `track_info.rs` (read once at init if the
+  host has it, then on `changed`), `note_name.rs` (`count` takes a fresh
+  list, `get` reads it), `voice_info.rs`, `param_indication.rs` and
+  `context_menu.rs`. clap-sys 0.5 has all five stable structs, so no
+  local bindings were needed.
+- voice-info rule: `get_extension` is `[thread-safe]` and can't call the
+  hooks, so `init` asks `voice_info()` once and the extension is offered
+  only if that returned `Some`. A later `None` makes `get` return false.
+- Skipped: a plugin-side way to call `clap_host_note_name.changed` and
+  `clap_host_voice_info.changed`. That needs a main-thread request channel
+  from the plugin, which `PluginContext` doesn't have yet. Follow-up.
+- Tests: `src/host_features_tests.rs` uses a recording host and recording
+  hooks over a `DynamicParams<4>` plugin.
+- Commands: `build-slot cargo clippy -p moose-clap --all-targets -- -D
+  warnings` (clean), `build-slot cargo test -p moose-clap` (57 passed).

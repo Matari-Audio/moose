@@ -604,7 +604,11 @@ fn custom_extension_queries_real_instances_and_rejects_busy() {
     });
 }
 
-unsafe extern "C" fn read_cursor(stream: *const clap_istream, buffer: *mut c_void, size: u64) -> i64 {
+unsafe extern "C" fn read_cursor(
+    stream: *const clap_istream,
+    buffer: *mut c_void,
+    size: u64,
+) -> i64 {
     // SAFETY: `ctx` is the test's live `(Vec<u8>, usize)` cursor.
     unsafe {
         let (bytes, at) = &mut *(*stream).ctx.cast::<(Vec<u8>, usize)>();
@@ -615,11 +619,18 @@ unsafe extern "C" fn read_cursor(stream: *const clap_istream, buffer: *mut c_voi
     }
 }
 
-unsafe extern "C" fn write_vec(stream: *const clap_ostream, buffer: *const c_void, size: u64) -> i64 {
+unsafe extern "C" fn write_vec(
+    stream: *const clap_ostream,
+    buffer: *const c_void,
+    size: u64,
+) -> i64 {
     // SAFETY: `ctx` is the test's live output `Vec<u8>`.
     unsafe {
         let out = &mut *(*stream).ctx.cast::<Vec<u8>>();
-        out.extend_from_slice(std::slice::from_raw_parts(buffer.cast::<u8>(), usize::try_from(size).unwrap()));
+        out.extend_from_slice(std::slice::from_raw_parts(
+            buffer.cast::<u8>(),
+            usize::try_from(size).unwrap(),
+        ));
         i64::try_from(size).unwrap_or(-1)
     }
 }
@@ -657,7 +668,10 @@ fn load_then_save_while_not_processing_returns_loaded_custom_state() {
                     ctx: (&raw mut saved).cast(),
                     write: Some(write_vec),
                 };
-                assert!(state_ext.save.unwrap()(plugin, &raw const output), "{phase}");
+                assert!(
+                    state_ext.save.unwrap()(plugin, &raw const output),
+                    "{phase}"
+                );
                 let restored = state::deserialize_state(&saved, hash).expect("own envelope");
                 assert_eq!(restored.extra.as_deref(), Some(&[7, 8, 9][..]), "{phase}");
                 if phase != "inactive" {
@@ -695,16 +709,30 @@ fn rejected_load_fails_and_keeps_the_previous_state() {
                     state_ext.load.unwrap()(plugin, &raw const input)
                 };
                 assert!(load(-12.0, &[1]), "{phase}");
-                assert!(!load(-30.0, b"bad"), "{phase}: rejected load reports failure");
-                assert_eq!(data.params_arc.get_plain(0), Some(-12.0), "{phase}: params kept");
+                assert!(
+                    !load(-30.0, b"bad"),
+                    "{phase}: rejected load reports failure"
+                );
+                assert_eq!(
+                    data.params_arc.get_plain(0),
+                    Some(-12.0),
+                    "{phase}: params kept"
+                );
                 let mut saved = Vec::new();
                 let output = clap_ostream {
                     ctx: (&raw mut saved).cast(),
                     write: Some(write_vec),
                 };
-                assert!(state_ext.save.unwrap()(plugin, &raw const output), "{phase}");
+                assert!(
+                    state_ext.save.unwrap()(plugin, &raw const output),
+                    "{phase}"
+                );
                 let restored = state::deserialize_state(&saved, hash).expect("own envelope");
-                assert_eq!(restored.extra.as_deref(), Some(&[1][..]), "{phase}: custom kept");
+                assert_eq!(
+                    restored.extra.as_deref(),
+                    Some(&[1][..]),
+                    "{phase}: custom kept"
+                );
                 if phase != "inactive" {
                     callbacks.deactivate.unwrap()(plugin);
                 }
@@ -805,11 +833,16 @@ fn process_panic_latches_until_reactivation() {
                 out_events: ptr::null(),
             };
             let run = || callbacks.process.unwrap()(plugin, &raw const process);
-            let frames = || enter_plugin(&data_from_plugin::<Probe>(plugin).plugin).processed_frames;
+            let frames =
+                || enter_plugin(&data_from_plugin::<Probe>(plugin).plugin).processed_frames;
             assert!(callbacks.activate.unwrap()(plugin, 48_000., 1, 1024));
             assert!(callbacks.start_processing.unwrap()(plugin));
             PANIC_IN_PROCESS.set(true);
-            assert_eq!(run(), CLAP_PROCESS_ERROR, "the panic block reports an error");
+            assert_eq!(
+                run(),
+                CLAP_PROCESS_ERROR,
+                "the panic block reports an error"
+            );
             PANIC_IN_PROCESS.set(false);
             let before = frames();
             out_l.fill(1.0);

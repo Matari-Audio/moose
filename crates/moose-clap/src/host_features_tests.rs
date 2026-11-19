@@ -1,0 +1,573 @@
+//! The runtime catalog and the main-thread extensions through the real CLAP
+//! callbacks, against a recording host and recording `MainThreadHooks`.
+
+use super::*;
+use clap_sys::color::clap_color;
+use clap_sys::ext::context_menu::{
+    CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY, CLAP_CONTEXT_MENU_ITEM_ENTRY,
+    CLAP_CONTEXT_MENU_ITEM_SEPARATOR, CLAP_CONTEXT_MENU_TARGET_KIND_PARAM,
+    clap_context_menu_builder, clap_context_menu_check_entry, clap_context_menu_entry,
+    clap_context_menu_item_kind, clap_context_menu_target,
+};
+use clap_sys::ext::note_name::clap_note_name;
+use clap_sys::ext::param_indication::CLAP_PARAM_INDICATION_AUTOMATION_RECORDING;
+use clap_sys::ext::params::CLAP_PARAM_CLEAR_ALL;
+use clap_sys::ext::track_info::{
+    CLAP_TRACK_INFO_HAS_AUDIO_CHANNEL, CLAP_TRACK_INFO_HAS_TRACK_COLOR,
+    CLAP_TRACK_INFO_HAS_TRACK_NAME, CLAP_TRACK_INFO_IS_FOR_BUS, clap_track_info,
+};
+use clap_sys::ext::voice_info::{CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_voice_info};
+use moose_core::main_thread::{
+    AutomationState, HostColor, HostMapping, MenuItem, MenuTarget, ParamIndication, TrackInfo,
+    TrackKind, VoiceInfo,
+};
+use moose_core::process::ProcessContext;
+use moose_params::{DynamicParams, FloatParam, SlotDef, SlotRange};
+use std::cell::RefCell;
+
+#[derive(moose_derive::Params)]
+#[params(id_scheme = "ordinal")]
+struct Modular {
+    #[param(id = 0, name = "Gain", range = "linear(0, 1)", default = 0.5)]
+    gain: FloatParam,
+    #[nested(base = 1)]
+    slots: DynamicParams<4>,
+}
+
+/// What the hooks saw, per test thread.
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Track(TrackInfo),
+    Indication(u32, ParamIndication),
+    Perform(MenuTarget, u32),
+}
+
+thread_local! {
+    static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+}
+
+fn seen() -> Vec<Seen> {
+    SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+struct Recorder;
+
+impl MainThreadHooks for Recorder {
+    fn track_info_changed(&mut self, _: &MainThread, info: &TrackInfo) {
+        SEEN.with(|s| s.borrow_mut().push(Seen::Track(info.clone())));
+    }
+    fn note_names(&self, _: &MainThread) -> Vec<NoteName> {
+        vec![
+            NoteName {
+                name: "Kick".into(),
+                port: None,
+                key: Some(36),
+                channel: None,
+            },
+            NoteName {
+                name: "Snare".into(),
+                port: Some(0),
+                key: Some(38),
+                channel: Some(9),
+            },
+        ]
+    }
+    fn voice_info(&self, _: &MainThread) -> Option<VoiceInfo> {
+        Some(VoiceInfo {
+            count: 4,
+            capacity: 16,
+            overlapping_notes: true,
+        })
+    }
+    fn param_indication(&mut self, _: &MainThread, id: u32, indication: ParamIndication) {
+        SEEN.with(|s| s.borrow_mut().push(Seen::Indication(id, indication)));
+    }
+    fn menu_items(&self, _: &MainThread, target: MenuTarget) -> Vec<MenuItem> {
+        let mut items = vec![MenuItem::Entry {
+            label: "Reset".into(),
+            action: 1,
+            enabled: true,
+        }];
+        if let MenuTarget::Param(_) = target {
+            items.push(MenuItem::Separator);
+            items.push(MenuItem::Check {
+                label: "Learn".into(),
+                action: 2,
+                enabled: true,
+                checked: false,
+            });
+        }
+        items
+    }
+    fn perform_menu(&mut self, _: &MainThread, target: MenuTarget, action: u32) -> bool {
+        SEEN.with(|s| s.borrow_mut().push(Seen::Perform(target, action)));
+        action <= 2
+    }
+}
+
+struct ModularPlugin {
+    params: Arc<Modular>,
+    meters: Arc<MeterStore>,
+    snapshot: Arc<SnapshotSlot>,
+}
+
+impl PluginExport for ModularPlugin {
+    type Params = Modular;
+    fn create() -> Self {
+        Self {
+            params: Arc::new(Modular::new()),
+            meters: MeterStore::new(),
+            snapshot: SnapshotSlot::new(),
+        }
+    }
+    fn main_thread(&self) -> Box<dyn MainThreadHooks> {
+        Box::new(Recorder)
+    }
+    fn params(&self) -> &Modular {
+        &self.params
+    }
+    fn params_arc(&self) -> Arc<Modular> {
+        Arc::clone(&self.params)
+    }
+    fn meter_store(&self) -> Arc<MeterStore> {
+        Arc::clone(&self.meters)
+    }
+    fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+        Arc::clone(&self.snapshot)
+    }
+}
+
+impl PluginRuntime for ModularPlugin {
+    type Sample = f32;
+    fn info() -> PluginInfo {
+        super::host_value_fixture::TestPlugin::info()
+    }
+    fn reset(&mut self, _: &AudioConfig) {}
+    fn process(
+        &mut self,
+        _: &mut AudioBuffer,
+        _: &EventList,
+        _: &mut ProcessContext,
+    ) -> ProcessStatus {
+        ProcessStatus::Normal
+    }
+}
+
+/// Everything the fake host was asked.
+#[derive(Default)]
+struct HostLog {
+    callbacks: AtomicU32,
+    restarts: AtomicU32,
+    rescans: Mutex<Vec<u32>>,
+    clears: Mutex<Vec<(u32, u32)>>,
+}
+
+impl HostLog {
+    fn rescans(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.rescans.lock().expect("rescans"))
+    }
+    fn clears(&self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.clears.lock().expect("clears"))
+    }
+}
+
+/// # Safety
+/// `host` is the test host whose `host_data` points to a live `HostLog`.
+unsafe fn log<'a>(host: *const clap_host) -> &'a HostLog {
+    // SAFETY: caller contract.
+    unsafe { &*(*host).host_data.cast::<HostLog>() }
+}
+
+unsafe extern "C" fn request_callback(host: *const clap_host) {
+    // SAFETY: called by the plugin with the test host.
+    unsafe { log(host) }
+        .callbacks
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn request_restart(host: *const clap_host) {
+    // SAFETY: called by the plugin with the test host.
+    unsafe { log(host) }
+        .restarts
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn rescan(host: *const clap_host, flags: u32) {
+    // SAFETY: called by the plugin with the test host.
+    let log = unsafe { log(host) };
+    log.rescans.lock().expect("rescans").push(flags);
+}
+
+unsafe extern "C" fn clear(host: *const clap_host, id: clap_id, flags: u32) {
+    // SAFETY: called by the plugin with the test host.
+    let log = unsafe { log(host) };
+    log.clears.lock().expect("clears").push((id, flags));
+}
+
+unsafe extern "C" fn track_get(_: *const clap_host, info: *mut clap_track_info) -> bool {
+    // SAFETY: the plugin passes a writable info.
+    let info = unsafe { &mut *info };
+    info.flags = CLAP_TRACK_INFO_HAS_TRACK_NAME
+        | CLAP_TRACK_INFO_HAS_TRACK_COLOR
+        | CLAP_TRACK_INFO_HAS_AUDIO_CHANNEL
+        | CLAP_TRACK_INFO_IS_FOR_BUS;
+    copy_str_to_buf(&mut info.name, "Drums");
+    info.color = clap_color {
+        alpha: 255,
+        red: 10,
+        green: 20,
+        blue: 30,
+    };
+    info.audio_channel_count = 2;
+    true
+}
+
+unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+    static PARAMS: clap_host_params = clap_host_params {
+        rescan: Some(rescan),
+        clear: Some(clear),
+        request_flush: None,
+    };
+    static TRACK: clap_host_track_info = clap_host_track_info {
+        get: Some(track_get),
+    };
+    // SAFETY: the plugin passes a NUL-terminated id.
+    let id = unsafe { CStr::from_ptr(id) };
+    if id == CLAP_EXT_PARAMS {
+        (&raw const PARAMS).cast()
+    } else if id == CLAP_EXT_TRACK_INFO {
+        (&raw const TRACK).cast()
+    } else {
+        ptr::null()
+    }
+}
+
+type Plugin = ModularPlugin;
+
+/// Run `test` on an initialized instance with the recording host.
+fn with_modular(test: impl FnOnce(*const clap_plugin, &HostLog, &Modular)) {
+    let log = HostLog::default();
+    // SAFETY: host, log and descriptor outlive the serial calls and destroy.
+    unsafe {
+        let mut host: clap_host = std::mem::zeroed();
+        host.clap_version = clap_sys::version::CLAP_VERSION;
+        host.host_data = (&raw const log).cast_mut().cast();
+        host.get_extension = Some(host_extension);
+        host.request_callback = Some(request_callback);
+        host.request_restart = Some(request_restart);
+        let descriptor = DescriptorHolder::new(&Plugin::info());
+        let plugin =
+            create_plugin_instance::<Plugin>(&raw const descriptor.descriptor, &raw const host);
+        assert!(!plugin.is_null());
+        assert!((*plugin).init.unwrap()(plugin));
+        let params = Arc::clone(&data_from_plugin::<Plugin>(plugin).params_arc);
+        test(plugin, &log, &params);
+        (*plugin).destroy.unwrap()(plugin);
+    }
+}
+
+fn linear(max: f64) -> SlotDef {
+    SlotDef::new("Cutoff", SlotRange::Linear { min: 0.0, max }).with_default(max / 2.0)
+}
+
+/// # Safety
+/// `plugin` is a live instance of `Plugin`.
+unsafe fn count(plugin: *const clap_plugin) -> u32 {
+    // SAFETY: caller contract.
+    unsafe { params_count::<Plugin>(plugin) }
+}
+
+/// The host-visible info for `id`, if it is exposed.
+///
+/// # Safety
+/// `plugin` is a live instance of `Plugin`.
+unsafe fn info_for(plugin: *const clap_plugin, id: u32) -> Option<clap_param_info> {
+    // SAFETY: caller contract; `info` is writable.
+    unsafe {
+        (0..count(plugin)).find_map(|i| {
+            let mut info: clap_param_info = std::mem::zeroed();
+            (params_get_info::<Plugin>(plugin, i, &raw mut info) && info.id == id).then_some(info)
+        })
+    }
+}
+
+#[test]
+fn catalog_wakes_coalesce_and_publish_structure_at_once_while_inactive() {
+    with_modular(|plugin, log, params| unsafe {
+        assert_eq!(count(plugin), 1, "free slots are not listed");
+        let slot = params.slots.slot(0).expect("slot 0");
+        let id = params.slots.id(slot);
+        params.slots.edit(|tx| tx.bind(slot, linear(1.0)));
+        params.slots.edit(|tx| tx.rename(slot, "Freq"));
+        assert_eq!(log.callbacks.load(Ordering::Relaxed), 1, "one callback");
+
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.restarts.load(Ordering::Relaxed), 0);
+        let rescans = log.rescans();
+        assert_eq!(rescans.len(), 1);
+        assert_ne!(rescans[0] & CLAP_PARAM_RESCAN_ALL, 0, "{rescans:?}");
+        assert_ne!(rescans[0] & CLAP_PARAM_RESCAN_INFO, 0, "{rescans:?}");
+        assert_eq!(log.clears(), [], "nothing was bound before");
+        assert_eq!(count(plugin), 2);
+        assert_eq!(info_for(plugin, id).expect("bound slot").max_value, 1.0);
+
+        // The wake flag is cleared, so the next change wakes again.
+        params.slots.edit(|tx| tx.rename(slot, "Pitch"));
+        assert_eq!(log.callbacks.load(Ordering::Relaxed), 2);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        let rescans = log.rescans();
+        assert_eq!(
+            rescans,
+            [CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT],
+            "a rename is info only"
+        );
+    });
+}
+
+#[test]
+fn structure_while_active_restarts_then_publishes_at_deactivate() {
+    with_modular(|plugin, log, params| unsafe {
+        let slot = params.slots.slot(1).expect("slot 1");
+        let id = params.slots.id(slot);
+        params.slots.edit(|tx| tx.bind(slot, linear(1.0)));
+        (*plugin).on_main_thread.unwrap()(plugin);
+        let _ = log.rescans();
+
+        assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 256));
+        params.slots.edit(|tx| tx.bind(slot, linear(100.0)));
+        (*plugin).on_main_thread.unwrap()(plugin);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.restarts.load(Ordering::Relaxed), 1, "one restart");
+        assert!(
+            log.rescans()
+                .iter()
+                .all(|flags| flags & CLAP_PARAM_RESCAN_ALL == 0),
+            "no RESCAN_ALL while active"
+        );
+        assert_eq!(log.clears(), []);
+        let data = data_from_plugin::<Plugin>(plugin);
+        assert_eq!(info_for(plugin, id).expect("listed").max_value, 1.0);
+
+        (*plugin).deactivate.unwrap()(plugin);
+        assert_eq!(log.clears(), [(id, CLAP_PARAM_CLEAR_ALL)]);
+        let rescans = log.rescans();
+        assert_ne!(
+            rescans.last().copied().unwrap_or(0) & CLAP_PARAM_RESCAN_ALL,
+            0,
+            "{rescans:?}"
+        );
+        assert_eq!(info_for(plugin, id).expect("listed").max_value, 100.0);
+        let audio_max = data
+            .audio
+            .enter()
+            .catalog
+            .by_id(id)
+            .expect("in catalog")
+            .range
+            .max();
+        assert_eq!(audio_max, 100.0, "the audio catalog was swapped too");
+
+        // Freeing the slot while inactive publishes at once.
+        params.slots.edit(|tx| tx.unbind(slot));
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.clears(), [(id, CLAP_PARAM_CLEAR_ALL)]);
+        assert!(info_for(plugin, id).is_none());
+        assert_eq!(log.restarts.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn track_info_reaches_the_hooks_at_init_and_on_change() {
+    with_modular(|plugin, _, _| unsafe {
+        let mut want = TrackInfo::new();
+        want.name = Some("Drums".into());
+        want.color = Some(HostColor {
+            r: 10,
+            g: 20,
+            b: 30,
+            a: 255,
+        });
+        want.audio_channels = Some(2);
+        want.kind = TrackKind::Bus;
+        assert_eq!(seen(), [Seen::Track(want.clone())], "read at init");
+        let ext = &*(*plugin).get_extension.unwrap()(plugin, CLAP_EXT_TRACK_INFO.as_ptr())
+            .cast::<clap_plugin_track_info>();
+        ext.changed.unwrap()(plugin);
+        assert_eq!(seen(), [Seen::Track(want)]);
+    });
+}
+
+#[test]
+fn note_names_and_voice_info_come_from_the_hooks() {
+    with_modular(|plugin, _, _| unsafe {
+        let get = (*plugin).get_extension.unwrap();
+        let names = &*get(plugin, CLAP_EXT_NOTE_NAME.as_ptr()).cast::<clap_plugin_note_name>();
+        assert_eq!(names.count.unwrap()(plugin), 2);
+        let mut name: clap_note_name = std::mem::zeroed();
+        assert!(names.get.unwrap()(plugin, 1, &raw mut name));
+        assert_eq!(
+            CStr::from_ptr(name.name.as_ptr()).to_str().expect("utf8"),
+            "Snare"
+        );
+        assert_eq!((name.port, name.key, name.channel), (0, 38, 9));
+        assert!(names.get.unwrap()(plugin, 0, &raw mut name));
+        assert_eq!((name.port, name.key, name.channel), (-1, 36, -1));
+        assert!(!names.get.unwrap()(plugin, 2, &raw mut name));
+
+        let voices = get(plugin, CLAP_EXT_VOICE_INFO.as_ptr()).cast::<clap_plugin_voice_info>();
+        assert!(!voices.is_null(), "offered: the hooks report voice info");
+        let mut info: clap_voice_info = std::mem::zeroed();
+        assert!((*voices).get.unwrap()(plugin, &raw mut info));
+        assert_eq!((info.voice_count, info.voice_capacity), (4, 16));
+        assert_eq!(info.flags, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES);
+    });
+}
+
+#[test]
+fn voice_info_is_hidden_without_hooks() {
+    // SAFETY: the host and descriptor outlive the serial calls.
+    unsafe {
+        let mut host: clap_host = std::mem::zeroed();
+        host.clap_version = clap_sys::version::CLAP_VERSION;
+        let descriptor = DescriptorHolder::new(&super::host_value_fixture::TestPlugin::info());
+        let plugin = create_plugin_instance::<super::host_value_fixture::TestPlugin>(
+            &raw const descriptor.descriptor,
+            &raw const host,
+        );
+        assert!((*plugin).init.unwrap()(plugin));
+        assert!((*plugin).get_extension.unwrap()(plugin, CLAP_EXT_VOICE_INFO.as_ptr()).is_null());
+        (*plugin).destroy.unwrap()(plugin);
+    }
+}
+
+#[test]
+fn param_indication_reaches_the_hooks() {
+    with_modular(|plugin, _, _| unsafe {
+        let _ = seen();
+        let ext = &*(*plugin).get_extension.unwrap()(plugin, CLAP_EXT_PARAM_INDICATION.as_ptr())
+            .cast::<clap_plugin_param_indication>();
+        let color = clap_color {
+            alpha: 1,
+            red: 2,
+            green: 3,
+            blue: 4,
+        };
+        ext.set_mapping.unwrap()(
+            plugin,
+            0,
+            true,
+            &raw const color,
+            c"Knob 1".as_ptr(),
+            ptr::null(),
+        );
+        ext.set_mapping.unwrap()(plugin, 0, false, ptr::null(), ptr::null(), ptr::null());
+        ext.set_automation.unwrap()(
+            plugin,
+            0,
+            CLAP_PARAM_INDICATION_AUTOMATION_RECORDING,
+            ptr::null(),
+        );
+        assert_eq!(
+            seen(),
+            [
+                Seen::Indication(
+                    0,
+                    ParamIndication::Mapping(Some(HostMapping {
+                        color: Some(HostColor {
+                            r: 2,
+                            g: 3,
+                            b: 4,
+                            a: 1
+                        }),
+                        label: "Knob 1".into(),
+                        description: String::new(),
+                    }))
+                ),
+                Seen::Indication(0, ParamIndication::Mapping(None)),
+                Seen::Indication(
+                    0,
+                    ParamIndication::Automation {
+                        state: AutomationState::Recording,
+                        color: None
+                    }
+                ),
+            ]
+        );
+    });
+}
+
+/// Items a fake menu builder received: (kind, label, action).
+type Built = Vec<(clap_context_menu_item_kind, String, u32)>;
+
+unsafe extern "C" fn add_item(
+    builder: *const clap_context_menu_builder,
+    kind: clap_context_menu_item_kind,
+    data: *const c_void,
+) -> bool {
+    // SAFETY: `ctx` is the test's `Built`; `data` matches `kind`.
+    unsafe {
+        let built = &mut *(*builder).ctx.cast::<Built>();
+        let item = match kind {
+            CLAP_CONTEXT_MENU_ITEM_ENTRY => {
+                let e = &*data.cast::<clap_context_menu_entry>();
+                (CStr::from_ptr(e.label), e.action_id)
+            }
+            CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY => {
+                let e = &*data.cast::<clap_context_menu_check_entry>();
+                (CStr::from_ptr(e.label), e.action_id)
+            }
+            _ => (c"", 0),
+        };
+        built.push((kind, item.0.to_string_lossy().into_owned(), item.1));
+    }
+    true
+}
+
+#[test]
+fn context_menu_populates_and_performs_through_the_hooks() {
+    with_modular(|plugin, _, _| unsafe {
+        let _ = seen();
+        let ext = &*(*plugin).get_extension.unwrap()(plugin, CLAP_EXT_CONTEXT_MENU.as_ptr())
+            .cast::<clap_plugin_context_menu>();
+        let mut built = Built::new();
+        let builder = clap_context_menu_builder {
+            ctx: (&raw mut built).cast(),
+            add_item: Some(add_item),
+            supports: None,
+        };
+        let target = clap_context_menu_target {
+            kind: CLAP_CONTEXT_MENU_TARGET_KIND_PARAM,
+            id: 0,
+        };
+        assert!(ext.populate.unwrap()(
+            plugin,
+            &raw const target,
+            &raw const builder
+        ));
+        assert_eq!(
+            built,
+            [
+                (CLAP_CONTEXT_MENU_ITEM_ENTRY, "Reset".to_owned(), 1),
+                (CLAP_CONTEXT_MENU_ITEM_SEPARATOR, String::new(), 0),
+                (CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY, "Learn".to_owned(), 2),
+            ]
+        );
+        built.clear();
+        assert!(ext.populate.unwrap()(
+            plugin,
+            ptr::null(),
+            &raw const builder
+        ));
+        assert_eq!(built.len(), 1, "a null target is the global menu");
+
+        assert!(ext.perform.unwrap()(plugin, &raw const target, 2));
+        assert!(!ext.perform.unwrap()(plugin, ptr::null(), 9));
+        assert_eq!(
+            seen(),
+            [
+                Seen::Perform(MenuTarget::Param(0), 2),
+                Seen::Perform(MenuTarget::Global, 9),
+            ]
+        );
+    });
+}
