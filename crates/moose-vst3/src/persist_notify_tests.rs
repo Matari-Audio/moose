@@ -57,6 +57,11 @@ struct Handler {
     thread: std::thread::ThreadId,
     events: Vec<(u8, u32, f64)>,
 }
+/// The handler implements no extra interface (no `IComponentHandler2/3`).
+unsafe extern "C" fn handler_qi(_: *mut c_void, _: *const u8, out: *mut *mut c_void) -> i32 {
+    unsafe { out.write(std::ptr::null_mut()) };
+    vst3::Steinberg::kNoInterface
+}
 unsafe extern "C" fn handler_add(_: *mut c_void) -> u32 {
     1
 }
@@ -167,8 +172,8 @@ fn factory_host_runloop_delivers_closed_editor_completion_without_polling_or_uaf
         let params = CREATED.with(|created| created.borrow().upgrade().unwrap());
         assert!(!host.event.get().is_null());
         let handler_vtbl = [
-            std::ptr::null(),
-            handler_add as *const c_void,
+            handler_qi as *const c_void,
+            handler_add as _,
             handler_add as _,
             begin as _,
             perform as _,

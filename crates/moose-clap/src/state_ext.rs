@@ -11,11 +11,11 @@ use clap_sys::ext::state_context::clap_plugin_state_context_type;
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
 };
-use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use clap_sys::stream::{clap_istream, clap_ostream};
 use moose_core::events::{EventBody, EventList};
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostSignal;
 use moose_core::presets::parse_preset_file;
 use moose_core::state;
 use moose_core::state::PluginFormat;
@@ -23,7 +23,7 @@ use moose_core::wrapper::{apply_or_queue_state, custom_state_for_save, run_exter
 use moose_params::Params;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
 // Extension: state
@@ -178,18 +178,6 @@ pub(crate) fn load_custom_state<P: PluginExport>(
 
 /// Metadata work belongs on the host main thread, including when an active
 /// plugin receives `params.flush` on its audio thread (CLAP 1.2.7 params.h).
-pub(crate) unsafe fn request_presentation_refresh(pending: &AtomicBool, host: *const clap_host) {
-    // SAFETY: the wrapper retains the host for this instance's full lifetime.
-    unsafe {
-        if !pending.swap(true, Ordering::AcqRel)
-            && !host.is_null()
-            && let Some(request) = (*host).request_callback
-        {
-            request(host);
-        }
-    }
-}
-
 pub(crate) unsafe fn request_changed_presentation<P: PluginExport>(
     data: &ClapPluginData<P>,
     events: &EventList,
@@ -198,8 +186,7 @@ pub(crate) unsafe fn request_changed_presentation<P: PluginExport>(
         matches!(event.body, EventBody::ParamChange { id, .. }
             if data.params_arc.parameter_affects_presentation(id))
     }) {
-        // SAFETY: data owns the pending flag and retains its CLAP host.
-        unsafe { request_presentation_refresh(&data.presentation_pending, data.host) };
+        data.host_queue.signal(HostSignal::PRESENTATION);
     }
 }
 
@@ -208,14 +195,7 @@ pub(crate) unsafe fn request_changed_presentation<P: PluginExport>(
 /// `on_main_thread` like editor-originated changes, so a host that loads
 /// state from another thread still gets the rescan on the main thread.
 pub(crate) unsafe fn request_value_rescan<P: PluginExport>(data: &ClapPluginData<P>) {
-    unsafe {
-        if !data.needs_rescan.swap(true, Ordering::Relaxed)
-            && !data.host.is_null()
-            && let Some(request_callback) = (*data.host).request_callback
-        {
-            request_callback(data.host);
-        }
-    }
+    data.host_queue.signal(HostSignal::PARAM_RESCAN);
 }
 
 /// `state-context`: every context saves and loads the full state. Moose

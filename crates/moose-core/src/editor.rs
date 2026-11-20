@@ -5,7 +5,7 @@ use moose_params::Params;
 use moose_params::sample::Float;
 
 use crate::events::TransportInfo;
-use crate::main_thread::{HostNotice, HostNotifier};
+use crate::main_thread::{HostNotice, MenuTarget};
 use crate::tasks::{AnyTaskSpawner, TaskSpawner};
 
 /// A lock-free editor factory bound to a plugin's param store.
@@ -659,59 +659,134 @@ pub enum EditorNotificationDelivery {
     QueuedAll,
 }
 
-/// Context passed to [`Editor::open`]. Carries:
+/// Everything an editor asks of its host, implemented once per format
+/// wrapper and handed to the editor inside its [`PluginContext`].
 ///
-/// - An `Arc<dyn EditorBridge>` - the host-plugin protocol surface
-///   (begin/set/end edit, `request_resize`, `get_state`, transport, …).
-/// - An `Arc<P>` typed parameter store - plugin authors `Deref` to
-///   `&P` and read fields directly: `state.gain.read()`.
+/// The [`EditorBridge`] supertrait carries the parameter gestures, reads,
+/// custom state and resize request. The methods here are the host
+/// notifications a format may or may not have; each defaults to "this
+/// format has no such call". Every method may be called from any thread the
+/// editor runs on: a wrapper whose host API is main-thread-only queues the
+/// call on its [`HostQueue`](crate::host_queue::HostQueue) and makes it in
+/// its main-thread callback.
+pub trait HostContext: EditorBridge {
+    /// Which of the bridge's notifications are already safe off the host's
+    /// UI thread. Metadata only.
+    fn delivery(&self) -> EditorNotificationDelivery {
+        EditorNotificationDelivery::HostThread
+    }
+
+    /// The project changed outside the parameters (CLAP
+    /// `state.mark_dirty`, VST3 `IComponentHandler2::setDirty`).
+    fn mark_dirty(&self) {}
+
+    /// Open or close a group of edits the host treats as one undo step
+    /// (VST3 `IComponentHandler2::startGroupEdit` / `finishGroupEdit`).
+    fn group_edits(&self, _edge: EditGroup) {}
+
+    /// Ask the host to deactivate and reactivate the plugin, for a change
+    /// the processor can only pick up in `activate` (CLAP
+    /// `host.request_restart`, VST3 `restartComponent`).
+    fn request_restart(&self) {}
+
+    /// Show the host's context menu for `target` at `(x, y)`, logical
+    /// points from the editor's top-left corner (CLAP `context-menu.popup`,
+    /// VST3 `IComponentHandler3::createContextMenu`). The plugin's own items
+    /// come from [`MainThreadHooks::menu_items`](crate::main_thread::MainThreadHooks::menu_items).
+    /// `true` when the request was made or queued; `false` when the format
+    /// or host has no host menu, and the editor should show its own.
+    fn context_menu(&self, _target: MenuTarget, _x: i32, _y: i32) -> bool {
+        false
+    }
+
+    /// The plugin's note names, voice info or ports changed.
+    fn notify(&self, _notice: HostNotice) {}
+
+    /// The editor's window moved to another OS scale. See
+    /// [`PluginContext::window_rescaled`].
+    fn window_rescaled(&self, _scale: f64) {}
+
+    /// A key the editor's own top-level window didn't use; `true` when the
+    /// host took it. See [`PluginContext::unhandled_key`].
+    fn unhandled_key(&self, _key: &keyboard_types::KeyboardEvent) -> bool {
+        false
+    }
+}
+
+/// A [`ClosureBridge`] is a host with no optional notifications.
+impl HostContext for ClosureBridge {}
+
+/// A bare [`EditorBridge`] seen as a [`HostContext`] with no optional
+/// notifications.
+struct BridgeHost(Arc<dyn EditorBridge>);
+
+impl EditorBridge for BridgeHost {
+    fn begin_edit(&self, id: u32) {
+        self.0.begin_edit(id);
+    }
+    fn set_param(&self, id: u32, normalized: f64) {
+        self.0.set_param(id, normalized);
+    }
+    fn end_edit(&self, id: u32) {
+        self.0.end_edit(id);
+    }
+    fn request_resize(&self, w: u32, h: u32) -> bool {
+        self.0.request_resize(w, h)
+    }
+    fn get_param(&self, id: u32) -> f64 {
+        self.0.get_param(id)
+    }
+    fn get_param_plain(&self, id: u32) -> f64 {
+        self.0.get_param_plain(id)
+    }
+    fn format_param(&self, id: u32) -> String {
+        self.0.format_param(id)
+    }
+    fn format_param_into(&self, id: u32, out: &mut String) {
+        self.0.format_param_into(id, out);
+    }
+    fn get_meter(&self, id: u32) -> f32 {
+        self.0.get_meter(id)
+    }
+    fn get_state(&self) -> Vec<u8> {
+        self.0.get_state()
+    }
+    fn set_state(&self, data: Vec<u8>) {
+        self.0.set_state(data);
+    }
+    fn transport(&self) -> Option<TransportInfo> {
+        self.0.transport()
+    }
+}
+
+impl HostContext for BridgeHost {}
+
+/// Context passed to [`Editor::open`]: the wrapper's [`HostContext`], the
+/// background-task lanes and the typed parameter store.
 ///
-/// The default `P = dyn Params` keeps the trait-object boundary
-/// (`Editor::open(ctx: PluginContext)`) one-typed; editor crates
-/// that want typed access (moose-egui, moose-slint, moose-iced) carry
-/// their own `<P>` and reconstitute `PluginContext<P>` internally
-/// via [`PluginContext::with_params`] using the `Arc<P>` they stored
-/// at editor construction.
+/// Plugin authors `Deref` to `&P` and read fields directly:
+/// `state.gain.read()`. The default `P = dyn Params` keeps the
+/// trait-object boundary (`Editor::open(ctx: PluginContext)`) one-typed;
+/// editor crates that want typed access (moose-egui, moose-slint,
+/// moose-iced) carry their own `<P>` and reconstitute `PluginContext<P>`
+/// internally via [`PluginContext::with_params`] using the `Arc<P>` they
+/// stored at editor construction.
 ///
-/// `Clone` is two refcount bumps (bridge + params). Editors that need
-/// to hand the context to UI worker threads or animation timers clone
-/// freely.
+/// `Clone` is a few refcount bumps. Editors that need to hand the context
+/// to UI worker threads or animation timers clone freely.
 pub struct PluginContext<P: ?Sized = dyn Params> {
+    host: Arc<dyn HostContext>,
+    /// The bridge gestures, reads and state go through: the host itself
+    /// unless an editor-side adapter replaced it ([`Self::with_bridge`]).
     bridge: Arc<dyn EditorBridge>,
-    notification_delivery: EditorNotificationDelivery,
+    delivery: EditorNotificationDelivery,
     /// Background-task spawner bundle (one lane per declared task type),
     /// stamped by the format wrapper from `PluginExport::task_spawner`
     /// when the plugin wired `tasks:`. Lets the editor schedule work via
     /// [`Self::tasks`]. `None` for a plugin with no background tasks.
     tasks: Option<AnyTaskSpawner>,
-    /// Tells the host the project changed outside the parameter system
-    /// (see [`Self::mark_dirty`]). `None` where the format has no such API.
-    mark_dirty: Option<MarkDirty>,
-    /// Brackets several edits into one host undo step (see
-    /// [`Self::begin_group`]). `None` where the format has no such API.
-    group_edits: Option<GroupEdits>,
-    /// Tells the host note names or voice info changed (see
-    /// [`Self::notify_host`]). `None` until a wrapper installs one.
-    host_notifier: Option<HostNotifier>,
-    /// Tells the wrapper the window's OS scale changed (see
-    /// [`Self::window_rescaled`]). `None` where nothing listens.
-    window_rescaled: Option<WindowRescaled>,
-    /// Takes keys the editor's own window didn't use (see
-    /// [`Self::unhandled_key`]). `None` where nothing listens.
-    unhandled_key: Option<UnhandledKey>,
     params: Arc<P>,
 }
-
-/// The wrapper's "project modified" notifier: callable from any thread, it
-/// delivers the format's call on the host's main/UI thread.
-pub type MarkDirty = Arc<dyn Fn() + Send + Sync>;
-
-/// The wrapper's OS-scale listener: callable from any thread.
-pub type WindowRescaled = Arc<dyn Fn(f64) + Send + Sync>;
-
-/// The host's listener for keys an editor window didn't use: returns true
-/// when it took the key. Callable from any thread.
-pub type UnhandledKey = Arc<dyn Fn(&keyboard_types::KeyboardEvent) -> bool + Send + Sync>;
 
 /// One edge of a group of parameter edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -720,51 +795,39 @@ pub enum EditGroup {
     End,
 }
 
-/// The wrapper's group-edit notifier: callable from any thread, it delivers
-/// the format's call on the host's main/UI thread in order with the edits.
-pub type GroupEdits = Arc<dyn Fn(EditGroup) + Send + Sync>;
-
 impl<P: ?Sized> Clone for PluginContext<P> {
     fn clone(&self) -> Self {
         Self {
+            host: Arc::clone(&self.host),
             bridge: Arc::clone(&self.bridge),
-            notification_delivery: self.notification_delivery,
+            delivery: self.delivery,
             tasks: self.tasks.clone(),
-            mark_dirty: self.mark_dirty.clone(),
-            group_edits: self.group_edits.clone(),
-            host_notifier: self.host_notifier.clone(),
-            window_rescaled: self.window_rescaled.clone(),
-            unhandled_key: self.unhandled_key.clone(),
             params: Arc::clone(&self.params),
         }
     }
 }
 
 impl<P: ?Sized> PluginContext<P> {
-    /// Build a typed context from any [`EditorBridge`] implementor and
-    /// the plugin's typed param store. Add background-task scheduling
-    /// with [`Self::with_tasks`].
-    pub fn new(bridge: Arc<dyn EditorBridge>, params: Arc<P>) -> Self {
+    /// Build a context from the wrapper's [`HostContext`] and the plugin's
+    /// typed param store. Add background-task scheduling with
+    /// [`Self::with_tasks`].
+    pub fn from_host(host: Arc<dyn HostContext>, params: Arc<P>) -> Self {
+        let delivery = host.delivery();
         Self {
-            bridge,
-            notification_delivery: EditorNotificationDelivery::HostThread,
+            bridge: Arc::clone(&host) as Arc<dyn EditorBridge>,
+            host,
+            delivery,
             tasks: None,
-            mark_dirty: None,
-            group_edits: None,
-            host_notifier: None,
-            window_rescaled: None,
-            unhandled_key: None,
             params,
         }
     }
 
-    /// Install the format's "project modified" notifier (CLAP
-    /// `state.mark_dirty`, VST3 `IComponentHandler2::setDirty`). Format
-    /// wrappers call this; the closure must be safe to call from any thread.
-    #[must_use]
-    pub fn with_mark_dirty(mut self, mark_dirty: MarkDirty) -> Self {
-        self.mark_dirty = Some(mark_dirty);
-        self
+    /// Build a context from a bare [`EditorBridge`]: a host with none of
+    /// the optional notifications. Tests and editor harnesses use this;
+    /// format wrappers implement [`HostContext`] and call
+    /// [`Self::from_host`].
+    pub fn new(bridge: Arc<dyn EditorBridge>, params: Arc<P>) -> Self {
+        Self::from_host(Arc::new(BridgeHost(bridge)), params)
     }
 
     /// Tell the host the project changed in a way it cannot see through
@@ -772,18 +835,7 @@ impl<P: ?Sized> PluginContext<P> {
     /// Parameter edits need no call: the host tracks those itself. A no-op
     /// on formats without the API (AU, standalone). Any thread.
     pub fn mark_dirty(&self) {
-        if let Some(f) = &self.mark_dirty {
-            f();
-        }
-    }
-
-    /// Install the wrapper's OS-scale listener, so a host that sizes the
-    /// view in physical pixels and sends no scale of its own can be told the
-    /// new size. The closure must be safe to call from any thread.
-    #[must_use]
-    pub fn with_window_rescaled(mut self, rescaled: WindowRescaled) -> Self {
-        self.window_rescaled = Some(rescaled);
-        self
+        self.host.mark_dirty();
     }
 
     /// The open window moved to another OS scale (Windows monitor DPI, X11
@@ -791,19 +843,7 @@ impl<P: ?Sized> PluginContext<P> {
     /// for that size with [`Self::request_resize`], which then converts at
     /// the new scale. Not for host-set scales. Any thread.
     pub fn window_rescaled(&self, scale: f64) {
-        if let Some(f) = &self.window_rescaled {
-            f(scale);
-        }
-    }
-
-    /// Install the host's listener for keys the editor's own top-level
-    /// window didn't use. The standalone uses it for its shortcuts and
-    /// computer-keyboard MIDI where the editor has its own window (native
-    /// Wayland). The closure must be safe to call from any thread.
-    #[must_use]
-    pub fn with_unhandled_key(mut self, unhandled: UnhandledKey) -> Self {
-        self.unhandled_key = Some(unhandled);
-        self
+        self.host.window_rescaled(scale);
     }
 
     /// Offer the host a key the editor's top-level window didn't use;
@@ -811,16 +851,7 @@ impl<P: ?Sized> PluginContext<P> {
     /// host's window gets unused keys by itself. Any thread.
     #[must_use]
     pub fn unhandled_key(&self, key: &keyboard_types::KeyboardEvent) -> bool {
-        self.unhandled_key.as_ref().is_some_and(|f| f(key))
-    }
-
-    /// Install the format's group-edit notifier (VST3
-    /// `IComponentHandler2::startGroupEdit` / `finishGroupEdit`). Format
-    /// wrappers call this; the closure must be safe to call from any thread.
-    #[must_use]
-    pub fn with_group_edits(mut self, group_edits: GroupEdits) -> Self {
-        self.group_edits = Some(group_edits);
-        self
+        self.host.unhandled_key(key)
     }
 
     /// Start a group of edits the host treats as one (one undo step), such
@@ -829,49 +860,57 @@ impl<P: ?Sized> PluginContext<P> {
     /// `begin_edit` / `end_edit`. A no-op on formats without the API. Any
     /// thread.
     pub fn begin_group(&self) {
-        if let Some(f) = &self.group_edits {
-            f(EditGroup::Begin);
-        }
+        self.host.group_edits(EditGroup::Begin);
     }
 
     /// Close the group started by [`Self::begin_group`].
     pub fn end_group(&self) {
-        if let Some(f) = &self.group_edits {
-            f(EditGroup::End);
-        }
+        self.host.group_edits(EditGroup::End);
     }
 
-    /// Install the wrapper's [`HostNotifier`]. Format wrappers call this.
+    /// Ask the host to deactivate and reactivate the plugin, for a change
+    /// the processor only picks up in `activate` (an oversampling switch
+    /// that changes latency). A no-op where the format has no such call.
+    /// Any thread.
+    pub fn request_restart(&self) {
+        self.host.request_restart();
+    }
+
+    /// Show the host's context menu for `target` (a parameter's automation
+    /// and MIDI-learn entries, plus the plugin's own
+    /// [`MainThreadHooks::menu_items`](crate::main_thread::MainThreadHooks::menu_items))
+    /// at `(x, y)`, logical points from the editor's top-left corner.
+    /// `false` when the host has no such menu; show the editor's own then.
+    /// Any thread.
     #[must_use]
-    pub fn with_host_notifier(mut self, notifier: HostNotifier) -> Self {
-        self.host_notifier = Some(notifier);
-        self
+    pub fn context_menu(&self, target: MenuTarget, x: i32, y: i32) -> bool {
+        self.host.context_menu(target, x, y)
     }
 
     /// Tell the host `notice` changed (CLAP `note_name.changed`,
     /// `voice_info.changed`). A no-op on formats without the API. Any
     /// thread except the audio thread.
     pub fn notify_host(&self, notice: HostNotice) {
-        if let Some(notifier) = &self.host_notifier {
-            notifier.notify(notice);
-        }
+        self.host.notify(notice);
     }
 
-    /// Declare which notifications the format already queues safely. This is
-    /// metadata only: it does not change when or how any bridge method runs.
+    /// Which notifications the format already queues safely.
+    #[must_use]
+    pub fn notification_delivery(&self) -> EditorNotificationDelivery {
+        self.delivery
+    }
+
+    /// Override the notification delivery reported by
+    /// [`Self::notification_delivery`] (for test harnesses built with
+    /// [`Self::new`] or [`Self::from_closures`]).
     #[must_use]
     pub fn with_notification_delivery(mut self, delivery: EditorNotificationDelivery) -> Self {
-        self.notification_delivery = delivery;
+        self.delivery = delivery;
         self
     }
 
-    #[must_use]
-    pub const fn notification_delivery(&self) -> EditorNotificationDelivery {
-        self.notification_delivery
-    }
-
     /// Install an editor-side bridge adapter without losing task lanes, the
-    /// typed parameter store, or the format's delivery capabilities.
+    /// typed parameter store, or the host's notifications.
     #[must_use]
     pub fn with_bridge(mut self, bridge: Arc<dyn EditorBridge>) -> Self {
         self.bridge = bridge;
@@ -903,6 +942,12 @@ impl<P: ?Sized> PluginContext<P> {
         &self.bridge
     }
 
+    /// The wrapper's host handle, for editors that pass it to a worker.
+    #[must_use]
+    pub fn host(&self) -> &Arc<dyn HostContext> {
+        &self.host
+    }
+
     /// Access the typed param store as an `Arc`. Use this when you
     /// need to capture the params in a `'static` closure (e.g. an iced
     /// `Subscription` or a worker thread).
@@ -912,19 +957,15 @@ impl<P: ?Sized> PluginContext<P> {
     }
 
     /// Replace the param-store generic parameter while reusing the
-    /// same bridge. Used by editor crates that receive the dyn-erased
-    /// `PluginContext` from [`Editor::open`] and want the typed
+    /// same host and bridge. Used by editor crates that receive the
+    /// dyn-erased `PluginContext` from [`Editor::open`] and want the typed
     /// `PluginContext<P>` for their UI closure.
     pub fn with_params<Q: ?Sized>(&self, params: Arc<Q>) -> PluginContext<Q> {
         PluginContext {
+            host: Arc::clone(&self.host),
             bridge: Arc::clone(&self.bridge),
-            notification_delivery: self.notification_delivery,
+            delivery: self.delivery,
             tasks: self.tasks.clone(),
-            mark_dirty: self.mark_dirty.clone(),
-            group_edits: self.group_edits.clone(),
-            host_notifier: self.host_notifier.clone(),
-            window_rescaled: self.window_rescaled.clone(),
-            unhandled_key: self.unhandled_key.clone(),
             params,
         }
     }
@@ -996,20 +1037,10 @@ impl<P: ?Sized> PluginContext<P> {
 }
 
 impl PluginContext<dyn Params> {
-    /// Build a dyn-erased context from a [`ClosureBridge`]. Convenience
-    /// for format wrappers that compose state inline via closures.
+    /// Build a dyn-erased context from a [`ClosureBridge`]: a host with no
+    /// optional notifications. Tests and editor harnesses use this.
     pub fn from_closures(bridge: ClosureBridge, params: Arc<dyn Params>) -> Self {
-        Self {
-            bridge: Arc::new(bridge),
-            notification_delivery: EditorNotificationDelivery::HostThread,
-            tasks: None,
-            mark_dirty: None,
-            group_edits: None,
-            host_notifier: None,
-            window_rescaled: None,
-            unhandled_key: None,
-            params,
-        }
+        Self::from_host(Arc::new(bridge), params)
     }
 }
 
@@ -1019,14 +1050,10 @@ impl<P: Params + 'static> PluginContext<P> {
     #[must_use]
     pub fn dyn_erase(self) -> PluginContext<dyn Params> {
         PluginContext {
+            host: self.host,
             bridge: self.bridge,
-            notification_delivery: self.notification_delivery,
+            delivery: self.delivery,
             tasks: self.tasks,
-            mark_dirty: self.mark_dirty,
-            group_edits: self.group_edits,
-            host_notifier: self.host_notifier,
-            window_rescaled: self.window_rescaled,
-            unhandled_key: self.unhandled_key,
             params: self.params as Arc<dyn Params>,
         }
     }
@@ -1447,15 +1474,13 @@ mod fit_tests {
 }
 
 #[cfg(test)]
-mod notification_delivery_tests {
+mod host_context_tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn adapting_context_preserves_delivery_params_and_tasks_without_dispatching() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let set_calls = Arc::clone(&calls);
-        let bridge: Arc<dyn EditorBridge> = Arc::new(ClosureBridge {
+    fn bridge(set_calls: Arc<AtomicUsize>) -> ClosureBridge {
+        ClosureBridge {
             begin_edit: Box::new(|_| {}),
             set_param: Box::new(move |_, _| {
                 set_calls.fetch_add(1, Ordering::Relaxed);
@@ -1469,55 +1494,162 @@ mod notification_delivery_tests {
             get_state: Box::new(Vec::new),
             set_state: Box::new(|_| {}),
             transport: Box::new(|| None),
-        });
+        }
+    }
+
+    /// A host that records every optional notification.
+    struct Recorder {
+        bridge: ClosureBridge,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                bridge: bridge(Arc::new(AtomicUsize::new(0))),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        fn push(&self, entry: String) {
+            self.log.lock().expect("log lock").push(entry);
+        }
+    }
+
+    impl EditorBridge for Recorder {
+        fn begin_edit(&self, id: u32) {
+            self.push(format!("begin {id}"));
+        }
+        fn set_param(&self, id: u32, normalized: f64) {
+            self.push(format!("set {id} {normalized}"));
+        }
+        fn end_edit(&self, id: u32) {
+            self.push(format!("end {id}"));
+        }
+        fn request_resize(&self, w: u32, h: u32) -> bool {
+            self.bridge.request_resize(w, h)
+        }
+        fn get_param(&self, id: u32) -> f64 {
+            self.bridge.get_param(id)
+        }
+        fn get_param_plain(&self, id: u32) -> f64 {
+            self.bridge.get_param_plain(id)
+        }
+        fn format_param(&self, id: u32) -> String {
+            self.bridge.format_param(id)
+        }
+        fn get_meter(&self, id: u32) -> f32 {
+            self.bridge.get_meter(id)
+        }
+        fn get_state(&self) -> Vec<u8> {
+            self.bridge.get_state()
+        }
+        fn set_state(&self, data: Vec<u8>) {
+            self.push(format!("state {data:?}"));
+        }
+        fn transport(&self) -> Option<TransportInfo> {
+            None
+        }
+    }
+
+    impl HostContext for Recorder {
+        fn delivery(&self) -> EditorNotificationDelivery {
+            EditorNotificationDelivery::QueuedEdits
+        }
+        fn mark_dirty(&self) {
+            self.push("dirty".into());
+        }
+        fn group_edits(&self, edge: EditGroup) {
+            self.push(format!("group {edge:?}"));
+        }
+        fn request_restart(&self) {
+            self.push("restart".into());
+        }
+        fn context_menu(&self, target: MenuTarget, x: i32, y: i32) -> bool {
+            self.push(format!("menu {target:?} {x} {y}"));
+            true
+        }
+        fn notify(&self, notice: HostNotice) {
+            self.push(format!("notify {notice:?}"));
+        }
+        fn window_rescaled(&self, scale: f64) {
+            self.push(format!("scale {scale}"));
+        }
+    }
+
+    #[test]
+    fn every_editor_call_reaches_the_one_host() {
+        let host = Arc::new(Recorder::new());
+        let context =
+            PluginContext::from_host(Arc::clone(&host) as Arc<dyn HostContext>, Arc::new(()))
+                .with_params(Arc::new(()));
+        context.begin_group();
+        context.automate(3_u32, 0.5);
+        context.end_group();
+        context.set_state(vec![9]);
+        context.request_restart();
+        assert!(context.context_menu(MenuTarget::Param(3), 10, 20));
+        context.notify_host(HostNotice::VOICE_INFO);
+        context.window_rescaled(2.0);
+        assert_eq!(
+            context.notification_delivery(),
+            EditorNotificationDelivery::QueuedEdits
+        );
+        let log = host.log.lock().expect("log lock").clone();
+        assert_eq!(
+            log,
+            [
+                "group Begin",
+                "begin 3",
+                "set 3 0.5",
+                "end 3",
+                "group End",
+                "state [9]",
+                "dirty",
+                "restart",
+                "menu Param(3) 10 20",
+                "notify HostNotice(VOICE_INFO)",
+                "scale 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bridge_adapter_keeps_the_hosts_notifications_params_and_tasks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = Arc::new(Recorder::new());
         let tasks = TaskSpawner::<u8>::new(|_| {});
         let params = Arc::new(());
-        let context = PluginContext::new(Arc::clone(&bridge), Arc::clone(&params))
-            .with_tasks(Some(AnyTaskSpawner::new(&tasks)))
-            .with_notification_delivery(EditorNotificationDelivery::QueuedEdits);
+        let context =
+            PluginContext::from_host(host.clone() as Arc<dyn HostContext>, Arc::clone(&params))
+                .with_tasks(Some(AnyTaskSpawner::new(&tasks)));
         let adapted = context
             .clone()
             .with_params(Arc::clone(&params))
-            .with_bridge(bridge);
+            .with_bridge(Arc::new(bridge(Arc::clone(&calls))));
         assert_eq!(
             adapted.notification_delivery(),
             EditorNotificationDelivery::QueuedEdits
         );
         assert!(Arc::ptr_eq(adapted.params(), &params));
         assert!(adapted.tasks::<u8>().is_some());
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
         adapted.set_param(1_u32, 0.5);
-        assert_eq!(
-            calls.load(Ordering::Relaxed),
-            1,
-            "capabilities add no queue or latency"
-        );
+        adapted.mark_dirty();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "edits go to the adapter");
+        assert_eq!(*host.log.lock().expect("log lock"), ["dirty"]);
     }
 
     #[test]
-    fn set_state_marks_dirty_and_survives_adapters() {
-        let dirty = Arc::new(AtomicUsize::new(0));
-        let seen = Arc::clone(&dirty);
-        let bridge: Arc<dyn EditorBridge> = Arc::new(ClosureBridge {
-            begin_edit: Box::new(|_| {}),
-            set_param: Box::new(|_, _| {}),
-            end_edit: Box::new(|_| {}),
-            request_resize: Box::new(|_, _| false),
-            get_param: Box::new(|_| 0.0),
-            get_param_plain: Box::new(|_| 0.0),
-            format_param: Box::new(|_| String::new()),
-            get_meter: Box::new(|_| 0.0),
-            get_state: Box::new(Vec::new),
-            set_state: Box::new(|_| {}),
-            transport: Box::new(|| None),
-        });
-        let context = PluginContext::new(bridge, Arc::new(()))
-            .with_mark_dirty(Arc::new(move || {
-                seen.fetch_add(1, Ordering::Relaxed);
-            }))
-            .with_params(Arc::new(()));
-        context.set_state(vec![1]);
+    fn a_bare_bridge_has_no_optional_notifications() {
+        let context = PluginContext::new(
+            Arc::new(bridge(Arc::new(AtomicUsize::new(0)))) as Arc<dyn EditorBridge>,
+            Arc::new(()),
+        );
         context.mark_dirty();
-        assert_eq!(dirty.load(Ordering::Relaxed), 2);
+        context.request_restart();
+        assert!(!context.context_menu(MenuTarget::Global, 0, 0));
+        assert_eq!(
+            context.notification_delivery(),
+            EditorNotificationDelivery::HostThread
+        );
     }
 }

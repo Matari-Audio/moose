@@ -1,9 +1,10 @@
 //! State save and load (component and controller chunks).
 
 use crate::ffi;
-use crate::instance::{K_PARAM_VALUES_CHANGED, Vst3Instance};
+use crate::instance::Vst3Instance;
 
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostSignal;
 use moose_core::state;
 use moose_core::wrapper::{apply_or_queue_state, custom_state_for_save, run_extern_callback_with};
 use moose_params::Params;
@@ -168,10 +169,8 @@ pub(crate) unsafe fn apply_host_state<P: PluginExport>(
         editor.state_changed();
     }
     // Delivered now on the UI thread, else left for the next drain.
-    ffi::moose_vst3_mark_restart(
-        std::ptr::from_ref(inst).cast_mut().cast(),
-        K_PARAM_VALUES_CHANGED,
-    );
+    inst.host_queue.signal(HostSignal::PARAM_RESCAN);
+    ffi::moose_vst3_flush_host_queue(std::ptr::from_ref(inst).cast_mut().cast());
     1
 }
 

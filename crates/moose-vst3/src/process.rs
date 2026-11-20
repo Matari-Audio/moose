@@ -2,7 +2,7 @@
 
 use crate::ffi;
 use crate::input_events::cb_begin_input_events;
-use crate::instance::{K_LATENCY_CHANGED, K_PARAM_VALUES_CHANGED, Vst3Instance};
+use crate::instance::Vst3Instance;
 use crate::lifecycle::{cb_create, cb_destroy, cb_prepare, vst3_process_mode};
 
 use moose_core::bus_routing::{BusActivation, BusRouting, MAX_AUDIO_BUSES};
@@ -10,6 +10,7 @@ use moose_core::cast::{len_u32, sample_pos_i64};
 use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostSignal;
 use moose_core::rt::{RtSection, audit};
 use moose_core::wrapper::{apply_queued_state, enter_plugin, run_audio_block_latched};
 use moose_params::Params;
@@ -160,8 +161,8 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
         // entire block. See `pending_state` field comment for the
         // queue-overflow policy.
         if apply_queued_state(&mut *plugin, &inst.pending_state).is_some_and(|r| r.is_ok()) {
-            // An atomic bit-set; the UI thread sends it.
-            ffi::moose_vst3_mark_restart(ctx, K_PARAM_VALUES_CHANGED);
+            // Wait-free signal; the UI thread drains it as `kParamValuesChanged`.
+            inst.host_queue.signal(HostSignal::PARAM_RESCAN);
         }
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the
@@ -314,9 +315,8 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
         // the next host main-thread callback.
         let new_latency = plugin.latency();
         if inst.latency_cache.swap(new_latency, Ordering::Relaxed) != new_latency {
-            // `ctx` is the shim's live component key for this instance;
-            // `mark_restart` only sets a bit on its atomic (RT-safe).
-            ffi::moose_vst3_mark_restart(ctx, K_LATENCY_CHANGED);
+            // Wait-free signal; the UI thread drains it as `kLatencyChanged`.
+            inst.host_queue.signal(HostSignal::LATENCY);
         }
         inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
     })

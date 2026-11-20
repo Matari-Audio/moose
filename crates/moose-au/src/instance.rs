@@ -20,15 +20,15 @@ use moose_core::editor::SendPtr;
 use moose_core::events::EVENT_LIST_PREALLOC;
 use moose_core::events::{EventList, ExactEvent, ExactEventBody, LosslessEventCursor};
 use moose_core::export::PluginExport;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+use moose_core::host_queue::HostQueue;
 use moose_core::meters::MeterStore;
 use moose_core::plugin::PluginRuntime;
 use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::ump::SysExAssembler;
 use moose_core::wrapper::{PluginCell, SharedPlugin};
+use moose_params::PersistChangeSignal;
 use std::ffi::CString;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
@@ -243,9 +243,11 @@ impl Drop for ParamNotifier {
 }
 
 pub(crate) struct AuInstance<P: PluginExport> {
-    // First field: close worker requests before any native/editor teardown.
+    // First fields: close worker requests before any native/editor teardown.
+    pub(crate) persist_signal: Option<Arc<PersistChangeSignal>>,
+    pub(crate) host_queue: Arc<HostQueue>,
     #[cfg(target_os = "macos")]
-    pub(crate) persist_dispatch: Option<persist_notify::Dispatcher<P>>,
+    pub(crate) persist_dispatch: Option<persist_notify::Dispatcher>,
     /// The plugin in the wrapper-standard ownership cell: the audio
     /// thread owns it per block, host lifecycle callbacks own it while
     /// processing is stopped, and the two never overlap. `cb_state_save`
@@ -258,20 +260,15 @@ pub(crate) struct AuInstance<P: PluginExport> {
     /// Params are atomic-backed and `Sync`.
     pub(crate) params_arc: Arc<P::Params>,
     /// Shared meter storage, set once at instance creation. The
-    /// editor's `get_meter` closure reads these atomic slots instead
-    /// of the plugin instance. Editor wiring is macOS/iOS-only (the
-    /// AU GUI section), so the field follows it.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    /// editor's `get_meter` reads these atomic slots instead
+    /// of the plugin instance.
     pub(crate) meter_store: Arc<MeterStore>,
     /// Lock-free custom-state slot the audio thread publishes
     /// into, read by `save_state` so a snapshot-capable plugin's
     /// save never touches the plugin. Cached on the instance.
     pub(crate) snapshot: Arc<SnapshotSlot>,
     /// Background-task spawner (`None` unless the plugin wired `tasks:`),
-    /// cached at creation so the editor schedules without touching the plugin. Only
-    /// the editor path reads it, and that path is Apple-only (`AppKit` /
-    /// `UIKit`); off-Apple the field would be dead.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    /// cached at creation so the editor schedules without touching the plugin.
     pub(crate) task_spawner: Option<AnyTaskSpawner>,
     /// Lock-free editor factory, cached at creation - building
     /// the editor never touches the plugin (`--shell` rebuilds

@@ -7,9 +7,10 @@ use super::*;
 use clap_sys::color::clap_color;
 use clap_sys::ext::context_menu::{
     CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY, CLAP_CONTEXT_MENU_ITEM_ENTRY,
-    CLAP_CONTEXT_MENU_ITEM_SEPARATOR, CLAP_CONTEXT_MENU_TARGET_KIND_PARAM,
-    clap_context_menu_builder, clap_context_menu_check_entry, clap_context_menu_entry,
-    clap_context_menu_item_kind, clap_context_menu_target,
+    CLAP_CONTEXT_MENU_ITEM_SEPARATOR, CLAP_CONTEXT_MENU_TARGET_KIND_GLOBAL,
+    CLAP_CONTEXT_MENU_TARGET_KIND_PARAM, clap_context_menu_builder, clap_context_menu_check_entry,
+    clap_context_menu_entry, clap_context_menu_item_kind, clap_context_menu_target,
+    clap_host_context_menu,
 };
 use clap_sys::ext::note_name::clap_host_note_name;
 use clap_sys::ext::note_name::clap_note_name;
@@ -47,6 +48,7 @@ enum Seen {
 }
 
 thread_local! {
+    static CAN_POPUP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
     static NOTIFIER: RefCell<Option<HostNotifier>> = const { RefCell::new(None) };
 }
@@ -171,6 +173,7 @@ struct HostLog {
     note_names_changed: AtomicU32,
     voice_info_changed: AtomicU32,
     port_rescans: Mutex<Vec<u32>>,
+    popups: Mutex<Vec<(u32, clap_id, i32, i32)>>,
 }
 
 impl HostLog {
@@ -235,6 +238,26 @@ unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, flags: u32) {
     log.port_rescans.lock().expect("port rescans").push(flags);
 }
 
+unsafe extern "C" fn menu_can_popup(_: *const clap_host) -> bool {
+    CAN_POPUP.with(std::cell::Cell::get)
+}
+
+unsafe extern "C" fn menu_popup(
+    host: *const clap_host,
+    target: *const clap_context_menu_target,
+    _screen: i32,
+    x: i32,
+    y: i32,
+) -> bool {
+    // SAFETY: called by the plugin with the test host and a live target.
+    let (log, target) = unsafe { (log(host), &*target) };
+    log.popups
+        .lock()
+        .expect("popups")
+        .push((target.kind, target.id, x, y));
+    true
+}
+
 unsafe extern "C" fn track_get(_: *const clap_host, info: *mut clap_track_info) -> bool {
     // SAFETY: the plugin passes a writable info.
     let info = unsafe { &mut *info };
@@ -272,9 +295,17 @@ unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *
         is_rescan_flag_supported: None,
         rescan: Some(audio_ports_rescan),
     };
+    static MENU: clap_host_context_menu = clap_host_context_menu {
+        populate: None,
+        perform: None,
+        can_popup: Some(menu_can_popup),
+        popup: Some(menu_popup),
+    };
     // SAFETY: the plugin passes a NUL-terminated id.
     let id = unsafe { CStr::from_ptr(id) };
-    if id == CLAP_EXT_PARAMS {
+    if id == CLAP_EXT_CONTEXT_MENU {
+        (&raw const MENU).cast()
+    } else if id == CLAP_EXT_PARAMS {
         (&raw const PARAMS).cast()
     } else if id == CLAP_EXT_TRACK_INFO {
         (&raw const TRACK).cast()
@@ -496,6 +527,95 @@ fn host_notices_reach_the_host_on_the_main_thread() {
         (*plugin).on_main_thread.unwrap()(plugin);
         assert_eq!(log.note_names_changed.load(Ordering::Relaxed), 1);
         assert_eq!(log.voice_info_changed.load(Ordering::Relaxed), 2);
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn embedded_window_creation_refreshes_menu_capability() {
+    use moose_core::editor::{Editor, PluginContext, RawWindowHandle};
+
+    struct WindowEditor(bool);
+    impl Editor for WindowEditor {
+        fn size(&self) -> (u32, u32) {
+            (100, 100)
+        }
+        fn open(&mut self, _: RawWindowHandle, _: PluginContext) {
+            self.0 = true;
+            CAN_POPUP.with(|value| value.set(true));
+        }
+        fn is_open(&self) -> bool {
+            self.0
+        }
+        fn close(&mut self) {}
+    }
+
+    with_modular(|plugin, log, _| unsafe {
+        let data = crate::data_from_plugin::<Plugin>(plugin);
+        data.gui.enter().editor = Some(Box::new(WindowEditor(false)));
+        CAN_POPUP.with(|value| value.set(false));
+        assert!(gui_create::<Plugin>(
+            plugin,
+            CLAP_WINDOW_API_X11.as_ptr(),
+            false
+        ));
+        let context = editor_context::<Plugin>(plugin);
+        assert!(!context.context_menu(MenuTarget::Global, 1, 2));
+        let mut window: clap_window = std::mem::zeroed();
+        window.api = CLAP_WINDOW_API_X11.as_ptr();
+        window.specific.ptr = ptr::dangling_mut::<c_void>();
+        assert!(gui_set_parent::<Plugin>(plugin, &raw const window));
+        assert!(context.context_menu(MenuTarget::Global, 1, 2));
+        assert!(log.popups.lock().unwrap().is_empty());
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(log.popups.lock().unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn menu_falls_back_for_unsupported_and_floating_windows() {
+    with_modular(|plugin, log, _| unsafe {
+        let data = crate::data_from_plugin::<Plugin>(plugin);
+        let context = editor_context::<Plugin>(plugin);
+        CAN_POPUP.with(|value| value.set(false));
+        crate::context_menu::refresh_capability(data, &moose_core::thread::MainThread::assume());
+        assert!(!context.context_menu(MenuTarget::Global, 1, 2));
+        CAN_POPUP.with(|value| value.set(true));
+        crate::context_menu::refresh_capability(data, &moose_core::thread::MainThread::assume());
+        data.floating_mode.store(true, Ordering::Release);
+        assert!(!context.context_menu(MenuTarget::Global, 1, 2));
+        assert!(log.popups.lock().unwrap().is_empty());
+        data.floating_mode.store(false, Ordering::Release);
+        assert!(context.context_menu(MenuTarget::Global, 1, 2));
+    });
+}
+
+#[test]
+fn editor_host_requests_are_made_on_the_main_thread_in_one_callback() {
+    with_modular(|plugin, log, _| unsafe {
+        let context = editor_context::<Plugin>(plugin);
+        let callbacks = log.callbacks.load(Ordering::Relaxed);
+        let restarts = log.restarts.load(Ordering::Relaxed);
+        assert!(context.context_menu(MenuTarget::Param(3), 10, 20));
+        assert!(context.context_menu(MenuTarget::Global, 1, 2));
+        context.request_restart();
+        context.mark_dirty();
+        assert_eq!(log.callbacks.load(Ordering::Relaxed), callbacks + 1);
+        assert!(
+            log.popups.lock().expect("popups").is_empty(),
+            "not off the main thread"
+        );
+        assert_eq!(log.restarts.load(Ordering::Relaxed), restarts);
+
+        (*plugin).on_main_thread.unwrap()(plugin);
+        assert_eq!(
+            *log.popups.lock().expect("popups"),
+            [
+                (CLAP_CONTEXT_MENU_TARGET_KIND_PARAM, 3, 10, 20),
+                (CLAP_CONTEXT_MENU_TARGET_KIND_GLOBAL, 0, 1, 2),
+            ]
+        );
+        assert_eq!(log.restarts.load(Ordering::Relaxed), restarts + 1);
     });
 }
 

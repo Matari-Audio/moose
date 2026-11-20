@@ -267,18 +267,27 @@ impl PluginRuntime for ConnectNoticePlugin {
 
 #[test]
 fn notice_raised_during_connect_is_drained_when_catalog_waker_binds() {
+    use crate::lifecycle::cb_drain_host_queue;
     unsafe extern "C" fn noop_wake(_: *mut std::ffi::c_void) {}
     unsafe {
         *CONNECT_NOTIFIER.lock().unwrap() = None;
         let ctx = cb_create::<ConnectNoticePlugin>();
         assert!(!ctx.is_null());
         let inst = &*ctx.cast::<Vst3Instance<ConnectNoticePlugin>>();
-        // Notice raised during `connect()` stays pending until the COM
-        // `Host` finishes registering `ctx` and binds its catalog waker.
-        cb_set_catalog_waker::<ConnectNoticePlugin>(ctx, Some(noop_wake), std::ptr::null_mut());
+        // Notice raised during `connect()` stays queued in `host_queue` until
+        // the COM `Host` registers `ctx` and flushes/drains the queue.
         assert!(
-            inst.host_notifier.take().is_empty(),
-            "notice raised inside connect() must be drained once the catalog waker binds"
+            inst.host_queue
+                .pending()
+                .notices()
+                .contains(HostNotice::AUDIO_PORTS),
+            "notice raised inside connect() must remain pending until drained"
+        );
+        cb_set_catalog_waker::<ConnectNoticePlugin>(ctx, Some(noop_wake), std::ptr::null_mut());
+        cb_drain_host_queue::<ConnectNoticePlugin>(ctx);
+        assert!(
+            inst.host_queue.pending().notices().is_empty(),
+            "notice raised inside connect() must be drained once the host queue drains"
         );
         let notifier = CONNECT_NOTIFIER
             .lock()
@@ -287,8 +296,16 @@ fn notice_raised_during_connect_is_drained_when_catalog_waker_binds() {
             .expect("connect ran");
         notifier.notify(HostNotice::AUDIO_PORTS);
         assert!(
-            inst.host_notifier.take().is_empty(),
-            "subsequent notices continue to drain through the published notice_ctx"
+            inst.host_queue
+                .pending()
+                .notices()
+                .contains(HostNotice::AUDIO_PORTS),
+            "subsequent notices must queue into host_queue"
+        );
+        cb_drain_host_queue::<ConnectNoticePlugin>(ctx);
+        assert!(
+            inst.host_queue.pending().notices().is_empty(),
+            "subsequent notices must drain cleanly through cb_drain_host_queue"
         );
         cb_destroy::<ConnectNoticePlugin>(ctx);
     }

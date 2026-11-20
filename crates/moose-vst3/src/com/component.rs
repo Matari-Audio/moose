@@ -13,13 +13,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use moose_core::editor::EditGroup;
+use moose_core::main_thread::{MenuItem, MenuTarget};
 use moose_params::CatalogChange;
 use vst3::Steinberg::Vst::ChannelContext::{
     IInfoListener, IInfoListenerTrait, kChannelColorKey, kChannelNameKey,
 };
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComPtr, ComRef};
+use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 use super::view::View;
 use super::{Registration, cstr, retain, utf16_from, utf16_into};
@@ -400,6 +401,8 @@ pub(crate) struct Host {
     in_active: AtomicU32,
     out_active: AtomicU32,
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
+    has_handler3: AtomicBool,
+    in_drain_queue: AtomicBool,
     pending_restart: AtomicI32,
     presentation_revision: AtomicU64,
     /// A change that may move `presentation_revision` happened; the UI
@@ -469,6 +472,36 @@ pub(super) fn mark_restart(ctx: *mut c_void, flags: i32) {
         // A UI-thread caller (setState, the editor) delivers right away.
         if host.may_deliver(&lock(&host.edits)) {
             host.flush_pending_restart();
+        }
+    }
+}
+
+/// Drain the instance's `HostQueue` on the UI thread, or wake the UI thread
+/// when called off it. Lock-free on the audio thread.
+pub(super) fn flush_host_queue(ctx: *mut c_void) {
+    // SAFETY: set only for the duration of `Host::process`.
+    let on_audio = PROCESSING.with(|current| {
+        unsafe { current.get().as_ref() }
+            .filter(|h| h.ctx == ctx)
+            .map(Host::wake_ui)
+    });
+    if on_audio.is_none()
+        && let Some(host) = super::pin(ctx)
+    {
+        let can_deliver = {
+            let e = lock(&host.edits);
+            if host.may_deliver(&e) {
+                true
+            } else {
+                host.wake_edits(&e);
+                false
+            }
+        };
+        if can_deliver {
+            host.drain_host_queue();
+            host.flush_pending_restart();
+        } else {
+            host.wake_ui();
         }
     }
 }
@@ -564,6 +597,8 @@ impl Host {
                 desc.output_bus_kinds,
             )),
             handler: Mutex::new(None),
+            has_handler3: AtomicBool::new(false),
+            in_drain_queue: AtomicBool::new(false),
             pending_restart: AtomicI32::new(0),
             presentation_revision: AtomicU64::new(unsafe { (cb.param_presentation_revision)(ctx) }),
             presentation_check: AtomicBool::new(false),
@@ -649,10 +684,21 @@ impl Host {
     /// A processed or host-set change to `id`: if it can rename parameters,
     /// have the UI thread compare the presentation revision. Audio-safe.
     fn note_param_change(&self, id: u32) {
-        if unsafe { (self.reg.cb.param_affects_presentation)(self.ctx, id) }
-            && !self.presentation_check.swap(true, Ordering::AcqRel)
-        {
+        if unsafe { (self.reg.cb.param_affects_presentation)(self.ctx, id) } {
+            self.check_presentation();
+        }
+    }
+
+    pub(super) fn check_presentation(&self) {
+        if !self.presentation_check.swap(true, Ordering::AcqRel) {
             self.wake_ui();
+        }
+    }
+
+    pub(super) fn drain_host_queue(&self) {
+        if !self.in_drain_queue.swap(true, Ordering::AcqRel) {
+            unsafe { (self.reg.cb.drain_host_queue)(self.ctx) };
+            self.in_drain_queue.store(false, Ordering::Release);
         }
     }
 
@@ -837,6 +883,10 @@ impl Host {
 
     pub(super) fn drain_edits(&self) {
         drop(self.drain_locked(lock(&self.edits), false));
+        if self.may_deliver(&lock(&self.edits)) {
+            self.drain_host_queue();
+            self.flush_pending_restart();
+        }
     }
 
     /// Make queued calls oldest first. A transition drains wherever it runs;
@@ -976,8 +1026,114 @@ impl Host {
 
     /// Timer / dispatch tick on the UI thread.
     pub(super) fn on_ui_tick(&self) {
+        self.drain_host_queue();
         self.flush_pending_restart();
         self.drain_edits();
+    }
+
+    pub(super) fn has_context_menu(&self) -> bool {
+        self.has_handler3.load(Ordering::Acquire) && lock(&self.view).current_ptr.is_some()
+    }
+
+    /// Pop up the host's `IComponentHandler3` context menu on the UI thread.
+    pub(super) fn popup_context_menu(
+        &self,
+        target: MenuTarget,
+        x: i32,
+        y: i32,
+        items: &[MenuItem],
+    ) {
+        let Some(handler3) = self.handler().and_then(|h| h.cast::<IComponentHandler3>()) else {
+            return;
+        };
+        let Some(view) = lock(&self.view).current_ptr else {
+            return;
+        };
+        let param_id = match target {
+            MenuTarget::Param(id) => Some(id),
+            MenuTarget::Global => None,
+        };
+        let param_ptr = param_id
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        let raw_menu = unsafe { handler3.createContextMenu(view, param_ptr) };
+        let Some(menu) = (unsafe { ComPtr::from_raw(raw_menu) }) else {
+            return;
+        };
+        let Some(host_arc) = super::pin(self.ctx) else {
+            return;
+        };
+        let target_com = ComWrapper::new(ContextMenuTarget {
+            host: std::sync::Arc::downgrade(&host_arc),
+            target,
+        })
+        .to_com_ptr::<IContextMenuTarget>();
+        for item in items {
+            use IContextMenuItem_::Flags_::*;
+            let mut raw_item = IContextMenuItem {
+                name: [0; 128],
+                tag: 0,
+                flags: 0,
+            };
+            let mut with_target = false;
+            match item {
+                MenuItem::Entry {
+                    label,
+                    action,
+                    enabled,
+                } => {
+                    utf16_into(&mut raw_item.name, label);
+                    raw_item.tag = *action as i32;
+                    if !enabled {
+                        raw_item.flags = kIsDisabled as i32;
+                    }
+                    with_target = true;
+                }
+                MenuItem::Check {
+                    label,
+                    action,
+                    enabled,
+                    checked,
+                } => {
+                    utf16_into(&mut raw_item.name, label);
+                    raw_item.tag = *action as i32;
+                    if !enabled {
+                        raw_item.flags |= kIsDisabled as i32;
+                    }
+                    if *checked {
+                        raw_item.flags |= kIsChecked as i32;
+                    }
+                    with_target = true;
+                }
+                MenuItem::Separator => {
+                    raw_item.flags = kIsSeparator as i32;
+                }
+                MenuItem::Submenu { label, enabled } => {
+                    utf16_into(&mut raw_item.name, label);
+                    raw_item.flags = kIsGroupStart as i32;
+                    if !enabled {
+                        raw_item.flags |= kIsDisabled as i32;
+                    }
+                }
+                MenuItem::EndSubmenu => {
+                    raw_item.flags = kIsGroupEnd as i32;
+                }
+                MenuItem::Title { label } => {
+                    utf16_into(&mut raw_item.name, label);
+                    raw_item.flags = kIsDisabled as i32;
+                }
+                _ => continue,
+            }
+            let target_ptr = if with_target {
+                target_com
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), ComPtr::as_ptr)
+            } else {
+                std::ptr::null_mut()
+            };
+            unsafe { menu.addItem(&raw const raw_item, target_ptr) };
+        }
+        unsafe { menu.popup(x, y) };
     }
 
     // --- Restart and persist notifications -----------------------------------
@@ -985,6 +1141,7 @@ impl Host {
     /// Send any restart flags the audio thread, a catalog change or a
     /// presentation change left pending. UI thread only.
     pub(super) fn flush_pending_restart(&self) {
+        self.drain_host_queue();
         let Some(handler) = self.handler() else {
             return;
         };
@@ -1744,8 +1901,35 @@ unsafe extern "system" fn thread_timer_proc(_: *mut c_void, _: u32, id: usize, _
 }
 
 // ---------------------------------------------------------------------------
-// COM class
+// COM classes
 // ---------------------------------------------------------------------------
+
+struct ContextMenuTarget {
+    host: std::sync::Weak<Host>,
+    target: MenuTarget,
+}
+
+impl Class for ContextMenuTarget {
+    type Interfaces = (IContextMenuTarget,);
+}
+
+impl IContextMenuTargetTrait for ContextMenuTarget {
+    unsafe fn executeMenuItem(&self, tag: int32) -> tresult {
+        // A host may keep the menu (and so this target) past the instance;
+        // upgrading the Weak<Host> ties execution strictly to the original
+        // live instance and prevents pointer-reuse dispatch to a new one.
+        let Some(host) = self.host.upgrade() else {
+            return kResultFalse;
+        };
+        #[allow(clippy::cast_sign_loss, reason = "tags are the u32 actions we set")]
+        let action = tag as u32;
+        if unsafe { (host.reg.cb.perform_menu)(host.ctx, self.target, action) } != 0 {
+            kResultOk
+        } else {
+            kResultFalse
+        }
+    }
+}
 
 pub(super) struct Component {
     pub host: Arc<Host>,
@@ -2288,6 +2472,10 @@ impl IEditControllerTrait for Component {
         let h = &self.host;
         let handler = unsafe { retain(handler) };
         let has_handler = handler.is_some();
+        let has_handler3 = handler
+            .as_ref()
+            .and_then(ComPtr::cast::<IComponentHandler3>)
+            .is_some();
         // Hold the queue lock across the swap so concurrent editor calls land
         // on the right side of it.
         let e = h.drain_locked(lock(&h.edits), true);
@@ -2296,6 +2484,7 @@ impl IEditControllerTrait for Component {
         // An open group edit finishes there too and restarts first.
         let (mut e, reopen) = h.close_open_gestures(e);
         let previous = std::mem::replace(&mut *lock(&h.handler), handler);
+        h.has_handler3.store(has_handler3, Ordering::Release);
         if has_handler {
             for &id in reopen.gestures.iter().rev() {
                 e.pending.push_front(EditOp::Begin(id));

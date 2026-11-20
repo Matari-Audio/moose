@@ -3,7 +3,8 @@
 use crate::ffi;
 use crate::input_events::VST3_EVENT_END;
 use crate::instance::{
-    K_IO_CHANGED, OutputNoteIds, PendingOutputMutation, Vst3Gui, Vst3Instance, Vst3Scratch,
+    K_IO_CHANGED, K_LATENCY_CHANGED, K_PARAM_VALUES_CHANGED, K_RELOAD_COMPONENT, OutputNoteIds,
+    PendingOutputMutation, Vst3Gui, Vst3Instance, Vst3Scratch,
 };
 use crate::midi_proxy::{
     MIDI_PROXY_PER_CHANNEL, allocate_midi_proxy_ids, midi_proxy_default, midi_proxy_len,
@@ -19,9 +20,10 @@ use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::editor::SendPtr;
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
+use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
 use moose_core::main_thread::{
-    HostColor, HostNotice, HostNotifier, LearnSource, Midi2Controller, Midi2ControllerKind,
-    TrackInfo,
+    HostColor, HostNotice, HostNotifier, LearnSource, MenuTarget, Midi2Controller,
+    Midi2ControllerKind, TrackInfo,
 };
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
@@ -78,17 +80,17 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
             midi_maps.sort_by_key(|(id, _)| *id);
             let params_arc = plugin.params_arc();
             let mut hooks = plugin.main_thread();
-            // VST3 has no note-name / voice-info changed call; a port
-            // change becomes `kIoChanged`. The wake learns the instance
-            // once it is boxed; `cb_destroy` closes it before the free.
+            // The queue wake learns the instance once it is boxed; `cb_destroy`
+            // closes it before the free.
             let notice_ctx = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
-            let host_notifier = HostNotifier::new({
+            let host_queue = Arc::new(HostQueue::new({
                 let notice_ctx = Arc::clone(&notice_ctx);
                 // SAFETY: the pointer is the live instance until
                 // `cb_destroy` closes this wake.
-                move || unsafe { host_notice_woke::<P>(notice_ctx.load(Ordering::Acquire)) }
-            });
-            hooks.connect(host_notifier.clone());
+                move || unsafe { host_notice_woke(notice_ctx.load(Ordering::Acquire)) }
+            }));
+            let host_notifier = HostNotifier::from_queue(Arc::clone(&host_queue));
+            hooks.connect(host_notifier);
             let main_thread = MainThreadCell::new(hooks);
             let meter_store = plugin.meter_store();
             let snapshot = plugin.snapshot_slot();
@@ -136,6 +138,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 host_scale: AtomicU64::new(0),
                 window_scale: AtomicU64::new(0),
                 pending_resize: AtomicU64::new(0),
+                last_phys_size: AtomicU64::new(0),
                 audio: PluginCell::new(Vst3Scratch {
                     event_list: EventList::with_capacity(event_capacity),
                     input_num_frames: 0,
@@ -155,7 +158,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                     pending_output_mutation: PendingOutputMutation::None,
                 }),
                 gui: PluginCell::new(Vst3Gui { editor: None }),
-                host_notifier,
+                host_queue,
             });
             let raw = Box::into_raw(instance);
             notice_ctx.store(raw.cast(), Ordering::Release);
@@ -164,22 +167,83 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
     )
 }
 
-/// A [`HostNotice`] arrived: flag `kIoChanged` for a port change.
+/// The instance's [`HostQueue`] woke: flush if on the UI thread, or schedule
+/// a UI-thread drain.
 ///
 /// # Safety
 /// `ctx` is null or a live `Vst3Instance<P>`.
-pub(crate) unsafe fn host_notice_woke<P: PluginExport>(ctx: *mut std::ffi::c_void) {
-    // SAFETY: caller contract.
-    let Some(instance) = (unsafe { ctx.cast::<Vst3Instance<P>>().as_ref() }) else {
-        return;
-    };
-    if instance
-        .host_notifier
-        .take()
-        .contains(HostNotice::AUDIO_PORTS)
-    {
-        ffi::moose_vst3_mark_restart(ctx, K_IO_CHANGED);
+pub(crate) unsafe fn host_notice_woke(ctx: *mut std::ffi::c_void) {
+    if !ctx.is_null() {
+        ffi::moose_vst3_flush_host_queue(ctx);
     }
+}
+
+/// Drain the instance's [`HostQueue`] on the host UI thread.
+pub(crate) unsafe extern "C" fn cb_drain_host_queue<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    run_extern_callback_with::<P, ()>("vst3", "drain_host_queue", (), || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return;
+        };
+        // SAFETY: the COM layer calls this only on the host UI thread.
+        let main = MainThread::assume();
+        let drain = inst.host_queue.drain(&main);
+        let signals = drain.signals;
+        if signals.contains(HostSignal::MARK_DIRTY) {
+            ffi::moose_vst3_mark_dirty(ctx);
+        }
+        let mut restart = 0;
+        if signals.contains(HostSignal::RESTART) {
+            restart |= K_RELOAD_COMPONENT;
+        }
+        if signals.notices().contains(HostNotice::AUDIO_PORTS) {
+            restart |= K_IO_CHANGED;
+        }
+        if signals.contains(HostSignal::PARAM_RESCAN) {
+            restart |= K_PARAM_VALUES_CHANGED;
+        }
+        if signals.contains(HostSignal::LATENCY) {
+            restart |= K_LATENCY_CHANGED;
+        }
+        if restart != 0 {
+            ffi::moose_vst3_mark_restart(ctx, restart);
+        } else if signals.contains(HostSignal::PRESENTATION) {
+            ffi::moose_vst3_check_presentation(ctx);
+        }
+        for message in drain {
+            if let HostMessage::ContextMenu { target, x, y } = message {
+                let items = inst
+                    .main_thread
+                    .try_borrow_mut(&main)
+                    .map(|hooks| hooks.menu_items(&main, target))
+                    .unwrap_or_default();
+                let scale = inst.host_scale();
+                #[allow(clippy::cast_possible_truncation)]
+                let hx = (f64::from(x) * scale).round() as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let hy = (f64::from(y) * scale).round() as i32;
+                ffi::moose_vst3_popup_context_menu(ctx, target, hx, hy, &items);
+            }
+        }
+    });
+}
+
+pub(crate) unsafe fn cb_perform_menu<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    target: MenuTarget,
+    action: u32,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "perform_menu", 0, || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return 0;
+        };
+        // SAFETY: `IContextMenuTarget::executeMenuItem` is a UI-thread call.
+        let main = MainThread::assume();
+        let performed = inst
+            .main_thread
+            .try_borrow_mut(&main)
+            .is_some_and(|mut hooks| hooks.perform_menu(&main, target, action));
+        i32::from(performed)
+    })
 }
 
 pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
@@ -192,9 +256,9 @@ pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::
     run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
         if !ctx.is_null() {
             let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
-            instance.host_notifier.close();
-            rebind_signal(&instance.persist_signal, None, std::ptr::null_mut());
-            rebind_signal(&instance.catalog_signal, None, std::ptr::null_mut());
+            instance.host_queue.close();
+            rebind_signal(&instance.persist_signal, None, std::ptr::null_mut(), None);
+            rebind_signal(&instance.catalog_signal, None, std::ptr::null_mut(), None);
             drop(instance);
         }
     });
@@ -218,15 +282,20 @@ pub(crate) unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
 ) {
     run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
         let instance = &*ctx.cast::<Vst3Instance<P>>();
-        if let Some(signal) = rebind_signal(&instance.persist_signal, wake, wake_context) {
+        if let Some(signal) = rebind_signal(
+            &instance.persist_signal,
+            wake,
+            wake_context,
+            Some((Arc::clone(&instance.host_queue), HostSignal::PERSIST)),
+        ) {
             instance.params_arc.set_persist_change_signal(signal);
         }
     });
 }
 
 /// Close the signal in `slot` (waiting for a running wake) and, with
-/// `wake`, install one that calls `wake(wake_context)`; returns it for the
-/// params setter.
+/// `wake`, install one that signals `queue_signal` and calls
+/// `wake(wake_context)`; returns it for the params setter.
 ///
 /// # Safety
 /// `wake_context` stays valid for `wake` until the next rebind of `slot`.
@@ -234,6 +303,7 @@ pub(crate) unsafe fn rebind_signal(
     slot: &std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
     wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
     wake_context: *mut std::ffi::c_void,
+    queue_signal: Option<(Arc<HostQueue>, HostSignal)>,
 ) -> Option<std::sync::Weak<PersistChangeSignal>> {
     let mut binding = slot
         .lock()
@@ -247,6 +317,9 @@ pub(crate) unsafe fn rebind_signal(
     let context = unsafe { SendPtr::new(wake_context) };
     // SAFETY: as above; `wake` is the COM layer's wake for that context.
     let signal = Arc::new(PersistChangeSignal::new(move || unsafe {
+        if let Some((queue, bit)) = &queue_signal {
+            queue.signal(*bit);
+        }
         wake(context.as_ptr().cast_mut());
     }));
     let weak = Arc::downgrade(&signal);
@@ -261,12 +334,17 @@ pub(crate) unsafe extern "C" fn cb_set_catalog_waker<P: PluginExport>(
 ) {
     run_extern_callback_with::<P, ()>("vst3", "catalog_bind", (), || unsafe {
         let instance = &*ctx.cast::<Vst3Instance<P>>();
-        if let Some(signal) = rebind_signal(&instance.catalog_signal, wake, wake_context) {
+        if let Some(signal) = rebind_signal(
+            &instance.catalog_signal,
+            wake,
+            wake_context,
+            Some((Arc::clone(&instance.host_queue), HostSignal::PRESENTATION)),
+        ) {
             instance.params_arc.set_catalog_signal(signal);
             // Now that the COM Host has registered `ctx`, drain any
             // `HostNotice` raised synchronously during `hooks.connect(...)`
             // before the instance was registered.
-            host_notice_woke::<P>(ctx);
+            host_notice_woke(ctx);
         }
     });
 }
