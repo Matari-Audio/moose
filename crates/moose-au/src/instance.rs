@@ -1,12 +1,10 @@
 //! Per-instance state behind the AU shim's opaque context.
 
 #[cfg(target_os = "macos")]
-use crate::gui::moose_au_v2_host_latency_changed;
-#[cfg(target_os = "macos")]
 use crate::gui::moose_au_v2_host_set_param;
 use crate::output_events::NthCursor;
 use crate::output_events::UmpDrainCursor;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use crate::persist_notify;
 
 use moose_core::SYSEX_POOL_PREALLOC;
@@ -14,8 +12,6 @@ use moose_core::TransportSlot;
 use moose_core::buffer::RawBufferScratch;
 use moose_core::editor::Editor;
 use moose_core::editor::EditorBuilder;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-use moose_core::editor::SendPtr;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use moose_core::events::EVENT_LIST_PREALLOC;
 use moose_core::events::{EventList, ExactEvent, ExactEventBody, LosslessEventCursor};
@@ -27,7 +23,7 @@ use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::ump::SysExAssembler;
-use moose_core::wrapper::{PluginCell, SharedPlugin};
+use moose_core::wrapper::PluginCell;
 use moose_params::PersistChangeSignal;
 use std::ffi::CString;
 use std::sync::Arc;
@@ -35,13 +31,34 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU8, AtomicU64};
 #[cfg(target_os = "macos")]
 use std::thread::{self, JoinHandle, Thread};
 
 // ---------------------------------------------------------------------------
 // Instance wrapper - one per plugin instance, stored as the opaque ctx
 // ---------------------------------------------------------------------------
+
+/// Opaque `AuInstance<P>` handle carried across AU host/notifier threads.
+///
+/// Only dereferenced inside `HostQueue::with_open` (or passed as an opaque key
+/// to the C shim while `ParamNotifier` is joined before `cb_destroy` frees the
+/// instance).
+#[derive(Clone, Copy)]
+pub(crate) struct AuCtx(pub(crate) *mut std::ffi::c_void);
+
+// SAFETY: `AuCtx` is an opaque instance pointer whose dereferences are
+// serialized against `cb_destroy` by `HostQueue::with_open` / `close()` and
+// `ParamNotifier::drop` joining the notifier thread before free.
+unsafe impl Send for AuCtx {}
+unsafe impl Sync for AuCtx {}
+
+impl AuCtx {
+    #[inline]
+    pub(crate) fn as_ptr(self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
 
 /// Bounded handoff slot for state loads. Capacity 1: presets don't
 /// arrive faster than the audio thread completes a block, and on
@@ -159,10 +176,6 @@ pub(crate) type ParamNotifyQueue = crossbeam_queue::ArrayQueue<(u32, f32)>;
 pub(crate) struct ParamNotifier {
     pub(crate) queue: Arc<ParamNotifyQueue>,
     pub(crate) stop: Arc<AtomicBool>,
-    /// Set by the audio thread when `latency()` changes; drained on the
-    /// same wakeup as the param queue. The notifier thread broadcasts a
-    /// `kAudioUnitProperty_Latency` change, off the audio thread.
-    pub(crate) latency_dirty: Arc<AtomicBool>,
     /// Cached for a cheap `unpark` from the audio thread.
     pub(crate) thread: Thread,
     pub(crate) handle: Option<JoinHandle<()>>,
@@ -179,25 +192,16 @@ impl ParamNotifier {
     /// notifier is dropped - guaranteed because it lives in the
     /// `AuInstance` and `cb_destroy` drops it (joining the thread)
     /// before the shim frees the component.
-    pub(crate) unsafe fn spawn(ctx: SendPtr<std::ffi::c_void>) -> Option<Self> {
+    pub(crate) unsafe fn spawn(ctx: AuCtx) -> Option<Self> {
         let queue = Arc::new(ParamNotifyQueue::new(EVENT_LIST_PREALLOC));
         let stop = Arc::new(AtomicBool::new(false));
-        let latency_dirty = Arc::new(AtomicBool::new(false));
-        let (q, s, ld) = (
-            Arc::clone(&queue),
-            Arc::clone(&stop),
-            Arc::clone(&latency_dirty),
-        );
+        let (q, s) = (Arc::clone(&queue), Arc::clone(&stop));
         let drain = move || {
-            // SAFETY (both calls): `ctx` is an opaque key the C side maps
-            // to its component; the Rust instance is never dereferenced
-            // through it, and this thread is joined before the component
-            // is freed.
-            if ld.swap(false, Ordering::AcqRel) {
-                unsafe { moose_au_v2_host_latency_changed(ctx.as_ptr().cast_mut()) };
-            }
+            // SAFETY: `ctx` is an opaque key the C side maps to its
+            // component; the Rust instance is never dereferenced through
+            // it, and this thread is joined before the component is freed.
             while let Some((id, value)) = q.pop() {
-                unsafe { moose_au_v2_host_set_param(ctx.as_ptr().cast_mut(), id, value) };
+                unsafe { moose_au_v2_host_set_param(ctx.as_ptr(), id, value) };
             }
         };
         let handle = thread::Builder::new()
@@ -218,16 +222,9 @@ impl ParamNotifier {
         Some(Self {
             queue,
             stop,
-            latency_dirty,
             thread,
             handle: Some(handle),
         })
-    }
-
-    /// Flag a latency change for the polling notifier. Audio-thread work is
-    /// one coalescing atomic store; waking and host callbacks stay off-thread.
-    pub(crate) fn notify_latency(&self) {
-        self.latency_dirty.store(true, Ordering::Release);
     }
 }
 
@@ -246,14 +243,15 @@ pub(crate) struct AuInstance<P: PluginExport> {
     // First fields: close worker requests before any native/editor teardown.
     pub(crate) persist_signal: Option<Arc<PersistChangeSignal>>,
     pub(crate) host_queue: Arc<HostQueue>,
-    #[cfg(target_os = "macos")]
+    /// The main-queue dispatch source that drains `host_queue` (persist
+    /// completions, latency/tail changes) on macOS and iOS. `None` only when
+    /// libdispatch refused to create it; then nothing drains the queue.
+    #[cfg(target_vendor = "apple")]
     pub(crate) persist_dispatch: Option<persist_notify::Dispatcher>,
-    /// The plugin in the wrapper-standard ownership cell: the audio
-    /// thread owns it per block, host lifecycle callbacks own it while
-    /// processing is stopped, and the two never overlap. `cb_state_save`
-    /// and the editor's `get_state` read the lock-free snapshot instead,
-    /// so they never touch it. See `moose_core::wrapper::SharedPlugin`.
-    pub(crate) plugin: SharedPlugin<P>,
+    /// The plugin owned directly by this AU instance inside [`PluginCell`]:
+    /// the audio thread owns it per block, lifecycle callbacks own it while
+    /// stopped, and no other thread holds a cloned `Arc` to it.
+    pub(crate) plugin: PluginCell<P>,
     /// Stable handle to the params Arc, set once at instance creation.
     /// Host-thread callbacks (`cb_param_*`) read params through this
     /// handle so a param query never touches the plugin.
@@ -274,10 +272,12 @@ pub(crate) struct AuInstance<P: PluginExport> {
     /// the editor never touches the plugin (`--shell` rebuilds
     /// from the reloaded dylib, so GUI edits hot-reload).
     pub(crate) editor_builder: EditorBuilder<P::Params>,
-    /// Atomic snapshots of the plugin's most recent `latency()` /
-    /// `tail()`. Updated by the audio thread (or `cb_reset`).
-    pub(crate) latency_cache: AtomicU32,
-    pub(crate) tail_cache: AtomicU32,
+    /// The latency and tail reported to the host, published only when
+    /// `cb_reset` prepares the processor (the activation). The property
+    /// getters read it without entering the processor cell; a block that
+    /// sees either move raises `HostSignal::LATENCY`, which the main-queue
+    /// drain turns into a `kAudioUnitProperty_Latency` change.
+    pub(crate) delay: moose_core::delay::ReportedDelay,
     /// Current render mode as a [`ProcessMode`] discriminant. The host
     /// toggles AU offline rendering on the main thread (`cb_set_render_
     /// mode`); `cb_reset` and every `cb_process` block read it so a

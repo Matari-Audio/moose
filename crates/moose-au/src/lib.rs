@@ -87,7 +87,7 @@ use moose_params::{MidiSource, ParamFlags};
 
 use ffi::{AuCallbacks, AuParamDescriptor, AuPluginDescriptor};
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod persist_notify;
 
 // ---------------------------------------------------------------------------
@@ -828,16 +828,14 @@ mod tests {
     fn param_notifier_drains_and_joins() {
         use std::time::{Duration, Instant};
 
-        use moose_core::editor::SendPtr;
-
         use super::ParamNotifier;
+        use crate::instance::AuCtx;
 
-        let dummy = core::ptr::dangling::<std::ffi::c_void>();
+        let dummy = core::ptr::dangling_mut::<std::ffi::c_void>();
         // SAFETY: `dummy` is only ever compared (never dereferenced) by
         // the C map lookup, and the notifier is dropped (joined) below
         // while still in scope.
-        let notifier =
-            unsafe { ParamNotifier::spawn(SendPtr::new(dummy)) }.expect("spawn notifier");
+        let notifier = unsafe { ParamNotifier::spawn(AuCtx(dummy)) }.expect("spawn notifier");
 
         // Payload value is irrelevant (the host-set FFI no-ops here).
         for i in 0..100u32 {

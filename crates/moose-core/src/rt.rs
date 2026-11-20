@@ -673,14 +673,14 @@ mod tests {
     #[test]
     fn plugin_cell_ownership_is_allocation_free() {
         use super::imp::count_allocs;
-        use crate::wrapper::{enter_plugin, shared_plugin};
+        use crate::wrapper::{PluginCell, enter_plugin};
 
         // The audio thread takes plugin ownership every block, so that
         // must never allocate. The ownership cell holds no OS mutex - a
         // lock is a bare atomic load with nothing to lazily initialize.
-        let shared = shared_plugin(vec![0u8; 16]);
+        let plugin = PluginCell::new(vec![0u8; 16]);
         let n = count_allocs(|| {
-            drop(enter_plugin(&shared));
+            drop(enter_plugin(&plugin));
         });
         assert_eq!(n, 0, "taking plugin ownership must be allocation-free");
     }

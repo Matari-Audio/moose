@@ -122,7 +122,7 @@ unsafe extern "C" fn set_parent<P: PluginExport>(
     }
     run_extern_callback_with::<P, bool>("CLAP", "nested set_parent", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let host = data.host;
+        let host = data.host.as_ptr();
         let mut gui = data.gui.enter();
         if !gui.gui_created || gui.mode != GuiMode::WaylandNested || !host_supports(host) {
             return false;

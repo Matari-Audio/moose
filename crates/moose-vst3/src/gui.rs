@@ -7,7 +7,7 @@ use crate::midi_proxy::{MIDI_PROXY_PER_CHANNEL, allocated_midi_proxy_id};
 
 use moose_core::TransportSlot;
 use moose_core::editor::{
-    EditGroup, Editor, EditorBridge, HostContext, PluginContext, RawWindowHandle, SendPtr,
+    EditGroup, Editor, EditorBridge, HostContext, PluginContext, RawWindowHandle,
     clamp_logical_size, fit_logical_size,
 };
 use moose_core::events::TransportInfo;
@@ -27,9 +27,25 @@ use std::sync::atomic::Ordering;
 // HostContext
 // ---------------------------------------------------------------------------
 
+/// Opaque `Vst3Instance<P>` handle held by [`Vst3Host`].
+#[derive(Clone, Copy)]
+struct InstanceCtx(*mut std::ffi::c_void);
+
+// SAFETY: `Vst3Host` only passes this pointer into `ffi::moose_vst3_*`
+// helpers, which look up the live `Host` in the synchronized COM registry
+// (no-op once unregistered on teardown) rather than dereferencing `ctx`.
+unsafe impl Send for InstanceCtx {}
+unsafe impl Sync for InstanceCtx {}
+
+impl InstanceCtx {
+    fn as_ptr(self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
 /// One VST3 instance seen from its editor.
 pub(crate) struct Vst3Host<P: PluginExport> {
-    ctx: SendPtr<std::ffi::c_void>,
+    ctx: InstanceCtx,
     params: Arc<P::Params>,
     meter_store: Arc<MeterStore>,
     snapshot: Arc<SnapshotSlot>,
@@ -45,9 +61,7 @@ impl<P: PluginExport> Vst3Host<P> {
     unsafe fn new(ctx: *mut std::ffi::c_void) -> Self {
         let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
         Self {
-            // SAFETY: the instance outlives the editor (`cb_destroy` tears
-            // down the editor before freeing `ctx`).
-            ctx: unsafe { SendPtr::new(ctx) },
+            ctx: InstanceCtx(ctx),
             params: Arc::clone(&inst.params_arc),
             meter_store: Arc::clone(&inst.meter_store),
             snapshot: Arc::clone(&inst.snapshot),
@@ -61,7 +75,7 @@ impl<P: PluginExport> Vst3Host<P> {
 
 impl<P: PluginExport> EditorBridge for Vst3Host<P> {
     fn begin_edit(&self, id: u32) {
-        ffi::moose_vst3_begin_edit(self.ctx.as_ptr().cast_mut(), id);
+        ffi::moose_vst3_begin_edit(self.ctx.as_ptr(), id);
     }
 
     fn set_param(&self, id: u32, normalized: f64) {
@@ -73,21 +87,26 @@ impl<P: PluginExport> EditorBridge for Vst3Host<P> {
         if self.params.parameter_affects_presentation(id) {
             self.queue.signal(HostSignal::PRESENTATION);
         }
-        ffi::moose_vst3_perform_edit(self.ctx.as_ptr().cast_mut(), id, norm);
+        ffi::moose_vst3_perform_edit(self.ctx.as_ptr(), id, norm);
     }
 
     fn end_edit(&self, id: u32) {
-        ffi::moose_vst3_end_edit(self.ctx.as_ptr().cast_mut(), id);
+        ffi::moose_vst3_end_edit(self.ctx.as_ptr(), id);
     }
 
     fn request_resize(&self, w: u32, h: u32) -> bool {
         if w == 0 || h == 0 {
             return false;
         }
-        // SAFETY: `ctx` is the live `Vst3Instance<P>`.
-        let inst = unsafe { &*self.ctx.as_ptr().cast::<Vst3Instance<P>>() };
-        let (pw, ph) = logical_to_phys(w, h, inst.host_scale());
-        ffi::moose_vst3_request_resize(self.ctx.as_ptr().cast_mut(), pw, ph) != 0
+        let Some((pw, ph)) = self.queue.with_open(|| {
+            // SAFETY: `with_open` keeps `Vst3Instance<P>` alive against
+            // `cb_destroy` while we read its atomic scale.
+            let inst = unsafe { &*self.ctx.as_ptr().cast::<Vst3Instance<P>>() };
+            logical_to_phys(w, h, inst.host_scale())
+        }) else {
+            return false;
+        };
+        ffi::moose_vst3_request_resize(self.ctx.as_ptr(), pw, ph) != 0
     }
 
     fn get_param(&self, id: u32) -> f64 {
@@ -131,20 +150,20 @@ impl<P: PluginExport> EditorBridge for Vst3Host<P> {
 impl<P: PluginExport> HostContext for Vst3Host<P> {
     fn mark_dirty(&self) {
         self.queue.signal(HostSignal::MARK_DIRTY);
-        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr().cast_mut());
+        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr());
     }
 
     fn group_edits(&self, edge: EditGroup) {
-        ffi::moose_vst3_group_edit(self.ctx.as_ptr().cast_mut(), edge);
+        ffi::moose_vst3_group_edit(self.ctx.as_ptr(), edge);
     }
 
     fn request_restart(&self) {
         self.queue.signal(HostSignal::RESTART);
-        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr().cast_mut());
+        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr());
     }
 
     fn context_menu(&self, target: MenuTarget, x: i32, y: i32) -> bool {
-        let ctx = self.ctx.as_ptr().cast_mut();
+        let ctx = self.ctx.as_ptr();
         if !ffi::moose_vst3_has_context_menu(ctx) {
             return false;
         }
@@ -160,14 +179,16 @@ impl<P: PluginExport> HostContext for Vst3Host<P> {
 
     fn notify(&self, notice: HostNotice) {
         self.queue.signal(notice);
-        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr().cast_mut());
+        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr());
     }
 
     fn window_rescaled(&self, scale: f64) {
         if scale.is_finite() && scale > 0.0 {
-            // SAFETY: the editor is closed before the instance is freed.
-            let inst = unsafe { &*self.ctx.as_ptr().cast::<Vst3Instance<P>>() };
-            inst.window_scale.store(scale.to_bits(), Ordering::Relaxed);
+            self.queue.with_open(|| {
+                // SAFETY: `with_open` keeps `Vst3Instance<P>` alive against `cb_destroy`.
+                let inst = unsafe { &*self.ctx.as_ptr().cast::<Vst3Instance<P>>() };
+                inst.window_scale.store(scale.to_bits(), Ordering::Relaxed);
+            });
         }
     }
 }

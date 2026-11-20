@@ -1,5 +1,10 @@
 //! Custom-state save contract (audit 2026-11-18, step 1).
 //!
+//! This is a deprecated [`PluginLogic`] adapter test on purpose: processor-side
+//! `save_state` / `load_state` / snapshot hooks were removed from
+//! `moose::Plugin` (custom state lives in `#[persist]`) and survive only on
+//! `PluginLogic` for one release.
+//!
 //! A plugin that overrides only `save_state` must round-trip on every
 //! format without serializing on the audio thread every block: the shell
 //! publishes a baseline at creation, serializes on demand when a host save

@@ -55,7 +55,6 @@ use moose_params::Params;
 use std::ffi::{c_char, c_void};
 use std::mem::transmute;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
@@ -219,11 +218,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // Take ownership of the plugin for the whole block: an
         // uncontended `Acquire`, never a wait, since the host contract
         // keeps `process` from overlapping a lifecycle callback and host
-        // saves read the snapshot instead of the plugin. Enter through a
-        // local Arc clone so the guard doesn't pin a borrow of `data`
-        // (later per-block work needs `&mut data`).
-        let plugin_arc = Arc::clone(&data.plugin);
-        let mut instance = enter_plugin(&plugin_arc);
+        // saves read the snapshot instead of the plugin.
+        let mut instance = enter_plugin(&data.plugin);
 
         // Apply any state-load that the host or editor handed us
         // since the last block. Runs before per-block work so the
@@ -475,23 +471,15 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             }
         }
 
-        // On a latency change, flag it and wake the main thread, which
-        // asks the host to restart (`clap.latency` requires the call off
-        // the audio thread). The reported value waits for that restart.
-        let new_latency = instance.latency();
-        if data.latency_live.swap(new_latency, Ordering::Relaxed) != new_latency {
-            data.host_queue.signal(HostSignal::LATENCY);
-        }
-        // A shrinking reverb tail must reach the host so its bounce
-        // end-time is right. Unlike latency (which needs a main-thread
-        // restart), `clap.tail.changed` is an [audio-thread] callback, so
-        // notify the host directly from here - no deferral.
-        let new_tail = instance.tail();
-        if data.tail_cache.swap(new_tail, Ordering::Relaxed) != new_tail
-            && !data.host_tail.is_null()
-            && let Some(changed) = (*data.host_tail).changed
-        {
-            changed(data.host);
+        // Latency cannot change while active (`clap.latency`), so signal the
+        // main thread to request a restart; the new latency publishes on the
+        // next `activate`. Tail changes are `[audio-thread]` in CLAP 1.2
+        // (`clap/ext/tail.h`): publish atomically and notify `clap.tail.changed`
+        // directly without forcing a disruptive restart.
+        data.delay
+            .observe_latency_and_signal(instance.latency(), &data.host_queue);
+        if data.delay.publish_tail(instance.tail()) {
+            data.host.on_audio_thread().tail_changed(data.host_tail);
         }
 
         // GUI delivery has its own queue semantics. The public status belongs
@@ -855,12 +843,11 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // SAFETY: the wrapper retains the host for the instance's lifetime;
         // `request_callback` is thread-safe (CLAP host.h).
         unsafe {
-            let host = data_from_plugin::<P>(plugin).host;
-            if !host.is_null()
-                && let Some(request) = (*host).request_callback
-            {
-                request(host);
-            }
+            data_from_plugin::<P>(plugin)
+                .host
+                .on_audio_thread()
+                .as_any()
+                .request_callback();
         }
         CLAP_PROCESS_ERROR
     });

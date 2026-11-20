@@ -16,10 +16,10 @@ use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::thread::MainThreadCell;
-use moose_core::wrapper::{PluginCell, SharedPlugin};
+use moose_core::wrapper::PluginCell;
 use moose_params::{ParamRange, PersistChangeSignal};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Instance wrapper
@@ -54,12 +54,12 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     /// The plugin's main-thread part; reached only from edit-controller
     /// callbacks, which VST3 runs on the UI thread.
     pub(crate) main_thread: MainThreadCell<Box<dyn MainThreadHooks>>,
-    /// The plugin in the wrapper-standard ownership cell: the audio
-    /// thread owns it per block, host lifecycle callbacks own it while
-    /// processing is stopped, and the two never overlap. `cb_state_save`
-    /// and the editor's `get_state` read the lock-free snapshot instead,
-    /// so they never touch it. See `moose_core::wrapper::SharedPlugin`.
-    pub(crate) plugin: SharedPlugin<P>,
+    /// The plugin owned directly by this VST3 instance inside [`PluginCell`]:
+    /// the audio thread owns it per block, host lifecycle callbacks own it
+    /// while processing is stopped, and no other thread holds a cloned `Arc`
+    /// to it. `cb_state_save` and the editor's `get_state` read the lock-free
+    /// snapshot instead.
+    pub(crate) plugin: PluginCell<P>,
     /// Stable handle to the params Arc, set once at instance creation.
     /// Host-thread callbacks (`cb_param_*`) read params through this
     /// handle so a param query never touches the plugin.
@@ -130,13 +130,13 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     pub(crate) pending_state: Arc<StateLoadQueue>,
     /// Set by a panic in `process`; cleared by the next successful prepare.
     pub(crate) panic_latch: moose_core::wrapper::PanicLatch,
-    /// Atomic snapshots of the plugin's most recent `latency()` /
-    /// `tail()` reports. Updated by the audio thread (or `cb_reset`)
-    /// so host-thread callbacks (`cb_get_latency`, `cb_get_tail`) read
-    /// the value without forming a `&Inst.plugin` reference. Initial
-    /// value is whatever the plugin reports immediately after `init()`.
-    pub(crate) latency_cache: AtomicU32,
-    pub(crate) tail_cache: AtomicU32,
+    /// The latency and tail reported to the host, published only by
+    /// `cb_setup_processing` (the activation). `getLatencySamples` /
+    /// `getTailSamples` read it without entering the processor cell; a
+    /// block that sees either move raises `HostSignal::LATENCY`, drained on
+    /// the UI thread as `kLatencyChanged`. Starts at what the plugin reports
+    /// right after `init()`.
+    pub(crate) delay: moose_core::delay::ReportedDelay,
     /// Collision-free hidden MIDI proxy IDs in logical
     /// `(port, channel, controller)` order. Allocated deterministically
     /// from the top of the host-safe parameter domain while skipping
@@ -189,6 +189,10 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     pub(crate) gui: PluginCell<Vst3Gui>,
     /// Per-instance main-thread mailbox for signals and context-menu requests.
     pub(crate) host_queue: Arc<HostQueue>,
+    /// Borrowed pointer to the COM `Host`, set by `cb_bind_host_queue` in
+    /// `Host::new` and cleared + joined via `host_queue.close()` in
+    /// `Host::drop` before `Host` or its OS wakes are torn down.
+    pub(crate) host_wake_target: Arc<AtomicPtr<std::ffi::c_void>>,
 }
 
 impl<P: PluginExport> Vst3Instance<P> {

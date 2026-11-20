@@ -1,15 +1,13 @@
 //! Editor callbacks and the shim's view entry points.
 
-use crate::instance::{AuInstance, StateLoadQueue};
+use crate::instance::{AuCtx, AuInstance, StateLoadQueue};
 
 #[cfg(target_os = "macos")]
 use moose_core::Float;
 use moose_core::TransportSlot;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use moose_core::editor::RawWindowHandle;
-use moose_core::editor::{
-    Editor, EditorBridge, HostContext, PluginContext, SendPtr, fit_logical_size,
-};
+use moose_core::editor::{Editor, EditorBridge, HostContext, PluginContext, fit_logical_size};
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostQueue, HostSignal};
@@ -30,7 +28,7 @@ use std::sync::atomic::Ordering;
 
 /// One AU instance seen from its editor.
 pub(crate) struct AuHost<P: PluginExport> {
-    ctx: SendPtr<std::ffi::c_void>,
+    ctx: AuCtx,
     params: Arc<P::Params>,
     meter_store: Arc<MeterStore>,
     snapshot: Arc<SnapshotSlot>,
@@ -46,9 +44,7 @@ impl<P: PluginExport> AuHost<P> {
     unsafe fn new(ctx: *mut std::ffi::c_void) -> Self {
         let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
         Self {
-            // SAFETY: the instance outlives the editor (`cb_destroy` tears
-            // down the editor before freeing `ctx`).
-            ctx: unsafe { SendPtr::new(ctx) },
+            ctx: AuCtx(ctx),
             params: Arc::clone(&inst.params_arc),
             meter_store: Arc::clone(&inst.meter_store),
             snapshot: Arc::clone(&inst.snapshot),
@@ -68,7 +64,7 @@ impl<P: PluginExport> EditorBridge for AuHost<P> {
         // automation gesture. iOS AU v3 notifies via the AUParameterTree.
         #[cfg(target_os = "macos")]
         self.queue.with_open(|| unsafe {
-            moose_au_v2_host_begin_param_gesture(self.ctx.as_ptr().cast_mut(), id);
+            moose_au_v2_host_begin_param_gesture(self.ctx.as_ptr(), id);
         });
         #[cfg(not(target_os = "macos"))]
         let _ = (self.ctx, id);
@@ -78,7 +74,7 @@ impl<P: PluginExport> EditorBridge for AuHost<P> {
         let plain = self.params.set_normalized_returning_plain(id, normalized);
         #[cfg(target_os = "macos")]
         self.queue.with_open(|| unsafe {
-            moose_au_v2_host_set_param(self.ctx.as_ptr().cast_mut(), id, f32::from_f64(plain));
+            moose_au_v2_host_set_param(self.ctx.as_ptr(), id, f32::from_f64(plain));
         });
         #[cfg(not(target_os = "macos"))]
         let _ = (self.ctx, plain);
@@ -87,7 +83,7 @@ impl<P: PluginExport> EditorBridge for AuHost<P> {
     fn end_edit(&self, id: u32) {
         #[cfg(target_os = "macos")]
         self.queue.with_open(|| unsafe {
-            moose_au_v2_host_end_param_gesture(self.ctx.as_ptr().cast_mut(), id);
+            moose_au_v2_host_end_param_gesture(self.ctx.as_ptr(), id);
         });
         #[cfg(not(target_os = "macos"))]
         let _ = (self.ctx, id);
@@ -191,10 +187,10 @@ pub(crate) unsafe fn editor_context<P: PluginExport>(ctx: *mut std::ffi::c_void)
 /// # Safety
 /// `ctx` is a live `AuInstance<P>` pointer.
 #[cfg_attr(
-    not(any(target_os = "macos", test)),
+    not(any(target_vendor = "apple", test)),
     allow(
         dead_code,
-        reason = "called by the macOS main-queue dispatch source and unit tests"
+        reason = "called by the Apple main-queue dispatch source and unit tests"
     )
 )]
 pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
@@ -203,6 +199,20 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
 ) {
     let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
     let drain = inst.host_queue.drain(main);
+    // Commit only the delay lanes covered by the drained signals so a tail-only
+    // drain can never silently publish a racing latency observation.
+    if drain.has(HostSignal::LATENCY) && inst.delay.commit_latency() {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            moose_au_v2_host_latency_changed(ctx);
+        }
+    }
+    if drain.has(HostSignal::TAIL) && inst.delay.commit_tail() {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            moose_au_v2_host_tail_changed(ctx);
+        }
+    }
     if drain.has(HostSignal::PERSIST)
         && let Some((id, value)) = inst.params_arc.take_persist_change()
         && value.is_finite()
@@ -466,6 +476,7 @@ unsafe extern "C" {
     pub(crate) fn moose_au_v2_host_begin_param_gesture(ctx: *mut std::ffi::c_void, param_id: u32);
     pub(crate) fn moose_au_v2_host_end_param_gesture(ctx: *mut std::ffi::c_void, param_id: u32);
     pub(crate) fn moose_au_v2_host_latency_changed(ctx: *mut std::ffi::c_void);
+    pub(crate) fn moose_au_v2_host_tail_changed(ctx: *mut std::ffi::c_void);
 }
 
 #[cfg(test)]

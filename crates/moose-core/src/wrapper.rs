@@ -19,43 +19,12 @@ use std::any::type_name;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 
 use moose_params::ParamInfo;
 
 use crate::export::PluginExport;
 
 pub use plugin_cell::{PluginCell, PluginGuard};
-
-/// The ownership cell the real-time format wrappers (CLAP, VST3, AU) put
-/// around their plugin instance. The audio thread owns the
-/// plugin while the host is processing (`process`, the queued state
-/// apply); the host thread owns it while processing is stopped (`init`,
-/// `reset`, an inactive state load). The host contract makes those two
-/// mutually exclusive in time - a spec-compliant host never overlaps
-/// `process` with a lifecycle callback - so [`PluginCell`] holds no OS
-/// lock and the audio thread never waits. Ownership handoff carries a
-/// release-acquire edge (each owner observes the previous owner's
-/// writes), not mutual exclusion.
-///
-/// A host state save no longer touches the plugin at all: it reads the
-/// lock-free [`SnapshotSlot`](crate::snapshot::SnapshotSlot) the audio
-/// thread publishes each block (see [`save_extra`]). Meters ride the
-/// lock-free `MeterStore`, and params are atomic. So nothing on a
-/// non-audio thread contends with `process` on the hot path.
-///
-/// The soundness rests on the host's process/lifecycle exclusion
-/// contract; a debug-build overlap detector trips if a host ever
-/// violates it. The `Arc` is what makes GUI closures sound: they clone
-/// the handle instead of stashing a raw pointer into the instance
-/// struct.
-pub type SharedPlugin<P> = Arc<PluginCell<P>>;
-
-/// Wrap a freshly created plugin in the wrapper-standard ownership
-/// cell. See [`SharedPlugin`].
-pub fn shared_plugin<P>(plugin: P) -> SharedPlugin<P> {
-    Arc::new(PluginCell::new(plugin))
-}
 
 /// Take ownership of the plugin for the current callback. Never blocks:
 /// the audio thread owns the plugin while active, the host thread while
@@ -799,7 +768,7 @@ pub unsafe fn copy_c_str(out: *mut c_char, out_len: usize, text: &str) -> usize 
 mod plugin_cell_tests {
     use std::sync::Arc;
 
-    use super::{PluginCell, enter_plugin, shared_plugin};
+    use super::{PluginCell, enter_plugin};
 
     #[test]
     fn try_enter_declines_while_held_then_accepts_when_free() {
@@ -850,7 +819,7 @@ mod plugin_cell_tests {
 
     #[test]
     fn lock_round_trips_data() {
-        let plugin = shared_plugin(41);
+        let plugin = PluginCell::new(41);
         *enter_plugin(&plugin) += 1;
         assert_eq!(*enter_plugin(&plugin), 42);
     }
@@ -859,7 +828,7 @@ mod plugin_cell_tests {
     fn repeated_ownership_publishes_writes() {
         // Models the audio thread owning the cell block after block:
         // each release-acquire cycle observes the previous cycle's write.
-        let plugin = shared_plugin(0u64);
+        let plugin = PluginCell::new(0u64);
         for _ in 0..1000 {
             *enter_plugin(&plugin) += 1;
         }
@@ -872,7 +841,7 @@ mod plugin_cell_tests {
         // the cell, writes, and releases; only after it joins does the
         // main thread acquire. The cell's `Acquire` makes the worker's
         // write visible - no overlap, so the detector never trips.
-        let plugin = shared_plugin(0u32);
+        let plugin = Arc::new(PluginCell::new(0u32));
         let worker = {
             let plugin = Arc::clone(&plugin);
             std::thread::spawn(move || {
@@ -888,7 +857,7 @@ mod plugin_cell_tests {
         // A panic in an owner unwinds through the guard's `Drop`, which
         // releases the handoff (and clears the debug overlap flag), so
         // the cell stays usable - one bad block can't wedge it.
-        let plugin = shared_plugin(7);
+        let plugin = Arc::new(PluginCell::new(7));
         let for_panic = Arc::clone(&plugin);
         let _ = std::thread::spawn(move || {
             let _guard = enter_plugin(&for_panic);

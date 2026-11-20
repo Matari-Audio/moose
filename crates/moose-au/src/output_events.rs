@@ -30,7 +30,6 @@ use moose_core::ump::{
 };
 use moose_core::wrapper::run_extern_callback_with;
 use std::slice;
-use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
 // Output event callbacks (plugin → host MIDI)
@@ -102,9 +101,7 @@ pub(crate) unsafe extern "C" fn cb_latency_samples<P: PluginExport>(
         if ctx.is_null() {
             return 0;
         }
-        (*ctx.cast::<AuInstance<P>>())
-            .latency_cache
-            .load(Ordering::Relaxed)
+        (*ctx.cast::<AuInstance<P>>()).delay.latency()
     }
 }
 
@@ -117,9 +114,7 @@ pub(crate) unsafe extern "C" fn cb_tail_samples<P: PluginExport>(
         if ctx.is_null() {
             return 0;
         }
-        (*ctx.cast::<AuInstance<P>>())
-            .tail_cache
-            .load(Ordering::Relaxed)
+        (*ctx.cast::<AuInstance<P>>()).delay.tail()
     }
 }
 

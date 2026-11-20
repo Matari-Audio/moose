@@ -3,6 +3,7 @@
 use crate::catalog_sync;
 use crate::events::SoundingNotes;
 use crate::gui::Extensions;
+use crate::host_handle::{Any, HostHandle};
 #[cfg(all(target_os = "linux", feature = "clap-draft"))]
 use crate::wayland_nested;
 
@@ -11,11 +12,11 @@ use clap_sys::ext::params::clap_host_params;
 use clap_sys::ext::state::clap_host_state;
 use clap_sys::ext::tail::clap_host_tail;
 use clap_sys::ext::track_info::clap_host_track_info;
-use clap_sys::host::clap_host;
 use clap_sys::process::clap_process;
 use moose_core::Sample;
 use moose_core::TransportSlot;
 use moose_core::bus_routing::BusRouting;
+use moose_core::delay::ReportedDelay;
 use moose_core::editor::{Editor, EditorBuilder};
 use moose_core::events::EventList;
 use moose_core::export::PluginExport;
@@ -28,7 +29,7 @@ use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::thread::{MainThread, MainThreadCell};
-use moose_core::wrapper::{PluginCell, SharedPlugin};
+use moose_core::wrapper::PluginCell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -74,13 +75,12 @@ pub(crate) type StateLoadQueue = state::StateLoadQueue;
 pub(crate) struct ClapPluginData<P: PluginExport> {
     pub(crate) persist_signal: Option<Arc<moose_params::PersistChangeSignal>>,
     pub(crate) host_state: *const clap_host_state,
-    /// The user's plugin instance in the wrapper-standard ownership
-    /// cell: the audio thread owns it per block, host lifecycle
-    /// callbacks own it while processing is stopped, and the two never
-    /// overlap. `state_save` and the editor's `get_state` read the
-    /// lock-free snapshot instead, so they never touch it. See
-    /// `moose_core::wrapper::SharedPlugin`.
-    pub(crate) plugin: SharedPlugin<P>,
+    /// The user's plugin instance, owned directly by this wrapper instance
+    /// inside [`PluginCell`]: the audio thread owns it per block, host
+    /// lifecycle callbacks own it while processing is stopped, and no other
+    /// thread holds a cloned `Arc` to it. `state_save` and the editor's
+    /// `get_state` read the lock-free snapshot instead.
+    pub(crate) plugin: PluginCell<P>,
     /// Stable handle to the params Arc, set once at instance creation.
     /// Host-thread callbacks (`params_get_value`, `params_value_to_text`,
     /// `params_text_to_value`) read params through this handle so a
@@ -103,16 +103,12 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     /// through this never touches the plugin (`--shell` builds rebuild
     /// from the reloaded dylib, so GUI edits hot-reload).
     pub(crate) editor_builder: EditorBuilder<P::Params>,
-    /// The latency reported to the host: set at `activate` only,
-    /// because CLAP forbids a latency change while active. `latency_get`
-    /// reads it without touching `data.plugin`.
-    pub(crate) latency_cache: AtomicU32,
-    /// The plugin's `latency()` after its last block. When it moves off
-    /// `latency_cache`, the main thread asks the host to restart, and the
-    /// new value is reported from the next `activate`.
-    pub(crate) latency_live: AtomicU32,
-    /// The plugin's most recent `tail()`, refreshed every block.
-    pub(crate) tail_cache: AtomicU32,
+    /// The latency and tail reported to the host: published at `activate`
+    /// only, because CLAP forbids a latency change while active.
+    /// `latency.get` / `tail.get` read it without entering the processor
+    /// cell; a block that sees either move raises `HostSignal::LATENCY`,
+    /// and the main thread asks the host to restart.
+    pub(crate) delay: ReportedDelay,
     /// Index into `P::bus_layouts()` of the port config the host last
     /// selected through `clap.audio-ports-config` (0 = the default first
     /// layout). Read by the audio-ports extension so a config switch is
@@ -171,15 +167,16 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     /// reason as `audio`. Its owners are the GUI callbacks, all on the host
     /// main thread; `process` never touches it.
     pub(crate) gui: PluginCell<ClapGui>,
-    /// Host pointer (for querying host extensions).
-    pub(crate) host: *const clap_host,
+    /// Phase-gated host handle (`[thread-safe]` subset; narrow with
+    /// `on_main_thread(&main)` for `[main-thread]` host extension calls).
+    pub(crate) host: HostHandle<Any>,
     /// Host params extension (for `request_flush`).
     pub(crate) host_params: *const clap_host_params,
     /// Host latency extension (for `changed`). Null if the host doesn't
     /// expose `clap.latency`.
     pub(crate) host_latency: *const clap_host_latency,
-    /// Host tail extension (for `changed`). Null if the host doesn't
-    /// expose `clap.tail`.
+    /// Host tail extension (for `[audio-thread]` `changed`). Null if the host
+    /// doesn't expose `clap.tail`.
     pub(crate) host_tail: *const clap_host_tail,
     /// Host track-info extension. Null if the host doesn't expose it.
     pub(crate) host_track_info: *const clap_host_track_info,

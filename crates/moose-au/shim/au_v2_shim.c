@@ -336,6 +336,20 @@ void moose_au_v2_host_latency_changed(void *ctx) {
     AUEventListenerNotify(NULL, NULL, &event);
 }
 
+/* Broadcast a `kAudioUnitProperty_TailTime` property change off the audio thread. */
+void moose_au_v2_host_tail_changed(void *ctx) {
+    MooseAUv2 *inst = au_ctx_map_lookup(ctx);
+    if (!inst || !inst->componentInstance) return;
+    AudioUnitEvent event;
+    memset(&event, 0, sizeof(event));
+    event.mEventType = kAudioUnitEvent_PropertyChange;
+    event.mArgument.mProperty.mAudioUnit = inst->componentInstance;
+    event.mArgument.mProperty.mPropertyID = kAudioUnitProperty_TailTime;
+    event.mArgument.mProperty.mScope = kAudioUnitScope_Global;
+    event.mArgument.mProperty.mElement = 0;
+    AUEventListenerNotify(NULL, NULL, &event);
+}
+
 /* Whether the host should hand this plugin MIDI input. Gated on the
  * `accepts_midi_in` capability (category default, overridable via
  * `midi_input` in moose.toml), not the component type - so an `aumu`

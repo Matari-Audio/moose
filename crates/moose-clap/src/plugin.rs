@@ -6,17 +6,13 @@ use crate::data::ClapPluginData;
 use crate::data::HostOutPtr;
 use crate::data_from_plugin;
 use crate::gui::editor_context;
-use crate::note_name;
 use crate::ports::apply_port_activation;
 use crate::ports::host_rescan_audio_ports;
 use crate::track_info;
 use crate::voice_info;
-use clap_sys::ext::gui::CLAP_EXT_GUI;
-use clap_sys::ext::gui::clap_host_gui;
 
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency};
-use clap_sys::ext::params::CLAP_EXT_PARAMS;
-use clap_sys::ext::params::clap_host_params;
+use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_host_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail};
 use clap_sys::ext::track_info::{
@@ -78,29 +74,28 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
             catalog,
             data.params_arc.as_ref(),
         ));
-        // Query host params extension for request_flush support
-        if !data.host.is_null()
-            && let Some(get_ext) = (*data.host).get_extension
+        // Query host extensions (`get_extension` is `[thread-safe]`).
+        if let Some(ext) = data.host.extension::<clap_host_params>(CLAP_EXT_PARAMS) {
+            data.host_params = ext;
+        }
+        if let Some(ext) = data.host.extension::<clap_host_state>(CLAP_EXT_STATE) {
+            data.host_state = ext;
+        }
+        if let Some(ext) = data.host.extension::<clap_host_latency>(CLAP_EXT_LATENCY) {
+            data.host_latency = ext;
+        }
+        if let Some(ext) = data.host.extension::<clap_host_tail>(CLAP_EXT_TAIL) {
+            data.host_tail = ext;
+        }
+        if let Some(ext) = data
+            .host
+            .extension::<clap_host_track_info>(CLAP_EXT_TRACK_INFO)
+            .or_else(|| {
+                data.host
+                    .extension::<clap_host_track_info>(CLAP_EXT_TRACK_INFO_COMPAT)
+            })
         {
-            let ext = get_ext(data.host, CLAP_EXT_PARAMS.as_ptr());
-            if !ext.is_null() {
-                data.host_params = ext.cast::<clap_host_params>();
-            }
-            data.host_state = get_ext(data.host, CLAP_EXT_STATE.as_ptr()).cast::<clap_host_state>();
-            let lat_ext = get_ext(data.host, CLAP_EXT_LATENCY.as_ptr());
-            if !lat_ext.is_null() {
-                data.host_latency = lat_ext.cast::<clap_host_latency>();
-            }
-            let tail_ext = get_ext(data.host, CLAP_EXT_TAIL.as_ptr());
-            if !tail_ext.is_null() {
-                data.host_tail = tail_ext.cast::<clap_host_tail>();
-            }
-            data.host_track_info =
-                get_ext(data.host, CLAP_EXT_TRACK_INFO.as_ptr()).cast::<clap_host_track_info>();
-            if data.host_track_info.is_null() {
-                data.host_track_info = get_ext(data.host, CLAP_EXT_TRACK_INFO_COMPAT.as_ptr())
-                    .cast::<clap_host_track_info>();
-            }
+            data.host_track_info = ext;
         }
         if data.params_arc.wants_persist_notifications() {
             let queue = Arc::clone(&data.host_queue);
@@ -210,16 +205,21 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
                 return false;
             }
             data.panic_latch.clear();
-            // Refresh the caches from the freshly-reset instance so the
-            // host reads the real latency/tail before the first block -
-            // not the placeholder-rate value from create. No dirty flag:
-            // this is the baseline the host reads at activate, not a
-            // mid-session change needing changed() / request_restart.
-            data.latency_cache
-                .store(instance.latency(), Ordering::Relaxed);
-            data.latency_live
-                .store(instance.latency(), Ordering::Relaxed);
-            data.tail_cache.store(instance.tail(), Ordering::Relaxed);
+            // Publish what the freshly prepared processor reports, so the
+            // host reads the real latency/tail before the first block - not
+            // the placeholder-rate value from create. CLAP 1.2 permits
+            // `clap_host_latency.changed` only `[main-thread & being-activated]`,
+            // so notify right here when activation changes latency.
+            let prev_latency = data.delay.latency();
+            let new_latency = instance.latency();
+            data.delay.publish(new_latency, instance.tail());
+            if new_latency != prev_latency {
+                // SAFETY: `clap_plugin.activate` is `[main-thread & being-activated]`.
+                let main = MainThread::assume();
+                data.host
+                    .on_main_thread(&main)
+                    .latency_changed(data.host_latency);
+            }
         }
 
         // Pre-grow the widening / narrowing scratch so no host wire /
@@ -298,7 +298,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
         let rescan = !data.host_queue.take(HostSignal::PARAM_RESCAN).is_empty();
         catalog_sync::sync_parameters(data, &main, rescan);
         if data.ports_rescan.swap(false, Ordering::Relaxed) {
-            host_rescan_audio_ports(data);
+            host_rescan_audio_ports(data, &main);
         }
     });
 }
@@ -341,9 +341,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *cons
                 &AudioConfig::new(audio.sample_rate, audio.max_block_size).with_process_mode(mode),
             );
         }
-        // Latency stays as reported at `activate`: a change shows up at
-        // the next block, which asks the host to restart.
-        data.tail_cache.store(instance.tail(), Ordering::Relaxed);
+        // Latency stays as reported at `activate`: a latency change during
+        // processing asks the host to restart, whereas tail changes notify
+        // `[audio-thread]` `clap.tail.changed` directly without restarting.
     });
 }
 
@@ -355,6 +355,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
         data.panic_latch.report();
         // SAFETY: `clap_plugin.on_main_thread` is [main-thread] (plugin.h).
         let main = MainThread::assume();
+        let host = data.host.on_main_thread(&main);
         // Everything raised from here on wakes the host again.
         let drain = data.host_queue.drain(&main);
         let signals = drain.signals;
@@ -371,33 +372,24 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
             context.end_edit(id);
             // State dirtiness must also reach an inactive host that does not
             // implement params/request_flush.
-            host_mark_dirty(data);
+            host.mark_dirty(data.host_state);
         }
         if signals.contains(HostSignal::MARK_DIRTY) {
-            host_mark_dirty(data);
+            host.mark_dirty(data.host_state);
         }
         if signals.contains(HostSignal::FLOATING_CLOSED) {
             data.gui.enter().visible = false;
-            if !data.host.is_null()
-                && let Some(get) = (*data.host).get_extension
-            {
-                let host_gui = get(data.host, CLAP_EXT_GUI.as_ptr()).cast::<clap_host_gui>();
-                if !host_gui.is_null()
-                    && let Some(closed) = (*host_gui).closed
-                {
-                    closed(data.host, false);
-                }
-            }
+            host.gui_closed(false);
         }
         // Catalog changes, presentation revisions and value rescans. A
         // structure change requests a restart and is published inactive.
         catalog_sync::sync_parameters(data, &main, signals.contains(HostSignal::PARAM_RESCAN));
         let notices = signals.notices();
         if notices.contains(HostNotice::NOTE_NAMES) {
-            note_name::host_changed(data.host);
+            host.note_name_changed();
         }
         if notices.contains(HostNotice::VOICE_INFO) {
-            voice_info::host_changed(data.host);
+            host.voice_info_changed();
         }
         let active = data.active.load(Ordering::Relaxed);
         let mut restart = signals.contains(HostSignal::RESTART);
@@ -406,44 +398,22 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
             restart |= active;
         }
         if !active && data.ports_rescan.swap(false, Ordering::Relaxed) {
-            host_rescan_audio_ports(data);
+            host_rescan_audio_ports(data, &main);
         }
-        if signals.contains(HostSignal::LATENCY) && !data.host.is_null() {
-            if active {
-                restart = true;
-            } else if !data.host_latency.is_null()
-                && let Some(changed) = (*data.host_latency).changed
-            {
-                changed(data.host);
-            }
+        // CLAP 1.2 `clap_host_latency.changed` is `[main-thread & being-activated]`,
+        // so an active latency change requests a restart and `activate` emits
+        // `latency.changed` once the new latency is published.
+        if signals.contains(HostSignal::LATENCY) && !host.is_null() && active {
+            restart = true;
         }
-        if restart
-            && !data.host.is_null()
-            && let Some(request_restart) = (*data.host).request_restart
-        {
-            request_restart(data.host);
+        if restart {
+            host.as_any().request_restart();
         }
         for message in drain {
             // Messages added to moose after this wrapper are dropped.
             if let HostMessage::ContextMenu { target, x, y } = message {
                 context_menu::popup(data, &main, target, x, y);
             }
-        }
-    }
-}
-
-/// [main-thread] `state.mark_dirty`, when the host has it.
-///
-/// # Safety
-/// `data` belongs to a live instance.
-unsafe fn host_mark_dirty<P: PluginExport>(data: &ClapPluginData<P>) {
-    // SAFETY: caller contract; the host pointers live as long as the instance.
-    unsafe {
-        if !data.host.is_null()
-            && !data.host_state.is_null()
-            && let Some(mark_dirty) = (*data.host_state).mark_dirty
-        {
-            mark_dirty(data.host);
         }
     }
 }

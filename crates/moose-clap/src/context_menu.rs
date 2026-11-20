@@ -19,7 +19,6 @@ use clap_sys::ext::context_menu::{
     clap_context_menu_item_title, clap_context_menu_submenu, clap_context_menu_target,
     clap_host_context_menu, clap_plugin_context_menu,
 };
-use clap_sys::host::clap_host;
 use clap_sys::id::clap_id;
 use clap_sys::plugin::clap_plugin;
 use moose_core::export::PluginExport;
@@ -29,6 +28,7 @@ use moose_core::wrapper::run_extern_callback_with;
 
 use crate::data::ClapPluginData;
 use crate::data_from_plugin;
+use crate::host_handle::{Any, HostHandle};
 
 pub(crate) fn make_extension<P: PluginExport>() -> clap_plugin_context_menu {
     clap_plugin_context_menu {
@@ -171,25 +171,26 @@ unsafe extern "C" fn perform<P: PluginExport>(
 ///
 /// # Safety
 /// `host` is null or the live host. `get_extension` is [thread-safe].
-pub(crate) unsafe fn host_menu(host: *const clap_host) -> Option<&'static clap_host_context_menu> {
+pub(crate) unsafe fn host_menu(host: HostHandle<Any>) -> Option<&'static clap_host_context_menu> {
     // SAFETY: caller contract; host extensions live as long as the host.
     unsafe {
-        let get = host.as_ref()?.get_extension?;
-        let mut ext = get(host, CLAP_EXT_CONTEXT_MENU.as_ptr());
-        if ext.is_null() {
-            ext = get(host, CLAP_EXT_CONTEXT_MENU_COMPAT.as_ptr());
-        }
-        let ext = ext.cast::<clap_host_context_menu>().as_ref()?;
+        let ext = host
+            .extension::<clap_host_context_menu>(CLAP_EXT_CONTEXT_MENU)
+            .or_else(|| host.extension::<clap_host_context_menu>(CLAP_EXT_CONTEXT_MENU_COMPAT))?;
         ext.popup.is_some().then_some(ext)
     }
 }
 
 /// Refresh the main-thread-only capability after initialization or GUI creation.
-pub(crate) fn refresh_capability<P: PluginExport>(data: &ClapPluginData<P>, _main: &MainThread) {
-    // SAFETY: the instance owns a live host; the token proves main-thread access.
+pub(crate) fn refresh_capability<P: PluginExport>(data: &ClapPluginData<P>, main: &MainThread) {
+    let host = data.host.on_main_thread(main);
+    // SAFETY: the instance owns a live host; `HostHandle<MainThread>` proves
+    // main-thread access for `can_popup`.
     let supported = unsafe {
-        host_menu(data.host)
-            .is_some_and(|menu| menu.can_popup.is_none_or(|can_popup| can_popup(data.host)))
+        host_menu(host.as_any()).is_some_and(|menu| {
+            menu.can_popup
+                .is_none_or(|can_popup| can_popup(host.as_ptr()))
+        })
     };
     data.menu_popup_supported
         .store(supported, std::sync::atomic::Ordering::Release);
@@ -211,13 +212,14 @@ fn to_host_coords(v: i32, scale: f64) -> i32 {
 /// can't pop one up now.
 pub(crate) fn popup<P: PluginExport>(
     data: &ClapPluginData<P>,
-    _main: &MainThread,
+    main: &MainThread,
     target: MenuTarget,
     x: i32,
     y: i32,
 ) {
+    let host = data.host.on_main_thread(main);
     // SAFETY: the instance holds a live host pointer.
-    let Some(menu) = (unsafe { host_menu(data.host) }) else {
+    let Some(menu) = (unsafe { host_menu(host.as_any()) }) else {
         return;
     };
     let target = match target {
@@ -232,16 +234,16 @@ pub(crate) fn popup<P: PluginExport>(
     };
     let scale = data.host_scale();
     // SAFETY: `can_popup` and `popup` are [main-thread] (context-menu.h),
-    // which the token proves; `target` lives across the call.
+    // which `HostHandle<MainThread>` proves; `target` lives across the call.
     unsafe {
         if let Some(can_popup) = menu.can_popup
-            && !can_popup(data.host)
+            && !can_popup(host.as_ptr())
         {
             return;
         }
         if let Some(popup) = menu.popup {
             popup(
-                data.host,
+                host.as_ptr(),
                 &raw const target,
                 0,
                 to_host_coords(x, scale),

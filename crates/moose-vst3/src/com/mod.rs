@@ -344,6 +344,10 @@ pub(crate) fn flush_host_queue(ctx: *mut c_void) {
     component::flush_host_queue(ctx);
 }
 
+pub(crate) unsafe fn wake_host_queue(host: *mut c_void) {
+    unsafe { component::wake_host_queue(host) };
+}
+
 pub(crate) fn check_presentation(ctx: *mut c_void) {
     if let Some(host) = pin(ctx) {
         host.check_presentation();

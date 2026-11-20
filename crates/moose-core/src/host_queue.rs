@@ -64,8 +64,10 @@ bitflags::bitflags! {
         /// Deactivate and reactivate the plugin (CLAP `request_restart`,
         /// VST3 `restartComponent`).
         const RESTART = 1 << 9;
-        /// The processor's latency changed (CLAP `latency.changed` or a
-        /// restart, VST3 `kLatencyChanged`).
+        /// The processor's latency moved off what the host was told
+        /// (CLAP a restart or `latency.changed` while inactive; VST3
+        /// `kLatencyChanged`; AU `kAudioUnitProperty_Latency` / KVO `"latency"`).
+        /// See [`crate::delay::ReportedDelay`].
         const LATENCY = 1 << 10;
         /// Parameter values changed without an output event the host
         /// would see (CLAP `params.rescan(VALUES)`).
@@ -77,6 +79,10 @@ bitflags::bitflags! {
         const PERSIST = 1 << 13;
         /// The user closed a floating editor window (CLAP `gui.closed`).
         const FLOATING_CLOSED = 1 << 14;
+        /// The processor's release tail moved off what the host was told
+        /// (CLAP a restart; AU `kAudioUnitProperty_TailTime` / KVO `"tailTime"`).
+        /// See [`crate::delay::ReportedDelay`].
+        const TAIL = 1 << 15;
     }
 }
 
@@ -170,6 +176,22 @@ impl HostQueue {
         }
         self.signals.fetch_or(signal.bits(), Ordering::AcqRel);
         self.wake_once();
+    }
+
+    /// Record `signal` without invoking the immediate wake callback.
+    ///
+    /// Strictly wait-free (a single atomic RMW) with no OS wake syscall, for
+    /// real-time audio threads on formats whose main-thread drain is driven by
+    /// a periodic timer (AU, AAX) while non-RT callers still use [`Self::signal`]
+    /// for immediate wakes. Because `armed` is left untouched, a subsequent
+    /// [`Self::signal`] from another thread still wakes immediately and drains
+    /// both.
+    pub fn signal_no_wake(&self, signal: impl Into<HostSignal>) {
+        let signal = signal.into();
+        if signal.is_empty() {
+            return;
+        }
+        self.signals.fetch_or(signal.bits(), Ordering::AcqRel);
     }
 
     /// Queue `message` behind any posted before it. Allocation-free, any
@@ -487,6 +509,22 @@ mod tests {
         queue.signal(HostSignal::RESTART);
         assert_eq!(wakes.load(Ordering::Relaxed), 0);
         assert_eq!(queue.drain(&main()).signals, HostSignal::RESTART);
+    }
+
+    #[test]
+    fn signal_no_wake_records_without_waking_or_blocking_later_wakes() {
+        let (queue, wakes) = counting();
+        queue.signal_no_wake(HostSignal::LATENCY | HostSignal::TAIL);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.pending(), HostSignal::LATENCY | HostSignal::TAIL);
+        // Because `armed` stayed false, a non-RT `signal` still wakes once
+        // and the drain picks up all pending bits together.
+        queue.signal(HostSignal::MARK_DIRTY);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            queue.drain(&main()).signals,
+            HostSignal::LATENCY | HostSignal::TAIL | HostSignal::MARK_DIRTY
+        );
     }
 
     #[test]

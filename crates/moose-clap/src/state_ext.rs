@@ -3,9 +3,7 @@
 use crate::data::ClapPluginData;
 use crate::data_from_plugin;
 
-use clap_sys::ext::preset_load::{
-    CLAP_EXT_PRESET_LOAD, clap_host_preset_load, clap_plugin_preset_load,
-};
+use clap_sys::ext::preset_load::clap_plugin_preset_load;
 use clap_sys::ext::state::clap_plugin_state;
 use clap_sys::ext::state_context::clap_plugin_state_context_type;
 use clap_sys::factory::preset_discovery::{
@@ -305,17 +303,11 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
 
         // Tell the host the preset landed so it can update its
         // preset chrome (Bitwig's preset name display reads this).
-        if !data.host.is_null()
-            && let Some(get_ext) = (*data.host).get_extension
-        {
-            let host_ext =
-                get_ext(data.host, CLAP_EXT_PRESET_LOAD.as_ptr()).cast::<clap_host_preset_load>();
-            if !host_ext.is_null()
-                && let Some(loaded) = (*host_ext).loaded
-            {
-                loaded(data.host, location_kind, location, load_key);
-            }
-        }
+        // SAFETY: `preset_load.from_location` is `[main-thread]`.
+        let main = moose_core::thread::MainThread::assume();
+        data.host
+            .on_main_thread(&main)
+            .preset_loaded(location_kind, location, load_key);
         true
     })
 }

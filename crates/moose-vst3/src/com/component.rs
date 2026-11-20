@@ -416,6 +416,8 @@ pub(crate) struct Host {
     persist_wanted: bool,
     persist_bound: AtomicBool,
     persist_pending: AtomicBool,
+    /// A `MARK_DIRTY` raised before `setComponentHandler` installed a handler.
+    dirty_pending: AtomicBool,
     edits: Mutex<Edits>,
     view: Mutex<ViewSlot>,
     #[cfg(target_os = "linux")]
@@ -472,6 +474,30 @@ pub(super) fn mark_restart(ctx: *mut c_void, flags: i32) {
         // A UI-thread caller (setState, the editor) delivers right away.
         if host.may_deliver(&lock(&host.edits)) {
             host.flush_pending_restart();
+        }
+    }
+}
+
+/// Schedule a UI-thread drain of `HostQueue` through a borrowed `Host`
+/// pointer. Never pins `Arc<Host>`, never drops `Host`, and never drains
+/// synchronously — so a wake running on a background thread during teardown
+/// can never run `Host::drop` -> `HostQueue::close()` and self-deadlock.
+///
+/// # Safety
+/// `host` is a live `Host` pointer bound by `Host::new`; `Host::drop` closes
+/// `HostQueue` (joining every in-flight call) before tearing down `Host` or
+/// its OS wakes.
+pub(super) unsafe fn wake_host_queue(host: *mut c_void) {
+    let Some(host) = (unsafe { host.cast::<Host>().as_ref() }) else {
+        return;
+    };
+    let on_audio = PROCESSING.with(|current| current.get() == std::ptr::from_ref(host));
+    host.wake_ui();
+    if !on_audio {
+        #[cfg(target_os = "linux")]
+        if host.restart_fd.load(Ordering::Acquire) < 0 {
+            let e = lock(&host.edits);
+            host.wake_edits(&e);
         }
     }
 }
@@ -608,6 +634,7 @@ impl Host {
             persist_wanted: unsafe { (cb.wants_persist_notifications)(ctx) },
             persist_bound: AtomicBool::new(false),
             persist_pending: AtomicBool::new(false),
+            dirty_pending: AtomicBool::new(false),
             edits: Mutex::new(Edits {
                 #[cfg(target_os = "linux")]
                 ui_thread: Some(std::thread::current().id()),
@@ -647,7 +674,12 @@ impl Host {
         // already in it.
         let _ = unsafe { (cb.take_catalog_changes)(ctx) };
         let me = Arc::as_ptr(&host).cast_mut().cast();
+        unsafe { (cb.bind_host_queue)(ctx, me) };
         unsafe { (cb.set_catalog_waker)(ctx, Some(Self::wake_catalog), me) };
+        // Drain any `HostNotice` raised synchronously during `hooks.connect`
+        // inside `cb_create` before `Host` was bound.
+        host.drain_host_queue();
+        host.flush_pending_restart();
         Some(host)
     }
 
@@ -989,8 +1021,11 @@ impl Host {
             }
             EditOp::Resize(w, h) => self.resize_view(w, h),
             EditOp::Dirty => {
-                if let Some(h) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) {
-                    unsafe { h.setDirty(1) };
+                if let Some(h2) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) {
+                    self.dirty_pending.store(false, Ordering::Release);
+                    unsafe { h2.setDirty(1) };
+                } else {
+                    self.dirty_pending.store(true, Ordering::Release);
                 }
                 1
             }
@@ -1145,6 +1180,7 @@ impl Host {
         let Some(handler) = self.handler() else {
             return;
         };
+        self.flush_dirty();
         self.flush_persist_change();
         let cb = self.reg.cb;
         let mut check = self.presentation_check.swap(false, Ordering::AcqRel);
@@ -1209,6 +1245,17 @@ impl Host {
         }
         let me = std::ptr::from_ref(self).cast_mut().cast();
         unsafe { (self.reg.cb.set_persist_waker)(self.ctx, Some(Self::wake_persist), me) };
+    }
+
+    /// Deliver a `MARK_DIRTY` that arrived before an `IComponentHandler2` existed.
+    pub(super) fn flush_dirty(&self) {
+        let Some(h2) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) else {
+            return;
+        };
+        if !self.dirty_pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        unsafe { h2.setDirty(1) };
     }
 
     /// Report a completed persistent-document change as one host edit.
@@ -1853,6 +1900,10 @@ impl Drop for Host {
             // Joins any worker wake before the wakes go away.
             unsafe { (cb.set_persist_waker)(self.ctx, None, std::ptr::null_mut()) };
         }
+        // Closes `HostQueue` and joins any in-flight `wake_host_queue` while
+        // `self` and its OS wakes are still alive. Because `wake_host_queue`
+        // never pins `Arc<Host>`, it cannot re-enter `Host::drop` here.
+        unsafe { (cb.bind_host_queue)(self.ctx, std::ptr::null_mut()) };
         // Queued editor calls go out while the handler is still held, if
         // this thread may make them (the last reference can be a worker's).
         {
@@ -2499,6 +2550,7 @@ impl IEditControllerTrait for Component {
         drop(e);
         drop(previous);
         if has_handler {
+            h.flush_dirty();
             h.flush_persist_change();
         }
         kResultOk

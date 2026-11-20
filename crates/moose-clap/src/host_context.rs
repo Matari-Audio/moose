@@ -8,12 +8,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use clap_sys::ext::params::clap_host_params;
-use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
-use moose_core::editor::{
-    EditorBridge, EditorNotificationDelivery, HostContext, PluginContext, SendPtr,
-};
+use moose_core::editor::{EditorBridge, EditorNotificationDelivery, HostContext, PluginContext};
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
@@ -28,14 +24,32 @@ use moose_params::Params;
 use crate::data::{GuiChangeQueue, GuiParamChange, StateLoadQueue};
 use crate::data_from_plugin;
 use crate::gui::request_host_resize;
+use crate::host_handle::{Any, HostHandle, HostParamsHandle};
+
+/// Instance pointer held by [`ClapHost`]. Only dereferenced inside
+/// `HostQueue::with_open`, which `clap_plugin_destroy` joins via `close()`
+/// before freeing the plugin instance.
+#[derive(Clone, Copy)]
+struct PluginHandle(*const clap_plugin);
+
+// SAFETY: `ClapHost` only dereferences `self.0` inside `self.queue.with_open`,
+// and only reads/writes atomic fields (`floating_mode`, `window_scale`,
+// `host_scale`) on the underlying `ClapPluginData<P>`.
+unsafe impl Send for PluginHandle {}
+unsafe impl Sync for PluginHandle {}
+
+impl PluginHandle {
+    fn as_ptr(self) -> *const clap_plugin {
+        self.0
+    }
+}
 
 /// One CLAP instance seen from its editor.
 pub(crate) struct ClapHost<P: PluginExport> {
-    /// The live instance. The editor is closed and dropped in `destroy`
-    /// before the instance is freed.
-    plugin: SendPtr<clap_plugin>,
-    host: SendPtr<clap_host>,
-    host_params: SendPtr<clap_host_params>,
+    /// The live instance. Guarded by `queue.with_open` against `destroy`.
+    plugin: PluginHandle,
+    host: HostHandle<Any>,
+    host_params: HostParamsHandle,
     params: Arc<P::Params>,
     gui_changes: Arc<GuiChangeQueue>,
     gui_overflow: Arc<std::sync::atomic::AtomicBool>,
@@ -54,14 +68,13 @@ impl<P: PluginExport> ClapHost<P> {
         // SAFETY: caller contract.
         let data = unsafe { data_from_plugin::<P>(plugin) };
         // SAFETY: the host and its extensions outlive the instance, and
-        // off the main thread only the thread-safe `request_flush`,
-        // `request_callback`, `get_extension` and `gui.request_resize` are
-        // called through them.
+        // `HostHandle<Any>` / `HostParamsHandle` expose only `[thread-safe]`
+        // operations, all gated by `queue.with_open`.
         unsafe {
             Self {
-                plugin: SendPtr::new(plugin),
-                host: SendPtr::new(data.host),
-                host_params: SendPtr::new(data.host_params),
+                plugin: PluginHandle(plugin),
+                host: data.host,
+                host_params: HostParamsHandle::new(data.host_params),
                 params: Arc::clone(&data.params_arc),
                 gui_changes: Arc::clone(&data.gui_changes),
                 gui_overflow: Arc::clone(&data.gui_overflow),
@@ -79,18 +92,9 @@ impl<P: PluginExport> ClapHost<P> {
     /// [thread-safe]). Hosts without `clap.params` get nothing.
     fn request_flush(&self) {
         self.queue.with_open(|| {
-            let host_params = self.host_params.as_ptr();
-            if host_params.is_null() {
-                return;
-            }
             // SAFETY: `with_open` holds the instance open against `destroy`,
-            // so the host and its extension pointer are live; `request_flush`
-            // is [thread-safe] (params.h).
-            unsafe {
-                if let Some(flush) = (*host_params).request_flush {
-                    flush(self.host.as_ptr());
-                }
-            }
+            // so the host and its extension pointer are live.
+            unsafe { self.host.request_flush(self.host_params) };
         });
     }
 
@@ -143,7 +147,7 @@ impl<P: PluginExport> EditorBridge for ClapHost<P> {
                 // counts.
                 // SAFETY: the host outlives the instance; `gui.request_resize` is
                 // [thread-safe & !floating] (gui.h).
-                unsafe { request_host_resize(self.host.as_ptr(), data.host_scale(), w, h) }
+                unsafe { request_host_resize(self.host, data.host_scale(), w, h) }
             })
             .unwrap_or(false)
     }
@@ -208,8 +212,7 @@ impl<P: PluginExport> HostContext for ClapHost<P> {
         let supported = self
             .queue
             .with_open(|| {
-                // SAFETY: `with_open` keeps the host live; `get_extension` is
-                // [thread-safe] (host.h).
+                // SAFETY: `with_open` keeps the instance alive against `destroy`.
                 let data = unsafe { data_from_plugin::<P>(self.plugin.as_ptr()) };
                 !data.floating_mode.load(Ordering::Acquire)
                     && data.menu_popup_supported.load(Ordering::Acquire)
