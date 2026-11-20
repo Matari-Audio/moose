@@ -2899,13 +2899,18 @@ dependencies = [
 name = "moose-loader-tests"
 version = "7.0.0"
 dependencies = [
+ "clap-sys",
  "moose",
+ "moose-au",
+ "moose-clap",
  "moose-core",
  "moose-derive",
  "moose-gui",
  "moose-loader",
  "moose-params",
+ "moose-vst3",
  "reload-fixture-common",
+ "vst3",
 ]
 
 [[package]]
