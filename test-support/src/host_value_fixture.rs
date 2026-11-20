@@ -46,6 +46,10 @@ pub struct TestParams {
     pub structural_gain: AtomicBool,
 }
 impl TestParams {
+    pub fn gain_modulated_value(&self) -> f64 {
+        self.gain.modulated_value()
+    }
+
     fn drain_completion(&self) -> Option<(u32, f64)> {
         if !self.completion.pending.swap(false, Ordering::AcqRel) {
             return None;

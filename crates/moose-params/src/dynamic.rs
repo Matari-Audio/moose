@@ -275,6 +275,8 @@ struct SlotCell {
     /// Plain value as f64 bits. Plain, so a value restored before its
     /// binding keeps its meaning once the binding arrives.
     value: AtomicU64,
+    /// Mono modulation offset in plain units, as f64 bits. Never saved.
+    modulation: AtomicU64,
     bound: AtomicBool,
     shape: ShapeCell,
 }
@@ -322,6 +324,7 @@ impl<const N: usize> DynamicParams<N> {
             .map(|i| SlotCell {
                 id: u32::try_from(i).expect("slot count fits a parameter id"),
                 value: AtomicU64::new(0f64.to_bits()),
+                modulation: AtomicU64::new(0f64.to_bits()),
                 bound: AtomicBool::new(false),
                 shape: ShapeCell::new(Shape::FREE),
             })
@@ -426,6 +429,28 @@ impl<const N: usize> DynamicParams<N> {
         f64::from_bits(self.slots[slot.0].value.load(Ordering::Relaxed))
     }
 
+    /// The slot's mono modulation offset in plain units (`0.0` when
+    /// unmodulated). Lock-free.
+    #[must_use]
+    pub fn modulation(&self, slot: Slot) -> f64 {
+        f64::from_bits(self.slots[slot.0].modulation.load(Ordering::Relaxed))
+    }
+
+    /// The effective value of a bound slot: plain value plus modulation,
+    /// clamped and stepped into its current range. A free slot, or an
+    /// unmodulated one, reads its plain value. Lock-free.
+    #[must_use]
+    pub fn modulated_plain(&self, slot: Slot) -> f64 {
+        let cell = &self.slots[slot.0];
+        let plain = f64::from_bits(cell.value.load(Ordering::Relaxed));
+        let offset = f64::from_bits(cell.modulation.load(Ordering::Relaxed));
+        if offset == 0.0 || !cell.bound.load(Ordering::Relaxed) {
+            return plain;
+        }
+        let range = cell.shape.load().param_range();
+        range.denormalize(range.normalize(plain + offset))
+    }
+
     /// Bound slots and their definitions. Not for the audio thread.
     #[must_use]
     pub fn bound(&self) -> Vec<(Slot, SlotDef)> {
@@ -487,6 +512,8 @@ impl<const N: usize> DynamicParams<N> {
                 }
                 cell.shape.store(new_shape);
                 cell.bound.store(new.is_some(), Ordering::Relaxed);
+                // An offset in the old shape's units means nothing in the new.
+                cell.modulation.store(0f64.to_bits(), Ordering::Relaxed);
                 let range = new_shape.param_range();
                 let plain = match &new {
                     Some(def) if reset_values => def.default,
@@ -758,6 +785,22 @@ impl<const N: usize> Params for DynamicParams<N> {
             .slot_at_index(index, id)
             .or_else(|| self.slot_for_id(id))?;
         self.parse_slot(slot, text)
+    }
+
+    fn set_modulation(&self, id: u32, amount: f64) {
+        if let Some(slot) = self.slot_for_id(id)
+            && amount.is_finite()
+        {
+            self.slots[slot.0]
+                .modulation
+                .store(amount.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn clear_modulations(&self) {
+        for cell in &self.slots {
+            cell.modulation.store(0f64.to_bits(), Ordering::Relaxed);
+        }
     }
 
     fn snap_smoothers(&self) {}

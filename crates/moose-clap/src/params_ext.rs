@@ -237,9 +237,22 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
         // `apply_pending_events`.
         let params = data.params_arc.as_ref() as &dyn Params;
         for ev in scr.event_list.iter() {
-            if let EventBody::ParamChange { id, value } = ev.body {
-                params.set_plain(id, value);
-                defer_param_change(&mut scr.deferred_params, id, value);
+            match ev.body {
+                EventBody::ParamChange { id, value } => {
+                    params.set_plain(id, value);
+                    defer_param_change(&mut scr.deferred_params, id, value);
+                }
+                // Conversion accepts wildcard note IDs only for fully global
+                // modulation. Flush has no sample timeline: update the shared
+                // offset now so cancellation survives the next conversion.
+                EventBody::ParamMod {
+                    id,
+                    note_id: -1,
+                    value,
+                } => {
+                    params.set_modulation(id, value);
+                }
+                _ => {}
             }
         }
         request_changed_presentation(data, &scr.event_list);
