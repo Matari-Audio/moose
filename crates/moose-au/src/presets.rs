@@ -71,6 +71,7 @@ pub(crate) fn factory_presets<P: PluginExport>() -> &'static [FactoryPresetEntry
 /// the `malloc` / `free` externs above to keep the crate free of a
 /// libc dependency. Field names keep dlfcn's `dli_` prefix so they
 /// line up with the C declaration they shadow.
+#[cfg(unix)]
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct DlInfo {
@@ -80,6 +81,7 @@ pub(crate) struct DlInfo {
     pub(crate) dli_saddr: *mut std::ffi::c_void,
 }
 
+#[cfg(unix)]
 unsafe extern "C" {
     pub(crate) fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
 }
@@ -94,6 +96,7 @@ unsafe extern "C" {
 /// - AU v3 framework (iOS): `<F>.framework/<F>` - a shallow bundle, so
 ///   presets live in a flat `<F>.framework/Presets/` (one level up; a
 ///   `Resources/` subdir would make iOS installd reject the framework).
+#[cfg(unix)]
 pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::PathBuf> {
     let mut info = DlInfo {
         dli_fname: std::ptr::null(),
@@ -122,6 +125,15 @@ pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::Pat
     .into_iter()
     .flatten()
     .find(|root| root.is_dir())
+}
+
+#[cfg(not(unix))]
+#[allow(
+    clippy::extra_unused_type_parameters,
+    reason = "matches the Unix implementation, which uses P to locate the plugin image"
+)]
+pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::PathBuf> {
+    None
 }
 
 pub(crate) unsafe extern "C" fn cb_factory_preset_count<P: PluginExport>(

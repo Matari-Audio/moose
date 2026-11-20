@@ -28,7 +28,8 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "host ABIs use mixed integer widths; every value here is small"
+    clippy::unnecessary_cast,
+    reason = "host ABIs use mixed integer widths (vst3 C enums are u32 on Unix and i32 on Windows); every value here is small"
 )]
 #![allow(clippy::too_many_lines, reason = "scenario bodies read top to bottom")]
 #![allow(
