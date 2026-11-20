@@ -8,7 +8,8 @@ use moose_core::editor::Editor;
 use moose_core::editor::EditorBuilder;
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
-use moose_core::main_thread::{HostNotifier, MainThreadHooks};
+use moose_core::host_queue::HostQueue;
+use moose_core::main_thread::MainThreadHooks;
 use moose_core::meters::MeterStore;
 use moose_core::plugin::PluginRuntime;
 use moose_core::snapshot::SnapshotSlot;
@@ -31,19 +32,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 /// after the host already moved on.
 pub(crate) type StateLoadQueue = state::StateLoadQueue;
 
-/// VST3 `RestartFlags::kLatencyChanged`. The audio thread flags this
-/// through `moose_vst3_mark_restart` (an atomic bit-set, no host call);
-/// the shim drains it via `IComponentHandler::restartComponent` on the
-/// next host main-thread callback, so the actual notification lands on
-/// the UI thread - never the render thread or a moose-owned thread.
-pub(crate) const K_LATENCY_CHANGED: i32 = 8;
-
+/// VST3 `RestartFlags::kReloadComponent`: ask the host to reload / restart
+/// the component.
+pub(crate) const K_RELOAD_COMPONENT: i32 = 1;
+/// VST3 `RestartFlags::kIoChanged`: the buses changed.
+pub(crate) const K_IO_CHANGED: i32 = 2;
 /// VST3 `RestartFlags::kParamValuesChanged`: values moved without the host
 /// asking (a state load, or a queued state the audio thread applied), so
 /// the host re-reads them.
 pub(crate) const K_PARAM_VALUES_CHANGED: i32 = 4;
-/// VST3 `RestartFlags::kIoChanged`: the buses changed.
-pub(crate) const K_IO_CHANGED: i32 = 2;
+/// VST3 `RestartFlags::kLatencyChanged`. The audio thread flags this
+/// through `host_queue` / `moose_vst3_mark_restart` (an atomic bit-set, no
+/// host call); the COM layer drains it via `IComponentHandler::restartComponent`
+/// on the next host main-thread callback.
+pub(crate) const K_LATENCY_CHANGED: i32 = 8;
 
 pub(crate) struct Vst3Instance<P: PluginExport> {
     pub(crate) persist_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
@@ -167,6 +169,11 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     /// re-entering the cell, and `cb_gui_get_size` applies it on the next size
     /// query. GUI thread only; atomic for interior mutability through `&Inst`.
     pub(crate) pending_resize: AtomicU64,
+    /// Last known physical editor size `(w << 32) | h` (`0` until queried or
+    /// opened). Returned by `cb_gui_get_size` if the `gui` cell is busy and
+    /// no `pending_resize` is queued, so `IPlugView::getSize` never falls
+    /// back to `0x0`.
+    pub(crate) last_phys_size: AtomicU64,
     /// Audio + lifecycle-owned per-block scratch. Behind a `PluginCell` so
     /// every callback reaches it through a shared `&Vst3Instance` - never a
     /// whole-struct `&mut *ctx`, which would alias a concurrent host-thread
@@ -180,11 +187,19 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     /// editor-notify - all run on the host main thread; `cb_process` never
     /// touches it, so it can't overlap the audio thread.
     pub(crate) gui: PluginCell<Vst3Gui>,
-    /// The hooks' notifier; see `host_notice_woke`.
-    pub(crate) host_notifier: HostNotifier,
+    /// Per-instance main-thread mailbox for signals and context-menu requests.
+    pub(crate) host_queue: Arc<HostQueue>,
 }
 
 impl<P: PluginExport> Vst3Instance<P> {
+    /// Cache the most recently computed non-zero physical editor size.
+    pub(crate) fn store_phys_size(&self, w: u32, h: u32) {
+        if w > 0 && h > 0 {
+            self.last_phys_size
+                .store((u64::from(w) << 32) | u64::from(h), Ordering::Relaxed);
+        }
+    }
+
     /// The scale between the host's physical pixels and the editor's logical
     /// size: the host's content scale, else the open editor's window scale,
     /// else `1.0`. Never both multiplied.

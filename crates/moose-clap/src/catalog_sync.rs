@@ -22,13 +22,13 @@ use clap_sys::ext::params::{
     CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
     CLAP_PARAM_RESCAN_VALUES,
 };
-use moose_core::editor::SendPtr;
 use moose_core::export::PluginExport;
 use moose_core::thread::MainThread;
 use moose_params::{CatalogChange, CatalogSignal, ParamCatalog, ParamInfo, Params};
 
+use crate::ClapPluginData;
 use crate::remote_controls::refresh_remote_control_pages;
-use crate::{ClapPluginData, request_presentation_refresh};
+use moose_core::host_queue::HostSignal;
 
 /// The parameter list the host sees: the catalog and the indices of its
 /// available entries. One value, so the two can't disagree.
@@ -85,14 +85,9 @@ pub(crate) fn parameter_indices(
 pub(crate) fn install_catalog_signal<P: PluginExport>(
     data: &ClapPluginData<P>,
 ) -> Arc<CatalogSignal> {
-    // SAFETY: the host outlives the instance, and its `request_callback` is
-    // [thread-safe] (host.h), so the pointer may be used from any thread.
-    let host = unsafe { SendPtr::new(data.host) };
-    let pending = Arc::clone(&data.presentation_pending);
+    let queue = Arc::clone(&data.host_queue);
     let signal = Arc::new(CatalogSignal::new(move || {
-        // SAFETY: the host outlives the instance, and `destroy` closes the
-        // signal before the instance is freed.
-        unsafe { request_presentation_refresh(&pending, host.as_ptr()) };
+        queue.signal(HostSignal::PRESENTATION);
     }));
     data.params_arc.set_catalog_signal(Arc::downgrade(&signal));
     signal
@@ -104,8 +99,11 @@ pub(crate) fn install_catalog_signal<P: PluginExport>(
 ///
 /// # Safety
 /// `data` belongs to a live instance whose host pointer is valid.
-pub(crate) unsafe fn sync_parameters<P: PluginExport>(data: &ClapPluginData<P>, main: &MainThread) {
-    data.presentation_pending.store(false, Ordering::Release);
+pub(crate) unsafe fn sync_parameters<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    main: &MainThread,
+    rescan_values: bool,
+) {
     let changes = data.params_arc.take_catalog_changes();
     if changes.flags.contains(CatalogChange::STRUCTURE) {
         data.pending_structure
@@ -129,9 +127,7 @@ pub(crate) unsafe fn sync_parameters<P: PluginExport>(data: &ClapPluginData<P>, 
     if republished {
         flags |= CLAP_PARAM_RESCAN_ALL;
     }
-    if data.needs_rescan.swap(false, Ordering::Relaxed)
-        || changes.flags.contains(CatalogChange::VALUES)
-    {
+    if rescan_values || changes.flags.contains(CatalogChange::VALUES) {
         flags |= CLAP_PARAM_RESCAN_VALUES;
     }
     if revised || changes.flags.contains(CatalogChange::INFO) {

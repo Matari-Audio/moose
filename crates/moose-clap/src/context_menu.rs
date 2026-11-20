@@ -1,6 +1,8 @@
-//! `clap.context-menu` (plugin side): the host asks for the plugin's items
+//! `clap.context-menu`. Plugin side: the host asks for the plugin's items
 //! ([`MainThreadHooks::menu_items`]) and reports a pick
-//! ([`MainThreadHooks::perform_menu`]).
+//! ([`MainThreadHooks::perform_menu`]). Host side: the editor asks the host
+//! to show its menu (`PluginContext::context_menu`), which the wrapper
+//! queues and pops up from `on_main_thread` ([`popup`]).
 //!
 //! [`MainThreadHooks::menu_items`]: moose_core::main_thread::MainThreadHooks::menu_items
 //! [`MainThreadHooks::perform_menu`]: moose_core::main_thread::MainThreadHooks::perform_menu
@@ -11,10 +13,13 @@ use clap_sys::ext::context_menu::{
     CLAP_CONTEXT_MENU_ITEM_BEGIN_SUBMENU, CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY,
     CLAP_CONTEXT_MENU_ITEM_END_SUBMENU, CLAP_CONTEXT_MENU_ITEM_ENTRY,
     CLAP_CONTEXT_MENU_ITEM_SEPARATOR, CLAP_CONTEXT_MENU_ITEM_TITLE,
-    CLAP_CONTEXT_MENU_TARGET_KIND_PARAM, clap_context_menu_builder, clap_context_menu_check_entry,
-    clap_context_menu_entry, clap_context_menu_item_kind, clap_context_menu_item_title,
-    clap_context_menu_submenu, clap_context_menu_target, clap_plugin_context_menu,
+    CLAP_CONTEXT_MENU_TARGET_KIND_GLOBAL, CLAP_CONTEXT_MENU_TARGET_KIND_PARAM,
+    CLAP_EXT_CONTEXT_MENU, CLAP_EXT_CONTEXT_MENU_COMPAT, clap_context_menu_builder,
+    clap_context_menu_check_entry, clap_context_menu_entry, clap_context_menu_item_kind,
+    clap_context_menu_item_title, clap_context_menu_submenu, clap_context_menu_target,
+    clap_host_context_menu, clap_plugin_context_menu,
 };
+use clap_sys::host::clap_host;
 use clap_sys::id::clap_id;
 use clap_sys::plugin::clap_plugin;
 use moose_core::export::PluginExport;
@@ -22,6 +27,7 @@ use moose_core::main_thread::{MenuItem, MenuTarget};
 use moose_core::thread::MainThread;
 use moose_core::wrapper::run_extern_callback_with;
 
+use crate::data::ClapPluginData;
 use crate::data_from_plugin;
 
 pub(crate) fn make_extension<P: PluginExport>() -> clap_plugin_context_menu {
@@ -159,4 +165,88 @@ unsafe extern "C" fn perform<P: PluginExport>(
         data.with_hooks(&main, |hooks| hooks.perform_menu(&main, target, action_id))
             .unwrap_or(false)
     })
+}
+
+/// The host's `clap.context-menu`, if it can pop a menu up.
+///
+/// # Safety
+/// `host` is null or the live host. `get_extension` is [thread-safe].
+pub(crate) unsafe fn host_menu(host: *const clap_host) -> Option<&'static clap_host_context_menu> {
+    // SAFETY: caller contract; host extensions live as long as the host.
+    unsafe {
+        let get = host.as_ref()?.get_extension?;
+        let mut ext = get(host, CLAP_EXT_CONTEXT_MENU.as_ptr());
+        if ext.is_null() {
+            ext = get(host, CLAP_EXT_CONTEXT_MENU_COMPAT.as_ptr());
+        }
+        let ext = ext.cast::<clap_host_context_menu>().as_ref()?;
+        ext.popup.is_some().then_some(ext)
+    }
+}
+
+/// Refresh the main-thread-only capability after initialization or GUI creation.
+pub(crate) fn refresh_capability<P: PluginExport>(data: &ClapPluginData<P>, _main: &MainThread) {
+    // SAFETY: the instance owns a live host; the token proves main-thread access.
+    let supported = unsafe {
+        host_menu(data.host)
+            .is_some_and(|menu| menu.can_popup.is_none_or(|can_popup| can_popup(data.host)))
+    };
+    data.menu_popup_supported
+        .store(supported, std::sync::atomic::Ordering::Release);
+}
+
+/// Logical editor points to the host's window coordinates, at the scale
+/// `request_resize` uses.
+fn to_host_coords(v: i32, scale: f64) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a scaled window coordinate is far inside i32"
+    )]
+    let scaled = (f64::from(v) * scale).round() as i32;
+    scaled
+}
+
+/// [main-thread] Show the host's context menu for `target` at the editor's
+/// logical `(x, y)`. Nothing happens when the host has no menu or says it
+/// can't pop one up now.
+pub(crate) fn popup<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    _main: &MainThread,
+    target: MenuTarget,
+    x: i32,
+    y: i32,
+) {
+    // SAFETY: the instance holds a live host pointer.
+    let Some(menu) = (unsafe { host_menu(data.host) }) else {
+        return;
+    };
+    let target = match target {
+        MenuTarget::Param(id) => clap_context_menu_target {
+            kind: CLAP_CONTEXT_MENU_TARGET_KIND_PARAM,
+            id,
+        },
+        MenuTarget::Global => clap_context_menu_target {
+            kind: CLAP_CONTEXT_MENU_TARGET_KIND_GLOBAL,
+            id: 0,
+        },
+    };
+    let scale = data.host_scale();
+    // SAFETY: `can_popup` and `popup` are [main-thread] (context-menu.h),
+    // which the token proves; `target` lives across the call.
+    unsafe {
+        if let Some(can_popup) = menu.can_popup
+            && !can_popup(data.host)
+        {
+            return;
+        }
+        if let Some(popup) = menu.popup {
+            popup(
+                data.host,
+                &raw const target,
+                0,
+                to_host_coords(x, scale),
+                to_host_coords(y, scale),
+            );
+        }
+    }
 }

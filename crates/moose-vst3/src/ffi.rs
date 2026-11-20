@@ -443,6 +443,15 @@ pub struct Vst3Callbacks {
     pub gui_on_fd: unsafe extern "C" fn(ctx: *mut c_void),
     /// `Editor::on_timer`, from the run loop's 16 ms timer. UI thread.
     pub gui_on_timer: unsafe extern "C" fn(ctx: *mut c_void),
+    /// Drain the instance's `HostQueue` on the UI thread.
+    pub drain_host_queue: unsafe extern "C" fn(ctx: *mut c_void),
+    /// `MainThreadHooks::perform_menu` (`IContextMenuTarget::executeMenuItem`).
+    /// UI thread.
+    pub perform_menu: unsafe fn(
+        ctx: *mut c_void,
+        target: moose_core::main_thread::MenuTarget,
+        action: u32,
+    ) -> i32,
 }
 
 /// Register the plugin with the COM layer.
@@ -512,4 +521,34 @@ pub fn moose_vst3_group_edit(ctx: *mut c_void, edge: moose_core::editor::EditGro
 /// delivered on the UI thread.
 pub fn moose_vst3_mark_dirty(ctx: *mut c_void) {
     crate::com::mark_dirty(ctx);
+}
+
+/// Drain the instance's `HostQueue` if on the UI thread, or wake the UI
+/// thread to drain it. Safe from any thread, including the audio thread.
+pub fn moose_vst3_flush_host_queue(ctx: *mut c_void) {
+    crate::com::flush_host_queue(ctx);
+}
+
+/// Flag a parameter presentation revision check on the COM host.
+pub fn moose_vst3_check_presentation(ctx: *mut c_void) {
+    crate::com::check_presentation(ctx);
+}
+
+/// Whether the live host supports `IComponentHandler3::createContextMenu`
+/// on an open plug view.
+#[must_use]
+pub fn moose_vst3_has_context_menu(ctx: *mut c_void) -> bool {
+    crate::com::has_context_menu(ctx)
+}
+
+/// Pop up a VST3 host context menu (`IComponentHandler3::createContextMenu`)
+/// on the UI thread at physical view coordinates `(x, y)`.
+pub fn moose_vst3_popup_context_menu(
+    ctx: *mut c_void,
+    target: moose_core::main_thread::MenuTarget,
+    x: i32,
+    y: i32,
+    items: &[moose_core::main_thread::MenuItem],
+) {
+    crate::com::popup_context_menu(ctx, target, x, y, items);
 }

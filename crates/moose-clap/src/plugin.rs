@@ -1,6 +1,7 @@
 //! `clap_plugin` lifecycle callbacks: init, activate, process start and stop, reset, main-thread work.
 
 use crate::catalog_sync;
+use crate::context_menu;
 use crate::data::ClapPluginData;
 use crate::data::HostOutPtr;
 use crate::data_from_plugin;
@@ -24,8 +25,8 @@ use clap_sys::ext::track_info::{
 use clap_sys::plugin::clap_plugin;
 use moose_core::bus_routing::{BusActivation, BusRouting};
 use moose_core::config::{AudioConfig, ProcessMode};
-use moose_core::editor::SendPtr;
 use moose_core::export::PluginExport;
+use moose_core::host_queue::{HostMessage, HostSignal};
 use moose_core::main_thread::HostNotice;
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
@@ -102,15 +103,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
             }
         }
         if data.params_arc.wants_persist_notifications() {
-            let host = SendPtr::new(data.host);
-            let pending = data.persist_pending.clone();
+            let queue = Arc::clone(&data.host_queue);
             let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
-                if !pending.swap(true, Ordering::AcqRel)
-                    && !host.as_ptr().is_null()
-                    && let Some(request) = (*host.as_ptr()).request_callback
-                {
-                    request(host.as_ptr());
-                }
+                queue.signal(HostSignal::PERSIST);
             }));
             data.params_arc
                 .set_persist_change_signal(Arc::downgrade(&signal));
@@ -123,6 +118,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
         data.with_hooks(&main, |hooks| hooks.connect(notifier));
         data.voice_info_supported
             .store(voice_info::query(data, &main).is_some(), Ordering::Relaxed);
+        crate::context_menu::refresh_capability(data, &main);
         track_info::notify(data, &main);
         true
     })
@@ -152,7 +148,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *co
             if let Some(signal) = &(*data_ptr).catalog_signal {
                 signal.close();
             }
-            (*data_ptr).host_notifier.close();
+            (*data_ptr).host_queue.close();
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
         }));
@@ -299,7 +295,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
         // while active (restart + RESCAN_ALL, CLAP params.h).
         // SAFETY: `clap_plugin.deactivate` is [main-thread & active] (plugin.h).
         let main = MainThread::assume();
-        catalog_sync::sync_parameters(data, &main);
+        let rescan = !data.host_queue.take(HostSignal::PARAM_RESCAN).is_empty();
+        catalog_sync::sync_parameters(data, &main, rescan);
         if data.ports_rescan.swap(false, Ordering::Relaxed) {
             host_rescan_audio_ports(data);
         }
@@ -356,7 +353,12 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.panic_latch.report();
-        if data.persist_pending.swap(false, Ordering::AcqRel)
+        // SAFETY: `clap_plugin.on_main_thread` is [main-thread] (plugin.h).
+        let main = MainThread::assume();
+        // Everything raised from here on wakes the host again.
+        let drain = data.host_queue.drain(&main);
+        let signals = drain.signals;
+        if signals.contains(HostSignal::PERSIST)
             && let Some((id, value)) = data.params_arc.take_persist_change()
             && value.is_finite()
             && (0.0..=1.0).contains(&value)
@@ -368,22 +370,13 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
             context.set_param(id, value);
             context.end_edit(id);
             // State dirtiness must also reach an inactive host that does not
-            // implement params/request_flush. This is a main-thread-only API.
-            if !data.host.is_null()
-                && !data.host_state.is_null()
-                && let Some(mark_dirty) = (*data.host_state).mark_dirty
-            {
-                mark_dirty(data.host);
-            }
+            // implement params/request_flush.
+            host_mark_dirty(data);
         }
-        if data.dirty_pending.swap(false, Ordering::AcqRel)
-            && !data.host.is_null()
-            && !data.host_state.is_null()
-            && let Some(mark_dirty) = (*data.host_state).mark_dirty
-        {
-            mark_dirty(data.host);
+        if signals.contains(HostSignal::MARK_DIRTY) {
+            host_mark_dirty(data);
         }
-        if data.floating_closed.swap(false, Ordering::AcqRel) {
+        if signals.contains(HostSignal::FLOATING_CLOSED) {
             data.gui.enter().visible = false;
             if !data.host.is_null()
                 && let Some(get) = (*data.host).get_extension
@@ -398,42 +391,59 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
         }
         // Catalog changes, presentation revisions and value rescans. A
         // structure change requests a restart and is published inactive.
-        // SAFETY: `clap_plugin.on_main_thread` is [main-thread] (plugin.h).
-        let main = MainThread::assume();
-        catalog_sync::sync_parameters(data, &main);
-        // After `sync_parameters` cleared the wake flag, so a notice raised
-        // from here on schedules another callback.
-        let notices = data.host_notifier.take();
+        catalog_sync::sync_parameters(data, &main, signals.contains(HostSignal::PARAM_RESCAN));
+        let notices = signals.notices();
         if notices.contains(HostNotice::NOTE_NAMES) {
             note_name::host_changed(data.host);
         }
         if notices.contains(HostNotice::VOICE_INFO) {
             voice_info::host_changed(data.host);
         }
+        let active = data.active.load(Ordering::Relaxed);
+        let mut restart = signals.contains(HostSignal::RESTART);
         if notices.contains(HostNotice::AUDIO_PORTS) {
             data.ports_rescan.store(true, Ordering::Relaxed);
-            if data.active.load(Ordering::Relaxed)
-                && !data.host.is_null()
-                && let Some(restart) = (*data.host).request_restart
-            {
-                restart(data.host);
-            }
+            restart |= active;
         }
-        if !data.active.load(Ordering::Relaxed) && data.ports_rescan.swap(false, Ordering::Relaxed)
-        {
+        if !active && data.ports_rescan.swap(false, Ordering::Relaxed) {
             host_rescan_audio_ports(data);
         }
-
-        if data.latency_dirty.swap(false, Ordering::Relaxed) && !data.host.is_null() {
-            if data.active.load(Ordering::Relaxed) {
-                if let Some(req_restart) = (*data.host).request_restart {
-                    req_restart(data.host);
-                }
+        if signals.contains(HostSignal::LATENCY) && !data.host.is_null() {
+            if active {
+                restart = true;
             } else if !data.host_latency.is_null()
                 && let Some(changed) = (*data.host_latency).changed
             {
                 changed(data.host);
             }
+        }
+        if restart
+            && !data.host.is_null()
+            && let Some(request_restart) = (*data.host).request_restart
+        {
+            request_restart(data.host);
+        }
+        for message in drain {
+            // Messages added to moose after this wrapper are dropped.
+            if let HostMessage::ContextMenu { target, x, y } = message {
+                context_menu::popup(data, &main, target, x, y);
+            }
+        }
+    }
+}
+
+/// [main-thread] `state.mark_dirty`, when the host has it.
+///
+/// # Safety
+/// `data` belongs to a live instance.
+unsafe fn host_mark_dirty<P: PluginExport>(data: &ClapPluginData<P>) {
+    // SAFETY: caller contract; the host pointers live as long as the instance.
+    unsafe {
+        if !data.host.is_null()
+            && !data.host_state.is_null()
+            && let Some(mark_dirty) = (*data.host_state).mark_dirty
+        {
+            mark_dirty(data.host);
         }
     }
 }

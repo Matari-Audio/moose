@@ -171,6 +171,9 @@ unsafe extern "C" fn no_open_wayland(_: *mut c_void, _: *mut c_void, _: *mut c_v
 unsafe extern "C" fn no_fd(_: *mut c_void) -> i32 {
     -1
 }
+unsafe fn no_menu(_: *mut c_void, _: moose_core::main_thread::MenuTarget, _: u32) -> i32 {
+    0
+}
 
 fn callbacks() -> Vst3Callbacks {
     let process: ProcessFn = ok_process;
@@ -236,6 +239,8 @@ fn callbacks() -> Vst3Callbacks {
         gui_event_fd: no_fd,
         gui_on_fd: nop_ctx,
         gui_on_timer: nop_ctx,
+        drain_host_queue: nop_ctx,
+        perform_menu: no_menu,
     }
 }
 
@@ -1810,6 +1815,7 @@ mod host_features {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU8, AtomicU64};
 
+    // Only the group-edit tests use it, and they skip macOS.
     #[cfg(not(target_os = "macos"))]
     use moose_core::editor::EditGroup;
     use moose_params::CatalogChange;

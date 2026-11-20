@@ -40,6 +40,7 @@ use moose_core::events::{
     ExactEventMetadata, LosslessEventCursor, PushError, RawMidi1, RawUmp, TransportInfo,
 };
 use moose_core::export::PluginExport;
+use moose_core::host_queue::{HostQueue, HostSignal};
 use moose_core::info::MidiDialect;
 use moose_core::midi::decode_short_message;
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
@@ -115,16 +116,35 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 .map_or(0, |bus| bus.channels.channel_count());
             let param_infos = plugin.params().param_catalog();
             let params_arc = plugin.params_arc();
+            let wants_persist = params_arc.wants_persist_notifications();
             let latency_cache = AtomicU32::new(plugin.latency());
             let tail_cache = AtomicU32::new(plugin.tail());
+            #[cfg(target_os = "macos")]
+            let (persist_dispatch, host_queue) = if wants_persist
+                && let Some((dispatch, wake)) = unsafe { persist_notify::Dispatcher::new() }
+            {
+                (Some(dispatch), Arc::new(HostQueue::new(wake)))
+            } else {
+                (None, Arc::new(HostQueue::new(|| {})))
+            };
+            #[cfg(not(target_os = "macos"))]
+            let host_queue = Arc::new(HostQueue::new(|| {}));
+            let persist_signal = wants_persist.then(|| {
+                let queue = Arc::clone(&host_queue);
+                let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+                    queue.signal(HostSignal::PERSIST);
+                }));
+                params_arc.set_persist_change_signal(Arc::downgrade(&signal));
+                signal
+            });
             let instance = Box::new(AuInstance::<P> {
+                persist_signal,
+                host_queue,
                 #[cfg(target_os = "macos")]
-                persist_dispatch: None,
+                persist_dispatch,
                 params_arc,
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 meter_store: plugin.meter_store(),
                 snapshot: plugin.snapshot_slot(),
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 task_spawner: plugin.task_spawner(),
                 editor_builder: plugin.editor_builder(),
                 plugin: shared_plugin(plugin),
@@ -196,9 +216,13 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 // SAFETY: `raw` is live until `cb_destroy`, which drops
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
+                if let Some(dispatch) = &(*raw).persist_dispatch {
+                    dispatch.activate::<P>(
+                        Arc::clone(&(*raw).host_queue),
+                        raw.cast::<std::ffi::c_void>(),
+                    );
+                }
                 let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
-                (*raw).persist_dispatch =
-                    persist_notify::Dispatcher::new((*raw).params_arc.clone(), ctx);
                 (*raw).param_notify = ParamNotifier::spawn(ctx);
             }
             raw.cast::<std::ffi::c_void>()
@@ -231,6 +255,10 @@ pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::
                 }
             }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(signal) = &(*raw).persist_signal {
+                    signal.close();
+                }
+                (*raw).host_queue.close();
                 drop(Box::from_raw(raw));
             }));
         }

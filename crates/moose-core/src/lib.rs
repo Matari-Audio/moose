@@ -9,6 +9,7 @@ pub mod denormal;
 pub mod editor;
 pub mod events;
 pub mod export;
+pub mod host_queue;
 pub mod info;
 pub mod main_thread;
 pub mod meters;
@@ -35,7 +36,7 @@ pub use bus_routing::{
     bus_layouts_fit_routing,
 };
 pub use config::{AudioConfig, ProcessMode};
-pub use editor::{Editor, EditorBuilder, IntoEditor, PluginContext};
+pub use editor::{Editor, EditorBuilder, HostContext, IntoEditor, PluginContext};
 pub use events::{
     AuEventMetadata, Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody,
     ExactEventMetadata, ExactEventQualifiers, ExactEventRef, ExactEventToken, ExactNoteAddress,
