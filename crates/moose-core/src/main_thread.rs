@@ -12,12 +12,11 @@
 //! [`HostNotifier`], handed to [`MainThreadHooks::connect`] and installed on
 //! the editor's [`PluginContext`](crate::editor::PluginContext).
 
-use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 
-use moose_params::{MidiSource, PersistChangeSignal};
+use moose_params::MidiSource;
 
+use crate::host_queue::{HostQueue, HostSignal};
 use crate::thread::MainThread;
 
 bitflags::bitflags! {
@@ -38,61 +37,50 @@ bitflags::bitflags! {
     }
 }
 
-/// Sends [`HostNotice`]s to the host. Cloning shares one notifier.
+/// Sends [`HostNotice`]s to the host: a handle on the instance's
+/// [`HostQueue`]. Cloning shares the queue.
 ///
 /// Notices coalesce: several before the wrapper's next main-thread callback
 /// reach the host once. Formats without a matching call drop them.
-#[derive(Clone)]
-pub struct HostNotifier(Arc<NotifierInner>);
-
-struct NotifierInner {
-    pending: AtomicU8,
-    wake: PersistChangeSignal,
-}
+#[derive(Clone, Debug)]
+pub struct HostNotifier(Arc<HostQueue>);
 
 impl HostNotifier {
-    /// A notifier whose `wake` asks the host for a main-thread callback,
-    /// where the wrapper calls [`Self::take`]. `wake` runs on the notifying
-    /// thread. Format wrappers build this.
+    /// A notifier on its own queue, whose `wake` asks the host for a
+    /// main-thread callback where the wrapper calls [`Self::take`]. See
+    /// [`HostQueue::new`] for what `wake` may do.
     #[doc(hidden)]
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self(Arc::new(NotifierInner {
-            pending: AtomicU8::new(0),
-            wake: PersistChangeSignal::new(wake),
-        }))
+        Self(Arc::new(HostQueue::new(wake)))
     }
 
-    /// Tell the host `notice` changed. Callable from any thread except the
-    /// audio thread: the wake may lock and call into the host.
+    /// A notifier on the wrapper's per-instance queue. Format wrappers build
+    /// this and drain the queue themselves.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_queue(queue: Arc<HostQueue>) -> Self {
+        Self(queue)
+    }
+
+    /// Tell the host `notice` changed. Any thread except the audio thread
+    /// (a wrapper's wake may not be audio-safe).
     pub fn notify(&self, notice: HostNotice) {
-        self.0.pending.fetch_or(notice.bits(), Ordering::AcqRel);
-        self.0.wake.notify();
+        self.0.signal(notice);
     }
 
-    /// The notices since the last call. Wrappers call this on the host's
-    /// main thread.
+    /// The notices since the last call, leaving the queue's other signals.
+    /// Wrappers call this on the host's main thread.
     #[doc(hidden)]
     #[must_use]
     pub fn take(&self) -> HostNotice {
-        HostNotice::from_bits_truncate(self.0.pending.swap(0, Ordering::AcqRel))
+        self.0.take(HostSignal::from(HostNotice::all())).notices()
     }
 
     /// Stop waking the host, after any wake in flight returns. Wrappers
     /// call this before the instance is freed; later notices stay pending.
     #[doc(hidden)]
     pub fn close(&self) {
-        self.0.wake.close();
-    }
-}
-
-impl fmt::Debug for HostNotifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HostNotifier")
-            .field(
-                "pending",
-                &HostNotice::from_bits_truncate(self.0.pending.load(Ordering::Relaxed)),
-            )
-            .finish_non_exhaustive()
+        self.0.close();
     }
 }
 
@@ -319,9 +307,9 @@ pub trait MainThreadHooks: Send + 'static {
 /// No main-thread part.
 impl MainThreadHooks for () {}
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -338,16 +326,23 @@ mod tests {
         notifier.notify(HostNotice::NOTE_NAMES);
         clone.notify(HostNotice::VOICE_INFO);
         clone.notify(HostNotice::NOTE_NAMES);
-        assert_eq!(wakes.load(Ordering::Relaxed), 3);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "one wake until a drain");
         assert_eq!(
             notifier.take(),
             HostNotice::NOTE_NAMES | HostNotice::VOICE_INFO
         );
         assert_eq!(notifier.take(), HostNotice::empty());
+        clone.notify(HostNotice::VOICE_INFO);
+        assert_eq!(wakes.load(Ordering::Relaxed), 2, "take re-arms the wake");
+        assert_eq!(notifier.take(), HostNotice::VOICE_INFO);
 
         notifier.close();
         clone.notify(HostNotice::VOICE_INFO);
-        assert_eq!(wakes.load(Ordering::Relaxed), 3, "a closed notifier wakes");
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            2,
+            "a closed notifier never wakes"
+        );
         assert_eq!(notifier.take(), HostNotice::VOICE_INFO);
     }
 }

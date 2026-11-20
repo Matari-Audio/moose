@@ -36,7 +36,6 @@ use crate::plugin::clap_plugin_stop_processing;
 use crate::process::clap_plugin_process;
 use crate::remote_controls::presented_remote_control_pages;
 use crate::state::StateLoadQueue;
-use crate::state_ext::request_presentation_refresh;
 
 #[doc(hidden)]
 pub mod __macro_deps {
@@ -59,6 +58,7 @@ mod data;
 pub mod draft;
 mod events;
 mod gui;
+mod host_context;
 mod note_name;
 mod param_indication;
 mod params_ext;
@@ -88,11 +88,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
-#[cfg(all(test, target_os = "linux"))]
-use clap_sys::ext::params::CLAP_PARAM_RESCAN_VALUES;
 #[cfg(test)]
 use clap_sys::ext::params::{
-    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
+    CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT, CLAP_PARAM_RESCAN_VALUES,
 };
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -107,6 +105,7 @@ use moose_core::config::ProcessMode;
 use moose_core::editor::SendPtr;
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList};
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostQueue;
 use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
 use moose_core::main_thread::HostNotifier;
 use moose_core::state;
@@ -128,9 +127,10 @@ mod host_value_tests {
     use moose_params::Params;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    static RESCAN: AtomicU32 = AtomicU32::new(0);
-    unsafe extern "C" fn rescan(_: *const clap_host, flags: u32) {
-        RESCAN.fetch_or(flags, Ordering::Relaxed);
+    unsafe extern "C" fn rescan(host: *const clap_host, flags: u32) {
+        // SAFETY: each host using this callback retains its counter until plugin destruction.
+        let rescans = unsafe { &*(*host).host_data.cast::<AtomicU32>() };
+        rescans.fetch_or(flags, Ordering::Relaxed);
     }
     unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const c_void {
         static PARAMS: clap_host_params = clap_host_params {
@@ -154,8 +154,10 @@ mod host_value_tests {
     fn ffi_text_hooks_and_rescan_preserve_declared_slot_range() {
         // SAFETY: own the plugin, descriptor, host, and all callback buffers.
         unsafe {
+            let rescans = AtomicU32::new(0);
             let mut host: clap_host = std::mem::zeroed();
             host.clap_version = CLAP_VERSION;
+            host.host_data = (&raw const rescans).cast_mut().cast();
             host.get_extension = Some(extension);
             let descriptor = DescriptorHolder::new(&TestPlugin::info());
             let plugin = create_plugin_instance::<TestPlugin>(
@@ -205,12 +207,12 @@ mod host_value_tests {
                 &raw mut parsed
             ));
             assert_eq!(parsed, -6.);
-            RESCAN.store(0, Ordering::Relaxed);
+            rescans.store(0, Ordering::Relaxed);
             params.rebound.store(true, Ordering::Relaxed);
             params.generation.fetch_add(1, Ordering::Relaxed);
             clap_plugin_on_main_thread::<TestPlugin>(plugin);
             assert_eq!(
-                RESCAN.load(Ordering::Relaxed),
+                rescans.load(Ordering::Relaxed),
                 CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT
             );
             assert!(params_value_to_text::<TestPlugin>(
@@ -451,8 +453,10 @@ mod host_value_tests {
     fn gui_values_flush_as_events_and_rescan_only_when_refused() {
         // SAFETY: own the plugin, descriptor, host, and output-event shims.
         unsafe {
+            let rescans = AtomicU32::new(0);
             let mut host: clap_host = std::mem::zeroed();
             host.clap_version = CLAP_VERSION;
+            host.host_data = (&raw const rescans).cast_mut().cast();
             host.get_extension = Some(extension);
             let descriptor = DescriptorHolder::new(&TestPlugin::info());
             let plugin = create_plugin_instance::<TestPlugin>(
@@ -473,7 +477,12 @@ mod host_value_tests {
             PUSHED.store(0, Ordering::Relaxed);
             assert!(flush_gui_changes::<TestPlugin>(data, &raw const out));
             assert_eq!(PUSHED.load(Ordering::Relaxed), 2);
-            assert!(!data.needs_rescan.load(Ordering::Relaxed));
+            assert!(
+                !data
+                    .host_queue
+                    .pending()
+                    .contains(moose_core::host_queue::HostSignal::PARAM_RESCAN)
+            );
             data.gui_changes
                 .push(GuiParamChange::Value(1, 0.75))
                 .unwrap_or_else(|_| panic!("queue full"));
@@ -482,7 +491,56 @@ mod host_value_tests {
                 try_push: Some(refuse),
             };
             assert!(!flush_gui_changes::<TestPlugin>(data, &raw const full));
-            assert!(data.needs_rescan.load(Ordering::Relaxed));
+            assert!(
+                data.host_queue
+                    .pending()
+                    .contains(moose_core::host_queue::HostSignal::PARAM_RESCAN)
+            );
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(rescans.load(Ordering::Relaxed), CLAP_PARAM_RESCAN_VALUES);
+            clap_plugin_destroy::<TestPlugin>(plugin);
+        }
+    }
+
+    #[test]
+    fn overflow_rescans_again_after_stale_values_drain() {
+        unsafe {
+            let rescans = AtomicU32::new(0);
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = CLAP_VERSION;
+            host.host_data = (&raw const rescans).cast_mut().cast();
+            host.get_extension = Some(extension);
+            let descriptor = DescriptorHolder::new(&TestPlugin::info());
+            let plugin = create_plugin_instance::<TestPlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plugin));
+            let data = data_from_plugin::<TestPlugin>(plugin);
+            for _ in 0..GUI_QUEUE_CAPACITY {
+                data.gui_changes
+                    .push(GuiParamChange::Value(1, 0.25))
+                    .unwrap_or_else(|_| panic!("queue full"));
+            }
+            let context = crate::host_context::editor_context::<TestPlugin>(plugin);
+            context.set_param(1_u32, 0.75);
+            assert!(data.gui_overflow.load(Ordering::Acquire));
+            // Service the initial rescan before the stale FIFO values.
+            (*plugin).on_main_thread.unwrap()(plugin);
+            assert_eq!(rescans.swap(0, Ordering::Relaxed), CLAP_PARAM_RESCAN_VALUES);
+            let out = clap_output_events {
+                ctx: ptr::null_mut(),
+                try_push: Some(accept),
+            };
+            assert!(flush_gui_changes::<TestPlugin>(data, &raw const out));
+            assert!(
+                data.host_queue
+                    .pending()
+                    .contains(moose_core::host_queue::HostSignal::PARAM_RESCAN)
+            );
+            assert!(!data.gui_overflow.load(Ordering::Acquire));
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(rescans.load(Ordering::Relaxed), CLAP_PARAM_RESCAN_VALUES);
             clap_plugin_destroy::<TestPlugin>(plugin);
         }
     }
@@ -739,6 +797,7 @@ mod floating_gui_tests {
                 CLAP_WINDOW_API_WAYLAND.as_ptr(),
                 true
             ));
+            assert!(!gui_create::<TestPlugin>(plugin, ptr::null(), true));
             let hook: Close = Arc::default();
             data.gui.enter().editor = Some(Box::new(Probe(hook.clone())));
             assert!(gui_is_api_supported::<TestPlugin>(
@@ -766,7 +825,7 @@ mod floating_gui_tests {
                 CLAP_WINDOW_API_WAYLAND.as_ptr(),
                 false
             ));
-            assert!(!gui_create::<TestPlugin>(plugin, ptr::null(), true));
+            assert!(!gui_create::<TestPlugin>(plugin, ptr::null(), false));
             assert!(gui_create::<TestPlugin>(
                 plugin,
                 CLAP_WINDOW_API_WAYLAND.as_ptr(),
@@ -805,6 +864,13 @@ mod floating_gui_tests {
             hook.lock().unwrap().take().unwrap()();
             clap_plugin_on_main_thread::<TestPlugin>(plugin);
             assert_eq!(counters[1].load(Ordering::Relaxed), 2);
+            gui_destroy::<TestPlugin>(plugin);
+            data.gui.enter().editor = Some(Box::new(Probe(hook.clone())));
+            assert!(gui_create::<TestPlugin>(plugin, ptr::null(), true));
+            assert!(gui_show::<TestPlugin>(plugin));
+            hook.lock().unwrap().take().unwrap()();
+            clap_plugin_on_main_thread::<TestPlugin>(plugin);
+            assert_eq!(counters[1].load(Ordering::Relaxed), 3);
             gui_destroy::<TestPlugin>(plugin);
             clap_plugin_destroy::<TestPlugin>(plugin);
         }
@@ -1252,18 +1318,25 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let hooks = MainThreadCell::new(instance.main_thread());
-        let presentation_pending = Arc::new(AtomicBool::new(false));
-        let host_notifier = HostNotifier::new({
-            let pending = Arc::clone(&presentation_pending);
+        let host_queue = Arc::new(HostQueue::new({
             // SAFETY: the host outlives the instance, and its
-            // `request_callback` is [thread-safe] (host.h).
+            // `request_callback` is [thread-safe] (host.h), so the audio
+            // thread may call it too.
             let host = unsafe { SendPtr::new(host) };
             move || {
-                // SAFETY: `destroy` closes the notifier before the instance
-                // and its host pointer go away.
-                unsafe { request_presentation_refresh(&pending, host.as_ptr()) };
+                let host = host.as_ptr();
+                // SAFETY: `destroy` closes the queue before the instance and
+                // its host pointer go away.
+                unsafe {
+                    if !host.is_null()
+                        && let Some(request) = (*host).request_callback
+                    {
+                        request(host);
+                    }
+                }
             }
-        });
+        }));
+        let host_notifier = HostNotifier::from_queue(Arc::clone(&host_queue));
         let exposed = Mutex::new(catalog_sync::ExposedParams::new(
             Arc::clone(&param_infos),
             params_arc.as_ref(),
@@ -1299,7 +1372,6 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
 
         let data = Box::new(ClapPluginData::<P> {
             persist_signal: None,
-            persist_pending: Arc::new(AtomicBool::new(false)),
             host_state: ptr::null(),
             plugin: shared_plugin(instance),
             params_arc,
@@ -1318,6 +1390,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             catalog_signal: None,
             pending_structure: MainThreadCell::new(None),
             hooks,
+            host_queue,
             host_notifier,
             note_names: MainThreadCell::new(Vec::new()),
             voice_info_supported: AtomicBool::new(false),
@@ -1328,21 +1401,18 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             host_latency: ptr::null(),
             host_tail: ptr::null(),
             host_track_info: ptr::null(),
-            latency_dirty: AtomicBool::new(false),
             ports_rescan: AtomicBool::new(false),
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
+            gui_overflow: Arc::new(AtomicBool::new(false)),
             pending_state: Arc::new(StateLoadQueue::new(1)),
             panic_latch: moose_core::wrapper::PanicLatch::new(),
             active: AtomicBool::new(false),
             processing: AtomicBool::new(false),
             render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
-            needs_rescan: Arc::new(AtomicBool::new(false)),
             floating_mode: AtomicBool::new(false),
+            menu_popup_supported: AtomicBool::new(false),
             floating_visible: Arc::new(AtomicBool::new(false)),
-            floating_closed: Arc::new(AtomicBool::new(false)),
-            dirty_pending: Arc::new(AtomicBool::new(false)),
             presentation_revision: AtomicU64::new(0),
-            presentation_pending,
             remote_pages,
             transport_slot: TransportSlot::new(),
             host_scale: AtomicU64::new(0),

@@ -2,7 +2,6 @@
 
 use crate::context_menu;
 use crate::data::GuiMode;
-use crate::data::GuiParamChange;
 use crate::data_from_plugin;
 use crate::note_name;
 use crate::param_indication;
@@ -20,7 +19,6 @@ use crate::remote_controls::make_remote_controls_extension;
 use crate::resolved_name;
 use crate::state_ext::make_preset_load_extension;
 use crate::state_ext::make_state_extension;
-use crate::state_ext::request_presentation_refresh;
 use crate::state_ext::state_context_load;
 use crate::state_ext::state_context_save;
 use crate::track_info;
@@ -28,6 +26,7 @@ use crate::voice_info;
 #[cfg(all(target_os = "linux", feature = "clap-draft"))]
 use crate::wayland_nested;
 
+pub(crate) use crate::host_context::editor_context;
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_activation::{
     CLAP_EXT_AUDIO_PORTS_ACTIVATION, CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT,
@@ -70,13 +69,10 @@ use clap_sys::ext::voice_info::{CLAP_EXT_VOICE_INFO, clap_plugin_voice_info};
 use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use moose_core::config::ProcessMode;
-use moose_core::editor::{
-    ClosureBridge, Editor, PluginContext, RawWindowHandle, SendPtr, fit_logical_size,
-};
+use moose_core::editor::{Editor, RawWindowHandle, fit_logical_size};
 use moose_core::export::PluginExport;
-use moose_core::state;
-use moose_core::wrapper::{custom_state_view, run_extern_callback_with};
-use moose_params::Params;
+use moose_core::host_queue::HostSignal;
+use moose_core::wrapper::run_extern_callback_with;
 use std::ffi::{CStr, c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr;
@@ -216,6 +212,45 @@ pub(crate) unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
     }
 }
 
+/// Resolve the window API for `gui_create`. CLAP allows a null or empty
+/// `api` when `is_floating` is true, in which case the plugin picks a
+/// supported floating API on the current platform; embedded GUIs must
+/// specify one.
+unsafe fn resolve_create_api<P: PluginExport>(
+    plugin: *const clap_plugin,
+    api: *const c_char,
+    is_floating: bool,
+) -> Option<*const c_char> {
+    if !api.is_null() && unsafe { *api } != 0 {
+        return unsafe { gui_is_api_supported::<P>(plugin, api, is_floating) }.then_some(api);
+    }
+    if !is_floating {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let candidates = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            [
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+                CLAP_WINDOW_API_X11.as_ptr(),
+            ]
+        } else {
+            [
+                CLAP_WINDOW_API_X11.as_ptr(),
+                CLAP_WINDOW_API_WAYLAND.as_ptr(),
+            ]
+        };
+        candidates
+            .into_iter()
+            .find(|&candidate| gui_is_api_supported::<P>(plugin, candidate, true))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = plugin;
+        None
+    }
+}
+
 pub(crate) unsafe extern "C" fn gui_create<P: PluginExport>(
     plugin: *const clap_plugin,
     api: *const c_char,
@@ -224,9 +259,9 @@ pub(crate) unsafe extern "C" fn gui_create<P: PluginExport>(
     // The editor builder is author code; firewall its construction so a
     // panic can't unwind across the C ABI (false = "no editor created").
     run_extern_callback_with::<P, bool>("CLAP", "gui_create", false, || unsafe {
-        if !gui_is_api_supported::<P>(plugin, api, is_floating) {
+        let Some(api) = resolve_create_api::<P>(plugin, api, is_floating) else {
             return false;
-        }
+        };
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
         #[cfg(all(target_os = "linux", feature = "clap-draft"))]
@@ -267,6 +302,7 @@ pub(crate) unsafe extern "C" fn gui_create<P: PluginExport>(
             editor.set_scale_factor(scale);
         }
         gui.gui_created = gui.editor.is_some();
+        crate::context_menu::refresh_capability(data, &moose_core::thread::MainThread::assume());
         gui.gui_created
     })
 }
@@ -280,7 +316,7 @@ pub(crate) unsafe extern "C" fn gui_destroy<P: PluginExport>(plugin: *const clap
         let editor = {
             let mut gui = data.gui.enter();
             data.floating_visible.store(false, Ordering::Release);
-            data.floating_closed.store(false, Ordering::Release);
+            let _ = data.host_queue.take(HostSignal::FLOATING_CLOSED);
             gui.visible = false;
             gui.gui_created = false;
             #[cfg(all(target_os = "linux", feature = "clap-draft"))]
@@ -474,6 +510,8 @@ pub(crate) unsafe fn gui_set_parent_inner<P: PluginExport>(
         if !editor.is_open() {
             return false;
         }
+        // Creating the native window invalidates the host's cached capability.
+        context_menu::refresh_capability(data, &moose_core::thread::MainThread::assume());
         // baseview attaches its child NSView at the parent's
         // `(0, 0)`. NSView's coordinate system is unflipped, so
         // `(0, 0)` is the parent's bottom-left - which renders the
@@ -493,179 +531,6 @@ pub(crate) unsafe fn gui_set_parent_inner<P: PluginExport>(
         #[cfg(target_os = "macos")]
         anchor_child_to_top(parent_ptr);
         true
-    }
-}
-
-pub(crate) unsafe fn editor_context<P: PluginExport>(plugin: *const clap_plugin) -> PluginContext {
-    unsafe {
-        let data = data_from_plugin::<P>(plugin);
-        let params = Arc::clone(&data.params_arc);
-        let meter_store = Arc::clone(&data.meter_store);
-        let snapshot = Arc::clone(&data.snapshot);
-        let pending_state_for_get = data.pending_state.clone();
-        let gui_changes = data.gui_changes.clone();
-        let gui_changes2 = data.gui_changes.clone();
-        let gui_changes3 = data.gui_changes.clone();
-        let host = SendPtr::new(data.host);
-        let host_params = SendPtr::new(data.host_params);
-        let request_flush = move || {
-            // `host_params` is null when the host omits the optional
-            // `clap_host_params` extension (the spec marks it optional);
-            // dereferencing it would crash hosts that don't implement
-            // params.
-            let hp = host_params.as_ptr();
-            if hp.is_null() {
-                return;
-            }
-            if let Some(f) = (*hp).request_flush {
-                f(host.as_ptr());
-            }
-        };
-        // `request_flush` is a `move ||` over only `Copy` captures, so the closure
-        // itself is `Copy` and we re-bind rather than `.clone()`.
-        let request_flush2 = request_flush;
-        let request_flush3 = request_flush;
-        let needs_rescan = data.needs_rescan.clone();
-        let presentation_pending = data.presentation_pending.clone();
-        let host_for_callback = SendPtr::new(data.host);
-        let params_for_set = params.clone();
-        let params_for_get = params.clone();
-        let params_for_plain = params.clone();
-        let params_for_fmt = params.clone();
-        let params_for_ctx = params.clone();
-        let task_spawner_for_ctx = data.task_spawner.clone();
-        let pending_state_for_set = data.pending_state.clone();
-        let transport_slot = data.transport_slot.clone();
-        PluginContext::from_closures(
-            ClosureBridge {
-                begin_edit: Box::new(move |id| {
-                    // Push can fail only if the audio thread hasn't
-                    // drained for `GUI_QUEUE_CAPACITY` gestures.
-                    // request_flush below pokes the host to call
-                    // back; a value the queue drops falls back to a
-                    // values rescan in set_param.
-                    let _ = gui_changes.push(GuiParamChange::GestureBegin(id));
-                    request_flush();
-                }),
-                set_param: Box::new(move |id, value| {
-                    let plain = params_for_set.set_normalized_returning_plain(id, value);
-                    if params_for_set.parameter_affects_presentation(id) {
-                        request_presentation_refresh(
-                            &presentation_pending,
-                            host_for_callback.as_ptr(),
-                        );
-                    }
-                    let queued = gui_changes2.push(GuiParamChange::Value(id, plain)).is_ok();
-                    request_flush2();
-                    // The queued PARAM_VALUE event is how the host hears
-                    // this edit. A values rescan per drag frame made hosts
-                    // (Bitwig) re-read every parameter on the main thread
-                    // mid-gesture, so it is only the fallback for a value
-                    // the full queue dropped.
-                    //
-                    // Symmetry with the host-pointer null guards at
-                    // `:297, :365, :1404`. CLAP guarantees a valid
-                    // host on init, but a host that creates a plugin
-                    // without ever calling `clap_plugin_init`-style
-                    // setup (rare validators) could leave `data.host`
-                    // null; the deref below would crash inside the
-                    // GUI thread.
-                    let host_ptr = host_for_callback.as_ptr();
-                    if !queued
-                        && !needs_rescan.swap(true, Ordering::Relaxed)
-                        && !host_ptr.is_null()
-                        && let Some(req_cb) = (*host_ptr).request_callback
-                    {
-                        req_cb(host_ptr);
-                    }
-                }),
-                end_edit: Box::new(move |id| {
-                    let _ = gui_changes3.push(GuiParamChange::GestureEnd(id));
-                    request_flush3();
-                }),
-                request_resize: Box::new({
-                    let host_ptr = SendPtr::new(data.host);
-                    let plugin_ptr = SendPtr::new(plugin);
-                    move |lw, lh| {
-                        // Read `host_scale` live (it's atomic) so a
-                        // `gui_set_scale` after the editor opened is reflected
-                        // instead of using a stale snapshot.
-                        let data = data_from_plugin::<P>(plugin_ptr.as_ptr());
-                        if data.floating_mode.load(Ordering::Acquire) {
-                            return false;
-                        }
-                        let host_scale = data.host_scale();
-                        request_host_resize(host_ptr.as_ptr(), host_scale, lw, lh)
-                    }
-                }),
-                get_param: Box::new(move |id| params_for_get.get_normalized(id).unwrap_or(0.0)),
-                get_param_plain: Box::new(move |id| params_for_plain.get_plain(id).unwrap_or(0.0)),
-                format_param: Box::new(move |id| {
-                    let plain = params_for_fmt.get_plain(id).unwrap_or(0.0);
-                    params_for_fmt
-                        .format_value(id, plain)
-                        .unwrap_or_else(|| format!("{plain:.1}"))
-                }),
-                get_meter: Box::new(move |id| meter_store.read(id)),
-                get_state: Box::new(move || {
-                    // Editor state read: never touches the plugin. A load
-                    // still queued for the audio thread wins over the slot.
-                    custom_state_view(&snapshot, &pending_state_for_get)
-                }),
-                set_state: Box::new(move |bytes| {
-                    // The editor sends RAW custom-state bytes - exactly
-                    // what `save_state()` emits and `get_state` above
-                    // returns - NOT a full `serialize_state` envelope.
-                    // Route them to the plugin's `load_state` through the
-                    // handoff queue. No params ride along: the editor
-                    // mutates params through `set_param`.
-                    //
-                    // Always enqueue, never apply here: this closure can run
-                    // on the editor's own thread (baseview drives a separate
-                    // thread on Linux), and the plugin cell must only ever be
-                    // entered from the audio thread (active) or the host main
-                    // thread (inactive) - never a third. The audio thread
-                    // drains the queue while active; while inactive the main
-                    // thread drains it in `state_save` / `deactivate`, so an
-                    // edit made in that window is neither lost nor stranded.
-                    pending_state_for_set.force_push(state::DeserializedState {
-                        extra: Some(bytes),
-                        ..state::DeserializedState::default()
-                    });
-                }),
-                transport: Box::new(move || transport_slot.read()),
-            },
-            params_for_ctx,
-        )
-        .with_tasks(task_spawner_for_ctx)
-        .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedEdits)
-        .with_host_notifier(data.host_notifier.clone())
-        .with_window_rescaled({
-            // The next `request_resize` converts at the window's new scale
-            // while the host has sent none of its own (`host_scale`).
-            let plugin = SendPtr::new(plugin);
-            Arc::new(move |scale| {
-                if scale.is_finite() && scale > 0.0 {
-                    let data = data_from_plugin::<P>(plugin.as_ptr());
-                    data.window_scale.store(scale.to_bits(), Ordering::Relaxed);
-                }
-            })
-        })
-        .with_mark_dirty({
-            // `state.mark_dirty` is [main-thread]: flag it and ask for
-            // `on_main_thread` (`request_callback` is thread-safe).
-            let dirty = data.dirty_pending.clone();
-            let host = SendPtr::new(data.host);
-            Arc::new(move || {
-                let host = host.as_ptr();
-                if !dirty.swap(true, Ordering::AcqRel)
-                    && !host.is_null()
-                    && let Some(request) = (*host).request_callback
-                {
-                    request(host);
-                }
-            })
-        })
     }
 }
 
@@ -760,18 +625,12 @@ pub(crate) unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_pl
             return false;
         };
         let visible = data.floating_visible.clone();
-        let closed = data.floating_closed.clone();
-        let host = SendPtr::new(data.host);
+        let queue = Arc::clone(&data.host_queue);
         visible.store(true, Ordering::Release);
         let on_close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if visible.swap(false, Ordering::AcqRel) {
-                closed.store(true, Ordering::Release);
-                let host = host.as_ptr();
-                if !host.is_null()
-                    && let Some(request) = (*host).request_callback
-                {
-                    request(host);
-                }
+                // `gui.closed` is [main-thread].
+                queue.signal(HostSignal::FLOATING_CLOSED);
             }
         });
         let opened = match mode {

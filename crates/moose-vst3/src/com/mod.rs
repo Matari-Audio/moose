@@ -340,6 +340,32 @@ pub(crate) fn mark_restart(ctx: *mut c_void, flags: i32) {
     component::mark_restart(ctx, flags);
 }
 
+pub(crate) fn flush_host_queue(ctx: *mut c_void) {
+    component::flush_host_queue(ctx);
+}
+
+pub(crate) fn check_presentation(ctx: *mut c_void) {
+    if let Some(host) = pin(ctx) {
+        host.check_presentation();
+    }
+}
+
+pub(crate) fn has_context_menu(ctx: *mut c_void) -> bool {
+    pin(ctx).is_some_and(|host| host.has_context_menu())
+}
+
+pub(crate) fn popup_context_menu(
+    ctx: *mut c_void,
+    target: moose_core::main_thread::MenuTarget,
+    x: i32,
+    y: i32,
+    items: &[moose_core::main_thread::MenuItem],
+) {
+    if let Some(host) = pin(ctx) {
+        host.popup_context_menu(target, x, y, items);
+    }
+}
+
 /// `ComPtr` from an incoming interface pointer, adding a reference.
 pub(crate) unsafe fn retain<I: vst3::Interface>(p: *mut I) -> Option<ComPtr<I>> {
     unsafe { ComRef::from_raw(p) }.map(|r| r.to_com_ptr())

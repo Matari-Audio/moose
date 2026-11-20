@@ -1,20 +1,201 @@
-//! Editor callbacks.
+//! Editor callbacks and [`Vst3Host`].
 
 use crate::ffi;
-use crate::instance::Vst3Instance;
+use crate::instance::{StateLoadQueue, Vst3Instance};
 use crate::lifecycle::vst3_midi_source;
 use crate::midi_proxy::{MIDI_PROXY_PER_CHANNEL, allocated_midi_proxy_id};
 
+use moose_core::TransportSlot;
 use moose_core::editor::{
-    ClosureBridge, Editor, PluginContext, RawWindowHandle, SendPtr, clamp_logical_size,
-    fit_logical_size,
+    EditGroup, Editor, EditorBridge, HostContext, PluginContext, RawWindowHandle, SendPtr,
+    clamp_logical_size, fit_logical_size,
 };
+use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
+use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
+use moose_core::main_thread::{HostNotice, MenuTarget};
+use moose_core::meters::MeterStore;
+use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
 use moose_core::wrapper::{custom_state_view, run_extern_callback_with};
 use moose_params::Params;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+// ---------------------------------------------------------------------------
+// HostContext
+// ---------------------------------------------------------------------------
+
+/// One VST3 instance seen from its editor.
+pub(crate) struct Vst3Host<P: PluginExport> {
+    ctx: SendPtr<std::ffi::c_void>,
+    params: Arc<P::Params>,
+    meter_store: Arc<MeterStore>,
+    snapshot: Arc<SnapshotSlot>,
+    pending_state: Arc<StateLoadQueue>,
+    transport: Arc<TransportSlot>,
+    queue: Arc<HostQueue>,
+    _plugin: PhantomData<fn() -> P>,
+}
+
+impl<P: PluginExport> Vst3Host<P> {
+    /// # Safety
+    /// `ctx` is a live `Vst3Instance<P>` pointer.
+    unsafe fn new(ctx: *mut std::ffi::c_void) -> Self {
+        let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
+        Self {
+            // SAFETY: the instance outlives the editor (`cb_destroy` tears
+            // down the editor before freeing `ctx`).
+            ctx: unsafe { SendPtr::new(ctx) },
+            params: Arc::clone(&inst.params_arc),
+            meter_store: Arc::clone(&inst.meter_store),
+            snapshot: Arc::clone(&inst.snapshot),
+            pending_state: Arc::clone(&inst.pending_state),
+            transport: Arc::clone(&inst.transport_slot),
+            queue: Arc::clone(&inst.host_queue),
+            _plugin: PhantomData,
+        }
+    }
+}
+
+impl<P: PluginExport> EditorBridge for Vst3Host<P> {
+    fn begin_edit(&self, id: u32) {
+        ffi::moose_vst3_begin_edit(self.ctx.as_ptr().cast_mut(), id);
+    }
+
+    fn set_param(&self, id: u32, normalized: f64) {
+        // Single trait dispatch: the post-clamp normalized value is what
+        // the host expects for `IComponentHandler::performEdit`.
+        let norm = self
+            .params
+            .set_normalized_returning_normalized(id, normalized);
+        if self.params.parameter_affects_presentation(id) {
+            self.queue.signal(HostSignal::PRESENTATION);
+        }
+        ffi::moose_vst3_perform_edit(self.ctx.as_ptr().cast_mut(), id, norm);
+    }
+
+    fn end_edit(&self, id: u32) {
+        ffi::moose_vst3_end_edit(self.ctx.as_ptr().cast_mut(), id);
+    }
+
+    fn request_resize(&self, w: u32, h: u32) -> bool {
+        if w == 0 || h == 0 {
+            return false;
+        }
+        // SAFETY: `ctx` is the live `Vst3Instance<P>`.
+        let inst = unsafe { &*self.ctx.as_ptr().cast::<Vst3Instance<P>>() };
+        let (pw, ph) = logical_to_phys(w, h, inst.host_scale());
+        ffi::moose_vst3_request_resize(self.ctx.as_ptr().cast_mut(), pw, ph) != 0
+    }
+
+    fn get_param(&self, id: u32) -> f64 {
+        self.params.get_normalized(id).unwrap_or(0.0)
+    }
+
+    fn get_param_plain(&self, id: u32) -> f64 {
+        self.params.get_plain(id).unwrap_or(0.0)
+    }
+
+    fn format_param(&self, id: u32) -> String {
+        let plain = self.params.get_plain(id).unwrap_or(0.0);
+        self.params
+            .format_value(id, plain)
+            .unwrap_or_else(|| format!("{plain:.1}"))
+    }
+
+    fn get_meter(&self, id: u32) -> f32 {
+        self.meter_store.read(id)
+    }
+
+    fn get_state(&self) -> Vec<u8> {
+        custom_state_view(&self.snapshot, &self.pending_state)
+    }
+
+    fn set_state(&self, data: Vec<u8>) {
+        // Always enqueue, never apply here: this can run on the editor's own
+        // thread, and the plugin cell is entered only from the audio thread
+        // (active) or the host main thread (inactive).
+        self.pending_state.force_push(state::DeserializedState {
+            extra: Some(data),
+            ..Default::default()
+        });
+    }
+
+    fn transport(&self) -> Option<TransportInfo> {
+        self.transport.read()
+    }
+}
+
+impl<P: PluginExport> HostContext for Vst3Host<P> {
+    fn mark_dirty(&self) {
+        self.queue.signal(HostSignal::MARK_DIRTY);
+        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr().cast_mut());
+    }
+
+    fn group_edits(&self, edge: EditGroup) {
+        ffi::moose_vst3_group_edit(self.ctx.as_ptr().cast_mut(), edge);
+    }
+
+    fn request_restart(&self) {
+        self.queue.signal(HostSignal::RESTART);
+        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr().cast_mut());
+    }
+
+    fn context_menu(&self, target: MenuTarget, x: i32, y: i32) -> bool {
+        let ctx = self.ctx.as_ptr().cast_mut();
+        if !ffi::moose_vst3_has_context_menu(ctx) {
+            return false;
+        }
+        let ok = self
+            .queue
+            .post(HostMessage::ContextMenu { target, x, y })
+            .is_ok();
+        if ok {
+            ffi::moose_vst3_flush_host_queue(ctx);
+        }
+        ok
+    }
+
+    fn notify(&self, notice: HostNotice) {
+        self.queue.signal(notice);
+        ffi::moose_vst3_flush_host_queue(self.ctx.as_ptr().cast_mut());
+    }
+
+    fn window_rescaled(&self, scale: f64) {
+        if scale.is_finite() && scale > 0.0 {
+            // SAFETY: the editor is closed before the instance is freed.
+            let inst = unsafe { &*self.ctx.as_ptr().cast::<Vst3Instance<P>>() };
+            inst.window_scale.store(scale.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Build the [`PluginContext`] handed to the instance's editor.
+///
+/// # Safety
+/// `ctx` is a live `Vst3Instance<P>` pointer.
+pub(crate) unsafe fn editor_context<P: PluginExport>(ctx: *mut std::ffi::c_void) -> PluginContext {
+    let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
+    let host: Arc<dyn HostContext> = Arc::new(unsafe { Vst3Host::<P>::new(ctx) });
+    PluginContext::from_host(host, Arc::clone(&inst.params_arc) as Arc<dyn Params>)
+        .with_tasks(inst.task_spawner.clone())
+}
+
+/// Compute the physical `ViewRect` dimensions for `editor` on the current platform.
+fn editor_phys_size<P: PluginExport>(inst: &Vst3Instance<P>, editor: &dyn Editor) -> (u32, u32) {
+    let (ew, eh) = editor.size();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = inst;
+        (ew, eh)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        logical_to_phys(ew, eh, inst.host_scale())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GUI callbacks
@@ -44,6 +225,10 @@ pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
             if let (Some(scale), Some(editor)) = (inst.reported_host_scale(), gui.editor.as_mut()) {
                 editor.set_scale_factor(scale);
             }
+            if let Some(ref editor) = gui.editor {
+                let (pw, ph) = editor_phys_size(inst, editor.as_ref());
+                inst.store_phys_size(pw, ph);
+            }
         }
         i32::from(gui.editor.is_some())
     })
@@ -59,11 +244,15 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
     run_extern_callback_with::<P, ()>("vst3", "gui_get_size", (), || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         // A host can query the size synchronously while an outer GUI callback
-        // holds the cell (mid-resize). If so, report the size the plugin just
-        // requested through `request_resize` (still pending), leaving the
-        // host's value untouched when there is none - never re-enter the cell.
+        // holds the cell (mid-resize or mid-open). Report the size the plugin
+        // just requested through `request_resize` (still pending), falling back
+        // to the last known physical size so `IPlugView::getSize` never returns
+        // a zeroed 0x0 ViewRect - never re-enter the cell.
         let Some(mut gui) = inst.gui.try_enter() else {
-            let packed = inst.pending_resize.load(Ordering::Relaxed);
+            let mut packed = inst.pending_resize.load(Ordering::Relaxed);
+            if packed == 0 {
+                packed = inst.last_phys_size.load(Ordering::Relaxed);
+            }
             if packed != 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 {
@@ -87,34 +276,10 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
             apply_physical_resize(editor.as_mut(), pw, ph, inst.host_scale());
         }
         if let Some(ref editor) = gui.editor {
-            let (ew, eh) = editor.size();
-            // VST3 `ViewRect` is documented as "in pixels". That's literally
-            // true on Windows/Linux, where hosts expect physical pixels and
-            // may drive the scale via `IPlugViewContentScaleSupport`. On
-            // macOS, AppKit handles the Retina backing automatically and
-            // hosts expect logical points - scaling here would double the
-            // window on Retina displays.
-            #[cfg(target_os = "macos")]
-            {
-                *w = ew;
-                *h = eh;
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                // Round-to-nearest, not truncate - `(w * scale) as u32`
-                // would round 199.9 → 199, drifting one pixel on
-                // fractional scales. Matches the CLAP / AAX / `to_physical_px`
-                // helper used elsewhere. Logical pixel sizes are bounded
-                // by `u32::MAX / scale`; in practice no editor exceeds
-                // 16384 logical pixels, so the `f64 → u32` truncation
-                // and sign casts are safe.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                {
-                    let host_scale = inst.host_scale();
-                    *w = (f64::from(ew) * host_scale).round() as u32;
-                    *h = (f64::from(eh) * host_scale).round() as u32;
-                }
-            }
+            let (pw, ph) = editor_phys_size(inst, editor.as_ref());
+            *w = pw;
+            *h = ph;
+            inst.store_phys_size(pw, ph);
         }
     });
 }
@@ -156,9 +321,10 @@ pub(crate) unsafe extern "C" fn cb_gui_set_content_scale<P: PluginExport>(
         // (`IPlugFrame::resizeView`) so its frame matches the child. Not a
         // no-op re-send: skipped when the scale didn't change.
         let (lw, lh) = editor.size();
+        let (pw, ph) = logical_to_phys(lw, lh, scale);
+        inst.store_phys_size(pw, ph);
         drop(gui);
         if changed && lw > 0 && lh > 0 {
-            let (pw, ph) = logical_to_phys(lw, lh, scale);
             ffi::moose_vst3_request_resize(ctx, pw, ph);
         }
     });
@@ -265,9 +431,14 @@ pub(crate) unsafe extern "C" fn cb_gui_set_size<P: PluginExport>(
         // else stash for `cb_gui_get_size` to apply on the next size query.
         match inst.gui.try_enter() {
             Some(mut gui) => {
+                // Clear any stale deferred resize so a subsequent `getSize`
+                // cannot overwrite this fresher host commit.
+                inst.pending_resize.store(0, Ordering::Relaxed);
                 if let Some(editor) = gui.editor.as_mut() {
                     inst.note_window_scale(editor.as_ref());
                     apply_physical_resize(editor.as_mut(), w, h, inst.host_scale());
+                    let (pw, ph) = editor_phys_size(inst, editor.as_ref());
+                    inst.store_phys_size(pw, ph);
                 }
             }
             None => {
@@ -299,7 +470,9 @@ pub(crate) unsafe extern "C" fn cb_midi_mapping_get_param_id<P: PluginExport>(
     let Some(source) = vst3_midi_source(controller) else {
         return 0; // kResultFalse
     };
-    let channel = u8::try_from(channel).unwrap_or(0);
+    let Ok(channel) = u8::try_from(channel) else {
+        return 0;
+    };
     // Returns a hit-flag (1/0); the shim maps it to kResultOk /
     // kResultFalse for the VST3 boundary. Explicit bindings win on
     // every bus - a bound parameter is one value, so per-port
@@ -395,131 +568,28 @@ pub(crate) unsafe fn gui_open_with<P: PluginExport>(
         let inst = &*ctx.cast::<Vst3Instance<P>>();
         let mut gui = inst.gui.enter();
         if let Some(ref mut editor) = gui.editor {
-            // Re-sync the editor's content scale to the host's current
-            // value right before opening. `host_scale` lives on the
-            // persistent instance and can already be set by the time the
-            // host attaches (REAPER on Linux reports it via
-            // `setContentScaleFactor` around `getSize`, *before* this
-            // `open`), but the editor's own copy only got the value if a
-            // `setContentScaleFactor` / `has_editor` replay happened to
-            // land after the editor object existed and before now. When
-            // it didn't - editor built while `host_scale` was still 1.0,
-            // host bumped it to 2.0, then attached - the editor would open
-            // pinned to 1.0 and render a half-size view in the host's 2x
-            // frame (with 2x-off click targets). Applying it here makes
-            // the open-time scale authoritative regardless of callback
-            // ordering. Skip macOS: Retina is driven through AppKit there
-            // and `host_scale` stays 1.0, so pinning would force 1x.
-            #[cfg(not(target_os = "macos"))]
-            editor.set_scale_factor(inst.host_scale());
-            let params = Arc::clone(&inst.params_arc);
-            let meter_store = Arc::clone(&inst.meter_store);
-            let snapshot = Arc::clone(&inst.snapshot);
-            let pending_state_for_get = inst.pending_state.clone();
-            let ctx_raw = SendPtr::new(ctx);
-            let params_for_set = params.clone();
-            let params_for_get = params.clone();
-            let params_for_plain = params.clone();
-            let params_for_fmt = params.clone();
-            let params_for_ctx = params.clone();
-            let task_spawner_for_ctx = inst.task_spawner.clone();
-            let pending_state_for_set = inst.pending_state.clone();
-            let transport_slot = inst.transport_slot.clone();
-            let context = PluginContext::from_closures(
-                ClosureBridge {
-                    begin_edit: Box::new(move |id| {
-                        ffi::moose_vst3_begin_edit(ctx_raw.as_ptr().cast_mut(), id);
-                    }),
-                    set_param: Box::new(move |id, value| {
-                        // Single trait dispatch: same value-then-readback
-                        // pattern collapsed via the trait helper. The
-                        // post-clamp normalized value is what the host
-                        // expects for `IComponentHandler::performEdit`.
-                        let norm = params_for_set.set_normalized_returning_normalized(id, value);
-                        ffi::moose_vst3_perform_edit(ctx_raw.as_ptr().cast_mut(), id, norm);
-                    }),
-                    end_edit: Box::new(move |id| {
-                        ffi::moose_vst3_end_edit(ctx_raw.as_ptr().cast_mut(), id);
-                    }),
-                    request_resize: Box::new(move |w, h| {
-                        // SAFETY: `ctx_raw` is the live
-                        // `Vst3Instance` pointer the shim holds in
-                        // its ctx -> MooseComponent table. The
-                        // closure runs on the GUI thread, same as
-                        // `cb_gui_set_content_scale` which is the
-                        // only writer of `host_scale`. Routing
-                        // through the shim's component (rather
-                        // than holding a plug view pointer) avoids
-                        // UAF across host editor recreations.
-                        let host_scale = (*ctx_raw.as_ptr().cast::<Vst3Instance<P>>()).host_scale();
-                        // VST3 hosts speak physical points;
-                        // `Editor` speaks logical.
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let pw = (f64::from(w) * host_scale).round() as u32;
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let ph = (f64::from(h) * host_scale).round() as u32;
-                        ffi::moose_vst3_request_resize(ctx_raw.as_ptr().cast_mut(), pw, ph) != 0
-                    }),
-                    get_param: Box::new(move |id| params_for_get.get_normalized(id).unwrap_or(0.0)),
-                    get_param_plain: Box::new(move |id| {
-                        params_for_plain.get_plain(id).unwrap_or(0.0)
-                    }),
-                    format_param: Box::new(move |id| {
-                        let plain = params_for_fmt.get_plain(id).unwrap_or(0.0);
-                        params_for_fmt
-                            .format_value(id, plain)
-                            .unwrap_or_else(|| format!("{plain:.1}"))
-                    }),
-                    get_meter: Box::new(move |id| meter_store.read(id)),
-                    get_state: Box::new(move || {
-                        // Editor state read: lock-free, reads the snapshot
-                        // the audio thread publishes each block. Never
-                        // touches the plugin, so an editor read can't
-                        // stall audio.
-                        custom_state_view(&snapshot, &pending_state_for_get)
-                    }),
-                    set_state: Box::new(move |bytes| {
-                        // The editor sends RAW custom-state bytes -
-                        // exactly what `save_state()` emits and
-                        // `get_state` above returns - NOT a full
-                        // `serialize_state` envelope. No params ride
-                        // along: the editor mutates params through
-                        // `set_param`.
-                        //
-                        // Always enqueue, never apply here: this closure can
-                        // run on the editor's own thread (baseview drives a
-                        // separate thread on Linux), and the plugin cell must
-                        // only ever be entered from the audio thread (active)
-                        // or the host main thread (inactive) - never a third.
-                        // The audio thread drains the queue while active; while
-                        // inactive the main thread drains it in `cb_state_save`
-                        // / `cb_set_active`, so an edit made in that window is
-                        // neither lost nor stranded.
-                        pending_state_for_set.force_push(state::DeserializedState {
-                            extra: Some(bytes),
-                            ..state::DeserializedState::default()
-                        });
-                    }),
-                    transport: Box::new(move || transport_slot.read()),
-                },
-                params_for_ctx,
-            )
-            .with_tasks(task_spawner_for_ctx)
-            .with_mark_dirty(Arc::new(move || {
-                ffi::moose_vst3_mark_dirty(ctx_raw.as_ptr().cast_mut());
-            }))
-            .with_group_edits(Arc::new(move |edge| {
-                ffi::moose_vst3_group_edit(ctx_raw.as_ptr().cast_mut(), edge);
-            }));
+            // Re-sync the editor's content scale to the host's reported
+            // value right before opening. Only replay a scale the host
+            // actually sent (`reported_host_scale`): passing the default
+            // 1.0 fallback from `host_scale()` would pin the editor to 1x
+            // instead of letting it follow the OS / monitor DPI scale.
+            if let Some(scale) = inst.reported_host_scale() {
+                editor.set_scale_factor(scale);
+            }
+            let (pw, ph) = editor_phys_size(inst, editor.as_ref());
+            inst.store_phys_size(pw, ph);
+            let context = editor_context::<P>(ctx);
             editor.open(handle, context);
-            // Re-sync the scale after `open`: on Windows `open` pumps
-            // messages, so a re-entrant `setContentScaleFactor` may have
-            // updated `host_scale` while `cb_gui_set_content_scale` had to skip
-            // the editor (the cell was held here). Apply the authoritative
-            // value now that the editor exists. macOS drives Retina through
-            // AppKit, so `host_scale` stays 1.0 and pinning would force 1x.
-            #[cfg(not(target_os = "macos"))]
-            editor.set_scale_factor(inst.host_scale());
+            // Re-sync after `open`: on Windows `open` pumps messages, so a
+            // re-entrant `setContentScaleFactor` may have updated
+            // `host_scale` while `cb_gui_set_content_scale` had to skip
+            // the editor (the cell was held here).
+            if let Some(scale) = inst.reported_host_scale() {
+                editor.set_scale_factor(scale);
+            }
+            inst.note_window_scale(editor.as_ref());
+            let (pw, ph) = editor_phys_size(inst, editor.as_ref());
+            inst.store_phys_size(pw, ph);
             i32::from(editor.is_open())
         } else {
             0
@@ -570,7 +640,7 @@ pub(crate) unsafe extern "C" fn cb_gui_event_fd<P: PluginExport>(
     run_extern_callback_with::<P, i32>("vst3", "gui_event_fd", -1, || {
         #[cfg(unix)]
         {
-            // SAFETY: host callback passes a live `Vst3Instance<P>` pointer.
+            // SAFETY: `ctx` is the live instance the shim registered.
             let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
             let gui = inst.gui.enter();
             gui.editor.as_ref().and_then(|e| e.event_fd()).unwrap_or(-1)
@@ -606,4 +676,192 @@ pub(crate) unsafe extern "C" fn cb_gui_on_timer<P: PluginExport>(ctx: *mut std::
             editor.on_timer();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_value_fixture::TestPlugin;
+    use crate::lifecycle::{cb_create, cb_destroy};
+    use moose_core::thread::MainThread;
+    use std::sync::Mutex;
+
+    struct RecordingEditor {
+        size: (u32, u32),
+        open: bool,
+        scales: Arc<Mutex<Vec<f64>>>,
+    }
+
+    impl Editor for RecordingEditor {
+        fn size(&self) -> (u32, u32) {
+            self.size
+        }
+
+        fn can_resize(&self) -> bool {
+            true
+        }
+
+        fn set_size(&mut self, width: u32, height: u32) -> bool {
+            self.size = (width, height);
+            true
+        }
+
+        fn set_scale_factor(&mut self, factor: f64) {
+            self.scales.lock().unwrap().push(factor);
+        }
+
+        fn open(&mut self, _parent: RawWindowHandle, _context: PluginContext) {
+            self.open = true;
+        }
+
+        fn close(&mut self) {
+            self.open = false;
+        }
+
+        fn is_open(&self) -> bool {
+            self.open
+        }
+    }
+
+    #[test]
+    fn vst3_host_context_routes_state_and_signals_through_host_queue() {
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            assert!(!ctx.is_null());
+            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+            let editor_ctx = editor_context::<TestPlugin>(ctx);
+
+            // State from the editor is queued for the processor, and reads
+            // see the queued state before it is applied.
+            editor_ctx.set_state(vec![1, 2, 3]);
+            assert_eq!(editor_ctx.get_state(), [1, 2, 3]);
+
+            editor_ctx.mark_dirty();
+            editor_ctx.request_restart();
+            editor_ctx.notify_host(HostNotice::AUDIO_PORTS);
+            editor_ctx.window_rescaled(1.5);
+            assert_eq!(
+                f64::from_bits(inst.window_scale.load(Ordering::Relaxed)),
+                1.5
+            );
+            // No live COM host with `IComponentHandler3`: the editor shows
+            // its own menu.
+            assert!(!editor_ctx.context_menu(MenuTarget::Global, 12, 34));
+
+            let main = MainThread::assume();
+            let drain = inst.host_queue.drain(&main);
+            assert!(drain.signals.contains(HostSignal::MARK_DIRTY));
+            assert!(drain.signals.contains(HostSignal::RESTART));
+            assert!(drain.signals.notices().contains(HostNotice::AUDIO_PORTS));
+            assert_eq!(drain.count(), 0, "a refused menu posts nothing");
+
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+
+    #[test]
+    fn busy_gui_get_size_returns_cached_last_phys_size_instead_of_zero() {
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+            inst.gui.enter().editor = Some(Box::new(RecordingEditor {
+                size: (640, 400),
+                open: false,
+                scales: Arc::default(),
+            }));
+
+            let (mut w, mut h) = (0, 0);
+            cb_gui_get_size::<TestPlugin>(ctx, &raw mut w, &raw mut h);
+            assert_eq!((w, h), (640, 400));
+
+            // Simulate a re-entrant `IPlugView::getSize` while the GUI cell is
+            // already held and no `pending_resize` is queued.
+            let held = inst.gui.enter();
+            let (mut busy_w, mut busy_h) = (0, 0);
+            cb_gui_get_size::<TestPlugin>(ctx, &raw mut busy_w, &raw mut busy_h);
+            assert_eq!((busy_w, busy_h), (640, 400));
+            drop(held);
+
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+
+    #[test]
+    fn gui_open_with_only_replays_reported_host_scale() {
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+            let scales = Arc::new(Mutex::new(Vec::new()));
+            inst.gui.enter().editor = Some(Box::new(RecordingEditor {
+                size: (500, 300),
+                open: false,
+                scales: Arc::clone(&scales),
+            }));
+
+            assert_eq!(inst.reported_host_scale(), None);
+            assert_eq!(gui_open_with::<TestPlugin>(ctx, RawWindowHandle::X11(1)), 1);
+            assert!(
+                scales.lock().unwrap().is_empty(),
+                "must not pin editor to default 1.0 scale when host reported no content scale"
+            );
+
+            cb_gui_close::<TestPlugin>(ctx);
+            cb_gui_set_content_scale::<TestPlugin>(ctx, 2.0);
+            scales.lock().unwrap().clear();
+
+            assert_eq!(gui_open_with::<TestPlugin>(ctx, RawWindowHandle::X11(1)), 1);
+            // macOS uses AppKit backing scale rather than IPlugViewContentScaleSupport,
+            // so `cb_gui_set_content_scale` does not record a host scale there.
+            #[cfg(target_os = "macos")]
+            assert!(scales.lock().unwrap().is_empty());
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(*scales.lock().unwrap(), vec![2.0, 2.0]);
+
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+
+    #[test]
+    fn gui_set_size_clears_stale_pending_resize() {
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+            inst.gui.enter().editor = Some(Box::new(RecordingEditor {
+                size: (400, 300),
+                open: true,
+                scales: Arc::default(),
+            }));
+
+            // Queue a deferred resize while the GUI cell is busy.
+            let held = inst.gui.enter();
+            cb_gui_set_size::<TestPlugin>(ctx, 900, 700);
+            assert_ne!(inst.pending_resize.load(Ordering::Relaxed), 0);
+            drop(held);
+
+            // An immediate resize after the cell is released must clear the
+            // older queued resize so `cb_gui_get_size` does not overwrite it.
+            cb_gui_set_size::<TestPlugin>(ctx, 640, 480);
+            assert_eq!(inst.pending_resize.load(Ordering::Relaxed), 0);
+
+            let (mut w, mut h) = (0, 0);
+            cb_gui_get_size::<TestPlugin>(ctx, &raw mut w, &raw mut h);
+            assert_eq!((w, h), (640, 480));
+
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
+
+    #[test]
+    fn midi_mapping_rejects_negative_channel() {
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            let mut param_id = u32::MAX;
+            assert_eq!(
+                cb_midi_mapping_get_param_id::<TestPlugin>(ctx, 0, -1, 1, &raw mut param_id),
+                0
+            );
+            assert_eq!(param_id, u32::MAX, "a refused query writes nothing");
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
 }

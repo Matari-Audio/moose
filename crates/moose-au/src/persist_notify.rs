@@ -1,15 +1,14 @@
-//! `AUv2` persistent-document completion on the host main queue, without a GUI
-//! or a polling worker. Mirrors the VST3 main-queue dispatch-source bridge.
-use crate::gui::{
-    moose_au_v2_host_begin_param_gesture, moose_au_v2_host_end_param_gesture,
-    moose_au_v2_host_set_param,
-};
+//! `AUv2` main-queue dispatch-source wake for the instance's [`HostQueue`].
+//!
+//! [`HostQueue`]: moose_core::host_queue::HostQueue
 use moose_core::editor::SendPtr;
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostQueue;
+use moose_core::thread::MainThread;
 use moose_core::wrapper::run_extern_callback_with;
-use moose_params::Params;
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 unsafe extern "C" {
     static _dispatch_source_type_data_or: c_void;
@@ -25,29 +24,35 @@ unsafe extern "C" {
         source: *mut c_void,
         callback: unsafe extern "C" fn(*mut c_void),
     );
+    fn dispatch_source_set_cancel_handler_f(
+        source: *mut c_void,
+        callback: unsafe extern "C" fn(*mut c_void),
+    );
     fn dispatch_resume(source: *mut c_void);
     fn dispatch_source_merge_data(source: *mut c_void, data: usize);
     fn dispatch_source_cancel(source: *mut c_void);
     fn dispatch_release(source: *mut c_void);
 }
-struct Context<P: PluginExport> {
-    params: Arc<P::Params>,
-    host: SendPtr<c_void>,
+
+struct DrainContext {
+    queue: Arc<HostQueue>,
+    ctx: SendPtr<c_void>,
 }
-pub(super) struct Dispatcher<P: PluginExport> {
-    signal: Arc<moose_params::PersistChangeSignal>,
+
+pub(super) struct Dispatcher {
     source: SendPtr<c_void>,
-    _context: Box<Context<P>>,
+    activated: AtomicBool,
 }
-impl<P: PluginExport> Dispatcher<P> {
-    /// Host main thread only, before publishing the instance to the host.
-    pub(super) unsafe fn new(params: Arc<P::Params>, host: SendPtr<c_void>) -> Option<Self> {
-        if !params.wants_persist_notifications() {
-            return None;
-        }
+
+impl Dispatcher {
+    /// Create a suspended main-queue dispatch source and its thread-safe
+    /// wake closure. Call [`Self::activate`] once the instance has its
+    /// stable heap address.
+    pub(super) unsafe fn new() -> Option<(Self, impl Fn() + Send + Sync + 'static)> {
         // SAFETY: libdispatch's exported opaque type and queue objects have
-        // static process lifetime; the source is resumed once and released by
-        // Drop on the same main thread as AU lifecycle/editor callbacks.
+        // static process lifetime; the source is resumed once in `activate`
+        // (or during `Drop` if creation unwinds early) and cancelled +
+        // released in `Drop`.
         unsafe {
             let raw = dispatch_source_create(
                 &raw const _dispatch_source_type_data_or,
@@ -59,55 +64,72 @@ impl<P: PluginExport> Dispatcher<P> {
                 return None;
             }
             let source = SendPtr::new(raw);
-            let mut context = Box::new(Context::<P> { params, host });
-            dispatch_set_context(raw, (&raw mut *context).cast());
-            dispatch_source_set_event_handler_f(raw, drain::<P>);
-            dispatch_resume(raw);
-            let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
+            let wake = move || {
                 dispatch_source_merge_data(source.as_ptr().cast_mut(), 1);
-            }));
-            context
-                .params
-                .set_persist_change_signal(Arc::downgrade(&signal));
-            Some(Self {
-                signal,
-                source,
-                _context: context,
-            })
+            };
+            Some((
+                Self {
+                    source,
+                    activated: AtomicBool::new(false),
+                },
+                wake,
+            ))
         }
     }
-}
-impl<P: PluginExport> Drop for Dispatcher<P> {
-    fn drop(&mut self) {
-        self.signal.close(); // joins an in-flight worker wake before release
-        // SAFETY: AU control callbacks and this source's handler are serialized
-        // on the host main thread. No handler is executing concurrently here;
-        // cancellation prevents subsequent event-handler calls. No cancel
-        // handler is installed, so no plugin code is queued after teardown.
+
+    /// Bind the instance pointer and resume the main-queue source.
+    pub(super) unsafe fn activate<P: PluginExport>(&self, queue: Arc<HostQueue>, ctx: *mut c_void) {
+        let raw = self.source.as_ptr().cast_mut();
+        let drain_ctx = Box::into_raw(Box::new(DrainContext {
+            queue,
+            // SAFETY: `drain` only dereferences `ctx` inside `queue.with_open`,
+            // which `cb_destroy` waits out via `host_queue.close()` before
+            // freeing the instance.
+            ctx: unsafe { SendPtr::new(ctx.cast_const()) },
+        }));
         unsafe {
-            dispatch_source_cancel(self.source.as_ptr().cast_mut());
-            dispatch_release(self.source.as_ptr().cast_mut());
+            dispatch_set_context(raw, drain_ctx.cast());
+            dispatch_source_set_event_handler_f(raw, drain::<P>);
+            dispatch_source_set_cancel_handler_f(raw, release_context);
+            dispatch_resume(raw);
+        }
+        self.activated.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        let raw = self.source.as_ptr().cast_mut();
+        // SAFETY: libdispatch forbids releasing a suspended source. If
+        // creation unwound before `activate`, cancel and resume before
+        // releasing so disposal never aborts the host. When activated,
+        // `cb_destroy` has already closed `HostQueue` (blocking future
+        // drains and waiting out any in-flight drain), and `release_context`
+        // frees `DrainContext` once libdispatch finishes cancellation.
+        unsafe {
+            dispatch_source_cancel(raw);
+            if !self.activated.load(Ordering::Acquire) {
+                dispatch_resume(raw);
+            }
+            dispatch_release(raw);
         }
     }
 }
+
 unsafe extern "C" fn drain<P: PluginExport>(raw: *mut c_void) {
-    run_extern_callback_with::<P, ()>("au", "persist_drain", (), || unsafe {
-        let context = &*raw.cast::<Context<P>>();
-        let Some((id, value)) = context.params.take_persist_change() else {
-            return;
-        };
-        if !value.is_finite()
-            || !(0.0..=1.0).contains(&value)
-            || context.params.get_normalized(id).is_none()
-        {
-            return;
-        }
-        let plain = context.params.set_normalized_returning_plain(id, value);
-        let host = context.host.as_ptr().cast_mut();
-        moose_au_v2_host_begin_param_gesture(host, id);
-        // AU wire values are f32, as in the existing editor bridge.
-        #[allow(clippy::cast_possible_truncation)]
-        moose_au_v2_host_set_param(host, id, plain as f32);
-        moose_au_v2_host_end_param_gesture(host, id);
+    run_extern_callback_with::<P, ()>("au", "host_queue_drain", (), || unsafe {
+        let context = &*raw.cast::<DrainContext>();
+        context.queue.with_open(|| {
+            let main = MainThread::assume();
+            crate::gui::drain_host_queue::<P>(context.ctx.as_ptr().cast_mut(), &main);
+        });
     });
+}
+
+unsafe extern "C" fn release_context(raw: *mut c_void) {
+    if !raw.is_null() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            drop(Box::from_raw(raw.cast::<DrainContext>()));
+        }));
+    }
 }

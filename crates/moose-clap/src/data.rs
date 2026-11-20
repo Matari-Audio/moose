@@ -19,6 +19,7 @@ use moose_core::bus_routing::BusRouting;
 use moose_core::editor::{Editor, EditorBuilder};
 use moose_core::events::EventList;
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostQueue;
 use moose_core::info::PluginInfo;
 use moose_core::main_thread::{HostNotifier, MainThreadHooks, NoteName};
 use moose_core::meters::MeterStore;
@@ -35,7 +36,7 @@ use std::sync::{Arc, Mutex};
 // GUI → host parameter change queue
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum GuiParamChange {
     GestureBegin(u32),
     Value(u32, f64), // (param_id, plain_value)
@@ -72,7 +73,6 @@ pub(crate) type StateLoadQueue = state::StateLoadQueue;
 
 pub(crate) struct ClapPluginData<P: PluginExport> {
     pub(crate) persist_signal: Option<Arc<moose_params::PersistChangeSignal>>,
-    pub(crate) persist_pending: Arc<AtomicBool>,
     pub(crate) host_state: *const clap_host_state,
     /// The user's plugin instance in the wrapper-standard ownership
     /// cell: the audio thread owns it per block, host lifecycle
@@ -149,8 +149,12 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     pub(crate) pending_structure: MainThreadCell<Option<Vec<u32>>>,
     /// The plugin's main-thread part (`PluginExport::main_thread`).
     pub(crate) hooks: MainThreadCell<Box<dyn MainThreadHooks>>,
-    /// Note-name / voice-info notices from the plugin. Connected at init,
-    /// closed at destroy; its wake schedules `on_main_thread`.
+    /// Every "tell the host later": the editor's dirty / restart /
+    /// context-menu requests, latency changes from the audio thread,
+    /// rescans, persist and catalog wakes, plugin notices. Its wake is
+    /// `request_callback`; `on_main_thread` drains it. Closed at destroy.
+    pub(crate) host_queue: Arc<HostQueue>,
+    /// The plugin's notices, on `host_queue`.
     pub(crate) host_notifier: HostNotifier,
     /// The note names taken by the last `note_name.count`.
     pub(crate) note_names: MainThreadCell<Vec<NoteName>>,
@@ -179,15 +183,12 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     pub(crate) host_tail: *const clap_host_tail,
     /// Host track-info extension. Null if the host doesn't expose it.
     pub(crate) host_track_info: *const clap_host_track_info,
-    /// Set on the audio thread when `latency()` changes; drained on the
-    /// main thread, which notifies the host. Coalesces a burst of
-    /// changes into one host notification per main-thread callback.
-    pub(crate) latency_dirty: AtomicBool,
     /// A `HostNotice::AUDIO_PORTS` waits for the plugin to be inactive,
     /// where the host may rescan the port list.
     pub(crate) ports_rescan: AtomicBool,
     /// Queue of GUI-initiated parameter changes to emit as output events.
     pub(crate) gui_changes: Arc<GuiChangeQueue>,
+    pub(crate) gui_overflow: Arc<AtomicBool>,
     /// Bounded SPSC handoff for state loads. Host (`state_load`) and
     /// editor (`set_state` callback) deserialize on their thread and
     /// push the result; the audio thread pops at the top of
@@ -216,18 +217,11 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     /// the per-block `ProcessContext`, but reallocation waits for the
     /// next `activate`.
     pub(crate) render_mode: AtomicU8,
-    /// Flag: GUI changed params, need rescan on main thread.
-    pub(crate) needs_rescan: Arc<AtomicBool>,
     pub(crate) floating_mode: AtomicBool,
+    pub(crate) menu_popup_supported: AtomicBool,
     pub(crate) floating_visible: Arc<AtomicBool>,
-    pub(crate) floating_closed: Arc<AtomicBool>,
-    /// The editor asked to mark the project dirty (`PluginContext::mark_dirty`,
-    /// any thread); `on_main_thread` calls `host_state.mark_dirty`.
-    pub(crate) dirty_pending: Arc<AtomicBool>,
     /// Last `Params::parameter_presentation_revision` the host saw.
     pub(crate) presentation_revision: AtomicU64,
-    /// Coalesces structural changed-ID notifications without a values rescan.
-    pub(crate) presentation_pending: Arc<AtomicBool>,
     /// Main-thread discovery cache; audio processing never reads or locks it.
     pub(crate) remote_pages: Mutex<Vec<(String, Vec<u32>)>>,
     /// Shared transport slot: audio thread writes each block, editor reads.

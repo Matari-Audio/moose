@@ -20,7 +20,9 @@ use keyboard_types::{Code, KeyState, Modifiers};
 use moose_gui::window::EditorWindowHandler;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle as RwhHandle};
 
-use moose_core::editor::{ClosureBridge, Editor, PluginContext, RawWindowHandle};
+use moose_core::editor::{
+    Editor, EditorBridge, EditorNotificationDelivery, HostContext, PluginContext, RawWindowHandle,
+};
 use moose_core::events::EventBody;
 use moose_core::export::{PluginExport, read_custom_state_offthread};
 use moose_core::info::PluginCategory;
@@ -219,12 +221,12 @@ where
             &transport,
             Arc::clone(&pending_state),
             Arc::clone(&pending_resize),
-        )
-        .with_unhandled_key(Arc::new(move |kb| {
-            let (reply, answer) = std::sync::mpsc::sync_channel(1);
-            key_tx.send(WaylandWake::Key(kb.clone(), reply)).is_ok()
-                && answer.recv().unwrap_or(false)
-        }));
+            Some(Box::new(move |kb| {
+                let (reply, answer) = std::sync::mpsc::sync_channel(1);
+                key_tx.send(WaylandWake::Key(kb.clone(), reply)).is_ok()
+                    && answer.recv().unwrap_or(false)
+            })),
+        );
         let closed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let _ = wake_tx.send(WaylandWake::Closed);
         });
@@ -464,6 +466,7 @@ where
             &transport,
             Arc::clone(&pending_state),
             Arc::clone(&pending_resize),
+            None,
         );
         // No `set_scale_factor`: without a host scale the editor's child
         // window follows the desktop scale on its own (see
@@ -1140,85 +1143,119 @@ fn is_mod_pressed(mods: Modifiers) -> bool {
     }
 }
 
-/// Build a minimal `PluginContext` that routes parameter reads /
-/// writes / meter reads through the live plugin instance. Transport
-/// closure reads from the shared `Transport` the audio thread writes.
+/// A key listener for keys the editor's own window didn't use.
+type UnhandledKey = Box<dyn Fn(&keyboard_types::KeyboardEvent) -> bool + Send + Sync>;
+
+/// The standalone app as the editor's host: parameter reads and writes go
+/// straight to the shared param store, meters and custom state through the
+/// live plugin, resizes to the window loop. It has no DAW to notify, so the
+/// optional host notifications keep their no-op defaults.
+struct StandaloneHost<P: PluginExport> {
+    plugin: Arc<Mutex<P>>,
+    params: Arc<P::Params>,
+    transport: Transport,
+    pending_state: Arc<ArrayQueue<Vec<u8>>>,
+    pending_resize: Arc<AtomicU64>,
+    unhandled_key: Option<UnhandledKey>,
+}
+
+impl<P: PluginExport> EditorBridge for StandaloneHost<P> {
+    fn begin_edit(&self, _id: u32) {}
+
+    fn set_param(&self, id: u32, normalized: f64) {
+        self.params.set_normalized(id, normalized);
+    }
+
+    fn end_edit(&self, _id: u32) {}
+
+    fn request_resize(&self, w: u32, h: u32) -> bool {
+        if w == 0 || h == 0 {
+            return false;
+        }
+        self.pending_resize
+            .store(pack_size((w, h)), Ordering::Release);
+        true
+    }
+
+    fn get_param(&self, id: u32) -> f64 {
+        self.params.get_normalized(id).unwrap_or(0.0)
+    }
+
+    fn get_param_plain(&self, id: u32) -> f64 {
+        self.params.get_plain(id).unwrap_or(0.0)
+    }
+
+    fn format_param(&self, id: u32) -> String {
+        let value = self.params.get_plain(id).unwrap_or(0.0);
+        self.params.format_value(id, value).unwrap_or_default()
+    }
+
+    fn get_meter(&self, id: u32) -> f32 {
+        self.plugin.try_lock().map_or(0.0, |p| p.get_meter(id))
+    }
+
+    fn get_state(&self) -> Vec<u8> {
+        // Blocking is bounded by the audio callback's lock hold (a block's
+        // worth); a `try_lock` fallback would hand the editor stale state on
+        // a lost race. Poisoned (audio thread panicked) degrades to empty.
+        self.plugin
+            .lock()
+            .map(|p| read_custom_state_offthread(&*p))
+            .unwrap_or_default()
+    }
+
+    fn set_state(&self, data: Vec<u8>) {
+        // The audio thread drains `pending_state` and applies `load_state`
+        // at the next block top under the lock it already takes, so this
+        // never blocks the UI thread. Newest wins if several arrive before
+        // a block drains one; the audio thread logs any `load_state` error.
+        let _ = self.pending_state.force_push(data);
+    }
+
+    fn transport(&self) -> Option<moose_core::events::TransportInfo> {
+        Some(self.transport.snapshot())
+    }
+}
+
+impl<P: PluginExport> HostContext for StandaloneHost<P> {
+    fn delivery(&self) -> EditorNotificationDelivery {
+        EditorNotificationDelivery::QueuedAll
+    }
+
+    fn unhandled_key(&self, key: &keyboard_types::KeyboardEvent) -> bool {
+        self.unhandled_key.as_ref().is_some_and(|f| f(key))
+    }
+}
+
+/// The editor's context: a [`StandaloneHost`] over the live plugin.
+/// `unhandled_key` takes keys an editor with its own window (native
+/// Wayland) didn't use.
 fn synthesize_editor_context<P: PluginExport>(
     plugin: &Arc<Mutex<P>>,
     transport: &Transport,
     pending_state: Arc<ArrayQueue<Vec<u8>>>,
     pending_resize: Arc<AtomicU64>,
+    unhandled_key: Option<UnhandledKey>,
 ) -> PluginContext
 where
     P::Params: 'static,
 {
-    // Poison-tolerant: if the audio thread panicked, the editor
-    // context still needs the params Arc to function. Recovering
-    // the inner guard is safe because params_arc only clones an
-    // Arc<P::Params> - it doesn't read mutable state.
-    let params: Arc<P::Params> = plugin
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .params_arc();
-    let transport_read = transport.clone();
-
-    let params_read = Arc::clone(&params);
-    let params_write = Arc::clone(&params);
-    let params_plain = Arc::clone(&params);
-    let params_format = Arc::clone(&params);
-    let params_for_ctx = Arc::clone(&params);
-    let task_spawner: Option<AnyTaskSpawner> = plugin
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .task_spawner();
-    let plugin_meter = Arc::clone(plugin);
-    let plugin_save = Arc::clone(plugin);
-
-    PluginContext::from_closures(
-        ClosureBridge {
-            begin_edit: Box::new(|_id| {}),
-            set_param: Box::new(move |id, norm| {
-                params_write.set_normalized(id, norm);
-            }),
-            end_edit: Box::new(|_id| {}),
-            request_resize: Box::new(move |w, h| {
-                if w == 0 || h == 0 {
-                    return false;
-                }
-                pending_resize.store(pack_size((w, h)), Ordering::Release);
-                true
-            }),
-            get_param: Box::new(move |id| params_read.get_normalized(id).unwrap_or(0.0)),
-            get_param_plain: Box::new(move |id| params_plain.get_plain(id).unwrap_or(0.0)),
-            format_param: Box::new(move |id| {
-                let value = params_format.get_plain(id).unwrap_or(0.0);
-                params_format.format_value(id, value).unwrap_or_default()
-            }),
-            get_meter: Box::new(move |id| plugin_meter.try_lock().map_or(0.0, |p| p.get_meter(id))),
-            get_state: Box::new(move || {
-                // Blocking is bounded by the audio callback's lock
-                // hold (a block's worth); a try_lock's empty fallback
-                // silently kept stale editor state on a lost race.
-                // Poisoned (audio thread panicked) degrades to empty.
-                plugin_save
-                    .lock()
-                    .map(|p| read_custom_state_offthread(&*p))
-                    .unwrap_or_default()
-            }),
-            set_state: Box::new(move |bytes| {
-                // Hand the blob to the audio thread instead of locking the
-                // plugin here. It drains `pending_state` and applies
-                // `load_state` at the next block top under the lock it
-                // already takes - so this never blocks the UI thread and a
-                // slow load never stalls the callback's `try_lock`. Newest
-                // wins if several arrive before a block drains one; the audio
-                // thread logs any `load_state` error.
-                let _ = pending_state.force_push(bytes);
-            }),
-            transport: Box::new(move || Some(transport_read.snapshot())),
-        },
-        params_for_ctx,
-    )
-    .with_tasks(task_spawner)
-    .with_notification_delivery(moose_core::editor::EditorNotificationDelivery::QueuedAll)
+    // Poison-tolerant: if the audio thread panicked, the editor context
+    // still needs the params and task lanes, and taking them reads no
+    // mutable plugin state.
+    let (params, tasks): (Arc<P::Params>, Option<AnyTaskSpawner>) = {
+        let guard = plugin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard.params_arc(), guard.task_spawner())
+    };
+    let host = StandaloneHost {
+        plugin: Arc::clone(plugin),
+        params: Arc::clone(&params),
+        transport: transport.clone(),
+        pending_state,
+        pending_resize,
+        unhandled_key,
+    };
+    PluginContext::from_host(Arc::new(host), params as Arc<dyn Params>).with_tasks(tasks)
 }

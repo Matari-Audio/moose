@@ -44,6 +44,7 @@ use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routi
 use moose_core::config::ProcessMode;
 use moose_core::events::{EventBody, LosslessEventRef, OutputEventStatus, TransportInfo};
 use moose_core::export::PluginExport;
+use moose_core::host_queue::HostSignal;
 use moose_core::info::MidiDialect;
 use moose_core::midi::pitch_bend_to_bytes;
 use moose_core::process::ProcessStatus;
@@ -130,6 +131,11 @@ pub(crate) unsafe fn flush_gui_changes<P: PluginExport>(
                     }
                 }
             }
+        }
+        // A rescan before draining could be overwritten by older FIFO values.
+        // Re-read only after all of those events have reached the host.
+        if data.gui_overflow.swap(false, Ordering::AcqRel) {
+            request_value_rescan(data);
         }
         true
     }
@@ -413,14 +419,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // `plugin.process` exactly once - the splitting machinery is
         // inert. See `chunked_process` for the per-sub-block contract.
         let mut transport_snap = transport;
-        let request_latency_change = || {
-            if !data.latency_dirty.swap(true, Ordering::Relaxed)
-                && !data.host.is_null()
-                && let Some(request) = (*data.host).request_callback
-            {
-                request(data.host);
-            }
-        };
+        let request_latency_change = || data.host_queue.signal(HostSignal::LATENCY);
         let chunk_args = ChunkedProcess {
             events: &scr.event_list,
             sub_event_scratch: &mut scr.sub_event_scratch,
@@ -480,12 +479,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // asks the host to restart (`clap.latency` requires the call off
         // the audio thread). The reported value waits for that restart.
         let new_latency = instance.latency();
-        if data.latency_live.swap(new_latency, Ordering::Relaxed) != new_latency
-            && !data.latency_dirty.swap(true, Ordering::Relaxed)
-            && !data.host.is_null()
-            && let Some(req_cb) = (*data.host).request_callback
-        {
-            req_cb(data.host);
+        if data.latency_live.swap(new_latency, Ordering::Relaxed) != new_latency {
+            data.host_queue.signal(HostSignal::LATENCY);
         }
         // A shrinking reverb tail must reach the host so its bounce
         // end-time is right. Unlike latency (which needs a main-thread

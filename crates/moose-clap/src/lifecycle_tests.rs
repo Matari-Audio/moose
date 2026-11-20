@@ -356,16 +356,16 @@ fn active_latency_change_requests_restart_without_changed_callback() {
             .latency_live
             .store(active_latency + 64, Ordering::Relaxed);
         data_from_plugin::<Probe>(plugin)
-            .latency_dirty
-            .store(true, Ordering::Relaxed);
+            .host_queue
+            .signal(moose_core::host_queue::HostSignal::LATENCY);
         callbacks.on_main_thread.unwrap()(plugin);
         assert_eq!(calls[0].load(Ordering::Relaxed), 1);
         assert_eq!(calls[1].load(Ordering::Relaxed), 0);
         assert_eq!(latency_get::<Probe>(plugin), active_latency);
         callbacks.deactivate.unwrap()(plugin);
         data_from_plugin::<Probe>(plugin)
-            .latency_dirty
-            .store(true, Ordering::Relaxed);
+            .host_queue
+            .signal(moose_core::host_queue::HostSignal::LATENCY);
         callbacks.on_main_thread.unwrap()(plugin);
         assert_eq!(calls[1].load(Ordering::Relaxed), 1);
         callbacks.destroy.unwrap()(plugin);
