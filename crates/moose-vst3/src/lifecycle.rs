@@ -19,9 +19,9 @@ use moose_core::bus::{BusConfig, BusKind, BusLayout};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
-use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
+use moose_core::host_queue::{HostQueue, HostSignal, HostSink, dispatch};
 use moose_core::main_thread::{
-    BusDirection, HostColor, HostNotice, HostNotifier, LearnSource, MenuTarget, Midi2Controller,
+    BusDirection, HostColor, HostNotifier, LearnSource, MenuTarget, Midi2Controller,
     Midi2ControllerKind, TrackInfo,
 };
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
@@ -189,6 +189,74 @@ pub(crate) unsafe extern "C" fn cb_bind_host_queue<P: PluginExport>(
     });
 }
 
+struct Vst3Sink<'a, P: PluginExport> {
+    ctx: *mut std::ffi::c_void,
+    inst: &'a Vst3Instance<P>,
+    main: &'a MainThread,
+    restart: i32,
+    presentation: bool,
+}
+
+impl<P: PluginExport> HostSink for Vst3Sink<'_, P> {
+    fn mark_dirty(&mut self) {
+        ffi::moose_vst3_mark_dirty(self.ctx);
+    }
+
+    fn request_restart(&mut self) {
+        self.restart |= K_RELOAD_COMPONENT;
+    }
+
+    fn audio_ports_changed(&mut self) {
+        self.restart |= K_IO_CHANGED;
+    }
+
+    fn param_values_changed(&mut self) {
+        self.restart |= K_PARAM_VALUES_CHANGED;
+    }
+
+    fn presentation_changed(&mut self) {
+        self.presentation = true;
+    }
+
+    fn latency_changed(&mut self) {
+        // VST3 hosts may re-read `getLatencySamples` immediately inside
+        // `restartComponent(kLatencyChanged)` without calling
+        // `setupProcessing` again. Commit only the latency lane here so a
+        // tail-only drain can never silently publish a racing latency change.
+        if self.inst.delay.commit_latency() {
+            self.restart |= K_LATENCY_CHANGED;
+        }
+    }
+
+    fn tail_changed(&mut self) {
+        // Commit tail independently without requesting a PDC restart.
+        let _ = self.inst.delay.commit_tail();
+    }
+
+    fn flush_signals(&mut self) {
+        if self.restart != 0 {
+            ffi::moose_vst3_mark_restart(self.ctx, self.restart);
+        } else if self.presentation {
+            ffi::moose_vst3_check_presentation(self.ctx);
+        }
+    }
+
+    fn context_menu(&mut self, target: MenuTarget, x: i32, y: i32) {
+        let items = self
+            .inst
+            .main_thread
+            .try_borrow_mut(self.main)
+            .map(|hooks| hooks.menu_items(self.main, target))
+            .unwrap_or_default();
+        let scale = self.inst.host_scale();
+        #[allow(clippy::cast_possible_truncation)]
+        let hx = (f64::from(x) * scale).round() as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let hy = (f64::from(y) * scale).round() as i32;
+        ffi::moose_vst3_popup_context_menu(self.ctx, target, hx, hy, &items);
+    }
+}
+
 /// Drain the instance's [`HostQueue`] on the host UI thread.
 pub(crate) unsafe extern "C" fn cb_drain_host_queue<P: PluginExport>(ctx: *mut std::ffi::c_void) {
     run_extern_callback_with::<P, ()>("vst3", "drain_host_queue", (), || unsafe {
@@ -198,53 +266,14 @@ pub(crate) unsafe extern "C" fn cb_drain_host_queue<P: PluginExport>(ctx: *mut s
         // SAFETY: the COM layer calls this only on the host UI thread.
         let main = MainThread::assume();
         let drain = inst.host_queue.drain(&main);
-        let signals = drain.signals;
-        if signals.contains(HostSignal::MARK_DIRTY) {
-            ffi::moose_vst3_mark_dirty(ctx);
-        }
-        let mut restart = 0;
-        if signals.contains(HostSignal::RESTART) {
-            restart |= K_RELOAD_COMPONENT;
-        }
-        if signals.notices().contains(HostNotice::AUDIO_PORTS) {
-            restart |= K_IO_CHANGED;
-        }
-        if signals.contains(HostSignal::PARAM_RESCAN) {
-            restart |= K_PARAM_VALUES_CHANGED;
-        }
-        if signals.contains(HostSignal::LATENCY) {
-            // VST3 hosts may re-read `getLatencySamples` immediately inside
-            // `restartComponent(kLatencyChanged)` without calling
-            // `setupProcessing` again. Commit only the latency lane here so a
-            // tail-only drain can never silently publish a racing latency change.
-            if inst.delay.commit_latency() {
-                restart |= K_LATENCY_CHANGED;
-            }
-        }
-        if signals.contains(HostSignal::TAIL) {
-            // Commit tail independently without requesting a PDC restart.
-            let _ = inst.delay.commit_tail();
-        }
-        if restart != 0 {
-            ffi::moose_vst3_mark_restart(ctx, restart);
-        } else if signals.contains(HostSignal::PRESENTATION) {
-            ffi::moose_vst3_check_presentation(ctx);
-        }
-        for message in drain {
-            if let HostMessage::ContextMenu { target, x, y } = message {
-                let items = inst
-                    .main_thread
-                    .try_borrow_mut(&main)
-                    .map(|hooks| hooks.menu_items(&main, target))
-                    .unwrap_or_default();
-                let scale = inst.host_scale();
-                #[allow(clippy::cast_possible_truncation)]
-                let hx = (f64::from(x) * scale).round() as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let hy = (f64::from(y) * scale).round() as i32;
-                ffi::moose_vst3_popup_context_menu(ctx, target, hx, hy, &items);
-            }
-        }
+        let mut sink = Vst3Sink {
+            ctx,
+            inst,
+            main: &main,
+            restart: 0,
+            presentation: false,
+        };
+        dispatch(drain, &mut sink);
     });
 }
 

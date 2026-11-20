@@ -412,6 +412,93 @@ impl Drop for Drain<'_> {
     }
 }
 
+/// Format-side receiver for a drained [`HostQueue`].
+///
+/// Every [`HostSignal`] bit and [`HostMessage`] variant maps to a dedicated
+/// method. [`dispatch`] delivers all raised signals in deterministic order,
+/// calls [`Self::flush_signals`] so wrappers can coalesce format-specific
+/// notifications (for example VST3's `restartComponent` bitmask or CLAP's
+/// single `request_restart`), and then delivers queued messages in FIFO order.
+///
+/// All methods default to no-ops so wrappers that lack a concept (such as
+/// floating windows on VST3/AU) only implement what applies to them.
+pub trait HostSink {
+    /// [`HostSignal::PERSIST`]: a `#[persist]` field changed off-host.
+    fn persist_changed(&mut self) {}
+    /// [`HostSignal::MARK_DIRTY`]: project state changed outside parameters.
+    fn mark_dirty(&mut self) {}
+    /// [`HostSignal::FLOATING_CLOSED`]: user closed a floating editor window.
+    fn floating_closed(&mut self) {}
+    /// [`HostSignal::PARAM_RESCAN`]: parameter values changed internally.
+    fn param_values_changed(&mut self) {}
+    /// [`HostSignal::PRESENTATION`]: parameter metadata or catalog changed.
+    fn presentation_changed(&mut self) {}
+    /// [`HostSignal::NOTE_NAMES`]: note-name table changed.
+    fn note_names_changed(&mut self) {}
+    /// [`HostSignal::VOICE_INFO`]: voice count or polyphony info changed.
+    fn voice_info_changed(&mut self) {}
+    /// [`HostSignal::AUDIO_PORTS`]: audio port layout or configuration changed.
+    fn audio_ports_changed(&mut self) {}
+    /// [`HostSignal::LATENCY`]: processor latency moved off the reported value.
+    fn latency_changed(&mut self) {}
+    /// [`HostSignal::TAIL`]: processor tail moved off the reported value.
+    fn tail_changed(&mut self) {}
+    /// [`HostSignal::RESTART`]: plugin requested host deactivate/reactivate.
+    fn request_restart(&mut self) {}
+    /// Called once after all raised signals have been delivered and before
+    /// queued [`HostMessage`]s are processed.
+    fn flush_signals(&mut self) {}
+    /// [`HostMessage::ContextMenu`]: show the host's context menu at logical `(x, y)`.
+    fn context_menu(&mut self, _target: MenuTarget, _x: i32, _y: i32) {}
+}
+
+/// Deliver every raised signal and queued message in `drain` to `sink`.
+///
+/// Signals are visited in fixed order, followed by [`HostSink::flush_signals`],
+/// followed by each queued [`HostMessage`] in FIFO order.
+pub fn dispatch(drain: Drain<'_>, sink: &mut dyn HostSink) {
+    let signals = drain.signals;
+    if signals.contains(HostSignal::PERSIST) {
+        sink.persist_changed();
+    }
+    if signals.contains(HostSignal::MARK_DIRTY) {
+        sink.mark_dirty();
+    }
+    if signals.contains(HostSignal::FLOATING_CLOSED) {
+        sink.floating_closed();
+    }
+    if signals.contains(HostSignal::PARAM_RESCAN) {
+        sink.param_values_changed();
+    }
+    if signals.contains(HostSignal::PRESENTATION) {
+        sink.presentation_changed();
+    }
+    if signals.contains(HostSignal::NOTE_NAMES) {
+        sink.note_names_changed();
+    }
+    if signals.contains(HostSignal::VOICE_INFO) {
+        sink.voice_info_changed();
+    }
+    if signals.contains(HostSignal::AUDIO_PORTS) {
+        sink.audio_ports_changed();
+    }
+    if signals.contains(HostSignal::LATENCY) {
+        sink.latency_changed();
+    }
+    if signals.contains(HostSignal::TAIL) {
+        sink.tail_changed();
+    }
+    if signals.contains(HostSignal::RESTART) {
+        sink.request_restart();
+    }
+    sink.flush_signals();
+    for message in drain {
+        match message {
+            HostMessage::ContextMenu { target, x, y } => sink.context_menu(target, x, y),
+        }
+    }
+}
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use std::sync::Arc;
@@ -590,6 +677,111 @@ mod tests {
         assert_eq!(
             queue.drain(&main()).signals,
             bits.into_iter().fold(HostSignal::empty(), |a, b| a | b)
+        );
+    }
+
+    #[test]
+    fn dispatch_maps_every_host_signal_bit_distinctly_and_orders_flush_before_messages() {
+        #[derive(Default)]
+        struct Recorder {
+            calls: Vec<&'static str>,
+            menus: Vec<(MenuTarget, i32, i32)>,
+        }
+        impl HostSink for Recorder {
+            fn persist_changed(&mut self) {
+                self.calls.push("persist_changed");
+            }
+            fn mark_dirty(&mut self) {
+                self.calls.push("mark_dirty");
+            }
+            fn floating_closed(&mut self) {
+                self.calls.push("floating_closed");
+            }
+            fn param_values_changed(&mut self) {
+                self.calls.push("param_values_changed");
+            }
+            fn presentation_changed(&mut self) {
+                self.calls.push("presentation_changed");
+            }
+            fn note_names_changed(&mut self) {
+                self.calls.push("note_names_changed");
+            }
+            fn voice_info_changed(&mut self) {
+                self.calls.push("voice_info_changed");
+            }
+            fn audio_ports_changed(&mut self) {
+                self.calls.push("audio_ports_changed");
+            }
+            fn latency_changed(&mut self) {
+                self.calls.push("latency_changed");
+            }
+            fn tail_changed(&mut self) {
+                self.calls.push("tail_changed");
+            }
+            fn request_restart(&mut self) {
+                self.calls.push("request_restart");
+            }
+            fn flush_signals(&mut self) {
+                self.calls.push("flush_signals");
+            }
+            fn context_menu(&mut self, target: MenuTarget, x: i32, y: i32) {
+                self.calls.push("context_menu");
+                self.menus.push((target, x, y));
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for bit in HostSignal::all().iter() {
+            let (queue, _) = counting();
+            queue.signal(bit);
+            let mut rec = Recorder::default();
+            dispatch(queue.drain(&main()), &mut rec);
+            assert_eq!(
+                rec.calls.len(),
+                2,
+                "signal bit {bit:?} must invoke exactly one HostSink signal method plus flush_signals, got {:?}",
+                rec.calls
+            );
+            assert_eq!(rec.calls[1], "flush_signals");
+            assert!(
+                seen.insert(rec.calls[0]),
+                "signal bit {bit:?} collided on HostSink method {}",
+                rec.calls[0]
+            );
+        }
+
+        // Verify ordering: signals -> flush_signals -> FIFO messages.
+        let (queue, _) = counting();
+        queue.signal(HostSignal::MARK_DIRTY | HostSignal::LATENCY);
+        queue
+            .post(HostMessage::ContextMenu {
+                target: MenuTarget::Param(4),
+                x: 10,
+                y: 20,
+            })
+            .unwrap();
+        queue
+            .post(HostMessage::ContextMenu {
+                target: MenuTarget::Global,
+                x: 30,
+                y: 40,
+            })
+            .unwrap();
+        let mut rec = Recorder::default();
+        dispatch(queue.drain(&main()), &mut rec);
+        assert_eq!(
+            rec.calls,
+            [
+                "mark_dirty",
+                "latency_changed",
+                "flush_signals",
+                "context_menu",
+                "context_menu",
+            ]
+        );
+        assert_eq!(
+            rec.menus,
+            [(MenuTarget::Param(4), 10, 20), (MenuTarget::Global, 30, 40)]
         );
     }
 }

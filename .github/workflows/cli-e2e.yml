@@ -32,8 +32,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   PLUGINVAL_VERSION: v1.0.4
   CLAP_VALIDATOR_REV: 2f71690639a742ce805574ce42e31250e3147aa9
 
@@ -43,11 +43,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `part` splits the Windows job in two: its release builds (x64 +
-        # arm64 per config) made one job the 26 min critical path, and
-        # Windows runner slots are plentiful. macOS stays one job: macOS
-        # queue slots are the scarce resource.
-        #   plugins   = doctor + gain install/validate/uninstall + synth package
+        # `part` splits macOS and Windows into two parallel jobs (their
+        # multi-format / release packaging and auval sweeps otherwise
+        # dominate the critical path), while Linux stays a single `all` job.
+        #   plugins   = doctor + gain install/validate/uninstall + synth package + macOS auval
         #   scaffolds = scaffold round-trips + scaffolded rt-paranoid
         #
         # Scaffold shapes: effect instrument workspace-mixed everywhere, plus
@@ -57,8 +56,7 @@ jobs:
         exclude:
           - {os: ubuntu-24.04, part: plugins}
           - {os: ubuntu-24.04, part: scaffolds}
-          - {os: macos-15, part: plugins}
-          - {os: macos-15, part: scaffolds}
+          - {os: macos-15, part: all}
           - {os: windows-latest, part: all}
     runs-on: ${{ matrix.os }}
     defaults:
@@ -74,9 +72,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cli-e2e-${{ matrix.part }}
+          shared-key: cli-e2e-${{ matrix.os }}
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.part != 'scaffolds' }}
 
       - name: Linux system deps
         if: runner.os == 'Linux'
@@ -259,7 +257,7 @@ jobs:
       # (--no-build) leaves no root-owned build output. `validate --auval`
       # fails the step on any auval failure.
       - name: auval every example plugin
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.part != 'scaffolds'
         run: |
           set -e -o pipefail
           "$CARGO_MOOSE" build --au2
@@ -285,6 +283,7 @@ jobs:
           set -euo pipefail
           run=""; [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
           nz=""; [ "$RUNNER_OS" = macOS ] && nz=--no-notarize
+          host_only=""; [ "${{ github.event_name }}" = pull_request ] && host_only=--host-only
           mkdir -p "$RUNNER_TEMP/scaffold"
           for shape in effect instrument workspace-mixed ${{ runner.os == 'Linux' && 'pure stateful' || '' }}; do
             case $shape in
@@ -320,8 +319,12 @@ jobs:
             if grep -E "SKIP|not found" validate.log >/dev/null; then
               echo "::error::$shape: validate skipped a step"; exit 1
             fi
-            pf=clap,vst3; [ "$RUNNER_OS" = macOS ] && pf=clap,vst3,au2
-            "$CARGO_MOOSE" package --formats $pf $nz
+            if [ "$RUNNER_OS" = Linux ]; then
+              "$CARGO_MOOSE" package --formats clap,vst3
+            else
+              pf=clap,vst3; [ "$RUNNER_OS" = macOS ] && pf=clap,vst3,au2
+              "$CARGO_MOOSE" package --formats $pf $nz $host_only
+            fi
             "$CARGO_MOOSE" uninstall --user --yes
             [ "$RUNNER_OS" = macOS ] && sudo "$CARGO_MOOSE" uninstall --system --au2 --yes
             echo "::endgroup::"

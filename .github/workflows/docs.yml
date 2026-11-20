@@ -4,12 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+# Must match ci.yml's CARGO_* / RUST* env exactly so Swatinem/rust-cache@v2
+# hits ci.yml's `core-ubuntu-24.04` entry (RUSTDOCFLAGS is scoped to the
+# `cargo doc` step below so it does not perturb the cache key).
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  RUSTDOCFLAGS: -D warnings
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 concurrency:
   group: pages-${{ github.ref }}
@@ -37,9 +46,9 @@ jobs:
       # history if this needs revisiting.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: docs-ubuntu-24.04
+          shared-key: core-ubuntu-24.04
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
 
       - name: Linux system deps
         run: |
@@ -54,6 +63,8 @@ jobs:
             libfontconfig1-dev libfreetype-dev
 
       - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps
 
       # Publishing needs GitHub Pages enabled with "GitHub Actions" as the

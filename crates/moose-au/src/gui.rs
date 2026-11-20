@@ -10,7 +10,7 @@ use moose_core::editor::RawWindowHandle;
 use moose_core::editor::{Editor, EditorBridge, HostContext, PluginContext, fit_logical_size};
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
-use moose_core::host_queue::{HostQueue, HostSignal};
+use moose_core::host_queue::{HostQueue, HostSignal, HostSink, dispatch};
 use moose_core::main_thread::HostNotice;
 use moose_core::meters::MeterStore;
 use moose_core::snapshot::SnapshotSlot;
@@ -182,6 +182,54 @@ pub(crate) unsafe fn editor_context<P: PluginExport>(ctx: *mut std::ffi::c_void)
         .with_tasks(inst.task_spawner.clone())
 }
 
+#[cfg_attr(
+    not(any(target_vendor = "apple", test)),
+    allow(
+        dead_code,
+        reason = "used by drain_host_queue on Apple targets and in unit tests"
+    )
+)]
+struct AuSink<'a, P: PluginExport> {
+    ctx: *mut std::ffi::c_void,
+    inst: &'a AuInstance<P>,
+}
+
+impl<P: PluginExport> HostSink for AuSink<'_, P> {
+    fn persist_changed(&mut self) {
+        if let Some((id, value)) = self.inst.params_arc.take_persist_change()
+            && value.is_finite()
+            && (0.0..=1.0).contains(&value)
+            && self.inst.params_arc.get_normalized(id).is_some()
+        {
+            // SAFETY: `self.ctx` is a live `AuInstance<P>`.
+            let context = unsafe { editor_context::<P>(self.ctx) };
+            context.automate(id, value);
+        }
+    }
+
+    fn latency_changed(&mut self) {
+        // Commit only the latency lane so a tail-only drain can never
+        // silently publish a racing latency observation.
+        if self.inst.delay.commit_latency() {
+            #[cfg(target_os = "macos")]
+            // SAFETY: main thread, live instance.
+            unsafe {
+                moose_au_v2_host_latency_changed(self.ctx);
+            }
+        }
+    }
+
+    fn tail_changed(&mut self) {
+        if self.inst.delay.commit_tail() {
+            #[cfg(target_os = "macos")]
+            // SAFETY: main thread, live instance.
+            unsafe {
+                moose_au_v2_host_tail_changed(self.ctx);
+            }
+        }
+    }
+}
+
 /// Drain the instance's [`HostQueue`] on the main thread.
 ///
 /// # Safety
@@ -199,29 +247,8 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
 ) {
     let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
     let drain = inst.host_queue.drain(main);
-    // Commit only the delay lanes covered by the drained signals so a tail-only
-    // drain can never silently publish a racing latency observation.
-    if drain.has(HostSignal::LATENCY) && inst.delay.commit_latency() {
-        #[cfg(target_os = "macos")]
-        unsafe {
-            moose_au_v2_host_latency_changed(ctx);
-        }
-    }
-    if drain.has(HostSignal::TAIL) && inst.delay.commit_tail() {
-        #[cfg(target_os = "macos")]
-        unsafe {
-            moose_au_v2_host_tail_changed(ctx);
-        }
-    }
-    if drain.has(HostSignal::PERSIST)
-        && let Some((id, value)) = inst.params_arc.take_persist_change()
-        && value.is_finite()
-        && (0.0..=1.0).contains(&value)
-        && inst.params_arc.get_normalized(id).is_some()
-    {
-        let context = unsafe { editor_context::<P>(ctx) };
-        context.automate(id, value);
-    }
+    let mut sink = AuSink { ctx, inst };
+    dispatch(drain, &mut sink);
 }
 
 // ---------------------------------------------------------------------------

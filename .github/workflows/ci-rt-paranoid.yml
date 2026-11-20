@@ -17,8 +17,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 # Builds the DSP-distinct example plugins with the `rt-paranoid` feature
 # and runs their `assert_no_audio_alloc` tests, so any allocation the audio

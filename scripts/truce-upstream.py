@@ -75,14 +75,14 @@ def main():
         BASELINE.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
         print(f"Recorded {len(current['items'])} issues/PRs at {current['head']} in {BASELINE}")
         return 0
-    text, pending = report(json.loads(BASELINE.read_text()), current)
+    text, _pending = report(json.loads(BASELINE.read_text()), current)
     print(text)
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a") as out:
             out.write(text)
-    # Scheduled workflow failure notifies its subscribers without posting comments
-    # or trusting upstream content as code. Normal build CI never runs this gate.
-    return 1 if pending else 0
+    # Upstream news is recorded in the job summary without failing the workflow;
+    # real network, API, or self-test failures still raise and exit non-zero.
+    return 0
 
 
 if __name__ == "__main__":
