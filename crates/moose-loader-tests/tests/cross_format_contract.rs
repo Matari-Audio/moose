@@ -1002,6 +1002,8 @@ impl Harness for clap_host_harness::Clap {
 // VST3 host harness (COM only after the factory)
 // ---------------------------------------------------------------------------
 
+// VST3 SDK enum constants are u32 on Unix and i32 on Windows.
+#[cfg_attr(windows, allow(clippy::unnecessary_cast))]
 mod vst3_host_harness {
     use super::{Contract, HostEvent, MAX_FRAMES};
     use std::ffi::c_void;
@@ -1370,6 +1372,8 @@ mod vst3_host_harness {
     }
 }
 
+// Keep the SDK enum-to-int32 casts portable across Unix and Windows.
+#[cfg_attr(windows, allow(clippy::unnecessary_cast))]
 impl Harness for vst3_host_harness::Vst3 {
     const NAME: &'static str = "VST3";
     fn create() -> Self {
