@@ -96,15 +96,18 @@ unsafe extern "C" {
 /// - AU v3 framework (iOS): `<F>.framework/<F>` - a shallow bundle, so
 ///   presets live in a flat `<F>.framework/Presets/` (one level up; a
 ///   `Resources/` subdir would make iOS installd reject the framework).
-#[cfg(unix)]
 pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::PathBuf> {
+    component_presets_root_from_probe(cb_factory_preset_count::<P> as *const std::ffi::c_void)
+}
+
+#[cfg(unix)]
+fn component_presets_root_from_probe(probe: *const std::ffi::c_void) -> Option<std::path::PathBuf> {
     let mut info = DlInfo {
         dli_fname: std::ptr::null(),
         dli_fbase: std::ptr::null_mut(),
         dli_sname: std::ptr::null(),
         dli_saddr: std::ptr::null_mut(),
     };
-    let probe = cb_factory_preset_count::<P> as *const std::ffi::c_void;
     // SAFETY: `probe` is a function in this image; `dladdr` only
     // writes into the out-struct on success.
     if unsafe { dladdr(probe, &raw mut info) } == 0 || info.dli_fname.is_null() {
@@ -130,7 +133,9 @@ pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::Pat
 // Non-Unix test hosts can exercise the AU callback ABI, but have neither
 // dladdr nor an installed AU bundle from which to enumerate presets.
 #[cfg(not(unix))]
-pub(crate) fn component_presets_root<P: PluginExport>() -> Option<std::path::PathBuf> {
+fn component_presets_root_from_probe(
+    _probe: *const std::ffi::c_void,
+) -> Option<std::path::PathBuf> {
     None
 }
 
