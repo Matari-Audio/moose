@@ -411,6 +411,12 @@ pub(crate) struct Host {
     /// The catalog signal fired; the UI thread takes the changes.
     catalog_pending: AtomicBool,
     param_list: Mutex<ParamList>,
+    /// Dedicated non-colliding parameter ID for the root unit's
+    /// `kIsProgramChange` selector, exposed only when `program_list` is
+    /// non-empty (VST3 SDK `IUnitInfo` contract).
+    program_change_id: u32,
+    /// Currently selected index in the root unit's program list.
+    selected_program: AtomicI32,
     /// Suppresses the host's `setParamNormalized` echo of our own edit.
     in_perform_edit: AtomicBool,
     persist_wanted: bool,
@@ -425,6 +431,8 @@ pub(crate) struct Host {
     #[cfg(target_os = "linux")]
     restart_fd: AtomicI32,
     #[cfg(target_os = "linux")]
+    edit_fd: AtomicI32,
+    #[cfg(target_os = "linux")]
     timer: Mutex<Option<super::wake::linux::TimerWake>>,
     /// The host context (factory `setHostContext`, else `initialize`), for
     /// `IWaylandHost`.
@@ -433,7 +441,7 @@ pub(crate) struct Host {
     #[cfg(target_os = "macos")]
     main_queue: std::sync::OnceLock<super::wake::macos::MainQueueWake>,
     #[cfg(target_os = "windows")]
-    thread_timer: std::sync::OnceLock<super::wake::windows::ThreadTimer>,
+    message_wake: std::sync::OnceLock<super::wake::windows::MessageWake>,
 }
 
 // SAFETY: `ctx` is the Rust plugin instance, built for cross-thread use by
@@ -630,6 +638,8 @@ impl Host {
             presentation_check: AtomicBool::new(false),
             catalog_pending: AtomicBool::new(false),
             param_list: Mutex::new(ParamList::All),
+            program_change_id: allocate_program_change_id(reg),
+            selected_program: AtomicI32::new(0),
             in_perform_edit: AtomicBool::new(false),
             persist_wanted: unsafe { (cb.wants_persist_notifications)(ctx) },
             persist_bound: AtomicBool::new(false),
@@ -646,13 +656,15 @@ impl Host {
             #[cfg(target_os = "linux")]
             restart_fd: AtomicI32::new(-1),
             #[cfg(target_os = "linux")]
+            edit_fd: AtomicI32::new(-1),
+            #[cfg(target_os = "linux")]
             timer: Mutex::new(None),
             #[cfg(target_os = "linux")]
             context: std::sync::OnceLock::new(),
             #[cfg(target_os = "macos")]
             main_queue: std::sync::OnceLock::new(),
             #[cfg(target_os = "windows")]
-            thread_timer: std::sync::OnceLock::new(),
+            message_wake: std::sync::OnceLock::new(),
         });
         super::register_instance(&host);
         // Instances are created on the host UI thread, so these wakes bind
@@ -662,8 +674,8 @@ impl Host {
             let _ = host.main_queue.set(q);
         }
         #[cfg(target_os = "windows")]
-        if let Some(t) = super::wake::windows::ThreadTimer::new(thread_timer_proc) {
-            let _ = host.thread_timer.set(t);
+        if let Some(w) = super::wake::windows::MessageWake::new(ctx, win_message_event) {
+            let _ = host.message_wake.set(w);
         }
         #[cfg(target_os = "linux")]
         if let Some(rl) = factory_run_loop {
@@ -686,13 +698,18 @@ impl Host {
     /// Schedule a UI-thread flush. Lock-free, so the audio thread may call it.
     // `self` holds the wake on Linux and macOS.
     #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos")),
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
         allow(clippy::unused_self)
     )]
     fn wake_ui(&self) {
         #[cfg(target_os = "linux")]
         {
             let fd = self.restart_fd.load(Ordering::Acquire);
+            let fd = if fd >= 0 {
+                fd
+            } else {
+                self.edit_fd.load(Ordering::Acquire)
+            };
             if fd >= 0 {
                 super::wake::linux::FdWake::notify_fd(fd);
             }
@@ -701,7 +718,10 @@ impl Host {
         if let Some(q) = self.main_queue.get() {
             q.signal();
         }
-        // Windows: the thread timer flushes on every tick.
+        #[cfg(target_os = "windows")]
+        if let Some(w) = self.message_wake.get() {
+            w.signal();
+        }
     }
 
     /// The parameter set's `CatalogSignal` wake. Any non-audio thread.
@@ -831,9 +851,9 @@ impl Host {
         }
         #[cfg(target_os = "windows")]
         {
-            self.thread_timer
+            self.message_wake
                 .get()
-                .is_none_or(|t| t.thread == std::thread::current().id())
+                .is_none_or(|w| w.thread == std::thread::current().id())
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
@@ -841,8 +861,11 @@ impl Host {
         }
     }
 
-    // `self` holds the wake on macOS.
-    #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_self))]
+    // `self` holds the wake on macOS and Windows.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows")),
+        allow(clippy::unused_self)
+    )]
     fn wake_edits(&self, #[allow(unused_variables)] edits: &Edits) {
         #[cfg(target_os = "linux")]
         if let Some(w) = &edits.wake {
@@ -857,7 +880,10 @@ impl Host {
         if let Some(q) = self.main_queue.get() {
             q.signal();
         }
-        // Windows: the thread timer drains on every tick.
+        #[cfg(target_os = "windows")]
+        if let Some(w) = self.message_wake.get() {
+            w.signal();
+        }
     }
 
     /// Make `op` now on the UI thread (after anything queued before it), or
@@ -1225,6 +1251,10 @@ impl Host {
             q.signal();
         }
         #[cfg(target_os = "windows")]
+        if first && let Some(w) = host.message_wake.get() {
+            w.signal();
+        }
+        #[cfg(target_os = "windows")]
         let _ = first;
     }
 
@@ -1237,7 +1267,7 @@ impl Host {
         #[cfg(target_os = "macos")]
         let ready = self.main_queue.get().is_some();
         #[cfg(target_os = "windows")]
-        let ready = self.thread_timer.get().is_some();
+        let ready = self.message_wake.get().is_some();
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         let ready = false;
         if !ready || self.persist_bound.swap(true, Ordering::AcqRel) {
@@ -1328,6 +1358,7 @@ impl Host {
         // the detach batch.
         let old = {
             let mut e = self.drain_locked(lock(&self.edits), true);
+            self.edit_fd.store(-1, Ordering::Release);
             e.wake.take()
         };
         drop(old);
@@ -1339,11 +1370,17 @@ impl Host {
             let mut e = lock(&self.edits);
             e.ui_thread = Some(std::thread::current().id());
         }
-        if let Some(wake) = FdWake::bind(rl.clone(), Arc::downgrade(self), Host::drain_edits) {
+        if let Some(wake) = FdWake::bind(rl.clone(), Arc::downgrade(self), Host::on_ui_tick) {
+            self.edit_fd.store(wake.fd(), Ordering::Release);
             let mut e = lock(&self.edits);
             e.wake = Some(wake);
+            if !e.pending.is_empty() {
+                self.wake_edits(&e);
+            }
+        } else {
+            // Only fall back to a run-loop timer if the host refused eventfd.
+            *lock(&self.timer) = TimerWake::bind(rl, Arc::downgrade(self));
         }
-        *lock(&self.timer) = TimerWake::bind(rl, Arc::downgrade(self));
     }
 
     /// Keep the first host context offered; later ones are ignored.
@@ -1931,7 +1968,7 @@ impl Drop for Host {
         #[cfg(target_os = "macos")]
         drop(self.main_queue.take());
         #[cfg(target_os = "windows")]
-        drop(self.thread_timer.take());
+        drop(self.message_wake.take());
         lock(&self.handler).take();
         unsafe { (cb.destroy)(self.ctx) };
     }
@@ -1945,8 +1982,11 @@ unsafe extern "C" fn main_queue_event(ctx: *mut c_void) {
 }
 
 #[cfg(target_os = "windows")]
-unsafe extern "system" fn thread_timer_proc(_: *mut c_void, _: u32, id: usize, _: u32) {
-    if let Some(host) = super::find_instance(|h| h.thread_timer.get().is_some_and(|t| t.id == id)) {
+fn win_message_event(ctx: *mut c_void) {
+    if let Some(host) = super::pin(ctx) {
+        if let Some(w) = host.message_wake.get() {
+            w.clear_pending();
+        }
         host.on_ui_tick();
     }
 }
@@ -1986,24 +2026,81 @@ pub(super) struct Component {
     pub host: Arc<Host>,
 }
 
+/// `com-scrape-types` implements `InterfaceList` only for tuples up to arity
+/// 15; this struct carries all 18 COM interfaces exposed by [`Component`].
+pub(super) struct ComponentInterfaces;
+
+macro_rules! component_interface_list {
+    ($($field:ident : $iface:ty => $index:tt),+ $(,)?) => {
+        #[repr(C)]
+        pub(super) struct ComponentHeader {
+            $($field: $iface),+
+        }
+
+        // SAFETY: `ComponentHeader` is `#[repr(C)]` of single-pointer COM
+        // interface structs (`*const Vtbl`), so slot `$index` sits at byte
+        // offset `$index * size_of::<*mut ()>()`.
+        unsafe impl vst3::com_scrape_types::InterfaceList for ComponentInterfaces {
+            type Header = ComponentHeader;
+
+            fn query(iid: &vst3::com_scrape_types::Guid) -> Option<isize> {
+                $(
+                    if <$iface as vst3::com_scrape_types::Interface>::inherits(iid) {
+                        return Some(($index as isize) * (std::mem::size_of::<*mut ()>() as isize));
+                    }
+                )+
+                None
+            }
+        }
+
+        // SAFETY: every slot is initialized with `<I as Construct<C, W, OFFSET>>::OBJ`
+        // matching the exact offset returned by `InterfaceList::query`.
+        unsafe impl<C, W> vst3::com_scrape_types::MakeHeader<C, W> for ComponentInterfaces
+        where
+            C: vst3::Class,
+            W: vst3::com_scrape_types::Wrapper<C>,
+            $(
+                $iface: vst3::com_scrape_types::Construct<
+                    C,
+                    W,
+                    { ($index as isize) * (std::mem::size_of::<*mut ()>() as isize) },
+                >,
+            )+
+        {
+            const HEADER: Self::Header = ComponentHeader {
+                $($field: <$iface as vst3::com_scrape_types::Construct<
+                    C,
+                    W,
+                    { ($index as isize) * (std::mem::size_of::<*mut ()>() as isize) },
+                >>::OBJ),+
+            };
+        }
+    };
+}
+
+component_interface_list!(
+    i0: IComponent => 0,
+    i1: IAudioProcessor => 1,
+    i2: IAudioPresentationLatency => 2,
+    i3: IEditController => 3,
+    i4: IEditControllerHostEditing => 4,
+    i5: IMidiMapping => 5,
+    i6: IMidiMapping2 => 6,
+    i7: IProcessContextRequirements => 7,
+    i8: IUnitInfo => 8,
+    i9: IProgramListData => 9,
+    i10: INoteExpressionController => 10,
+    i11: INoteExpressionPhysicalUIMapping => 11,
+    i12: IKeyswitchController => 12,
+    i13: IParameterFunctionName => 13,
+    i14: IRemapParamID => 14,
+    i15: IInfoListener => 15,
+    i16: IMidiLearn => 16,
+    i17: IMidiLearn2 => 17,
+);
+
 impl Class for Component {
-    type Interfaces = (
-        IComponent,
-        IAudioProcessor,
-        IAudioPresentationLatency,
-        IEditController,
-        IEditControllerHostEditing,
-        IMidiMapping,
-        IMidiMapping2,
-        IProcessContextRequirements,
-        IUnitInfo,
-        INoteExpressionController,
-        IParameterFunctionName,
-        IRemapParamID,
-        IInfoListener,
-        IMidiLearn,
-        IMidiLearn2,
-    );
+    type Interfaces = ComponentInterfaces;
 }
 
 impl IAudioPresentationLatencyTrait for Component {
@@ -2443,13 +2540,34 @@ impl IEditControllerTrait for Component {
     }
 
     unsafe fn getParameterCount(&self) -> int32 {
-        self.host.param_count() as i32
+        let base = self.host.param_count() as i32;
+        let has_programs = !unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty();
+        base + i32::from(has_programs)
     }
 
     unsafe fn getParameterInfo(&self, index: int32, info: *mut ParameterInfo) -> tresult {
         let reg = self.host.reg;
-        let (Some(info), Some(index)) = (unsafe { info.as_mut() }, self.host.param_index(index))
-        else {
+        let Some(info) = (unsafe { info.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        let base_count = self.host.param_count() as i32;
+        if index == base_count {
+            use ParameterInfo_::ParameterFlags_::*;
+            let programs = unsafe { (reg.cb.program_list)(self.host.ctx) };
+            if programs.is_empty() {
+                return kInvalidArgument;
+            }
+            info.id = self.host.program_change_id;
+            utf16_into(&mut info.title, "Program");
+            utf16_into(&mut info.shortTitle, "Prog");
+            utf16_into(&mut info.units, "");
+            info.stepCount = programs.len().saturating_sub(1) as i32;
+            info.defaultNormalizedValue = 0.0;
+            info.unitId = 0;
+            info.flags = (kIsProgramChange | kIsList) as i32;
+            return kResultOk;
+        }
+        let Some(index) = self.host.param_index(index) else {
             return kInvalidArgument;
         };
         let p = &reg.params[index];
@@ -2496,6 +2614,16 @@ impl IEditControllerTrait for Component {
             return kInvalidArgument;
         };
         let h = &self.host;
+        if id == h.program_change_id {
+            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let Some(preset) = program_index_from_normalized(normalized, programs.len())
+                .and_then(|i| programs.get(i))
+            else {
+                return kInvalidArgument;
+            };
+            utf16_into(string, &preset.name);
+            return kResultOk;
+        }
         let plain = unsafe { (h.reg.cb.param_denormalize)(h.ctx, id, normalized) };
         let mut buf = [0 as c_char; 128];
         if unsafe { (h.reg.cb.param_format)(h.ctx, id, plain, buf.as_mut_ptr(), 128) } > 0 {
@@ -2516,7 +2644,16 @@ impl IEditControllerTrait for Component {
             return kInvalidArgument;
         }
         let h = &self.host;
-        let Ok(text) = std::ffi::CString::new(unsafe { utf16_from(string, 256) }) else {
+        let raw_text = unsafe { utf16_from(string, 256) };
+        if id == h.program_change_id {
+            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let Some(idx) = programs.iter().position(|p| p.name == raw_text) else {
+                return kResultFalse;
+            };
+            unsafe { *normalized = program_normalized_from_index(idx, programs.len()) };
+            return kResultOk;
+        }
+        let Ok(text) = std::ffi::CString::new(raw_text) else {
             return kResultFalse;
         };
         let mut plain = 0.0;
@@ -2528,11 +2665,25 @@ impl IEditControllerTrait for Component {
     }
 
     unsafe fn normalizedParamToPlain(&self, id: ParamID, normalized: ParamValue) -> ParamValue {
-        unsafe { (self.host.reg.cb.param_denormalize)(self.host.ctx, id, normalized) }
+        let h = &self.host;
+        if id == h.program_change_id {
+            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            return program_index_from_normalized(normalized, programs.len()).unwrap_or(0) as f64;
+        }
+        unsafe { (h.reg.cb.param_denormalize)(h.ctx, id, normalized) }
     }
 
     unsafe fn plainParamToNormalized(&self, id: ParamID, plain: ParamValue) -> ParamValue {
-        unsafe { (self.host.reg.cb.param_normalize)(self.host.ctx, id, plain) }
+        let h = &self.host;
+        if id == h.program_change_id {
+            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            if programs.len() <= 1 {
+                return 0.0;
+            }
+            let idx = (plain.round().clamp(0.0, (programs.len() - 1) as f64)) as usize;
+            return program_normalized_from_index(idx, programs.len());
+        }
+        unsafe { (h.reg.cb.param_normalize)(h.ctx, id, plain) }
     }
 
     unsafe fn getParamNormalized(&self, id: ParamID) -> ParamValue {
@@ -2541,6 +2692,13 @@ impl IEditControllerTrait for Component {
         let h = &self.host;
         if h.may_deliver(&lock(&h.edits)) {
             h.on_ui_tick();
+        }
+        if id == h.program_change_id {
+            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let idx = usize::try_from(h.selected_program.load(Ordering::Acquire))
+                .unwrap_or(0)
+                .min(programs.len().saturating_sub(1));
+            return program_normalized_from_index(idx, programs.len());
         }
         unsafe {
             let plain = (h.reg.cb.param_get_value)(h.ctx, id);
@@ -2551,6 +2709,26 @@ impl IEditControllerTrait for Component {
     unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
         let h = &self.host;
         if h.in_perform_edit.load(Ordering::Relaxed) {
+            return kResultOk;
+        }
+        if id == h.program_change_id {
+            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let Some(idx) = program_index_from_normalized(value, programs.len()) else {
+                return kInvalidArgument;
+            };
+            if !programs[idx].state.is_empty() {
+                let mut reader = SliceReadState {
+                    bytes: &programs[idx].state,
+                    pos: 0,
+                };
+                if unsafe {
+                    (h.reg.cb.state_load_stream)(h.ctx, (&raw mut reader).cast(), read_slice_chunk)
+                } == 0
+                {
+                    return kResultFalse;
+                }
+            }
+            h.selected_program.store(idx as i32, Ordering::Release);
             return kResultOk;
         }
         unsafe {
@@ -2878,6 +3056,9 @@ impl IProcessContextRequirementsTrait for Component {
     }
 }
 
+/// Single program list ID exposed when `MainThreadHooks::program_list` is non-empty.
+const PROGRAM_LIST_ID: ProgramListID = 0;
+
 impl IUnitInfoTrait for Component {
     unsafe fn getUnitCount(&self) -> int32 {
         self.host.reg.units.len() as i32
@@ -2890,38 +3071,84 @@ impl IUnitInfoTrait for Component {
         let (Some(info), Some(unit)) = (unsafe { info.as_mut() }, unit) else {
             return kInvalidArgument;
         };
+        let has_programs =
+            unit.id == 0 && !unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty();
         info.id = unit.id;
         info.parentUnitId = unit.parent;
         utf16_into(&mut info.name, &unit.name);
-        info.programListId = kNoProgramListId;
+        info.programListId = if has_programs {
+            PROGRAM_LIST_ID
+        } else {
+            kNoProgramListId
+        };
         kResultOk
     }
 
     unsafe fn getProgramListCount(&self) -> int32 {
-        0
+        i32::from(!unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty())
     }
 
-    unsafe fn getProgramListInfo(&self, _index: int32, _info: *mut ProgramListInfo) -> tresult {
-        kNotImplemented
+    unsafe fn getProgramListInfo(&self, index: int32, info: *mut ProgramListInfo) -> tresult {
+        let Some(info) = (unsafe { info.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        if index != 0 {
+            return kInvalidArgument;
+        }
+        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        if programs.is_empty() {
+            return kInvalidArgument;
+        }
+        info.id = PROGRAM_LIST_ID;
+        utf16_into(&mut info.name, "Factory Presets");
+        info.programCount = programs.len() as i32;
+        kResultOk
     }
 
     unsafe fn getProgramName(
         &self,
-        _list: ProgramListID,
-        _index: int32,
-        _name: *mut String128,
+        list: ProgramListID,
+        index: int32,
+        name: *mut String128,
     ) -> tresult {
-        kNotImplemented
+        let Some(name) = (unsafe { name.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        if list != PROGRAM_LIST_ID {
+            return kInvalidArgument;
+        }
+        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let Some(preset) = usize::try_from(index).ok().and_then(|i| programs.get(i)) else {
+            return kInvalidArgument;
+        };
+        utf16_into(name, &preset.name);
+        kResultOk
     }
 
     unsafe fn getProgramInfo(
         &self,
-        _list: ProgramListID,
-        _index: int32,
-        _attribute: vst3::Steinberg::Vst::CString,
-        _value: *mut String128,
+        list: ProgramListID,
+        index: int32,
+        attribute: vst3::Steinberg::Vst::CString,
+        value: *mut String128,
     ) -> tresult {
-        kNotImplemented
+        let Some(value) = (unsafe { value.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        if list != PROGRAM_LIST_ID || attribute.is_null() {
+            return kInvalidArgument;
+        }
+        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let Some(preset) = usize::try_from(index).ok().and_then(|i| programs.get(i)) else {
+            return kInvalidArgument;
+        };
+        let attr = unsafe { cstr(attribute) };
+        if matches!(attr, "Style" | "Category" | "Instrument") && !preset.category.is_empty() {
+            utf16_into(value, &preset.category);
+            kResultOk
+        } else {
+            kResultFalse
+        }
     }
 
     unsafe fn hasProgramPitchNames(&self, _list: ProgramListID, _index: int32) -> tresult {
@@ -2957,14 +3184,157 @@ impl IUnitInfoTrait for Component {
         kNotImplemented
     }
 
-    unsafe fn setUnitProgramData(
-        &self,
-        _list: int32,
-        _index: int32,
-        _data: *mut IBStream,
-    ) -> tresult {
-        kNotImplemented
+    unsafe fn setUnitProgramData(&self, list: int32, index: int32, data: *mut IBStream) -> tresult {
+        unsafe { self.setProgramData(list, index, data) }
     }
+}
+
+impl IProgramListDataTrait for Component {
+    unsafe fn programDataSupported(&self, list_id: ProgramListID) -> tresult {
+        if list_id == PROGRAM_LIST_ID
+            && !unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty()
+        {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
+    }
+
+    unsafe fn getProgramData(
+        &self,
+        list_id: ProgramListID,
+        program_index: int32,
+        data: *mut IBStream,
+    ) -> tresult {
+        let Some(stream) = (unsafe { ComRef::from_raw(data) }) else {
+            return kInvalidArgument;
+        };
+        if list_id != PROGRAM_LIST_ID {
+            return kInvalidArgument;
+        }
+        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let Some(preset) = usize::try_from(program_index)
+            .ok()
+            .and_then(|i| programs.get(i))
+        else {
+            return kInvalidArgument;
+        };
+        let bytes = &preset.state;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let chunk = (bytes.len() - written).min(i32::MAX as usize);
+            let mut wrote: int32 = 0;
+            let rc = unsafe {
+                stream.write(
+                    bytes[written..].as_ptr().cast_mut().cast(),
+                    chunk as int32,
+                    &raw mut wrote,
+                )
+            };
+            if rc != kResultOk || wrote <= 0 {
+                return kResultFalse;
+            }
+            written += wrote as usize;
+        }
+        kResultOk
+    }
+
+    unsafe fn setProgramData(
+        &self,
+        list_id: ProgramListID,
+        program_index: int32,
+        data: *mut IBStream,
+    ) -> tresult {
+        if list_id != PROGRAM_LIST_ID || data.is_null() {
+            return kInvalidArgument;
+        }
+        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let Some(index) = usize::try_from(program_index)
+            .ok()
+            .filter(|&i| i < programs.len())
+        else {
+            return kInvalidArgument;
+        };
+        let Some(bytes) = read_program_stream(data) else {
+            return kResultFalse;
+        };
+        let h = &self.host;
+        if unsafe { (h.reg.cb.set_program_data)(h.ctx, index, bytes.as_ptr(), bytes.len()) } {
+            kResultOk
+        } else {
+            kResultFalse
+        }
+    }
+}
+
+/// Bounded read cap for `IProgramListData::setProgramData` streams (32 MiB).
+const MAX_PROGRAM_DATA_BYTES: usize = 32 * 1024 * 1024;
+
+fn read_program_stream(stream: *mut IBStream) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = unsafe { super::read_state_chunk(stream.cast(), chunk.as_mut_ptr(), 4096) };
+        if n < 0 {
+            return None;
+        }
+        if n == 0 {
+            return Some(out);
+        }
+        let n = n as usize;
+        if out.len().saturating_add(n) > MAX_PROGRAM_DATA_BYTES {
+            return None;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn allocate_program_change_id(reg: &Registration) -> u32 {
+    let mut candidate = 0x7FFF_FFFEu32;
+    while reg.params.iter().any(|p| p.id == candidate) {
+        candidate = candidate.saturating_sub(1);
+    }
+    candidate
+}
+
+fn program_index_from_normalized(normalized: f64, count: usize) -> Option<usize> {
+    if count == 0 || !normalized.is_finite() {
+        return None;
+    }
+    if count == 1 {
+        return Some(0);
+    }
+    let idx = (normalized.clamp(0.0, 1.0) * (count - 1) as f64).round() as usize;
+    Some(idx.min(count - 1))
+}
+
+fn program_normalized_from_index(index: usize, count: usize) -> f64 {
+    if count <= 1 {
+        0.0
+    } else {
+        index.min(count - 1) as f64 / (count - 1) as f64
+    }
+}
+
+struct SliceReadState<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+unsafe extern "C" fn read_slice_chunk(ctx: *mut c_void, dst: *mut u8, max_len: u32) -> i64 {
+    if ctx.is_null() || dst.is_null() {
+        return -1;
+    }
+    let state = unsafe { &mut *ctx.cast::<SliceReadState<'_>>() };
+    let remaining = state.bytes.len().saturating_sub(state.pos);
+    let take = remaining.min(max_len as usize);
+    if take > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(state.bytes.as_ptr().add(state.pos), dst, take);
+        }
+        state.pos += take;
+    }
+    take as i64
 }
 
 /// The predefined note-expression types moose bridges to per-note MIDI 2.0
@@ -3059,6 +3429,102 @@ impl INoteExpressionControllerTrait for Component {
             }
             None => kResultFalse,
         }
+    }
+}
+
+impl INoteExpressionPhysicalUIMappingTrait for Component {
+    unsafe fn getPhysicalUIMapping(
+        &self,
+        bus: int32,
+        _channel: int16,
+        list: *mut PhysicalUIMapList,
+    ) -> tresult {
+        if bus < 0 || bus >= self.host.reg.desc.midi_input_ports {
+            return kInvalidArgument;
+        }
+        let Some(list) = (unsafe { list.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        if list.count > 0 && list.map.is_null() {
+            return kInvalidArgument;
+        }
+        let entries = if list.count == 0 {
+            &mut [][..]
+        } else {
+            // SAFETY: caller supplies `list.count` writable `PhysicalUIMap` items.
+            unsafe { std::slice::from_raw_parts_mut(list.map, list.count as usize) }
+        };
+        for entry in entries {
+            entry.noteExpressionTypeID = match entry.physicalUITypeID {
+                x if x == PhysicalUITypeIDs_::kPUIXMovement as u32 => {
+                    NoteExpressionTypeIDs_::kTuningTypeID as u32
+                }
+                x if x == PhysicalUITypeIDs_::kPUIYMovement as u32 => {
+                    NoteExpressionTypeIDs_::kBrightnessTypeID as u32
+                }
+                x if x == PhysicalUITypeIDs_::kPUIPressure as u32 => {
+                    NoteExpressionTypeIDs_::kExpressionTypeID as u32
+                }
+                _ => NoteExpressionTypeIDs_::kInvalidTypeID as u32,
+            };
+        }
+        kResultOk
+    }
+}
+
+impl IKeyswitchControllerTrait for Component {
+    unsafe fn getKeyswitchCount(&self, bus: int32, channel: int16) -> int32 {
+        if bus < 0 || bus >= self.host.reg.desc.midi_input_ports || !(0..16).contains(&channel) {
+            return 0;
+        }
+        unsafe { (self.host.reg.cb.keyswitches)(self.host.ctx, bus as u32, channel as u8) }.len()
+            as i32
+    }
+
+    unsafe fn getKeyswitchInfo(
+        &self,
+        bus: int32,
+        channel: int16,
+        key_switch_index: int32,
+        info: *mut KeyswitchInfo,
+    ) -> tresult {
+        if bus < 0 || bus >= self.host.reg.desc.midi_input_ports || !(0..16).contains(&channel) {
+            return kInvalidArgument;
+        }
+        let Some(info) = (unsafe { info.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        let list =
+            unsafe { (self.host.reg.cb.keyswitches)(self.host.ctx, bus as u32, channel as u8) };
+        let Some(ks) = usize::try_from(key_switch_index)
+            .ok()
+            .and_then(|i| list.get(i))
+        else {
+            return kInvalidArgument;
+        };
+        *info = unsafe { std::mem::zeroed() };
+        info.typeId = match ks.kind {
+            moose_core::main_thread::KeyswitchKind::NoteOn => {
+                KeyswitchTypeIDs_::kNoteOnKeyswitchTypeID as u32
+            }
+            moose_core::main_thread::KeyswitchKind::OnTheFly => {
+                KeyswitchTypeIDs_::kOnTheFlyKeyswitchTypeID as u32
+            }
+            moose_core::main_thread::KeyswitchKind::OnRelease => {
+                KeyswitchTypeIDs_::kOnReleaseKeyswitchTypeID as u32
+            }
+            moose_core::main_thread::KeyswitchKind::KeyRange => {
+                KeyswitchTypeIDs_::kKeyRangeTypeID as u32
+            }
+        };
+        utf16_into(&mut info.title, &ks.title);
+        utf16_into(&mut info.shortTitle, &ks.short_title);
+        info.keyswitchMin = i32::from(ks.min_key);
+        info.keyswitchMax = i32::from(ks.max_key);
+        info.keyRemapped = ks.remapped_key;
+        info.unitId = ks.unit_id;
+        info.flags = 0;
+        kResultOk
     }
 }
 

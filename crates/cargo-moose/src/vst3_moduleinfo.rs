@@ -11,15 +11,62 @@
     clippy::needless_borrows_for_generic_args
 )]
 
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Mutex;
 
-use vst3::ComPtr;
 use vst3::Steinberg::{
-    IPluginFactory, IPluginFactory2, IPluginFactory2Trait, IPluginFactoryTrait, PClassInfo2,
-    PFactoryInfo, PFactoryInfo_::FactoryFlags_,
+    IBStream, IBStreamTrait, IPluginCompatibility, IPluginCompatibility_iid,
+    IPluginCompatibilityTrait, IPluginFactory, IPluginFactory2, IPluginFactory2Trait,
+    IPluginFactoryTrait, PClassInfo2, PFactoryInfo, PFactoryInfo_::FactoryFlags_, int32, int64,
+    kInvalidArgument, kNotImplemented, kResultOk, tresult,
 };
+use vst3::{Class, ComPtr, ComWrapper};
+
+const COMPATIBILITY_CATEGORY: &str = "Plugin Compatibility Class";
+
+struct JsonCaptureStream {
+    bytes: Mutex<Vec<u8>>,
+}
+
+impl Class for JsonCaptureStream {
+    type Interfaces = (IBStream,);
+}
+
+impl IBStreamTrait for JsonCaptureStream {
+    unsafe fn read(&self, _buffer: *mut c_void, _num_bytes: int32, _read: *mut int32) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn write(
+        &self,
+        buffer: *mut c_void,
+        num_bytes: int32,
+        num_bytes_written: *mut int32,
+    ) -> tresult {
+        if buffer.is_null() || num_bytes < 0 {
+            return kInvalidArgument;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), num_bytes as usize) };
+        self.bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(slice);
+        if !num_bytes_written.is_null() {
+            unsafe { *num_bytes_written = num_bytes };
+        }
+        kResultOk
+    }
+
+    unsafe fn seek(&self, _pos: int64, _mode: int32, _result: *mut int64) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn tell(&self, _pos: *mut int64) -> tresult {
+        kNotImplemented
+    }
+}
 
 /// Bundle-relative location.
 pub(crate) const PATH: &str = "Contents/Resources/moduleinfo.json";
@@ -70,9 +117,13 @@ unsafe fn read_factory(binary: &Path, module_name: &str) -> Result<String, Strin
     let mut info: PFactoryInfo = unsafe { std::mem::zeroed() };
     unsafe { factory.getFactoryInfo(&raw mut info) };
     let mut classes = Vec::new();
+    let mut compatibility: Option<String> = None;
     for i in 0..unsafe { factory.countClasses() } {
         let mut c: PClassInfo2 = unsafe { std::mem::zeroed() };
-        if unsafe { factory2.getClassInfo2(i, &raw mut c) } == vst3::Steinberg::kResultOk {
+        if unsafe { factory2.getClassInfo2(i, &raw mut c) } == kResultOk {
+            if compatibility.is_none() && text(&c.category) == COMPATIBILITY_CATEGORY {
+                compatibility = unsafe { read_compatibility_json(&factory, &c.cid) };
+            }
             classes.push(c);
         }
     }
@@ -80,10 +131,186 @@ unsafe fn read_factory(binary: &Path, module_name: &str) -> Result<String, Strin
     // Unloading a Rust cdylib with live thread-locals can crash; this
     // process exits soon anyway.
     std::mem::forget(lib);
-    Ok(render(module_name, &info, &classes))
+    Ok(render(
+        module_name,
+        &info,
+        &classes,
+        compatibility.as_deref(),
+    ))
 }
 
-fn render(module_name: &str, info: &PFactoryInfo, classes: &[PClassInfo2]) -> String {
+unsafe fn read_compatibility_json(
+    factory: &ComPtr<IPluginFactory>,
+    cid: &[c_char; 16],
+) -> Option<String> {
+    let mut obj = std::ptr::null_mut();
+    let rc = unsafe {
+        factory.createInstance(
+            cid.as_ptr(),
+            IPluginCompatibility_iid.as_ptr().cast(),
+            &raw mut obj,
+        )
+    };
+    if rc != kResultOk || obj.is_null() {
+        return None;
+    }
+    let compat = unsafe { ComPtr::from_raw(obj.cast::<IPluginCompatibility>()) }?;
+    let stream = ComWrapper::new(JsonCaptureStream {
+        bytes: Mutex::new(Vec::new()),
+    });
+    let stream_ptr = stream.to_com_ptr::<IBStream>()?;
+    if unsafe { compat.getCompatibilityJSON(stream_ptr.as_ptr()) } != kResultOk {
+        return None;
+    }
+    let bytes = stream
+        .bytes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let raw = String::from_utf8(bytes).ok()?;
+    normalize_compatibility_json(&raw)
+}
+
+/// Normalize a VST3 `IPluginCompatibility::getCompatibilityJSON` payload (which
+/// may use JSON5 comments inside or outside the root array and trailing commas)
+/// into a standard JSON array suitable for embedding in `moduleinfo.json`.
+fn normalize_compatibility_json(raw: &str) -> Option<String> {
+    let cleaned = strip_json5_comments_and_trailing_commas(raw);
+    let trimmed = cleaned.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    // Verify the opening `[` matches the final `]` (no trailing garbage or
+    // concatenated root values outside strings).
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut closed_at = None;
+    for (idx, ch) in trimmed.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '[' | '{' => depth += 1,
+            ']' | '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    closed_at = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_string || depth != 0 || closed_at != Some(trimmed.len() - 1) {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn strip_json5_comments_and_trailing_commas(input: &str) -> String {
+    let mut chars = input.chars().peekable();
+    let mut no_comments = String::with_capacity(input.len());
+    let mut in_string = None;
+    while let Some(ch) = chars.next() {
+        if let Some(quote) = in_string {
+            if ch == '\\'
+                && let Some(escaped) = chars.next()
+            {
+                match escaped {
+                    '\r' => {
+                        chars.next_if_eq(&'\n');
+                    }
+                    '\n' | '\u{2028}' | '\u{2029}' => {}
+                    _ => {
+                        no_comments.push(ch);
+                        no_comments.push(escaped);
+                    }
+                }
+                continue;
+            }
+            if ch == quote {
+                in_string = None;
+            }
+        } else if matches!(ch, '"' | '\'') {
+            in_string = Some(ch);
+        } else if ch == '/' && chars.next_if_eq(&'/').is_some() {
+            while chars
+                .next_if(|c| !matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}'))
+                .is_some()
+            {}
+            continue;
+        } else if ch == '/' && chars.next_if_eq(&'*').is_some() {
+            while let Some(c) = chars.next() {
+                if c == '*' && chars.next_if_eq(&'/').is_some() {
+                    break;
+                }
+            }
+            continue;
+        } else if matches!(ch, '\u{2028}' | '\u{2029}') {
+            no_comments.push('\n');
+            continue;
+        }
+        no_comments.push(ch);
+    }
+
+    // Strip trailing commas immediately preceding `]` or `}` outside strings.
+    let chars: Vec<char> = no_comments.chars().collect();
+    let mut out = String::with_capacity(no_comments.len());
+    let mut j = 0;
+    let mut str_quote: Option<char> = None;
+    while j < chars.len() {
+        let ch = chars[j];
+        if let Some(q) = str_quote {
+            if ch == '\\' && j + 1 < chars.len() {
+                out.push(ch);
+                out.push(chars[j + 1]);
+                j += 2;
+                continue;
+            }
+            if ch == q {
+                str_quote = None;
+            }
+            out.push(ch);
+            j += 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            str_quote = Some(ch);
+            out.push(ch);
+            j += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut look = j + 1;
+            while look < chars.len() && chars[look].is_whitespace() {
+                look += 1;
+            }
+            if look < chars.len() && (chars[look] == ']' || chars[look] == '}') {
+                j += 1;
+                continue;
+            }
+        }
+        out.push(ch);
+        j += 1;
+    }
+    out
+}
+
+fn render(
+    module_name: &str,
+    info: &PFactoryInfo,
+    classes: &[PClassInfo2],
+    compatibility: Option<&str>,
+) -> String {
     let flag = |bit: u32| info.flags as u32 & bit != 0;
     let mut out = String::new();
     let _ = write!(
@@ -124,7 +351,11 @@ fn render(module_name: &str, info: &PFactoryInfo, classes: &[PClassInfo2]) -> St
             c.cardinality,
         );
     }
-    out.push_str("\n  ]\n}\n");
+    if let Some(compat) = compatibility {
+        let _ = write!(out, "\n  ],\n  \"Compatibility\": {compat}\n}}\n");
+    } else {
+        out.push_str("\n  ]\n}\n");
+    }
     out
 }
 
@@ -182,5 +413,50 @@ mod tests {
     #[test]
     fn strings_are_escaped() {
         assert_eq!(quote("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
+    }
+
+    #[test]
+    fn compatibility_preserves_mappings_and_decoded_strings() {
+        for newline in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+            let half = "A".repeat(16);
+            let raw = format!(
+                "[// aliases{newline}{{\"New\":\"{half}\\{newline}{half}\",\"Name\":\"日本語\"}}]"
+            );
+            let normalized = normalize_compatibility_json(&raw).unwrap();
+            let decoded: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+            assert_eq!(decoded[0]["New"], "A".repeat(32));
+            assert_eq!(decoded[0]["Name"], "日本語");
+        }
+    }
+
+    #[test]
+    fn render_includes_compatibility_array_when_present() {
+        let info: PFactoryInfo = unsafe { std::mem::zeroed() };
+        let compat = r#"[{"New":"00112233445566778899AABBCCDDEEFF","Old":["FFEEDDCCBBAA99887766554433221100"]}]"#;
+        let with = render("Demo", &info, &[], Some(compat));
+        assert!(with.contains(&format!("\"Compatibility\": {compat}")));
+        let without = render("Demo", &info, &[], None);
+        assert!(!without.contains("\"Compatibility\""));
+    }
+
+    #[test]
+    fn normalize_compatibility_accepts_json5_comments_and_trailing_commas() {
+        let payload = r#"
+            /* leading comment */
+            [
+              // line comment inside array
+              { "New": "00112233445566778899AABBCCDDEEFF", "Old": ["FFEEDDCCBBAA99887766554433221100",], },
+            ]
+            /* trailing compatibility comment */
+        "#;
+        let normalized = normalize_compatibility_json(payload).expect("valid JSON5 array");
+        assert!(normalized.starts_with('[') && normalized.ends_with(']'));
+        assert!(normalized.contains("00112233445566778899AABBCCDDEEFF"));
+        assert!(!normalized.contains("leading comment"));
+        assert!(!normalized.contains("trailing compatibility"));
+        assert!(!normalized.contains(",]"));
+        assert!(!normalized.contains(",}"));
+        assert!(normalize_compatibility_json(r#"{"not":"an-array"}"#).is_none());
+        assert!(normalize_compatibility_json(r"[] []").is_none());
     }
 }

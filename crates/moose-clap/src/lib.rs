@@ -56,6 +56,8 @@ mod context_menu;
 mod data;
 #[cfg(feature = "clap-draft")]
 pub mod draft;
+#[cfg(feature = "clap-draft")]
+mod draft_ext;
 mod events;
 mod gui;
 mod host_context;
@@ -314,9 +316,17 @@ mod host_value_tests {
         }
     }
 
-    static PUSHED: AtomicU32 = AtomicU32::new(0);
-    unsafe extern "C" fn accept(_: *const clap_output_events, _: *const clap_event_header) -> bool {
-        PUSHED.fetch_add(1, Ordering::Relaxed);
+    unsafe extern "C" fn accept(
+        out: *const clap_output_events,
+        _: *const clap_event_header,
+    ) -> bool {
+        if !out.is_null() {
+            // SAFETY: tests that pass a non-null `ctx` point it at a live `AtomicU32`.
+            let ctx = unsafe { (*out).ctx };
+            if !ctx.is_null() {
+                unsafe { (*ctx.cast::<AtomicU32>()).fetch_add(1, Ordering::Relaxed) };
+            }
+        }
         true
     }
     unsafe extern "C" fn refuse(_: *const clap_output_events, _: *const clap_event_header) -> bool {
@@ -470,13 +480,13 @@ mod host_value_tests {
                     .push(GuiParamChange::Value(1, value))
                     .unwrap_or_else(|_| panic!("queue full"));
             }
+            let pushed = AtomicU32::new(0);
             let out = clap_output_events {
-                ctx: ptr::null_mut(),
+                ctx: (&raw const pushed).cast_mut().cast(),
                 try_push: Some(accept),
             };
-            PUSHED.store(0, Ordering::Relaxed);
             assert!(flush_gui_changes::<TestPlugin>(data, &raw const out));
-            assert_eq!(PUSHED.load(Ordering::Relaxed), 2);
+            assert_eq!(pushed.load(Ordering::Relaxed), 2);
             assert!(
                 !data
                     .host_queue
@@ -1393,6 +1403,20 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             host_track_info: ptr::null(),
             host_log: ptr::null(),
             host_thread_check: ptr::null(),
+            host_thread_pool: ptr::null(),
+            active_pool_task: std::sync::atomic::AtomicPtr::new(ptr::null_mut()),
+            #[cfg(feature = "clap-draft")]
+            host_param_hovered: ptr::null(),
+            #[cfg(feature = "clap-draft")]
+            hovered_param: AtomicU64::new(0),
+            #[cfg(feature = "clap-draft")]
+            host_undo: MainThreadCell::new(None),
+            #[cfg(feature = "clap-draft")]
+            undo_groups: Arc::new(draft_ext::UndoGroupQueue::new()),
+            #[cfg(feature = "clap-draft")]
+            undo_save_state_override: MainThreadCell::new(None),
+            #[cfg(feature = "clap-draft")]
+            undo_context: Mutex::new(draft_ext::UndoContextState::default()),
             ports_rescan: AtomicBool::new(false),
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
             gui_overflow: Arc::new(AtomicBool::new(false)),
@@ -2306,6 +2330,165 @@ mod surround_tests {
             assert_eq!(map(plugin, true, 0, output.as_mut_ptr(), 8), 0);
             assert_eq!(map(plugin, true, 0, ptr::null_mut(), 8), 0);
             clap_plugin_destroy::<Surround>(plugin);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ambisonic_tests {
+    use super::host_value_fixture::{TestParams, TestPlugin};
+    use super::*;
+    use clap_sys::ext::ambisonic::{
+        CLAP_AMBISONIC_NORMALIZATION_MAXN, CLAP_AMBISONIC_NORMALIZATION_SN3D,
+        CLAP_AMBISONIC_ORDERING_ACN, CLAP_AMBISONIC_ORDERING_FUMA, CLAP_EXT_AMBISONIC,
+        CLAP_PORT_AMBISONIC, clap_ambisonic_config, clap_plugin_ambisonic,
+    };
+    use clap_sys::ext::configurable_audio_ports::clap_audio_port_configuration_request;
+    use moose_core::bus::BusLayout;
+
+    struct Ambisonic(TestPlugin);
+    impl PluginExport for Ambisonic {
+        type Params = TestParams;
+        fn create() -> Self {
+            Self(TestPlugin::create())
+        }
+        fn params(&self) -> &TestParams {
+            self.0.params()
+        }
+        fn params_arc(&self) -> Arc<TestParams> {
+            self.0.params_arc()
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            self.0.meter_store()
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            self.0.snapshot_slot()
+        }
+    }
+    impl PluginRuntime for Ambisonic {
+        type Sample = f32;
+        fn reset(&mut self, _: &AudioConfig) {}
+        fn info() -> PluginInfo {
+            TestPlugin::info()
+        }
+        fn bus_layouts() -> Vec<BusLayout> {
+            vec![
+                BusLayout::ambisonic(1),
+                BusLayout::ambisonic(3),
+                BusLayout::stereo(),
+            ]
+        }
+        fn process(
+            &mut self,
+            _: &mut AudioBuffer,
+            _: &EventList,
+            _: &mut moose_core::process::ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    #[test]
+    fn host_queries_and_configures_ambisonic_ports() {
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = CLAP_VERSION;
+
+            // Non-ambisonic plugin does not expose `clap.ambisonic`.
+            let plain_desc = DescriptorHolder::new(&TestPlugin::info());
+            let plain = create_plugin_instance::<TestPlugin>(
+                &raw const plain_desc.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<TestPlugin>(plain));
+            assert!(
+                clap_plugin_get_extension::<TestPlugin>(plain, CLAP_EXT_AMBISONIC.as_ptr())
+                    .is_null()
+            );
+            clap_plugin_destroy::<TestPlugin>(plain);
+
+            // Ambisonic plugin exposes ACN + SN3D config and matches configurable-audio-ports.
+            let desc = DescriptorHolder::new(&Ambisonic::info());
+            let plugin =
+                create_plugin_instance::<Ambisonic>(&raw const desc.descriptor, &raw const host);
+            assert!(clap_plugin_init::<Ambisonic>(plugin));
+            let ext = clap_plugin_get_extension::<Ambisonic>(plugin, CLAP_EXT_AMBISONIC.as_ptr())
+                .cast::<clap_plugin_ambisonic>();
+            assert!(!ext.is_null());
+            let is_supported = (*ext).is_config_supported.unwrap();
+            let get_config = (*ext).get_config.unwrap();
+
+            let acn_sn3d = clap_ambisonic_config {
+                ordering: CLAP_AMBISONIC_ORDERING_ACN,
+                normalization: CLAP_AMBISONIC_NORMALIZATION_SN3D,
+            };
+            let fuma_maxn = clap_ambisonic_config {
+                ordering: CLAP_AMBISONIC_ORDERING_FUMA,
+                normalization: CLAP_AMBISONIC_NORMALIZATION_MAXN,
+            };
+            assert!(is_supported(plugin, &raw const acn_sn3d));
+            assert!(!is_supported(plugin, &raw const fuma_maxn));
+            assert!(!is_supported(plugin, ptr::null()));
+
+            let mut port_info: clap_audio_port_info = std::mem::zeroed();
+            assert!(audio_ports_get::<Ambisonic>(
+                plugin,
+                0,
+                true,
+                &raw mut port_info
+            ));
+            assert_eq!(port_info.channel_count, 4);
+            assert_eq!(CStr::from_ptr(port_info.port_type), CLAP_PORT_AMBISONIC);
+
+            let mut cfg: clap_ambisonic_config = std::mem::zeroed();
+            assert!(get_config(plugin, true, 0, &raw mut cfg));
+            assert_eq!(cfg.ordering, CLAP_AMBISONIC_ORDERING_ACN);
+            assert_eq!(cfg.normalization, CLAP_AMBISONIC_NORMALIZATION_SN3D);
+            assert!(!get_config(plugin, true, 1, &raw mut cfg));
+            assert!(!get_config(plugin, true, 0, ptr::null_mut()));
+
+            // Switch via `configurable-audio-ports` to 3rd-order Ambisonic (16 ch).
+            let req = clap_audio_port_configuration_request {
+                is_input: true,
+                port_index: 0,
+                channel_count: 16,
+                port_type: CLAP_PORT_AMBISONIC.as_ptr(),
+                port_details: (&raw const acn_sn3d).cast(),
+            };
+            assert!(crate::ports::configurable_ports_can_apply::<Ambisonic>(
+                plugin,
+                &raw const req,
+                1
+            ));
+            assert!(crate::ports::configurable_ports_apply::<Ambisonic>(
+                plugin,
+                &raw const req,
+                1
+            ));
+            assert!(audio_ports_get::<Ambisonic>(
+                plugin,
+                0,
+                false,
+                &raw mut port_info
+            ));
+            assert_eq!(port_info.channel_count, 16);
+
+            // Reject unsupported FuMa details even when channel count matches.
+            let bad_req = clap_audio_port_configuration_request {
+                port_details: (&raw const fuma_maxn).cast(),
+                ..req
+            };
+            assert!(!crate::ports::configurable_ports_can_apply::<Ambisonic>(
+                plugin,
+                &raw const bad_req,
+                1
+            ));
+
+            // Stereo layout (index 2) is not Ambisonic, so get_config returns false.
+            assert!(audio_ports_config_select::<Ambisonic>(plugin, 2));
+            assert!(!get_config(plugin, true, 0, &raw mut cfg));
+
+            clap_plugin_destroy::<Ambisonic>(plugin);
         }
     }
 }

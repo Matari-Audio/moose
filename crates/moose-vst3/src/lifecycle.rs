@@ -3,8 +3,8 @@
 use crate::ffi;
 use crate::input_events::VST3_EVENT_END;
 use crate::instance::{
-    K_IO_CHANGED, K_LATENCY_CHANGED, K_PARAM_VALUES_CHANGED, K_RELOAD_COMPONENT, OutputNoteIds,
-    PendingOutputMutation, Vst3Gui, Vst3Instance, Vst3Scratch,
+    K_IO_CHANGED, K_KEYSWITCH_CHANGED, K_LATENCY_CHANGED, K_PARAM_VALUES_CHANGED,
+    K_RELOAD_COMPONENT, OutputNoteIds, PendingOutputMutation, Vst3Gui, Vst3Instance, Vst3Scratch,
 };
 use crate::midi_proxy::{
     MIDI_PROXY_PER_CHANNEL, allocate_midi_proxy_ids, midi_proxy_default, midi_proxy_len,
@@ -21,8 +21,8 @@ use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostQueue, HostSignal, HostSink, dispatch};
 use moose_core::main_thread::{
-    BusDirection, HostColor, HostNotifier, LearnSource, MenuTarget, Midi2Controller,
-    Midi2ControllerKind, TrackInfo,
+    BusDirection, HostColor, HostNotifier, Keyswitch, LearnSource, MenuTarget, Midi2Controller,
+    Midi2ControllerKind, ProgramPreset, TrackInfo,
 };
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
@@ -69,6 +69,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 param_infos.iter().map(|i| (i.id, i.range)).collect();
             // Sort by id so `binary_search_by_key` works in the hot lookups.
             param_ranges.sort_by_key(|(id, _)| *id);
+            let param_id_indices = param_infos.sorted_id_indices();
             // Precompute the MIDI-controller bindings, sorted by id, so the
             // audio thread bridges mapped controllers without a linear scan.
             let mut midi_maps: Vec<(u32, MidiMap)> = param_infos
@@ -134,6 +135,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 active: AtomicBool::new(false),
                 processing: AtomicBool::new(false),
                 param_ranges,
+                param_id_indices,
                 midi_maps,
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
@@ -208,6 +210,10 @@ impl<P: PluginExport> HostSink for Vst3Sink<'_, P> {
 
     fn audio_ports_changed(&mut self) {
         self.restart |= K_IO_CHANGED;
+    }
+
+    fn keyswitches_changed(&mut self) {
+        self.restart |= K_KEYSWITCH_CHANGED;
     }
 
     fn param_values_changed(&mut self) {
@@ -872,6 +878,72 @@ pub(crate) fn vst3_topology_consistent(layouts: &[BusLayout]) -> bool {
     layouts
         .iter()
         .all(|l| kinds(&l.inputs) == first_in && kinds(&l.outputs) == first_out)
+}
+
+/// `MainThreadHooks::keyswitches` (`IKeyswitchController`). UI thread.
+pub(crate) unsafe fn cb_keyswitches<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    bus: u32,
+    channel: u8,
+) -> Vec<Keyswitch> {
+    run_extern_callback_with::<P, Vec<Keyswitch>>("vst3", "keyswitches", Vec::new(), || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return Vec::new();
+        };
+        // SAFETY: `IKeyswitchController` callbacks run on the host UI thread.
+        let main = MainThread::assume();
+        inst.main_thread
+            .try_borrow_mut(&main)
+            .map(|hooks| hooks.keyswitches(&main, bus, channel))
+            .unwrap_or_default()
+    })
+}
+
+/// `MainThreadHooks::program_list` (`IUnitInfo` + `IProgramListData`). UI thread.
+pub(crate) unsafe fn cb_program_list<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+) -> Vec<ProgramPreset> {
+    run_extern_callback_with::<P, Vec<ProgramPreset>>(
+        "vst3",
+        "program_list",
+        Vec::new(),
+        || unsafe {
+            let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+                return Vec::new();
+            };
+            // SAFETY: `IUnitInfo` / `IProgramListData` callbacks run on the host UI thread.
+            let main = MainThread::assume();
+            inst.main_thread
+                .try_borrow_mut(&main)
+                .map(|hooks| hooks.program_list(&main))
+                .unwrap_or_default()
+        },
+    )
+}
+
+/// `MainThreadHooks::set_program_data` (`IProgramListData::setProgramData` /
+/// `IUnitInfo::setUnitProgramData`). UI thread.
+pub(crate) unsafe fn cb_set_program_data<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    index: usize,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    run_extern_callback_with::<P, bool>("vst3", "set_program_data", false, || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return false;
+        };
+        let bytes = if data.is_null() || len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(data, len)
+        };
+        // SAFETY: `IProgramListData::setProgramData` runs on the host UI thread.
+        let main = MainThread::assume();
+        inst.main_thread
+            .try_borrow_mut(&main)
+            .is_some_and(|mut hooks| hooks.set_program_data(&main, index, bytes))
+    })
 }
 
 /// Build a slice from a `(ptr, len)` the C++ shim handed us, or an empty

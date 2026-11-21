@@ -2490,7 +2490,10 @@ mod clap_spec {
             "value list is stepped"
         );
         for info in &infos {
-            assert!(info.cookie.is_null(), "moose hands out no cookies");
+            assert!(
+                !info.cookie.is_null(),
+                "D6 dense-index CLAP params hand out non-null cookies"
+            );
             let mut v = f64::NAN;
             assert!(unsafe { (params.get_value.unwrap())(clap.plugin, info.id, &raw mut v) });
             assert_eq!(v, info.default_value, "{} default", name(info));

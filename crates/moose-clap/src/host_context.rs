@@ -53,6 +53,8 @@ pub(crate) struct ClapHost<P: PluginExport> {
     params: Arc<P::Params>,
     gui_changes: Arc<GuiChangeQueue>,
     gui_overflow: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "clap-draft")]
+    undo_groups: Arc<crate::draft_ext::UndoGroupQueue>,
     pending_state: Arc<StateLoadQueue>,
     snapshot: Arc<SnapshotSlot>,
     meter_store: Arc<MeterStore>,
@@ -78,6 +80,8 @@ impl<P: PluginExport> ClapHost<P> {
                 params: Arc::clone(&data.params_arc),
                 gui_changes: Arc::clone(&data.gui_changes),
                 gui_overflow: Arc::clone(&data.gui_overflow),
+                #[cfg(feature = "clap-draft")]
+                undo_groups: Arc::clone(&data.undo_groups),
                 pending_state: Arc::clone(&data.pending_state),
                 snapshot: Arc::clone(&data.snapshot),
                 meter_store: Arc::clone(&data.meter_store),
@@ -85,6 +89,33 @@ impl<P: PluginExport> ClapHost<P> {
                 queue: Arc::clone(&data.host_queue),
                 _plugin: PhantomData,
             }
+        }
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn enqueue_undo(&self, op: crate::draft_ext::UndoOp) {
+        if self.undo_groups.enqueue(op, |staged| {
+            moose_core::wrapper::run_extern_callback_with::<P, _>(
+                "CLAP",
+                "capture undo state",
+                Err(()),
+                || {
+                    let extra = staged.unwrap_or_else(|| self.get_state());
+                    let mut bytes = Vec::new();
+                    let ok = crate::state_ext::write_snapshot::<P>(
+                        state::hash_plugin_id(P::info().clap_id),
+                        &self.params,
+                        &extra,
+                        |chunk| {
+                            bytes.extend_from_slice(chunk);
+                            i64::try_from(chunk.len()).unwrap_or(-1)
+                        },
+                    );
+                    ok.then(|| Arc::new(bytes)).ok_or(())
+                },
+            )
+        }) {
+            self.queue.signal(HostSignal::UNDO_GROUP);
         }
     }
 
@@ -100,8 +131,12 @@ impl<P: PluginExport> ClapHost<P> {
 
     /// Queue a gesture for the audio thread and poke the host. `false` when
     /// the queue was full.
-    fn push(&self, change: GuiParamChange) -> bool {
-        let queued = self.gui_changes.push(change).is_ok();
+    fn push(&self, change: impl FnOnce() -> GuiParamChange) -> bool {
+        let push = || self.gui_changes.push(change()).is_ok();
+        #[cfg(feature = "clap-draft")]
+        let queued = self.undo_groups.push_gui(push);
+        #[cfg(not(feature = "clap-draft"))]
+        let queued = push();
         self.request_flush();
         queued
     }
@@ -112,11 +147,14 @@ impl<P: PluginExport> EditorBridge for ClapHost<P> {
         // The queue drops a gesture only if the audio thread hasn't drained
         // `GUI_QUEUE_CAPACITY` of them; values still reach the host through
         // the rescan fallback in `set_param`.
-        self.push(GuiParamChange::GestureBegin(id));
+        self.push(|| GuiParamChange::GestureBegin(id));
     }
 
     fn set_param(&self, id: u32, normalized: f64) {
-        let plain = self.params.set_normalized_returning_plain(id, normalized);
+        let queued = self.push(|| {
+            let plain = self.params.set_normalized_returning_plain(id, normalized);
+            GuiParamChange::Value(id, plain)
+        });
         if self.params.parameter_affects_presentation(id) {
             self.queue.signal(HostSignal::PRESENTATION);
         }
@@ -124,7 +162,7 @@ impl<P: PluginExport> EditorBridge for ClapHost<P> {
         // values rescan per drag frame made hosts (Bitwig) re-read every
         // parameter mid-gesture, so it is only the fallback for a value the
         // full queue dropped.
-        if !self.push(GuiParamChange::Value(id, plain)) {
+        if !queued {
             self.gui_overflow.store(true, Ordering::Release);
             self.queue.signal(HostSignal::PARAM_RESCAN);
             self.request_flush();
@@ -132,7 +170,7 @@ impl<P: PluginExport> EditorBridge for ClapHost<P> {
     }
 
     fn end_edit(&self, id: u32) {
-        self.push(GuiParamChange::GestureEnd(id));
+        self.push(|| GuiParamChange::GestureEnd(id));
     }
 
     fn request_resize(&self, w: u32, h: u32) -> bool {
@@ -183,10 +221,16 @@ impl<P: PluginExport> EditorBridge for ClapHost<P> {
         // thread, and the plugin cell is entered only from the audio thread
         // (active) or the main thread (inactive), which drains the queue in
         // `state_save` / `deactivate`.
-        self.pending_state.force_push(state::DeserializedState {
-            extra: Some(data),
-            ..Default::default()
-        });
+        let queue = |data| {
+            self.pending_state.force_push(state::DeserializedState {
+                extra: Some(data),
+                ..Default::default()
+            });
+        };
+        #[cfg(feature = "clap-draft")]
+        self.undo_groups.push_custom_state(data, queue);
+        #[cfg(not(feature = "clap-draft"))]
+        queue(data);
     }
 
     fn transport(&self) -> Option<TransportInfo> {
@@ -202,6 +246,37 @@ impl<P: PluginExport> HostContext for ClapHost<P> {
     fn mark_dirty(&self) {
         // `state.mark_dirty` is [main-thread].
         self.queue.signal(HostSignal::MARK_DIRTY);
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn group_edits(&self, edge: moose_core::editor::EditGroup) {
+        let op = match edge {
+            moose_core::editor::EditGroup::Begin => crate::draft_ext::UndoOp::Begin,
+            moose_core::editor::EditGroup::End => crate::draft_ext::UndoOp::End,
+        };
+        self.enqueue_undo(op);
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn param_hovered(&self, id: Option<u32>) {
+        let encoded = id.map_or(1, |id| u64::from(id) + 2);
+        self.queue.with_open(|| {
+            // SAFETY: `with_open` keeps the instance alive against `destroy`.
+            let data = unsafe { data_from_plugin::<P>(self.plugin.as_ptr()) };
+            data.hovered_param.store(encoded, Ordering::Release);
+            // SAFETY: `clap_host.request_callback` is [thread-safe] and live.
+            unsafe { data.host.request_callback() };
+        });
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn request_undo(&self) {
+        self.enqueue_undo(crate::draft_ext::UndoOp::RequestUndo);
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn request_redo(&self) {
+        self.enqueue_undo(crate::draft_ext::UndoOp::RequestRedo);
     }
 
     fn request_restart(&self) {
@@ -239,6 +314,17 @@ impl<P: PluginExport> HostContext for ClapHost<P> {
                 data.window_scale.store(scale.to_bits(), Ordering::Relaxed);
             });
         }
+    }
+
+    fn forward_xkb_key(&self, keycode: u32, keysym: u32, modifiers: u32, pressed: bool) -> bool {
+        self.queue
+            .post(HostMessage::ForwardXkbKey {
+                keycode,
+                keysym,
+                modifiers,
+                pressed,
+            })
+            .is_ok()
     }
 }
 

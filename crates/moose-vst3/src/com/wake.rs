@@ -2,10 +2,12 @@
 //!
 //! VST3 wants `restartComponent`, edit gestures and `resizeView` on the UI
 //! thread, but the audio thread and editor workers produce them. Each OS
-//! gets one wake that runs a host-object callback on that thread:
-//! - Linux: the host `IRunLoop` (eventfd handlers and a 30 ms timer).
-//! - macOS: a main-queue libdispatch source.
-//! - Windows: a null-HWND thread timer on the creating (UI) thread.
+//! gets an event-driven wake that runs a host-object callback on that thread
+//! without polling:
+//! - Linux: the host `IRunLoop` with an `eventfd` handler (falling back to a
+//!   run-loop timer only if the host refuses `registerEventHandler`).
+//! - macOS: a main-queue libdispatch `DATA_OR` source.
+//! - Windows: a message-only window (`HWND_MESSAGE`) woken with `PostMessageW`.
 //!
 //! Without a wake, pending work drains on the next host UI-thread call
 //! (parameter reads, edit gestures).
@@ -15,8 +17,9 @@
     allow(dead_code)
 )]
 
-/// Poll interval of the Linux run-loop timer and the Windows thread timer.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Fallback poll interval on Linux only when a host `IRunLoop` refuses
+/// `registerEventHandler`.
+#[cfg(target_os = "linux")]
 pub(super) const RESTART_TIMER_MS: u32 = 30;
 
 #[cfg(target_os = "linux")]
@@ -251,45 +254,322 @@ pub(super) mod macos {
 #[cfg(target_os = "windows")]
 pub(super) mod windows {
     use std::ffi::c_void;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    type TimerProc = unsafe extern "system" fn(*mut c_void, u32, usize, u32);
+    const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
+    const WM_CLOSE: u32 = 0x0010;
+    const WM_MOOSE_WAKE: u32 = 0x8001; // WM_APP + 1
+    const GWLP_USERDATA: i32 = -21;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    const DROP_CLOSE_TIMEOUT_MS: u32 = 500;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    const WAKE_IDLE: u8 = 0;
+    const WAKE_POSTING: u8 = 1;
+    const WAKE_RETRY: u8 = 3;
+
+    type WndProc = unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize;
+
+    #[repr(C)]
+    struct WndClassExW {
+        cb_size: u32,
+        style: u32,
+        lpfn_wnd_proc: Option<WndProc>,
+        cb_cls_extra: i32,
+        cb_wnd_extra: i32,
+        h_instance: *mut c_void,
+        h_icon: *mut c_void,
+        h_cursor: *mut c_void,
+        hbr_background: *mut c_void,
+        lpsz_menu_name: *const u16,
+        lpsz_class_name: *const u16,
+        h_icon_sm: *mut c_void,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FreeLibrary(module: *mut c_void) -> i32;
+        fn GetModuleHandleExW(
+            flags: u32,
+            module_name: *const c_void,
+            module: *mut *mut c_void,
+        ) -> i32;
+    }
 
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn SetTimer(hwnd: *mut c_void, id: usize, ms: u32, proc_: Option<TimerProc>) -> usize;
-        fn KillTimer(hwnd: *mut c_void, id: usize) -> i32;
+        fn UnregisterClassW(name: *const u16, instance: *mut c_void) -> i32;
+        fn RegisterClassExW(wc: *const WndClassExW) -> u16;
+        fn CreateWindowExW(
+            ex_style: u32,
+            class_name: *const u16,
+            window_name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: *mut c_void,
+            menu: *mut c_void,
+            instance: *mut c_void,
+            param: *mut c_void,
+        ) -> *mut c_void;
+        fn DestroyWindow(hwnd: *mut c_void) -> i32;
+        fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn SendMessageTimeoutW(
+            hwnd: *mut c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
+        fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, new_long: isize) -> isize;
+        fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
     }
 
-    /// A thread timer on the creating thread's message queue. The host UI
-    /// thread creates instances, so `proc_` runs there for the instance's
-    /// whole life; a scan thread without a pump simply never fires it.
-    pub(in super::super) struct ThreadTimer {
-        pub id: usize,
+    static CLASS_NAME: [u16; 19] = [
+        b'M' as u16,
+        b'o' as u16,
+        b'o' as u16,
+        b's' as u16,
+        b'e' as u16,
+        b'V' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'3' as u16,
+        b'W' as u16,
+        b'a' as u16,
+        b'k' as u16,
+        b'e' as u16,
+        b'W' as u16,
+        b'i' as u16,
+        b'n' as u16,
+        b'd' as u16,
+        b'w' as u16,
+        0,
+    ];
+
+    static HANDLER: OnceLock<fn(*mut c_void)> = OnceLock::new();
+    static CLASS_USERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: *mut c_void,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        if msg == WM_MOOSE_WAKE {
+            let ctx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut c_void;
+            if !ctx.is_null()
+                && let Some(handler) = HANDLER.get()
+            {
+                handler(ctx);
+            }
+            return 0;
+        }
+        if msg == WM_CLOSE {
+            return unsafe { DestroyWindow(hwnd) } as isize;
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    fn retain_module() -> *mut c_void {
+        let mut hmod = std::ptr::null_mut();
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                wnd_proc as *const c_void,
+                &raw mut hmod,
+            );
+        }
+        hmod
+    }
+
+    fn acquire_class(hinst: *mut c_void) -> bool {
+        let mut users = CLASS_USERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *users == 0 {
+            let wc = WndClassExW {
+                cb_size: u32::try_from(std::mem::size_of::<WndClassExW>()).unwrap_or(0),
+                style: 0,
+                lpfn_wnd_proc: Some(wnd_proc),
+                cb_cls_extra: 0,
+                cb_wnd_extra: 0,
+                h_instance: hinst,
+                h_icon: std::ptr::null_mut(),
+                h_cursor: std::ptr::null_mut(),
+                hbr_background: std::ptr::null_mut(),
+                lpsz_menu_name: std::ptr::null(),
+                lpsz_class_name: CLASS_NAME.as_ptr(),
+                h_icon_sm: std::ptr::null_mut(),
+            };
+            if unsafe { RegisterClassExW(&raw const wc) } == 0 {
+                return false;
+            }
+        }
+        *users += 1;
+        true
+    }
+
+    fn release_class_and_module(hinst: *mut c_void) {
+        let mut users = CLASS_USERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *users -= 1;
+        if *users == 0 && unsafe { UnregisterClassW(CLASS_NAME.as_ptr(), hinst) } == 0 {
+            // The class still refers to wnd_proc. Pin this registration.
+            *users = 1;
+            return;
+        }
+        drop(users);
+        unsafe { FreeLibrary(hinst) };
+    }
+
+    /// Event-driven Win32 message-only window (`HWND_MESSAGE`) wake.
+    ///
+    /// Replaces periodic `SetTimer` polling: `signal` coalesces bursts via an
+    /// atomic flag and posts a single `WM_MOOSE_WAKE` directly to the host UI
+    /// thread's message queue (zero polling, allocation-free).
+    pub(in super::super) struct MessageWake {
+        hwnd: *mut c_void,
+        module: *mut c_void,
         pub thread: std::thread::ThreadId,
+        state: AtomicU8,
     }
 
-    impl ThreadTimer {
-        pub fn new(proc_: TimerProc) -> Option<Self> {
-            let id = unsafe {
-                SetTimer(
-                    std::ptr::null_mut(),
+    // SAFETY: `PostMessageW` and `SendMessageTimeoutW` are thread-safe per
+    // Win32; `DestroyWindow` runs on the owning thread (directly when dropped
+    // on it, or synchronously via `SendMessageTimeoutW(..., WM_CLOSE, ...)`).
+    unsafe impl Send for MessageWake {}
+    unsafe impl Sync for MessageWake {}
+
+    impl MessageWake {
+        pub fn new(ctx: *mut c_void, handler: fn(*mut c_void)) -> Option<Self> {
+            let _ = HANDLER.set(handler);
+            let hinst = retain_module();
+            if hinst.is_null() {
+                return None;
+            }
+            if !acquire_class(hinst) {
+                unsafe { FreeLibrary(hinst) };
+                return None;
+            }
+            let hwnd = unsafe {
+                CreateWindowExW(
                     0,
-                    super::RESTART_TIMER_MS,
-                    Some(proc_),
+                    CLASS_NAME.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    std::ptr::null_mut(),
+                    hinst,
+                    std::ptr::null_mut(),
                 )
             };
-            (id != 0).then(|| Self {
-                id,
+            if hwnd.is_null() {
+                release_class_and_module(hinst);
+                return None;
+            }
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize) };
+            Some(Self {
+                hwnd,
+                module: hinst,
                 thread: std::thread::current().id(),
+                state: AtomicU8::new(WAKE_IDLE),
             })
+        }
+
+        pub fn signal(&self) {
+            loop {
+                match self.state.load(Ordering::Acquire) {
+                    WAKE_IDLE => {
+                        if self
+                            .state
+                            .compare_exchange(
+                                WAKE_IDLE,
+                                WAKE_POSTING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let posted = unsafe { PostMessageW(self.hwnd, WM_MOOSE_WAKE, 0, 0) } != 0;
+                        if posted {
+                            // The UI may already have cleared this attempt and started
+                            // another. Only the UI may clear a successful post.
+                            return;
+                        }
+                        // `PostMessageW` failed (queue full / closing): restore
+                        // `WAKE_IDLE` so future signals can retry instead of
+                        // wedging on `pending=true`.
+                        let prev = self.state.swap(WAKE_IDLE, Ordering::AcqRel);
+                        if prev != WAKE_RETRY {
+                            return;
+                        }
+                    }
+                    WAKE_POSTING => {
+                        if self
+                            .state
+                            .compare_exchange(
+                                WAKE_POSTING,
+                                WAKE_RETRY,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+
+        pub fn clear_pending(&self) {
+            self.state.store(WAKE_IDLE, Ordering::Release);
         }
     }
 
-    impl Drop for ThreadTimer {
+    impl Drop for MessageWake {
         fn drop(&mut self) {
-            // Fails off the creating thread; the orphaned proc then finds
-            // no instance with this id and does nothing.
-            unsafe { KillTimer(std::ptr::null_mut(), self.id) };
+            unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) };
+            let destroyed = if std::thread::current().id() == self.thread {
+                unsafe { DestroyWindow(self.hwnd) != 0 }
+            } else {
+                // Synchronously dispatch `WM_CLOSE` to the owner thread (bounded
+                // by `DROP_CLOSE_TIMEOUT_MS`). Check both dispatch and destruction.
+                let mut result = 0usize;
+                unsafe {
+                    SendMessageTimeoutW(
+                        self.hwnd,
+                        WM_CLOSE,
+                        0,
+                        0,
+                        SMTO_ABORTIFHUNG,
+                        DROP_CLOSE_TIMEOUT_MS,
+                        &raw mut result,
+                    ) != 0
+                        && result != 0
+                }
+            };
+            // On timeout or destruction failure a window may still dispatch
+            // wnd_proc. Keep its module reference for the process lifetime.
+            if destroyed {
+                release_class_and_module(self.module);
+            }
         }
     }
 }

@@ -46,6 +46,8 @@ pub(crate) const K_PARAM_VALUES_CHANGED: i32 = 4;
 /// host call); the COM layer drains it via `IComponentHandler::restartComponent`
 /// on the next host main-thread callback.
 pub(crate) const K_LATENCY_CHANGED: i32 = 8;
+/// VST3 `RestartFlags::kKeyswitchChanged`.
+pub(crate) const K_KEYSWITCH_CHANGED: i32 = 1024;
 
 pub(crate) struct Vst3Instance<P: PluginExport> {
     pub(crate) persist_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
@@ -110,7 +112,11 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     /// per call would heap-allocate on a tight host read path. Ranges
     /// are static for the life of the plugin instance, so caching is
     /// safe.
+    /// Sorted `(id, range)` lookup for O(log n) normalization without hashing.
     pub(crate) param_ranges: Vec<(u32, ParamRange)>,
+    /// Sorted `(id, dense_index)` table built at instantiation for O(log n)
+    /// dense-index parameter dispatch (`*_by_index`).
+    pub(crate) param_id_indices: Vec<(u32, usize)>,
     /// Precomputed MIDI-controller bindings, sorted by param id, for the
     /// audio-thread bridge in `process_block`. Only params with a
     /// `midi_map` appear, so it's empty for the common no-mapping plugin
@@ -196,6 +202,15 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
 }
 
 impl<P: PluginExport> Vst3Instance<P> {
+    /// Resolve `id` to its dense catalog slot in `O(log n)`.
+    #[inline]
+    pub(crate) fn param_index_of(&self, id: u32) -> Option<usize> {
+        self.param_id_indices
+            .binary_search_by_key(&id, |&(pid, _)| pid)
+            .ok()
+            .map(|at| self.param_id_indices[at].1)
+    }
+
     /// Cache the most recently computed non-zero physical editor size.
     pub(crate) fn store_phys_size(&self, w: u32, h: u32) {
         if w > 0 && h > 0 {

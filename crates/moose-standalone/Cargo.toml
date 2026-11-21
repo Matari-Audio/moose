@@ -14,7 +14,6 @@ moose-params = { workspace = true }
 moose-driver = { workspace = true, optional = true }
 cpal = "0.17"
 pico-args = "0.5"
-dirs = "5"
 midir = "0.10"
 crossbeam-queue = "0.3"
 hound = { version = "3", optional = true }

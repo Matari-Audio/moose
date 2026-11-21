@@ -301,6 +301,16 @@ Collisions never panic a host:
 `moose_params::hash_param_id` still exists for a parameter set that has
 never shipped, but moose never calls it to assign host IDs.
 
+## Implementation Status (Updated 2026-11-21)
+
+The structural overhaul tracked above is now implemented across `moose-core`, `moose-params`, `moose-clap`, `moose-vst3`, and `moose-au`:
+
+- **A. Bindings & ABI:** `A1` (pure-Rust `vst3` 0.3.0 COM layer replacing C++ shim), `A2` (k-way `IParamValueQueue` merge + unbounded channel scratch), `A3` (phase-gated `HostHandle` + `SendPtr` removal), `A4` (`moduleinfo.json` + validation), `A5` (`clap-draft` feature for CLAP 1.2+ drafts).
+- **B. Lifecycle & Threading:** `B1`/`B2` (`PluginCell`, `prepare`/`reset`, zero-polling event-driven Win32/Linux/Apple host wakes), `B4` (`PanicLatch` + `clap.log` forwarding), `B5` (`clap.log`, `clap.thread-check`, `clap.thread-pool` via `ProcessContext::parallel_for`), `B6` (single per-instance `HostQueue` + `HostSink` + `dispatch()` with `loom` proofs).
+- **C. State:** `C1`/`C2` (`clap.state-context`, main-thread save/load), `C3` (OAST v2 string-ID envelope + `StateMigrationChain` + VST3 `IRemapParamID`), `C4` (VST3 `IComponentHandler2` group edits + `clap.undo/4` & `clap.undo_context/4` under `clap-draft`), `C5` (`setDirty` / `state.mark_dirty`).
+- **D. Parameters:** `D1` (`DynamicParams<N>` runtime slot pool + `CatalogSignal`), `D2` (`kParamValuesChanged`), `D3` (CLAP mono modulation), `D4` (processor-owned generic smoothers), `D5` (per-instance edit epoch), `D6` (dense-index CLAP strict-provenance cookies + VST3 sorted ID→index lookups), `D7` (`param-indication`, `context-menu`, `IParameterFunctionName`, `IParameterFinder` + `MuiEditor::param_at`, `IMidiLearn2`/`IMidiMapping2`, `clap.params-origin/1`, `clap.param-hovered/1`), `D8` (`ValueListParam`), `D9` (side-map string IDs beside numeric host IDs).
+- **E. Events, Audio & Host Interfaces:** `E1`/`E2` (single-vec `EventList`, `PerSample` ramps), `E3`/`E5` (`IAudioPresentationLatency`, `INoteExpressionPhysicalUIMapping`, `IKeyswitchController`, `IProgramListData`, `IPluginCompatibility`, `clap.ambisonic/3`).
+
 ## Sources
 
 - CLAP changelog: https://github.com/free-audio/clap/blob/main/ChangeLog.md

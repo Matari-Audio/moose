@@ -1,0 +1,119 @@
+# Format-validator conformance and loom concurrency proofs for moose,
+# running on public GitHub Actions (free runners) rather than private monorepo
+# minutes.
+#   validators : build example plugins; clap-validator, the VST3 SDK
+#                validator and pluginval (headless) on every bundle
+#   loom       : model-check the lock-free handoffs (seqlock, PluginCell,
+#                HostQueue, task pool)
+name: Conformance
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'examples/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/ci/conformance.sh'
+      - '.github/workflows/conformance.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'examples/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/ci/conformance.sh'
+      - '.github/workflows/conformance.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CLAP_VALIDATOR_VERSION: 0.4.1
+  PLUGINVAL_VERSION: v1.0.4
+  VST3_SDK_TAG: v3.8.0_build_66
+
+jobs:
+  validators:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: validators
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Cache validators
+        id: cache-validators
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/validators
+          key: validators-${{ runner.os }}-cv${{ env.CLAP_VALIDATOR_VERSION }}-pv${{ env.PLUGINVAL_VERSION }}-${{ env.VST3_SDK_TAG }}
+      - name: Linux system deps
+        run: |
+          sudo apt-get update
+          build_tools=()
+          if [ "${{ steps.cache-validators.outputs.cache-hit }}" != "true" ]; then
+            build_tools+=(cmake ninja-build unzip)
+          fi
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config mold "${build_tools[@]}" \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev libwayland-dev \
+            libasound2-dev libjack-jackd2-dev libfontconfig1-dev libfreetype-dev \
+            xvfb xauth
+      - name: Build validators (cache miss)
+        if: steps.cache-validators.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          mkdir -p validators/bin
+          cargo install --locked --git https://github.com/free-audio/clap-validator \
+            --tag "$CLAP_VALIDATOR_VERSION" --root validators clap-validator
+          curl -fsSL -o pv.zip \
+            "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_Linux.zip"
+          unzip -oq pv.zip -d validators/bin
+          git clone -q --depth 1 --branch "$VST3_SDK_TAG" --recurse-submodules --shallow-submodules \
+            https://github.com/steinbergmedia/vst3sdk.git vst3sdk
+          cmake -S vst3sdk -B vst3sdk/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF \
+            -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=OFF -DSMTG_RUN_VST_VALIDATOR=OFF
+          cmake --build vst3sdk/build --target validator
+          cp vst3sdk/build/bin/Release/validator validators/bin/
+      - name: Validators on PATH
+        run: |
+          chmod +x "$RUNNER_TEMP"/validators/bin/*
+          echo "$RUNNER_TEMP/validators/bin" >> "$GITHUB_PATH"
+      - name: Build cargo-moose
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo build -p cargo-moose
+          echo "CARGO_MOOSE=$PWD/target/debug/cargo-moose" >> "$GITHUB_ENV"
+      - name: Validate example plugins
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: xvfb-run -a scripts/ci/conformance.sh
+
+  loom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: loom
+        run: cargo test -p moose-core --features loom --release --lib loom

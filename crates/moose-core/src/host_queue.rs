@@ -36,6 +36,7 @@ type Ring = crossbeam_queue::ArrayQueue<HostMessage>;
 #[cfg(all(test, feature = "loom"))]
 type Ring = loom_ring::Ring;
 
+use crate::editor::EditGroup;
 use crate::main_thread::{HostNotice, MenuTarget};
 use crate::thread::MainThread;
 
@@ -58,6 +59,8 @@ bitflags::bitflags! {
         const VOICE_INFO = 1 << 1;
         /// See [`HostNotice::AUDIO_PORTS`].
         const AUDIO_PORTS = 1 << 2;
+        /// See [`HostNotice::KEYSWITCHES`].
+        const KEYSWITCHES = 1 << 3;
         /// The project changed outside the parameters (CLAP
         /// `state.mark_dirty`, VST3 `IComponentHandler2::setDirty`).
         const MARK_DIRTY = 1 << 8;
@@ -83,6 +86,9 @@ bitflags::bitflags! {
         /// (CLAP a restart; AU `kAudioUnitProperty_TailTime` / KVO `"tailTime"`).
         /// See [`crate::delay::ReportedDelay`].
         const TAIL = 1 << 15;
+        /// Pending edit-group transitions (`clap.undo/4`) waiting to drain on
+        /// the host main thread.
+        const UNDO_GROUP = 1 << 16;
     }
 }
 
@@ -109,6 +115,24 @@ pub enum HostMessage {
     /// points relative to the editor's top-left corner (CLAP
     /// `context-menu.popup`, VST3 `IComponentHandler3::createContextMenu`).
     ContextMenu { target: MenuTarget, x: i32, y: i32 },
+    /// The editor's pointer is hovering `Some(param_id)` or left all controls
+    /// (`None`) — CLAP `clap.param-hovered/1`.
+    ParamHovered(Option<u32>),
+    /// Open or close a grouped edit transaction (CLAP `clap.undo/4`
+    /// `begin_change` / `change_made`, VST3 `startGroupEdit` / `finishGroupEdit`).
+    EditGroup(EditGroup),
+    /// Ask the host to undo the last change (CLAP `clap.undo/4` `request_undo`).
+    RequestUndo,
+    /// Ask the host to redo the last undone change (CLAP `clap.undo/4` `request_redo`).
+    RequestRedo,
+    /// Forward an unhandled XKB key event from an embedded/nested Wayland
+    /// editor to the host (`clap.gui-xkb-key-forwarding/1`).
+    ForwardXkbKey {
+        keycode: u32,
+        keysym: u32,
+        modifiers: u32,
+        pressed: bool,
+    },
 }
 
 /// Set in [`HostQueue::waking`] once [`HostQueue::close`] ran.
@@ -449,17 +473,31 @@ pub trait HostSink {
     fn voice_info_changed(&mut self) {}
     /// [`HostSignal::AUDIO_PORTS`]: audio port layout or configuration changed.
     fn audio_ports_changed(&mut self) {}
+    /// [`HostSignal::KEYSWITCHES`]: keyswitch table changed (VST3 `kKeyswitchChanged`).
+    fn keyswitches_changed(&mut self) {}
     /// [`HostSignal::LATENCY`]: processor latency moved off the reported value.
     fn latency_changed(&mut self) {}
     /// [`HostSignal::TAIL`]: processor tail moved off the reported value.
     fn tail_changed(&mut self) {}
     /// [`HostSignal::RESTART`]: plugin requested host deactivate/reactivate.
     fn request_restart(&mut self) {}
+    /// [`HostSignal::UNDO_GROUP`]: pending edit-group / undo transitions are ready.
+    fn undo_groups_ready(&mut self) {}
     /// Called once after all raised signals have been delivered and before
     /// queued [`HostMessage`]s are processed.
     fn flush_signals(&mut self) {}
     /// [`HostMessage::ContextMenu`]: show the host's context menu at logical `(x, y)`.
     fn context_menu(&mut self, _target: MenuTarget, _x: i32, _y: i32) {}
+    /// [`HostMessage::ParamHovered`]: pointer hover moved onto `Some(id)` or left (`None`).
+    fn param_hovered(&mut self, _id: Option<u32>) {}
+    /// [`HostMessage::EditGroup`]: grouped undo edit boundary.
+    fn edit_group(&mut self, _edge: EditGroup) {}
+    /// [`HostMessage::RequestUndo`]: ask the host to undo.
+    fn request_undo(&mut self) {}
+    /// [`HostMessage::RequestRedo`]: ask the host to redo.
+    fn request_redo(&mut self) {}
+    /// [`HostMessage::ForwardXkbKey`]: forward an unhandled XKB key event to the host.
+    fn forward_xkb_key(&mut self, _keycode: u32, _keysym: u32, _modifiers: u32, _pressed: bool) {}
 }
 
 /// Deliver every raised signal and queued message in `drain` to `sink`.
@@ -492,6 +530,9 @@ pub fn dispatch(drain: Drain<'_>, sink: &mut dyn HostSink) {
     if signals.contains(HostSignal::AUDIO_PORTS) {
         sink.audio_ports_changed();
     }
+    if signals.contains(HostSignal::KEYSWITCHES) {
+        sink.keyswitches_changed();
+    }
     if signals.contains(HostSignal::LATENCY) {
         sink.latency_changed();
     }
@@ -501,10 +542,23 @@ pub fn dispatch(drain: Drain<'_>, sink: &mut dyn HostSink) {
     if signals.contains(HostSignal::RESTART) {
         sink.request_restart();
     }
+    if signals.contains(HostSignal::UNDO_GROUP) {
+        sink.undo_groups_ready();
+    }
     sink.flush_signals();
     for message in drain {
         match message {
             HostMessage::ContextMenu { target, x, y } => sink.context_menu(target, x, y),
+            HostMessage::ParamHovered(id) => sink.param_hovered(id),
+            HostMessage::EditGroup(edge) => sink.edit_group(edge),
+            HostMessage::RequestUndo => sink.request_undo(),
+            HostMessage::RequestRedo => sink.request_redo(),
+            HostMessage::ForwardXkbKey {
+                keycode,
+                keysym,
+                modifiers,
+                pressed,
+            } => sink.forward_xkb_key(keycode, keysym, modifiers, pressed),
         }
     }
 }
@@ -722,6 +776,9 @@ mod tests {
             fn audio_ports_changed(&mut self) {
                 self.calls.push("audio_ports_changed");
             }
+            fn keyswitches_changed(&mut self) {
+                self.calls.push("keyswitches_changed");
+            }
             fn latency_changed(&mut self) {
                 self.calls.push("latency_changed");
             }
@@ -730,6 +787,9 @@ mod tests {
             }
             fn request_restart(&mut self) {
                 self.calls.push("request_restart");
+            }
+            fn undo_groups_ready(&mut self) {
+                self.calls.push("undo_groups_ready");
             }
             fn flush_signals(&mut self) {
                 self.calls.push("flush_signals");

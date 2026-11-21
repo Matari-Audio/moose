@@ -724,3 +724,56 @@ fn dropping_editor_revokes_the_dialog_owner() {
     drop(editor);
     assert_eq!(*owner.lock().unwrap(), None);
 }
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn param_at_resolves_bound_widgets_and_rejects_empty_space() {
+    let params = Arc::new(Synth::default());
+    let (mut editor, _handler, _log) = open(&params);
+
+    for param_id in [10u32, 20, 30] {
+        let pt = centre(&editor, param_id);
+        assert_eq!(
+            editor.param_at(pt.x.round() as i32, pt.y.round() as i32),
+            Some(param_id),
+            "centre of param {param_id} widget must resolve to Some({param_id})"
+        );
+    }
+
+    assert_eq!(editor.param_at(-10, -10), None);
+    assert_eq!(editor.param_at(399, 299), None);
+
+    // Resizing scales logical coordinates by fit zoom; `param_at` maps through zoom.
+    let pt_gain = centre(&editor, 10);
+    editor = editor.resizable((200, 150));
+    assert!(editor.set_size(800, 600));
+    assert_eq!(
+        editor.param_at(
+            (pt_gain.x * 2.0).round() as i32,
+            (pt_gain.y * 2.0).round() as i32
+        ),
+        Some(10),
+        "2x zoomed logical coordinates must resolve to the same bound parameter"
+    );
+
+    // Unknown parameter IDs must still draw via `bind_as` without being
+    // published to `param_at`.
+    let unknown_view = MuiEditor::new(params.clone(), Ui::default(), (400, 300), |ui, bridge| {
+        let known = bridge.bind(ui, 10u32, |ui, id, v| knob(ui, id, "Gain", v, 0.0..=1.0));
+        let unknown = bridge.bind(ui, 999_999u32, |ui, id, v| {
+            knob(ui, id, "Unknown", v, 0.0..=1.0)
+        });
+        row([known, unknown])
+    });
+    let (unknown_editor, _h2, _log2) = open_with(&params, unknown_view);
+    let known_pt = centre(&unknown_editor, 10);
+    let unknown_pt = centre(&unknown_editor, 999_999);
+    assert_eq!(
+        unknown_editor.param_at(known_pt.x.round() as i32, known_pt.y.round() as i32),
+        Some(10)
+    );
+    assert_eq!(
+        unknown_editor.param_at(unknown_pt.x.round() as i32, unknown_pt.y.round() as i32),
+        None
+    );
+}

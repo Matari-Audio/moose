@@ -3,6 +3,10 @@ use crate::config::ProcessMode;
 use crate::events::{EventList, TransportInfo};
 use crate::tasks::{AnyTaskSpawner, TaskSpawner};
 
+/// Host-provided RT thread-pool executor (`num_tasks`, `task_fn`) -> `true` if
+/// the host executed all `0..num_tasks` tasks before returning.
+pub type ThreadPoolExec<'a> = &'a dyn Fn(u32, &(dyn Fn(u32) + Sync)) -> bool;
+
 /// Per-block context handed to `process()`. Construct via
 /// [`Self::new`] + the `with_*` builders. Marked `#[non_exhaustive]`
 /// so adding host-populated fields in future (e.g. `host_latency`,
@@ -25,6 +29,7 @@ pub struct ProcessContext<'a> {
     params_fn: Option<&'a dyn Fn(u32) -> f64>,
     meters_fn: Option<&'a dyn Fn(u32, f32)>,
     latency_change_request: Option<&'a dyn Fn()>,
+    thread_pool: Option<ThreadPoolExec<'a>>,
     /// Type-erased handle to this instance's background-task spawner,
     /// installed by the shell when the plugin wired `tasks:` on
     /// `plugin!`. Recover a typed spawner with [`Self::tasks`].
@@ -48,6 +53,7 @@ impl<'a> ProcessContext<'a> {
             params_fn: None,
             meters_fn: None,
             latency_change_request: None,
+            thread_pool: None,
             tasks: None,
         }
     }
@@ -92,6 +98,34 @@ impl<'a> ProcessContext<'a> {
     pub fn request_latency_change(&self) {
         if let Some(request) = self.latency_change_request {
             request();
+        }
+    }
+
+    /// Install a host RT thread-pool executor (e.g. CLAP `clap.thread-pool`).
+    #[must_use]
+    pub fn with_thread_pool(mut self, exec: ThreadPoolExec<'a>) -> Self {
+        self.thread_pool = Some(exec);
+        self
+    }
+
+    /// Execute `0..num_tasks` across the host's RT thread pool when available
+    /// (CLAP `clap.thread-pool`), falling back to sequential execution on the
+    /// calling audio thread when no pool is present or the host declines.
+    ///
+    /// Allocation-free: `f` is borrowed on the stack for the duration of the
+    /// synchronous parallel region.
+    pub fn parallel_for(&self, num_tasks: u32, f: impl Fn(u32) + Sync) {
+        if num_tasks == 0 {
+            return;
+        }
+        if num_tasks > 1
+            && let Some(exec) = self.thread_pool
+            && exec(num_tasks, &f)
+        {
+            return;
+        }
+        for i in 0..num_tasks {
+            f(i);
         }
     }
 
@@ -158,4 +192,54 @@ pub enum ProcessStatus {
     Tail(u32),
     /// Keep alive even if input is silent.
     KeepAlive,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{EventList, TransportInfo};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn parallel_for_uses_host_pool_and_falls_back_sequentially() {
+        let transport = TransportInfo::default();
+        let mut out = EventList::with_capacity(4);
+        let sum = AtomicU32::new(0);
+
+        // Without a host pool: runs sequentially on the caller thread.
+        let ctx = ProcessContext::new(&transport, 48_000.0, 64, &mut out);
+        ctx.parallel_for(5, |i| {
+            sum.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), 15);
+
+        // With a host pool that executes tasks concurrently across threads.
+        let pool_calls = AtomicU32::new(0);
+        let pool = |n: u32, f: &(dyn Fn(u32) + Sync)| -> bool {
+            pool_calls.fetch_add(1, Ordering::Relaxed);
+            std::thread::scope(|s| {
+                for i in 0..n {
+                    s.spawn(move || f(i));
+                }
+            });
+            true
+        };
+        let sum2 = AtomicU32::new(0);
+        let ctx = ProcessContext::new(&transport, 48_000.0, 64, &mut out).with_thread_pool(&pool);
+        ctx.parallel_for(6, |i| {
+            sum2.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(pool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sum2.load(Ordering::Relaxed), 21);
+
+        // When the host pool declines (`false`), falls back sequentially.
+        let decline = |_: u32, _: &(dyn Fn(u32) + Sync)| false;
+        let sum3 = AtomicU32::new(0);
+        let ctx =
+            ProcessContext::new(&transport, 48_000.0, 64, &mut out).with_thread_pool(&decline);
+        ctx.parallel_for(4, |i| {
+            sum3.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(sum3.load(Ordering::Relaxed), 10);
+    }
 }

@@ -740,6 +740,51 @@ impl<P: Params> Editor for MuiEditor<P> {
         s.view.bridge.end_all();
         self.requests.redraw();
     }
+
+    fn param_at(&self, x: i32, y: i32) -> Option<u32> {
+        let s = lock(&self.shared);
+        let zoom = s
+            .view
+            .zoom(Size::new(f64::from(self.size.0), f64::from(self.size.1)));
+        let zoom = if zoom.is_finite() && zoom > 0.0 {
+            zoom
+        } else {
+            1.0
+        };
+        let point = mui::prelude::Point::new(f64::from(x) / zoom, f64::from(y) / zoom);
+        let scene = s.ui.scene()?;
+        // Walk topmost z-order first so overlapping controls resolve to the
+        // visible widget; ascend `parent` for composite sub-surfaces.
+        for surface in scene.surfaces().rev() {
+            if surface.disabled {
+                continue;
+            }
+            if let Some(clip) = surface.clip
+                && (point.x < clip.x0
+                    || point.x > clip.x1
+                    || point.y < clip.y0
+                    || point.y > clip.y1)
+            {
+                continue;
+            }
+            let local = surface.local(point);
+            if local.x < 0.0
+                || local.y < 0.0
+                || local.x > surface.frame.size.width
+                || local.y > surface.frame.size.height
+            {
+                continue;
+            }
+            let mut key = Some(surface.key.as_str());
+            while let Some(k) = key {
+                if let Some(param) = s.view.bridge.param_for_widget(k) {
+                    return Some(param);
+                }
+                key = scene.surface(k).and_then(|n| n.parent.as_deref());
+            }
+        }
+        None
+    }
 }
 
 impl<P: Params> Drop for MuiEditor<P> {

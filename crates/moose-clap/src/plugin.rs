@@ -17,6 +17,7 @@ use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_host_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
+use clap_sys::ext::thread_pool::{CLAP_EXT_THREAD_POOL, clap_host_thread_pool};
 use clap_sys::ext::track_info::{
     CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, clap_host_track_info,
 };
@@ -108,6 +109,25 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
         {
             data.host_thread_check = ext;
         }
+        if let Some(ext) = data
+            .host
+            .extension::<clap_host_thread_pool>(CLAP_EXT_THREAD_POOL)
+        {
+            data.host_thread_pool = ext;
+        }
+        #[cfg(feature = "clap-draft")]
+        if let Some(ext) = data
+            .host
+            .extension::<crate::draft::clap_host_param_hovered>(
+                crate::draft::CLAP_EXT_PARAM_HOVERED,
+            )
+        {
+            data.host_param_hovered = ext;
+        }
+        // Do NOT eagerly query `clap.undo/4` here: CLAP specifies that
+        // querying `CLAP_EXT_UNDO` disables implicit host undo snapshots from
+        // `state.mark_dirty`. Resolve it lazily only when the plugin actually
+        // starts reporting explicit change groups.
         data.host.debug_assert_main_thread(data.host_thread_check);
         if data.params_arc.wants_persist_notifications() {
             let queue = Arc::clone(&data.host_queue);
@@ -156,6 +176,19 @@ pub(crate) unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *co
                 signal.close();
             }
             (*data_ptr).host_queue.close();
+            #[cfg(feature = "clap-draft")]
+            {
+                let main = MainThread::assume();
+                if let Some(ext) = *(*data_ptr).host_undo.borrow(&main) {
+                    let host = (*data_ptr).host.on_main_thread(&main);
+                    if let Some(subscribe) =
+                        ext.as_ref().and_then(|undo| undo.set_wants_context_updates)
+                    {
+                        subscribe(host.as_raw(), false);
+                    }
+                    (*data_ptr).undo_groups.cancel_open_on_destroy(host, ext);
+                }
+            }
             report_latched_panic(&*data_ptr);
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
@@ -465,6 +498,84 @@ impl<P: PluginExport> HostSink for ClapSink<'_, P> {
     fn context_menu(&mut self, target: MenuTarget, x: i32, y: i32) {
         context_menu::popup(self.data, self.main, target, x, y);
     }
+
+    #[cfg(feature = "clap-draft")]
+    fn param_hovered(&mut self, id: Option<u32>) {
+        // SAFETY: main thread, live host handle and cached extension pointer.
+        unsafe {
+            crate::draft_ext::notify_param_hovered(self.host, self.data.host_param_hovered, id);
+        }
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn edit_group(&mut self, edge: moose_core::editor::EditGroup) {
+        let ext = resolve_host_undo(self.data, self.main);
+        // SAFETY: main thread, live host handle and resolved extension pointer.
+        unsafe { crate::draft_ext::notify_edit_group(self.host, ext, edge) };
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn request_undo(&mut self) {
+        let ext = self
+            .data
+            .host_undo
+            .borrow(self.main)
+            .unwrap_or(std::ptr::null());
+        // SAFETY: main thread, live host handle and resolved extension pointer.
+        unsafe { crate::draft_ext::notify_request_undo(self.host, ext) };
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn request_redo(&mut self) {
+        let ext = self
+            .data
+            .host_undo
+            .borrow(self.main)
+            .unwrap_or(std::ptr::null());
+        // SAFETY: main thread, live host handle and resolved extension pointer.
+        unsafe { crate::draft_ext::notify_request_redo(self.host, ext) };
+    }
+
+    fn forward_xkb_key(&mut self, keycode: u32, keysym: u32, modifiers: u32, pressed: bool) {
+        #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+        // SAFETY: main thread, live host handle.
+        let _ = unsafe {
+            crate::wayland_nested::forward_xkb_key(
+                self.host.as_ptr(),
+                keycode,
+                keysym,
+                modifiers,
+                pressed,
+            )
+        };
+        #[cfg(not(all(target_os = "linux", feature = "clap-draft")))]
+        let _ = (keycode, keysym, modifiers, pressed);
+    }
+}
+
+/// Lazily query `clap.undo/4` on the host main thread once the plugin actually
+/// uses explicit undo operations, preserving implicit `state.mark_dirty` undo
+/// for dirty-only plugins.
+#[cfg(feature = "clap-draft")]
+fn resolve_host_undo<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    main: &MainThread,
+) -> *const crate::draft::clap_host_undo {
+    if let Some(ext) = *data.host_undo.borrow(main) {
+        return ext;
+    }
+    // SAFETY: the explicit reporting feature is first activated on the main thread.
+    unsafe {
+        let ext = data
+            .host
+            .extension::<crate::draft::clap_host_undo>(crate::draft::CLAP_EXT_UNDO)
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        *data.host_undo.borrow_mut(main) = Some(ext);
+        if let Some(subscribe) = ext.as_ref().and_then(|undo| undo.set_wants_context_updates) {
+            subscribe(data.host.as_ptr(), true);
+        }
+        ext
+    }
 }
 
 pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
@@ -488,6 +599,39 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
             pending: HostSignal::empty(),
         };
         dispatch(drain, &mut sink);
+        #[cfg(feature = "clap-draft")]
+        match data.hovered_param.swap(0, Ordering::AcqRel) {
+            0 => {}
+            1 => crate::draft_ext::notify_param_hovered(host, data.host_param_hovered, None),
+            encoded => crate::draft_ext::notify_param_hovered(
+                host,
+                data.host_param_hovered,
+                u32::try_from(encoded - 2).ok(),
+            ),
+        }
+        #[cfg(feature = "clap-draft")]
+        {
+            let flush = if data.undo_groups.has_pending() {
+                let ext = resolve_host_undo(data, &main);
+                // SAFETY: main thread, live host handle and resolved extension.
+                data.undo_groups
+                    .drain_main_thread(host, ext, &data.undo_save_state_override, &main)
+            } else {
+                false
+            };
+            if flush || !data.undo_groups.retry_gui_change.is_empty() {
+                // SAFETY: `params.request_flush` is [thread-safe] and host is live.
+                if data.host_params.is_null() {
+                    // A host without clap.params can still consume gestures in process().
+                    if let Some(process) = (*host.as_ptr()).request_process {
+                        process(host.as_ptr());
+                    }
+                } else {
+                    host.as_any()
+                        .request_flush(crate::host_handle::HostParamsHandle::new(data.host_params));
+                }
+            }
+        }
     }
 }
 

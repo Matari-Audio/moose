@@ -1,9 +1,13 @@
-//! Audio and note ports: audio-ports, audio-ports-config, configurable-audio-ports, audio-ports-activation, surround and note-ports.
+//! Audio and note ports: audio-ports, audio-ports-config, configurable-audio-ports, audio-ports-activation, surround, ambisonic and note-ports.
 
 use crate::copy_str_to_buf;
 use crate::data::ClapPluginData;
 use crate::data_from_plugin;
 
+use clap_sys::ext::ambisonic::{
+    CLAP_AMBISONIC_NORMALIZATION_SN3D, CLAP_AMBISONIC_ORDERING_ACN, CLAP_PORT_AMBISONIC,
+    clap_ambisonic_config,
+};
 use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_AUDIO_PORT_PREFERS_64BITS, CLAP_AUDIO_PORT_SUPPORTS_64BITS,
     CLAP_AUDIO_PORTS_RESCAN_LIST, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info,
@@ -56,6 +60,7 @@ pub(crate) fn clap_port_type_ptr(channels: ChannelConfig) -> *const c_char {
     match channels {
         ChannelConfig::Mono => CLAP_PORT_MONO.as_ptr(),
         ChannelConfig::Stereo => CLAP_PORT_STEREO.as_ptr(),
+        ChannelConfig::Ambisonic { .. } => CLAP_PORT_AMBISONIC.as_ptr(),
         ChannelConfig::Custom(4 | 6 | 8) => CLAP_PORT_SURROUND.as_ptr(),
         ChannelConfig::Custom(_) => ptr::null(),
     }
@@ -188,6 +193,74 @@ pub(crate) unsafe extern "C" fn surround_map<P: PluginExport>(
         ptr::copy_nonoverlapping(channels.as_ptr(), destination, channels.len());
     }
     len_u32(channels.len())
+}
+
+/// Whether `P` declares at least one enabled Ambisonic bus across its layouts.
+pub(crate) fn has_ambisonic_bus<P: PluginExport>() -> bool {
+    P::bus_layouts().iter().any(|layout| {
+        layout
+            .inputs
+            .iter()
+            .chain(&layout.outputs)
+            .any(|bus| bus.enabled && matches!(bus.channels, ChannelConfig::Ambisonic { .. }))
+    })
+}
+
+/// Canonical CLAP Ambisonic config exposed by `ChannelConfig::Ambisonic`:
+/// ACN channel ordering + SN3D normalization.
+const CANONICAL_AMBISONIC_CONFIG: clap_ambisonic_config = clap_ambisonic_config {
+    ordering: CLAP_AMBISONIC_ORDERING_ACN,
+    normalization: CLAP_AMBISONIC_NORMALIZATION_SN3D,
+};
+
+pub(crate) unsafe extern "C" fn ambisonic_is_config_supported<P: PluginExport>(
+    _plugin: *const clap_plugin,
+    config: *const clap_ambisonic_config,
+) -> bool {
+    if config.is_null() || !has_ambisonic_bus::<P>() {
+        return false;
+    }
+    // SAFETY: CLAP guarantees `config` points to a valid `clap_ambisonic_config`.
+    let cfg = unsafe { *config };
+    cfg.ordering == CANONICAL_AMBISONIC_CONFIG.ordering
+        && cfg.normalization == CANONICAL_AMBISONIC_CONFIG.normalization
+}
+
+pub(crate) unsafe extern "C" fn ambisonic_get_config<P: PluginExport>(
+    plugin: *const clap_plugin,
+    is_input: bool,
+    port_index: u32,
+    info: *mut clap_ambisonic_config,
+) -> bool {
+    if info.is_null() {
+        return false;
+    }
+    let layouts = P::bus_layouts();
+    // SAFETY: CLAP supplies a live plugin instance for this main-thread callback.
+    let index = unsafe { selected_layout_index::<P>(plugin, layouts.len()) };
+    let Some(layout) = layouts.get(index) else {
+        return false;
+    };
+    let buses = if is_input {
+        &layout.inputs
+    } else {
+        &layout.outputs
+    };
+    let Some(bus) = buses
+        .iter()
+        .filter(|bus| bus.enabled)
+        .nth(port_index as usize)
+    else {
+        return false;
+    };
+    if !matches!(bus.channels, ChannelConfig::Ambisonic { .. }) {
+        return false;
+    }
+    // SAFETY: CLAP guarantees `info` is a writable `clap_ambisonic_config`.
+    unsafe {
+        *info = CANONICAL_AMBISONIC_CONFIG;
+    }
+    true
 }
 
 pub(crate) fn make_audio_ports_extension<P: PluginExport>() -> clap_plugin_audio_ports {
@@ -347,8 +420,8 @@ pub(crate) unsafe fn layout_for_requests<P: PluginExport>(
             // SAFETY: ours are static CLAP constants.
             let type_fits = wanted
                 .is_none_or(|wanted| !ours.is_null() && wanted == unsafe { CStr::from_ptr(ours) });
-            // Mono and stereo ignore details. Surround details must match
-            // our canonical channel map; ambisonic types never match.
+            // Mono and stereo ignore details. Surround details must match our
+            // canonical channel map; Ambisonic details must match ACN + SN3D.
             let details_fit = request.port_details.is_null()
                 || wanted == Some(CLAP_PORT_MONO)
                 || wanted == Some(CLAP_PORT_STEREO)
@@ -364,7 +437,16 @@ pub(crate) unsafe fn layout_for_requests<P: PluginExport>(
                                     request.channel_count as usize,
                                 )
                             }
-                });
+                })
+                || (wanted == Some(CLAP_PORT_AMBISONIC)
+                    && matches!(bus.channels, ChannelConfig::Ambisonic { .. })
+                    && {
+                        // SAFETY: an ambisonic request's details point to a
+                        // `clap_ambisonic_config`.
+                        let cfg = unsafe { *request.port_details.cast::<clap_ambisonic_config>() };
+                        cfg.ordering == CANONICAL_AMBISONIC_CONFIG.ordering
+                            && cfg.normalization == CANONICAL_AMBISONIC_CONFIG.normalization
+                    });
             type_fits && details_fit
         })
     };
