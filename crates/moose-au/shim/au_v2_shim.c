@@ -351,17 +351,22 @@ static void fill_param_event(AudioUnitEvent *event, AudioUnit unit,
     event->mArgument.mParameter.mElement = 0;
 }
 
-static void notify_property_change_both(MooseAUv2 *inst, AudioUnitPropertyID prop) {
+static void notify_property_change_scoped(MooseAUv2 *inst, AudioUnitPropertyID prop,
+                                          AudioUnitScope scope) {
     if (!inst || au_v2_is_closing(inst) || !inst->componentInstance) return;
-    if (!notify_listeners(inst, prop, kAudioUnitScope_Global, 0)) return;
+    if (!notify_listeners(inst, prop, scope, 0)) return;
     AudioUnitEvent event;
     memset(&event, 0, sizeof(event));
     event.mEventType = kAudioUnitEvent_PropertyChange;
     event.mArgument.mProperty.mAudioUnit = inst->componentInstance;
     event.mArgument.mProperty.mPropertyID = prop;
-    event.mArgument.mProperty.mScope = kAudioUnitScope_Global;
+    event.mArgument.mProperty.mScope = scope;
     event.mArgument.mProperty.mElement = 0;
     AUEventListenerNotify(NULL, NULL, &event);
+}
+
+static void notify_property_change_both(MooseAUv2 *inst, AudioUnitPropertyID prop) {
+    notify_property_change_scoped(inst, prop, kAudioUnitScope_Global);
 }
 
 static void au_v2_sink_begin_edit(void *ud, uint32_t param_id) {
@@ -410,6 +415,18 @@ static void au_v2_sink_param_values_changed(void *ud) {
                      kAUParameterListener_AnyParameter,
                      kAudioUnitEvent_ParameterValueChange);
     AUEventListenerNotify(NULL, NULL, &event);
+}
+
+static void au_v2_sink_state_changed(void *ud) {
+    // Hosts (Logic, Live) mark the project dirty on a ClassInfo change.
+    notify_property_change_both((MooseAUv2 *)ud, kAudioUnitProperty_ClassInfo);
+}
+
+static void au_v2_sink_audio_ports_changed(void *ud) {
+    MooseAUv2 *inst = (MooseAUv2 *)ud;
+    notify_property_change_both(inst, kAudioUnitProperty_SupportedNumChannels);
+    notify_property_change_scoped(inst, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input);
+    notify_property_change_scoped(inst, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output);
 }
 
 static void au_v2_sink_param_presentation_changed(void *ud) {
@@ -477,6 +494,8 @@ static OSStatus au_v2_open(void *self_, AudioComponentInstance instance) {
     sink.tail_changed = au_v2_sink_tail_changed;
     sink.param_values_changed = au_v2_sink_param_values_changed;
     sink.param_presentation_changed = au_v2_sink_param_presentation_changed;
+    sink.state_changed = au_v2_sink_state_changed;
+    sink.audio_ports_changed = au_v2_sink_audio_ports_changed;
 
     if (g_callbacks->create_with_sink) {
         // Ownership transfers at the call, even if creation fails. Rust
@@ -1062,7 +1081,11 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
             double secs = 0.0;
             if (g_callbacks && g_callbacks->tail_samples && inst->rustCtx &&
                 inst->sampleRate > 0.0) {
-                secs = (double)g_callbacks->tail_samples(inst->rustCtx) / inst->sampleRate;
+                UInt32 tail = g_callbacks->tail_samples(inst->rustCtx);
+                // AU has no infinite-tail marker: UINT32_MAX samples would make
+                // hosts (Logic) render ~25 h of tail on bounce. Report a bound.
+                // ponytail: fixed 10 s, make it a descriptor field if a plugin needs longer.
+                secs = tail == UINT32_MAX ? 10.0 : (double)tail / inst->sampleRate;
             }
             *(Float64 *)outData = secs;
             *ioSize = sizeof(Float64);

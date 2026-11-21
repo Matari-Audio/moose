@@ -299,6 +299,13 @@ typedef struct {
     void (*param_values_changed)(void *user_data);
     void (*param_presentation_changed)(void *user_data);
     void (*request_resize)(void *user_data, uint32_t width, uint32_t height);
+    /* Appended after v13; readers copy only fields inside `size`, so these
+     * need no ABI version bump. Non-parameter state changed: hosts should
+     * mark the project dirty (v2: ClassInfo property change). */
+    void (*state_changed)(void *user_data);
+    /* Audio bus layout or channel capabilities changed (v2:
+     * SupportedNumChannels and StreamFormat property changes). */
+    void (*audio_ports_changed)(void *user_data);
 } MooseAuHostSink;
 
 /* Transport snapshot filled by the AU v2 / v3 shim from

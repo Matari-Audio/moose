@@ -401,6 +401,25 @@ impl<P: PluginExport> HostSink for AuSink<'_, P> {
         }
     }
 
+    fn mark_dirty(&mut self) {
+        if self.inst.host_queue.is_closed() {
+            return;
+        }
+        // SAFETY: main thread, live instance.
+        unsafe { self.inst.host_sink.state_changed() };
+    }
+
+    fn audio_ports_changed(&mut self) {
+        if self.inst.host_queue.is_closed() {
+            return;
+        }
+        // SAFETY: main thread, live instance.
+        unsafe { self.inst.host_sink.audio_ports_changed() };
+    }
+
+    // `request_restart` stays a no-op: AU hosts re-read latency, tail and
+    // stream formats live, and there is no "please reinitialize me" call.
+
     fn tail_changed(&mut self) {
         if self.inst.host_queue.is_closed() {
             return;

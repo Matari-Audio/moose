@@ -60,6 +60,8 @@ impl HostSink {
         copy_field!(param_values_changed);
         copy_field!(param_presentation_changed);
         copy_field!(request_resize);
+        copy_field!(state_changed);
+        copy_field!(audio_ports_changed);
         #[allow(clippy::cast_possible_truncation)]
         {
             copy.size = declared.min(std::mem::size_of::<MooseAuHostSink>()) as u32;
@@ -138,6 +140,32 @@ impl HostSink {
     )]
     pub(crate) unsafe fn param_presentation_changed(&self) {
         if let Some(f) = self.0.param_presentation_changed {
+            unsafe { f(self.0.user_data) };
+        }
+    }
+
+    #[cfg_attr(
+        not(any(target_vendor = "apple", test)),
+        allow(
+            dead_code,
+            reason = "called by drain_host_queue on Apple targets and in tests"
+        )
+    )]
+    pub(crate) unsafe fn state_changed(&self) {
+        if let Some(f) = self.0.state_changed {
+            unsafe { f(self.0.user_data) };
+        }
+    }
+
+    #[cfg_attr(
+        not(any(target_vendor = "apple", test)),
+        allow(
+            dead_code,
+            reason = "called by drain_host_queue on Apple targets and in tests"
+        )
+    )]
+    pub(crate) unsafe fn audio_ports_changed(&self) {
+        if let Some(f) = self.0.audio_ports_changed {
             unsafe { f(self.0.user_data) };
         }
     }

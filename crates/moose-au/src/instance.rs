@@ -31,17 +31,17 @@ use std::sync::{Arc, Mutex};
 // Instance wrapper - one per plugin instance, stored as the opaque ctx
 // ---------------------------------------------------------------------------
 
-/// Opaque `AuInstance<P>` handle carried across AU host/notifier threads.
+/// Opaque `AuInstance<P>` handle carried across AU host threads and the
+/// main-queue drain source.
 ///
-/// Only dereferenced inside `HostQueue::with_open` (or passed as an opaque key
-/// to the C shim while `ParamNotifier` is joined before `cb_destroy` frees the
-/// instance).
+/// Only dereferenced inside `HostQueue::with_open`. `finalize_destroy` closes
+/// the queue before dropping the instance, and that drop cancels the drain
+/// source (`host_drain::Dispatcher`).
 #[derive(Clone, Copy)]
 pub(crate) struct AuCtx(pub(crate) *mut std::ffi::c_void);
 
 // SAFETY: `AuCtx` is an opaque instance pointer whose dereferences are
-// serialized against `cb_destroy` by `HostQueue::with_open` / `close()` and
-// `ParamNotifier::drop` joining the notifier thread before free.
+// serialized against `cb_destroy` by `HostQueue::with_open` / `close()`.
 unsafe impl Send for AuCtx {}
 unsafe impl Sync for AuCtx {}
 
