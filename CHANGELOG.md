@@ -8,8 +8,7 @@ Notable changes per release.
   `save_state`, `load_state`, `snapshot_into`, `snapshot_version`,
   `snapshot_prealloc_hint` and `SNAPSHOTS` are gone; keep custom state in
   `#[persist]` fields on `Shared`. `state_changed` stays (it runs after a host
-  load lands, with the loaded params in `shared`). The deprecated
-  `PluginLogic` adapter keeps the old hooks for one release.
+  load lands, with the loaded params in `shared`).
 - **Parameter edit counters are per instance (D5).** A setter counts only on
   its own tree's counter (or the field's own, outside a tree); the
   process-wide `EDIT_EPOCH` is gone. A hand-written `Params` impl without a
@@ -45,11 +44,32 @@ Notable changes per release.
   drain (`HostSignal::LATENCY` -> `kLatencyChanged` / `kAudioUnitProperty_Latency`;
   `HostSignal::TAIL` -> `kAudioUnitProperty_TailTime` on AU, silent commit on
   VST3 without a PDC restart).
-- **Deprecated: `PluginLogic`, `PluginLogic64`, `PurePluginLogic(64)` and
-  `moose::plugin! { logic: .. }`** (since 7.1.0, removal planned for 8.0).
+- **Breaking: the legacy plugin traits are removed.** `PluginLogic`,
+  `PluginLogic64`, `PurePluginLogic`, `PurePluginLogic64`, the
+  `moose::plugin! { logic: .. }` arm and the `moose::__deprecated` module are
+  gone. They were deprecated earlier in this unreleased cycle (the notes
+  said "since 7.1.0, removal planned for 8.0"); no release ever shipped the
+  deprecation, so they are removed outright instead of lingering until 8.0.
   Implement `moose::Plugin` and export with `plugin: X`; tests and runners
-  name the wrapper `PluginShell`. `PluginLogicCore` (what the wrappers bind)
-  is unchanged. Every in-tree example and plugin except kurv has moved.
+  name the wrapper `PluginShell`. `PluginLogicCore` (what the format
+  wrappers bind) stays public for the macro and `moose-loader`, but is now
+  `#[doc(hidden)]` and no longer re-exported from `moose-gui`.
+- **`cargo moose` debug builds share plain cargo's target cache.** The
+  default `-C target-cpu=x86-64-v3` now applies to release builds only, so
+  `cargo moose run --debug`, `cargo test`, `cargo clippy` and rust-analyzer
+  stop rebuilding every dependency when you switch between them. An
+  explicit `--target-cpu` still applies to every profile.
+- **`cargo moose` cross builds keep their per-target rustflags under a
+  user `RUSTFLAGS`.** Cargo ignores `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` when
+  `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` is set, which silently dropped
+  `target-cpu` and the Windows `+crt-static`. The user's flags are now folded
+  into each per-target variable instead.
+- **`cargo moose new` templates.** The generated CI no longer installs
+  `mold` or exports `RUSTFLAGS` (Rust 1.90+ links with `rust-lld` on x86_64
+  Linux, and `RUSTFLAGS` would override `[target.*].rustflags`), drops the
+  `CARGO_PROFILE_*_DEBUG` env vars already set in `[profile.dev]`, and pins
+  `windows-2025`. A `--no-standalone` README no longer glues the first
+  command onto the opening code fence.
 - **`Plugin::reactivate`.** A host re-activation the processor still fits
   now calls `reactivate(processor, shared, config)` on the main thread
   (default: `reset`), so a plugin can redo what `activate` reads from its

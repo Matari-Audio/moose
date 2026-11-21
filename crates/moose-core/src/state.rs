@@ -238,7 +238,7 @@ pub fn resolve_named_params(state: &mut DeserializedState, catalog: &moose_param
 }
 
 /// Reason a [`crate::PluginRuntime::load_state`] /
-/// `moose_plugin::PluginLogic::load_state` implementation failed to
+/// `moose_plugin::PluginLogicCore::load_state` implementation failed to
 /// interpret the host-supplied extra-state blob. Format wrappers
 /// receive this on the audio-thread apply path and log it; hosts
 /// that surface a non-success code to the DAW (e.g. CLAP

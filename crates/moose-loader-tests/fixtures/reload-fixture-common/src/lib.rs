@@ -7,14 +7,11 @@
 //! whether a reload carried the live state over or re-initialized it.
 //!
 //! `CounterLogic` (keep-a and keep-b) serializes its `counter` through
-//! `save_state` / `load_state`, so a reload between them carries the
-//! count over. `ResetLogic` defines neither, so a reload to it can't
-//! restore the carried blob and starts fresh - the sound fallback.
-//!
-//! Both are deprecated `PluginLogic` adapters on purpose: hot reload carries
-//! processor-side `save_state` / `load_state` blobs, which `moose::Plugin` no
-//! longer has (its custom state lives in `#[persist]`).
+//! `PluginLogicCore::save_state` / `load_state`, so a reload between them
+//! carries the count over. `ResetLogic` defines neither, so a reload to it
+//! can't restore the carried blob and starts fresh - the sound fallback.
 
+use moose::__reexport::moose_plugin::{PluginEditor, PluginLogicCore};
 use moose::prelude::*;
 
 #[derive(Params)]
@@ -46,13 +43,15 @@ fn as_u32(counter: u64) -> u32 {
 
 pub struct CounterLogic;
 
-#[expect(
-    deprecated,
-    reason = "covers the hot-reload carry of the legacy `PluginLogic` path"
-)]
-impl PluginLogic for CounterLogic {
+impl PluginLogicCore<f32> for CounterLogic {
     type Params = FxParams;
     type DspState = CounterState;
+
+    fn init(_params: &FxParams, _cx: &InitContext) -> CounterState {
+        CounterState::default()
+    }
+
+    fn reset(_state: &mut CounterState, _params: &FxParams, _config: &AudioConfig) {}
 
     fn process(
         state: &mut CounterState,
@@ -81,6 +80,10 @@ impl PluginLogic for CounterLogic {
         state.counter = u64::from_le_bytes(bytes);
         Ok(())
     }
+}
+
+impl PluginEditor<f32> for CounterLogic {
+    type Params = FxParams;
 
     fn editor(_params: Arc<FxParams>) -> Box<dyn Editor> {
         Box::new(NoEditor)
@@ -89,13 +92,15 @@ impl PluginLogic for CounterLogic {
 
 pub struct ResetLogic;
 
-#[expect(
-    deprecated,
-    reason = "covers the hot-reload carry of the legacy `PluginLogic` path"
-)]
-impl PluginLogic for ResetLogic {
+impl PluginLogicCore<f32> for ResetLogic {
     type Params = FxParams;
     type DspState = ResetState;
+
+    fn init(_params: &FxParams, _cx: &InitContext) -> ResetState {
+        ResetState::default()
+    }
+
+    fn reset(_state: &mut ResetState, _params: &FxParams, _config: &AudioConfig) {}
 
     fn process(
         state: &mut ResetState,
@@ -112,6 +117,10 @@ impl PluginLogic for ResetLogic {
     fn latency(state: &ResetState) -> u32 {
         as_u32(state.counter)
     }
+}
+
+impl PluginEditor<f32> for ResetLogic {
+    type Params = FxParams;
 
     fn editor(_params: Arc<FxParams>) -> Box<dyn Editor> {
         Box::new(NoEditor)

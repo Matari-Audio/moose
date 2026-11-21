@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # No fuzz/ checkout: truce-audio/truce-fuzz-tests path-depends on
-      # truce-* crates that don't exist here. Restore once MOOSE has its
+      # truce-* crates that don't exist here. Restore once moose has its
       # own harness repo (supply-chain.sh audits fuzz/ when present).
       # cargo-deny shells out to `cargo metadata`, so a toolchain must be
       # on PATH. No workspace compilation happens - both tools only parse

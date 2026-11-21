@@ -39,9 +39,8 @@ stack.
 - **`CpuBackend`** (re-exported from `moose-cpu` with the `cpu` feature) -- the tiny-skia software rasterizer (the `RenderBackend` trait it implements lives in `moose-gui-types`)
 - **`BaseviewTranslator`** -- maps `baseview::Event`s into the
   `InputEvent` stream consumed by `moose_gui_types::interaction::dispatch`
-- **Re-exports** of every `moose-gui-types` and `moose-plugin`
-  public symbol so existing `moose_gui::layout::*` /
-  `moose_gui::PluginLogic` paths keep resolving
+- **Re-exports** of `moose-gui-types` symbols so `moose_gui::layout::*`
+  paths resolve cleanly
 
 ## Widgets
 
@@ -61,4 +60,4 @@ fn editor(params: Arc<MyParams>) -> Box<dyn Editor> {
 }
 ```
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

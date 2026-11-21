@@ -1,19 +1,28 @@
-//! The `plugin!` macro - one macro to export a `PluginLogic` impl
+//! The `plugin!` macro - one macro to export a [`crate::Plugin`] impl
 //! to all formats with zero boilerplate.
 
 /// Export a plugin to all active format targets.
 ///
 /// This is the only macro a developer needs. It generates all format
-/// exports (CLAP, VST3, etc.) based on Cargo features.
+/// exports (CLAP, VST3, AU, etc.) based on Cargo features.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// moose::plugin! {
-///     logic: Gain,
+///     plugin: Gain,
 ///     params: GainParams,
 /// }
+/// // tests: moose_test::assert_valid_info::<PluginShell>();
 /// ```
+///
+/// Both `plugin:` and `params:` are required. For a derived store, `params:`
+/// also identifies its compile-time parameter index. A manual `Params`
+/// adapter can supply `param_index: DerivedStore` when it shares that
+/// derived store's parameter IDs and field names.
+///
+/// The exported wrapper is named `PluginShell`, so the `Plugin` trait
+/// from the prelude stays usable in the invoking module.
 ///
 /// # Feature-combination matrix
 ///
@@ -23,10 +32,10 @@
 ///
 /// | Features                    | Result                                      |
 /// |-----------------------------|---------------------------------------------|
-/// | none                        | `cargo check` / test-only logic dylib       |
+/// | none                        | `cargo check` / test-only plugin dylib      |
 /// | one or more of `clap`, `vst3`, `au` | multi-format cdylib that exports every enabled format from one binary |
-/// | `shell` only                | shell-mode loader (logic dylib loaded at runtime) |
-/// | `shell` + format(s)         | shell-mode cdylib that re-exports the loaded logic to the enabled formats |
+/// | `shell` only                | shell-mode loader (plugin dylib loaded at runtime) |
+/// | `shell` + format(s)         | shell-mode cdylib that re-exports the loaded plugin to the enabled formats |
 ///
 /// `cargo moose build` / `cargo moose install` set the appropriate
 /// features per format on each invocation, so the multi-format case
@@ -38,9 +47,10 @@
 ///
 /// # Hot-reload
 ///
-/// Add a `shell` feature to your Cargo.toml and build the shell with
-/// `--features shell --release`. The logic dylib is built normally
-/// (`cargo build`). The shell watches for changes and hot-reloads.
+/// Add a `shell` feature to your Cargo.toml (`cargo moose new` already
+/// does), install the shell once, then rebuild the plugin dylib
+/// normally. The shell watches for changes and hot-reloads the plugin;
+/// main-thread hooks stay baked into the shell.
 ///
 /// ```toml
 /// [features]
@@ -48,32 +58,11 @@
 /// ```
 ///
 /// ```bash
-/// cargo build --release --features shell  # one-time: install shell
-/// cargo watch -x build                    # iterate: logic hot-reloads
+/// cargo moose install --shell   # one-time: install the shell
+/// cargo watch -x build          # iterate: the plugin hot-reloads
 /// ```
 ///
-/// Zero code changes. Same `moose::plugin!` macro.
-///
-/// # `plugin:` or `logic:`
-///
-/// `plugin: X` exports an `impl moose::Plugin for X` (it is
-/// `logic: moose::Lifecycle<X>`) and names the exported wrapper
-/// `PluginShell` only, so the `Plugin` trait from the prelude stays usable
-/// in the invoking module. `logic: X` exports a `PluginLogic` impl and also
-/// keeps the older `Plugin` alias for the wrapper.
-///
-/// ```ignore
-/// moose::plugin! {
-///     plugin: Gain,
-///     params: GainParams,
-/// }
-/// // tests: moose_test::assert_valid_info::<PluginShell>();
-/// ```
-///
-/// Both `logic:` (or `plugin:`) and `params:` are required. For a derived store, `params:`
-/// also identifies its compile-time parameter index. A manual `Params`
-/// adapter can supply `param_index: DerivedStore` when it shares that
-/// derived store's parameter IDs and field names.
+/// Zero code changes. Same `moose::plugin! { plugin: .. }` invocation.
 #[macro_export]
 macro_rules! plugin {
     (
@@ -98,56 +87,11 @@ macro_rules! plugin {
     ) => {
         $crate::__plugin_impl!(@shell $crate::Lifecycle<$plugin>, $params, $index,);
     };
-    (
-        logic: $logic:ty,
-        params: $params:ty $(,)?
-    ) => {
-        $crate::__plugin_impl!($logic, $params, $params,);
-    };
-    // Opt-in managed background tasks: each listed type implements
-    // `BackgroundTask` and gets its own lane (queue + mode). See the
-    // `tasks` module.
-    (
-        logic: $logic:ty,
-        params: $params:ty,
-        tasks: [$($task:ty),+ $(,)?] $(,)?
-    ) => {
-        $crate::__plugin_impl!($logic, $params, $params, tasks: [$($task),+],);
-    };
-    // A manual Params adapter may expose different wire values while sharing
-    // the IDs and fields of its derived storage type.
-    (
-        logic: $logic:ty,
-        params: $params:ty,
-        param_index: $index:ty $(,)?
-    ) => {
-        $crate::__plugin_impl!($logic, $params, $index,);
-    };
-}
-
-/// Warnings the macros raise at their call site.
-#[doc(hidden)]
-pub mod __deprecated {
-    /// Named by `moose::plugin! { logic: .. }`.
-    #[deprecated(
-        since = "7.1.0",
-        note = "`moose::plugin! { logic: .. }` exports a deprecated `PluginLogic`; implement `moose::Plugin` and use `plugin: X`"
-    )]
-    pub const LOGIC_KEY: () = ();
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __plugin_impl {
-    // `logic:` form (deprecated): also keep the `Plugin` alias for the
-    // wrapper, and warn at the invocation.
-    ($logic:ty, $params:ty, $index:ty, $(tasks: [$($task:ty),+],)?) => {
-        const _: () = $crate::__deprecated::LOGIC_KEY;
-        $crate::__plugin_impl!(@shell $logic, $params, $index, $(tasks: [$($task),+],)?);
-
-        /// Older name of [`PluginShell`], kept for `logic:` exports.
-        pub type Plugin = __HotShellWrapper;
-    };
     (@shell $logic:ty, $params:ty, $index:ty, $(tasks: [$($task:ty),+],)?) => {
         // Compile-time param index: walks the params type's sidecar
         // tree (written by `derive(Params)`) under `target/param-index/`

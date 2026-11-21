@@ -44,4 +44,4 @@ fn editor(params: Arc<MyParams>) -> Box<dyn Editor> {
 }
 ```
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

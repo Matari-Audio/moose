@@ -4,10 +4,6 @@
 //! stores the spawner, `process` stamps it into the `ProcessContext`,
 //! `ctx.tasks::<T>()` recovers it, and the pool runs the handler
 //! off-thread.
-#![expect(
-    deprecated,
-    reason = "covers the deprecated `PluginLogic` path, still supported until it is removed"
-)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,14 +11,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use moose::prelude::BackgroundTask;
+use moose::{Lifecycle, Plugin};
 use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;
 use moose_core::events::{EventList, TransportInfo};
-use moose_core::plugin::PluginRuntime;
+use moose_core::plugin::{
+    PluginRuntime, PreparationConfig, PreparationError, PreparationFrameBound,
+};
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::tasks::{AnyTaskSpawner, TaskSpawner, TaskSpawnerBundle};
+use moose_core::tasks::{AnyTaskSpawner, InitContext, TaskSpawner, TaskSpawnerBundle};
 use moose_derive::Params;
-use moose_gui::PluginLogic;
 
 #[derive(Params)]
 struct TaskParams {
@@ -39,9 +37,20 @@ struct TaskPlugin;
 #[derive(Clone, Copy, Debug)]
 struct Ping;
 
-impl PluginLogic for TaskPlugin {
-    type Params = TaskParams;
-    type DspState = ();
+impl Plugin for TaskPlugin {
+    type Shared = TaskParams;
+    type MainThread = ();
+    type Processor = ();
+
+    fn main_thread(_shared: &Arc<TaskParams>) {}
+
+    fn activate(
+        _shared: &TaskParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<(), PreparationError> {
+        Ok(())
+    }
 
     fn process(
         _state: &mut (),
@@ -91,11 +100,17 @@ fn background_task_runs_when_scheduled_from_process() {
     };
     let tasks = AnyTaskSpawner::new(&spawner);
 
-    let mut shell = moose_loader::static_shell::StaticShell::<TaskParams, TaskPlugin>::from_parts(
-        params,
-        Some(tasks),
-    );
-    shell.reset(&AudioConfig::new(44100.0, 64));
+    let mut shell =
+        moose_loader::static_shell::StaticShell::<TaskParams, Lifecycle<TaskPlugin>>::from_parts(
+            params,
+            Some(tasks),
+        );
+    shell
+        .prepare(&PreparationConfig::new(
+            AudioConfig::new(44100.0, 64),
+            PreparationFrameBound::ExplicitDriver,
+        ))
+        .unwrap();
 
     // One block: `process` schedules a Ping through `ctx.tasks::<Ping>()`.
     let input = vec![0.0f32; 64];

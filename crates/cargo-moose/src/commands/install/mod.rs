@@ -366,8 +366,9 @@ location.
 
 x86_64 builds default to `-C target-cpu=x86-64-v3` (AVX2 + FMA + BMI2)
 so `wide`'s compile-time SIMD dispatch picks the wider path. aarch64
-builds use NEON unconditionally and get no extra flag. Override with
-`--target-cpu`.
+builds use NEON unconditionally and get no extra flag. `--debug` builds
+skip the default so they share plain cargo's target cache. Override
+with `--target-cpu`.
 
 Options:
   --clap           CLAP only

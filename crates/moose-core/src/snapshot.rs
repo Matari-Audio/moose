@@ -89,7 +89,7 @@ impl SnapshotSlot {
     /// **cleared before `write` runs** (its capacity is retained, so a
     /// steady state stays allocation-free), so `write` just fills it and
     /// returns whether a snapshot exists - matching the
-    /// `PluginLogic::snapshot_into` contract, where a writer that only
+    /// `PluginLogicCore::snapshot_into` contract, where a writer that only
     /// `extend`s must not accumulate across blocks. Never blocks - on
     /// lock contention with a reader the publish is skipped and the
     /// previous snapshot stands.
@@ -323,7 +323,7 @@ mod tests {
     fn writer_that_only_appends_does_not_accumulate_across_publishes() {
         // Regression: the framework clears the buffer before each writer
         // runs, so a plugin `snapshot_into` that only `extend`s (per the
-        // `PluginLogic::snapshot_into` "cleared first" contract) must not
+        // `PluginLogicCore::snapshot_into` "cleared first" contract) must not
         // append the new snapshot onto the previous one.
         let slot = SnapshotSlot::new();
         slot.publish(|buf| {

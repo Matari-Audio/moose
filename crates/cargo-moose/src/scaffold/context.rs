@@ -230,6 +230,49 @@ impl MooseTomlContext {
 }
 
 // ---------------------------------------------------------------------------
+// CiContext & ProjectReadmeContext - root-level CI workflow & README.md
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub(crate) struct CiContext {
+    pub rt_paranoid_crates: Vec<String>,
+}
+
+impl CiContext {
+    pub fn new(crate_names: Vec<String>) -> Self {
+        Self {
+            rt_paranoid_crates: crate_names,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct ProjectReadmeContext {
+    pub project_title: String,
+    pub is_workspace: bool,
+    pub has_standalone: bool,
+    pub has_ci: bool,
+    pub plugin_crates: Vec<String>,
+}
+
+impl ProjectReadmeContext {
+    pub fn new(
+        project_name: &str,
+        is_workspace: bool,
+        features: FeatureSet,
+        plugin_crates: Vec<String>,
+    ) -> Self {
+        Self {
+            project_title: to_pascal_case(project_name),
+            is_workspace,
+            has_standalone: features.standalone,
+            has_ci: features.ci,
+            plugin_crates,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers - pure functions producing the precomputed string fields
 // the templates substitute in.
 // ---------------------------------------------------------------------------
