@@ -443,6 +443,9 @@ pub struct Vst3Callbacks {
     pub gui_on_fd: unsafe extern "C" fn(ctx: *mut c_void),
     /// `Editor::on_timer`, from the run loop's 16 ms timer. UI thread.
     pub gui_on_timer: unsafe extern "C" fn(ctx: *mut c_void),
+    /// Bind (non-null) or unbind and close (null) the `HostQueue` wake
+    /// target to the COM `Host` pointer. Called by `Host::new` and `Host::drop`.
+    pub bind_host_queue: unsafe extern "C" fn(ctx: *mut c_void, host: *mut c_void),
     /// Drain the instance's `HostQueue` on the UI thread.
     pub drain_host_queue: unsafe extern "C" fn(ctx: *mut c_void),
     /// `MainThreadHooks::perform_menu` (`IContextMenuTarget::executeMenuItem`).
@@ -527,6 +530,16 @@ pub fn moose_vst3_mark_dirty(ctx: *mut c_void) {
 /// thread to drain it. Safe from any thread, including the audio thread.
 pub fn moose_vst3_flush_host_queue(ctx: *mut c_void) {
     crate::com::flush_host_queue(ctx);
+}
+
+/// Schedule a UI-thread drain of `HostQueue` through a borrowed COM `Host`
+/// pointer. Never pins `Arc<Host>` and never drains synchronously.
+///
+/// # Safety
+/// `host` is a live COM `Host` pointer bound via `bind_host_queue`; the caller
+/// must close `HostQueue` before freeing `host`.
+pub unsafe fn moose_vst3_wake_host_queue(host: *mut c_void) {
+    unsafe { crate::com::wake_host_queue(host) };
 }
 
 /// Flag a parameter presentation revision check on the COM host.

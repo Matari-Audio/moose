@@ -17,7 +17,7 @@ use crate::instance::drain_sysex_input;
 use crate::output_events::NthCursor;
 use crate::output_events::UmpDrainCursor;
 use crate::output_events::typed_midi1_bytes;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use crate::persist_notify;
 use crate::state::StateLoadQueue;
 
@@ -33,8 +33,6 @@ use moose_core::bus_routing::{BusActivation, BusRouting};
 use moose_core::cast::{len_u32, sample_pos_i64};
 use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-use moose_core::editor::SendPtr;
 use moose_core::events::{
     AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
     ExactEventMetadata, LosslessEventCursor, PushError, RawMidi1, RawUmp, TransportInfo,
@@ -52,14 +50,14 @@ use moose_core::ump::{
 };
 use moose_core::wrapper::{
     PluginCell, apply_or_queue_state, apply_queued_state, copy_c_str, custom_state_for_save,
-    enter_plugin, run_audio_block_latched, run_extern_callback_with, shared_plugin,
+    enter_plugin, run_audio_block_latched, run_extern_callback_with,
 };
 use moose_params::Params;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Intentional leaks
@@ -117,17 +115,20 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
             let param_infos = plugin.params().param_catalog();
             let params_arc = plugin.params_arc();
             let wants_persist = params_arc.wants_persist_notifications();
-            let latency_cache = AtomicU32::new(plugin.latency());
-            let tail_cache = AtomicU32::new(plugin.tail());
-            #[cfg(target_os = "macos")]
-            let (persist_dispatch, host_queue) = if wants_persist
-                && let Some((dispatch, wake)) = unsafe { persist_notify::Dispatcher::new() }
-            {
-                (Some(dispatch), Arc::new(HostQueue::new(wake)))
-            } else {
-                (None, Arc::new(HostQueue::new(|| {})))
-            };
-            #[cfg(not(target_os = "macos"))]
+            // Every Apple instance (macOS AUv2/AUv3 and iOS AUv3) gets the
+            // event-driven main-queue dispatch source: latency/tail and
+            // `#[persist]` signals wake the main queue directly without polling.
+            #[cfg(target_vendor = "apple")]
+            let (persist_dispatch, host_queue) =
+                if let Some((dispatch, wake)) = unsafe { persist_notify::Dispatcher::new() } {
+                    (Some(dispatch), Arc::new(HostQueue::new(wake)))
+                } else {
+                    // Without a main-queue wake, runtime delay and persist
+                    // changes could never reach the host. Fail instantiation
+                    // through the existing null-context error contract.
+                    return std::ptr::null_mut();
+                };
+            #[cfg(not(target_vendor = "apple"))]
             let host_queue = Arc::new(HostQueue::new(|| {}));
             let persist_signal = wants_persist.then(|| {
                 let queue = Arc::clone(&host_queue);
@@ -137,19 +138,19 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 params_arc.set_persist_change_signal(Arc::downgrade(&signal));
                 signal
             });
+            let delay = moose_core::delay::ReportedDelay::new(plugin.latency(), plugin.tail());
             let instance = Box::new(AuInstance::<P> {
                 persist_signal,
                 host_queue,
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 persist_dispatch,
                 params_arc,
                 meter_store: plugin.meter_store(),
                 snapshot: plugin.snapshot_slot(),
                 task_spawner: plugin.task_spawner(),
                 editor_builder: plugin.editor_builder(),
-                plugin: shared_plugin(plugin),
-                latency_cache,
-                tail_cache,
+                plugin: PluginCell::new(plugin),
+                delay,
                 render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
                 #[cfg(target_os = "macos")]
                 param_notify: None,
@@ -208,6 +209,17 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                     .collect(),
             });
             let raw = Box::into_raw(instance);
+            #[cfg(target_vendor = "apple")]
+            unsafe {
+                // SAFETY: `raw` is live until `cb_destroy`, which closes
+                // `HostQueue` (joining any in-flight drain) before freeing.
+                if let Some(dispatch) = &(*raw).persist_dispatch {
+                    dispatch.activate::<P>(
+                        Arc::clone(&(*raw).host_queue),
+                        raw.cast::<std::ffi::c_void>(),
+                    );
+                }
+            }
             // Spawn the param-notify thread now that the instance has its final
             // address: the AU shim will map exactly this pointer to its
             // component, and the notifier hands it back to the host-set FFI.
@@ -216,13 +228,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 // SAFETY: `raw` is live until `cb_destroy`, which drops
                 // `param_notify` (joining the thread) before the shim frees the
                 // component; the notifier only uses the pointer as an opaque key.
-                if let Some(dispatch) = &(*raw).persist_dispatch {
-                    dispatch.activate::<P>(
-                        Arc::clone(&(*raw).host_queue),
-                        raw.cast::<std::ffi::c_void>(),
-                    );
-                }
-                let ctx = SendPtr::new(raw.cast::<std::ffi::c_void>().cast_const());
+                let ctx = crate::instance::AuCtx(raw.cast::<std::ffi::c_void>());
                 (*raw).param_notify = ParamNotifier::spawn(ctx);
             }
             raw.cast::<std::ffi::c_void>()
@@ -295,9 +301,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
                 let _rt = RtSection::enter();
                 plugin.reset(&AudioConfig::new(sample_rate, max_frames).with_process_mode(mode));
             }
-            inst.latency_cache
-                .store(plugin.latency(), Ordering::Relaxed);
-            inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+            // A plain reset (maybe on the render thread) keeps the reported
+            // latency and tail; a change shows up at the next block.
             return;
         }
         audio.prepared = false;
@@ -326,9 +331,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
                 return;
             }
             inst.panic_latch.clear();
-            inst.latency_cache
-                .store(plugin.latency(), Ordering::Relaxed);
-            inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+            // The activation: the only place the reported values change.
+            inst.delay.publish(plugin.latency(), plugin.tail());
         }
         audio.prepared_mode = mode_raw;
         audio.prepared = true;
@@ -765,10 +769,8 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         // Take ownership of the plugin for the whole block: an
         // uncontended `Acquire`, never a wait, since the host contract
         // keeps `process` from overlapping a lifecycle callback and host
-        // saves read the snapshot instead of the plugin. Enter through a
-        // local Arc clone so the guard doesn't pin a borrow of `inst`.
-        let plugin_arc = Arc::clone(&inst.plugin);
-        let mut plugin = enter_plugin(&plugin_arc);
+        // saves read the snapshot instead of the plugin.
+        let mut plugin = enter_plugin(&inst.plugin);
 
         // Apply any pending state-load before per-block work so the
         // plugin sees consistent params and extra state for the
@@ -1038,22 +1040,11 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
             .finish_widening(outputs, num_output_channels, len_u32(num_frames));
         scr.output_events.ensure_sorted_by_offset();
 
-        // Refresh latency / tail caches so the host's main-thread
-        // queries don't have to touch the plugin. On an actual
-        // change, flag the polling notifier to broadcast a
-        // `kAudioUnitProperty_Latency` change (AU v2 / macOS). AU v3
-        // (iOS) has no Rust->appex notify path; its host re-reads the
-        // cached value on its own, unchanged.
-        let prev_latency = inst.latency_cache.swap(plugin.latency(), Ordering::Relaxed);
-        #[cfg(target_os = "macos")]
-        if prev_latency != inst.latency_cache.load(Ordering::Relaxed)
-            && let Some(notifier) = &inst.param_notify
-        {
-            notifier.notify_latency();
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = prev_latency;
-        inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+        // A latency or tail change raises a wait-free event signal; the Apple
+        // main-queue dispatch source (`DISPATCH_SOURCE_TYPE_DATA_OR` on macOS
+        // and iOS) commits the observed lane and notifies the host.
+        inst.delay
+            .observe_and_signal(plugin.latency(), plugin.tail(), &inst.host_queue);
     })
     .is_some();
     if !ok {

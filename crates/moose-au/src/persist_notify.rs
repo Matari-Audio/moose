@@ -1,7 +1,8 @@
-//! `AUv2` main-queue dispatch-source wake for the instance's [`HostQueue`].
+//! Apple (`macOS` / `iOS`) main-queue dispatch-source wake for the instance's
+//! [`HostQueue`].
 //!
 //! [`HostQueue`]: moose_core::host_queue::HostQueue
-use moose_core::editor::SendPtr;
+use crate::instance::AuCtx;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
 use moose_core::thread::MainThread;
@@ -34,13 +35,29 @@ unsafe extern "C" {
     fn dispatch_release(source: *mut c_void);
 }
 
+/// Owned libdispatch source pointer.
+#[derive(Clone, Copy)]
+struct DispatchSource(*mut c_void);
+
+impl DispatchSource {
+    fn as_ptr(self) -> *mut c_void {
+        self.0
+    }
+}
+
+// SAFETY: `dispatch_source_merge_data` is thread-safe per libdispatch's API,
+// and `HostQueue::close()` joins every in-flight wake before `Dispatcher::drop`
+// cancels and releases the source.
+unsafe impl Send for DispatchSource {}
+unsafe impl Sync for DispatchSource {}
+
 struct DrainContext {
     queue: Arc<HostQueue>,
-    ctx: SendPtr<c_void>,
+    ctx: AuCtx,
 }
 
 pub(super) struct Dispatcher {
-    source: SendPtr<c_void>,
+    source: DispatchSource,
     activated: AtomicBool,
 }
 
@@ -63,9 +80,9 @@ impl Dispatcher {
             if raw.is_null() {
                 return None;
             }
-            let source = SendPtr::new(raw);
+            let source = DispatchSource(raw);
             let wake = move || {
-                dispatch_source_merge_data(source.as_ptr().cast_mut(), 1);
+                dispatch_source_merge_data(source.as_ptr(), 1);
             };
             Some((
                 Self {
@@ -79,13 +96,10 @@ impl Dispatcher {
 
     /// Bind the instance pointer and resume the main-queue source.
     pub(super) unsafe fn activate<P: PluginExport>(&self, queue: Arc<HostQueue>, ctx: *mut c_void) {
-        let raw = self.source.as_ptr().cast_mut();
+        let raw = self.source.0;
         let drain_ctx = Box::into_raw(Box::new(DrainContext {
             queue,
-            // SAFETY: `drain` only dereferences `ctx` inside `queue.with_open`,
-            // which `cb_destroy` waits out via `host_queue.close()` before
-            // freeing the instance.
-            ctx: unsafe { SendPtr::new(ctx.cast_const()) },
+            ctx: AuCtx(ctx),
         }));
         unsafe {
             dispatch_set_context(raw, drain_ctx.cast());
@@ -99,7 +113,7 @@ impl Dispatcher {
 
 impl Drop for Dispatcher {
     fn drop(&mut self) {
-        let raw = self.source.as_ptr().cast_mut();
+        let raw = self.source.0;
         // SAFETY: libdispatch forbids releasing a suspended source. If
         // creation unwound before `activate`, cancel and resume before
         // releasing so disposal never aborts the host. When activated,
@@ -121,7 +135,7 @@ unsafe extern "C" fn drain<P: PluginExport>(raw: *mut c_void) {
         let context = &*raw.cast::<DrainContext>();
         context.queue.with_open(|| {
             let main = MainThread::assume();
-            crate::gui::drain_host_queue::<P>(context.ctx.as_ptr().cast_mut(), &main);
+            crate::gui::drain_host_queue::<P>(context.ctx.as_ptr(), &main);
         });
     });
 }

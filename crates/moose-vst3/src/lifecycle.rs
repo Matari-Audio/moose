@@ -17,7 +17,6 @@ use moose_core::TransportSlot;
 use moose_core::buffer::RawBufferScratch;
 use moose_core::bus::{BusConfig, BusKind, BusLayout};
 use moose_core::config::{AudioConfig, ProcessMode};
-use moose_core::editor::SendPtr;
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
@@ -31,13 +30,12 @@ use moose_core::state;
 use moose_core::thread::{MainThread, MainThreadCell};
 use moose_core::wrapper::{
     PluginCell, apply_queued_state, enter_plugin, find_bus_layout, run_extern_callback_with,
-    shared_plugin,
 };
 use moose_params::{MidiSource, ParamFunction, ParamRange, Params, PersistChangeSignal};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // C callback implementations
@@ -80,14 +78,24 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
             midi_maps.sort_by_key(|(id, _)| *id);
             let params_arc = plugin.params_arc();
             let mut hooks = plugin.main_thread();
-            // The queue wake learns the instance once it is boxed; `cb_destroy`
-            // closes it before the free.
-            let notice_ctx = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+            // The queue wake learns the borrowed COM `Host` pointer once
+            // `Host::new` registers it, and `Host::drop` clears it and closes
+            // the queue (joining any in-flight wake) before tearing down `Host`
+            // or its OS wakes. The wake never pins `Arc<Host>`, so it can never
+            // run `Host::drop` -> `close()` and self-deadlock.
+            let host_wake_target =
+                Arc::new(AtomicPtr::<std::ffi::c_void>::new(std::ptr::null_mut()));
             let host_queue = Arc::new(HostQueue::new({
-                let notice_ctx = Arc::clone(&notice_ctx);
-                // SAFETY: the pointer is the live instance until
-                // `cb_destroy` closes this wake.
-                move || unsafe { host_notice_woke(notice_ctx.load(Ordering::Acquire)) }
+                let host_wake_target = Arc::clone(&host_wake_target);
+                move || {
+                    let host = host_wake_target.load(Ordering::Acquire);
+                    if !host.is_null() {
+                        // SAFETY: `cb_bind_host_queue(ctx, null)` clears
+                        // `host_wake_target` and calls `host_queue.close()`
+                        // before `Host::drop` tears down `Host` or its wakes.
+                        unsafe { ffi::moose_vst3_wake_host_queue(host) };
+                    }
+                }
             }));
             let host_notifier = HostNotifier::from_queue(Arc::clone(&host_queue));
             hooks.connect(host_notifier);
@@ -96,8 +104,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
             let snapshot = plugin.snapshot_slot();
             let task_spawner = plugin.task_spawner();
             let editor_builder = plugin.editor_builder();
-            let latency_cache = AtomicU32::new(plugin.latency());
-            let tail_cache = AtomicU32::new(plugin.tail());
+            let delay = moose_core::delay::ReportedDelay::new(plugin.latency(), plugin.tail());
             let midi_proxy_ids = allocate_midi_proxy_ids(&param_infos, midi_proxy_len::<P>());
             // One point per parameter per block fits next to the note
             // events; a mapped controller pushes two (event + change).
@@ -115,7 +122,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 persist_signal: std::sync::Mutex::new(None),
                 catalog_signal: std::sync::Mutex::new(None),
                 main_thread,
-                plugin: shared_plugin(plugin),
+                plugin: PluginCell::new(plugin),
                 params_arc,
                 meter_store,
                 snapshot,
@@ -131,8 +138,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
                 panic_latch: moose_core::wrapper::PanicLatch::new(),
-                latency_cache,
-                tail_cache,
+                delay,
                 midi_proxy_ids,
                 midi_proxy_values,
                 host_scale: AtomicU64::new(0),
@@ -159,23 +165,28 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 }),
                 gui: PluginCell::new(Vst3Gui { editor: None }),
                 host_queue,
+                host_wake_target,
             });
-            let raw = Box::into_raw(instance);
-            notice_ctx.store(raw.cast(), Ordering::Release);
-            raw.cast::<std::ffi::c_void>()
+            Box::into_raw(instance).cast::<std::ffi::c_void>()
         },
     )
 }
 
-/// The instance's [`HostQueue`] woke: flush if on the UI thread, or schedule
-/// a UI-thread drain.
-///
-/// # Safety
-/// `ctx` is null or a live `Vst3Instance<P>`.
-pub(crate) unsafe fn host_notice_woke(ctx: *mut std::ffi::c_void) {
-    if !ctx.is_null() {
-        ffi::moose_vst3_flush_host_queue(ctx);
-    }
+/// Bind (non-null) or unbind and close (null) the instance's [`HostQueue`]
+/// wake target against the COM `Host`.
+pub(crate) unsafe extern "C" fn cb_bind_host_queue<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    host: *mut std::ffi::c_void,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "bind_host_queue", (), || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return;
+        };
+        inst.host_wake_target.store(host, Ordering::Release);
+        if host.is_null() {
+            inst.host_queue.close();
+        }
+    });
 }
 
 /// Drain the instance's [`HostQueue`] on the host UI thread.
@@ -202,7 +213,17 @@ pub(crate) unsafe extern "C" fn cb_drain_host_queue<P: PluginExport>(ctx: *mut s
             restart |= K_PARAM_VALUES_CHANGED;
         }
         if signals.contains(HostSignal::LATENCY) {
-            restart |= K_LATENCY_CHANGED;
+            // VST3 hosts may re-read `getLatencySamples` immediately inside
+            // `restartComponent(kLatencyChanged)` without calling
+            // `setupProcessing` again. Commit only the latency lane here so a
+            // tail-only drain can never silently publish a racing latency change.
+            if inst.delay.commit_latency() {
+                restart |= K_LATENCY_CHANGED;
+            }
+        }
+        if signals.contains(HostSignal::TAIL) {
+            // Commit tail independently without requesting a PDC restart.
+            let _ = inst.delay.commit_tail();
         }
         if restart != 0 {
             ffi::moose_vst3_mark_restart(ctx, restart);
@@ -293,6 +314,22 @@ pub(crate) unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
     });
 }
 
+/// Opaque COM-layer context passed back to `wake` in [`rebind_signal`].
+#[derive(Clone, Copy)]
+struct WakeContext(*mut std::ffi::c_void);
+
+impl WakeContext {
+    fn as_ptr(self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
+// SAFETY: the caller keeps `wake_context` alive until the next rebind of
+// `slot`, and `old.close()` in `rebind_signal` joins every in-flight wake
+// before the caller releases it.
+unsafe impl Send for WakeContext {}
+unsafe impl Sync for WakeContext {}
+
 /// Close the signal in `slot` (waiting for a running wake) and, with
 /// `wake`, install one that signals `queue_signal` and calls
 /// `wake(wake_context)`; returns it for the params setter.
@@ -312,15 +349,13 @@ pub(crate) unsafe fn rebind_signal(
         old.close();
     }
     let wake = wake?;
-    // SAFETY: the caller keeps `wake_context` alive until it rebinds, and
-    // `close` in that rebind waits out a running wake.
-    let context = unsafe { SendPtr::new(wake_context) };
+    let context = WakeContext(wake_context);
     // SAFETY: as above; `wake` is the COM layer's wake for that context.
     let signal = Arc::new(PersistChangeSignal::new(move || unsafe {
         if let Some((queue, bit)) = &queue_signal {
             queue.signal(*bit);
         }
-        wake(context.as_ptr().cast_mut());
+        wake(context.as_ptr());
     }));
     let weak = Arc::downgrade(&signal);
     *binding = Some(signal);
@@ -341,10 +376,6 @@ pub(crate) unsafe extern "C" fn cb_set_catalog_waker<P: PluginExport>(
             Some((Arc::clone(&instance.host_queue), HostSignal::PRESENTATION)),
         ) {
             instance.params_arc.set_catalog_signal(signal);
-            // Now that the COM Host has registered `ctx`, drain any
-            // `HostNotice` raised synchronously during `hooks.connect(...)`
-            // before the instance was registered.
-            host_notice_woke(ctx);
         }
     });
 }
@@ -598,9 +629,8 @@ pub(crate) unsafe extern "C" fn cb_prepare<P: PluginExport>(
                 return 0;
             }
             inst.panic_latch.clear();
-            inst.latency_cache
-                .store(plugin.latency(), Ordering::Relaxed);
-            inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+            // The activation: the only place the reported values change.
+            inst.delay.publish(plugin.latency(), plugin.tail());
         }
         audio.output_note_ids.clear();
         audio.pending_output_mutation = PendingOutputMutation::None;
@@ -631,9 +661,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
                     .with_process_mode(vst3_process_mode(process_mode)),
             );
         }
-        inst.latency_cache
-            .store(plugin.latency(), Ordering::Relaxed);
-        inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+        // Latency and tail stay as reported at activation; a change shows
+        // up at the next block, which asks the host to restart.
         audio.output_note_ids.clear();
         audio.pending_output_mutation = PendingOutputMutation::None;
     });

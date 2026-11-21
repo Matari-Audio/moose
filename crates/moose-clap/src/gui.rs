@@ -66,7 +66,6 @@ use clap_sys::ext::track_info::{
     CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, clap_plugin_track_info,
 };
 use clap_sys::ext::voice_info::{CLAP_EXT_VOICE_INFO, clap_plugin_voice_info};
-use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use moose_core::config::ProcessMode;
 use moose_core::editor::{Editor, RawWindowHandle, fit_logical_size};
@@ -135,7 +134,7 @@ pub(crate) unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
         #[cfg(all(target_os = "linux", feature = "clap-draft"))]
         if api == wayland_nested::API {
             let data = data_from_plugin::<P>(plugin);
-            if is_floating || !wayland_nested::host_supports(data.host) {
+            if is_floating || !wayland_nested::host_supports(data.host.as_ptr()) {
                 return false;
             }
             let mut gui = data.gui.enter();
@@ -320,7 +319,7 @@ pub(crate) unsafe extern "C" fn gui_destroy<P: PluginExport>(plugin: *const clap
             gui.visible = false;
             gui.gui_created = false;
             #[cfg(all(target_os = "linux", feature = "clap-draft"))]
-            wayland_nested::unregister(data.host, &mut gui.nested);
+            wayland_nested::unregister(data.host.as_ptr(), &mut gui.nested);
             gui.editor.take()
         };
         // Both `editor.close()` and the `Box<dyn Editor>` drop run author
@@ -737,27 +736,20 @@ pub(crate) unsafe extern "C" fn gui_suggest_title<P: PluginExport>(
 /// doesn't expose the gui extension. Logical-to-physical scaling
 /// matches `gui_get_size`.
 pub(crate) unsafe fn request_host_resize(
-    host: *const clap_host,
+    host: crate::host_handle::HostHandle<crate::host_handle::Any>,
     host_scale: f64,
     lw: u32,
     lh: u32,
 ) -> bool {
     unsafe {
-        if host.is_null() {
-            return false;
-        }
-        let Some(get_ext) = (*host).get_extension else {
+        let Some(host_gui) = host.extension::<clap_host_gui>(CLAP_EXT_GUI) else {
             return false;
         };
-        let host_gui_ptr = get_ext(host, CLAP_EXT_GUI.as_ptr()).cast::<clap_host_gui>();
-        if host_gui_ptr.is_null() {
-            return false;
-        }
-        let Some(req) = (*host_gui_ptr).request_resize else {
+        let Some(req) = host_gui.request_resize else {
             return false;
         };
         let (pw, ph) = scale_logical_to_physical(lw, lh, host_scale);
-        req(host, pw, ph)
+        req(host.as_ptr(), pw, ph)
     }
 }
 
@@ -966,14 +958,14 @@ pub(crate) struct Extensions<P: PluginExport> {
 pub(crate) unsafe extern "C" fn latency_get<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        data.latency_cache.load(Ordering::Relaxed)
+        data.delay.latency()
     }
 }
 
 pub(crate) unsafe extern "C" fn tail_get<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        data.tail_cache.load(Ordering::Relaxed)
+        data.delay.tail()
     }
 }
 

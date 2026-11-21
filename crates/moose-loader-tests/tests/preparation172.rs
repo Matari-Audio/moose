@@ -1,5 +1,7 @@
 //! Real generated-symbol tests; root runner must provide exact built SDK rlibs.
 //! No skipping, no guessed target directory, no dependency/manifest mutation.
+//! The fixtures are deprecated `PluginLogic` adapters on purpose (their
+//! processor-side state hooks are gone from `moose::Plugin`).
 #![cfg(feature = "shell")]
 use moose_core::{
     AudioConfig,

@@ -87,6 +87,9 @@ impl PluginRuntime for Probe {
         }
         Ok(())
     }
+    fn tail(&self) -> u32 {
+        PROBE_TAIL.get()
+    }
     fn process(
         &mut self,
         audio: &mut AudioBuffer,
@@ -112,6 +115,7 @@ static TEST_ALLOC: moose_core::rt::RtCheckAlloc = moose_core::rt::RtCheckAlloc::
 thread_local! {
     static PANIC_IN_PROCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ALLOC_IN_RESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROBE_TAIL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn with_probe(test: impl FnOnce(*const clap_plugin)) {
@@ -352,22 +356,157 @@ fn active_latency_change_requests_restart_without_changed_callback() {
         let active_latency = latency_get::<Probe>(plugin);
         // A block saw the plugin's latency move: the restart is requested,
         // but the host keeps reading the active latency until then.
-        data_from_plugin::<Probe>(plugin)
-            .latency_live
-            .store(active_latency + 64, Ordering::Relaxed);
-        data_from_plugin::<Probe>(plugin)
-            .host_queue
-            .signal(moose_core::host_queue::HostSignal::LATENCY);
+        let data = data_from_plugin::<Probe>(plugin);
+        data.delay
+            .observe_and_signal(active_latency + 64, 0, &data.host_queue);
+        assert!(
+            data.host_queue
+                .pending()
+                .contains(moose_core::host_queue::HostSignal::LATENCY)
+        );
         callbacks.on_main_thread.unwrap()(plugin);
         assert_eq!(calls[0].load(Ordering::Relaxed), 1);
         assert_eq!(calls[1].load(Ordering::Relaxed), 0);
         assert_eq!(latency_get::<Probe>(plugin), active_latency);
         callbacks.deactivate.unwrap()(plugin);
+        // CLAP 1.2 `clap_host_latency.changed` is `[main-thread & being-activated]`:
+        // an inactive `on_main_thread` drain must NOT invoke `latency.changed`;
+        // instead, `activate` emits it when the freshly prepared latency differs.
         data_from_plugin::<Probe>(plugin)
             .host_queue
             .signal(moose_core::host_queue::HostSignal::LATENCY);
         callbacks.on_main_thread.unwrap()(plugin);
+        assert_eq!(calls[1].load(Ordering::Relaxed), 0);
+        // Simulate a previously reported latency different from the freshly
+        // prepared one so `activate` sees a real change and calls `changed`.
+        data_from_plugin::<Probe>(plugin)
+            .delay
+            .publish(active_latency + 64, 0);
+        assert!(callbacks.activate.unwrap()(plugin, 48000., 1, 1024));
         assert_eq!(calls[1].load(Ordering::Relaxed), 1);
+        callbacks.deactivate.unwrap()(plugin);
+        callbacks.destroy.unwrap()(plugin);
+    }
+}
+
+#[test]
+fn active_tail_change_notifies_clap_tail_without_requesting_restart() {
+    use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
+    unsafe extern "C" fn restart(host: *const clap_host) {
+        (unsafe { &*(*host).host_data.cast::<[AtomicU32; 2]>() })[0]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe extern "C" fn tail_changed(host: *const clap_host) {
+        (unsafe { &*(*host).host_data.cast::<[AtomicU32; 2]>() })[1]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+        static TAIL: clap_host_tail = clap_host_tail {
+            changed: Some(tail_changed),
+        };
+        if unsafe { CStr::from_ptr(id) } == CLAP_EXT_TAIL {
+            (&raw const TAIL).cast()
+        } else {
+            ptr::null()
+        }
+    }
+    struct ResetTail;
+    impl Drop for ResetTail {
+        fn drop(&mut self) {
+            PROBE_TAIL.set(0);
+        }
+    }
+    let _reset = ResetTail;
+    PROBE_TAIL.set(128);
+    unsafe {
+        let calls = [AtomicU32::new(0), AtomicU32::new(0)];
+        let mut host: clap_host = std::mem::zeroed();
+        host.clap_version = clap_sys::version::CLAP_VERSION;
+        host.host_data = (&raw const calls).cast_mut().cast();
+        host.get_extension = Some(extension);
+        host.request_restart = Some(restart);
+        let descriptor = DescriptorHolder::new(&Probe::info());
+        let plugin =
+            create_plugin_instance::<Probe>(&raw const descriptor.descriptor, &raw const host);
+        let callbacks = &*plugin;
+        assert!(callbacks.init.unwrap()(plugin));
+        assert!(callbacks.activate.unwrap()(plugin, 48000., 1, 1024));
+        assert!(callbacks.start_processing.unwrap()(plugin));
+        let tail_ext = &*callbacks.get_extension.unwrap()(plugin, CLAP_EXT_TAIL.as_ptr())
+            .cast::<clap_plugin_tail>();
+        assert_eq!(tail_ext.get.unwrap()(plugin), 128);
+
+        // Change tail while active: `process` must publish atomically and call
+        // `[audio-thread]` `clap_host_tail::changed` without requesting restart.
+        PROBE_TAIL.set(1024);
+        let mut in_l = [0.0f32; 4];
+        let mut in_r = [0.0f32; 4];
+        let mut out_l = [0.0f32; 4];
+        let mut out_r = [0.0f32; 4];
+        let mut in_ptrs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+        let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+        let mut in_buf = clap_audio_buffer {
+            data32: in_ptrs.as_mut_ptr(),
+            data64: ptr::null_mut(),
+            channel_count: 2,
+            latency: 0,
+            constant_mask: 0,
+        };
+        let mut out_buf = clap_audio_buffer {
+            data32: out_ptrs.as_mut_ptr(),
+            data64: ptr::null_mut(),
+            channel_count: 2,
+            latency: 0,
+            constant_mask: 0,
+        };
+        let proc = clap_process {
+            steady_time: 0,
+            frames_count: 4,
+            transport: ptr::null(),
+            audio_inputs: &raw mut in_buf,
+            audio_outputs: &raw mut out_buf,
+            audio_inputs_count: 1,
+            audio_outputs_count: 1,
+            in_events: ptr::null(),
+            out_events: ptr::null(),
+        };
+        assert_eq!(
+            callbacks.process.unwrap()(plugin, &raw const proc),
+            CLAP_PROCESS_CONTINUE
+        );
+        assert_eq!(tail_ext.get.unwrap()(plugin), 1024);
+        assert_eq!(
+            calls[1].load(Ordering::Relaxed),
+            1,
+            "clap.tail.changed must fire on audio thread"
+        );
+        assert_eq!(
+            calls[0].load(Ordering::Relaxed),
+            0,
+            "tail-only change must not request restart"
+        );
+        assert!(
+            !data_from_plugin::<Probe>(plugin)
+                .host_queue
+                .pending()
+                .contains(moose_core::host_queue::HostSignal::LATENCY)
+        );
+        callbacks.on_main_thread.unwrap()(plugin);
+        assert_eq!(
+            calls[0].load(Ordering::Relaxed),
+            0,
+            "main-thread drain must not request restart"
+        );
+
+        // Second block at the same tail does not re-notify.
+        assert_eq!(
+            callbacks.process.unwrap()(plugin, &raw const proc),
+            CLAP_PROCESS_CONTINUE
+        );
+        assert_eq!(calls[1].load(Ordering::Relaxed), 1);
+
+        callbacks.stop_processing.unwrap()(plugin);
+        callbacks.deactivate.unwrap()(plugin);
         callbacks.destroy.unwrap()(plugin);
     }
 }

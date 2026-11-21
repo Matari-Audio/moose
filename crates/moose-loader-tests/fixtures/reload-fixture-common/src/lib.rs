@@ -10,6 +10,10 @@
 //! `save_state` / `load_state`, so a reload between them carries the
 //! count over. `ResetLogic` defines neither, so a reload to it can't
 //! restore the carried blob and starts fresh - the sound fallback.
+//!
+//! Both are deprecated `PluginLogic` adapters on purpose: hot reload carries
+//! processor-side `save_state` / `load_state` blobs, which `moose::Plugin` no
+//! longer has (its custom state lives in `#[persist]`).
 
 use moose::prelude::*;
 

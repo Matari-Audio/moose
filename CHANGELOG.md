@@ -4,6 +4,12 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Breaking: `moose::Plugin` drops its processor-side custom-state hooks.**
+  `save_state`, `load_state`, `snapshot_into`, `snapshot_version`,
+  `snapshot_prealloc_hint` and `SNAPSHOTS` are gone; keep custom state in
+  `#[persist]` fields on `Shared`. `state_changed` stays (it runs after a host
+  load lands, with the loaded params in `shared`). The deprecated
+  `PluginLogic` adapter keeps the old hooks for one release.
 - **Parameter edit counters are per instance (D5).** A setter counts only on
   its own tree's counter (or the field's own, outside a tree); the
   process-wide `EDIT_EPOCH` is gone. A hand-written `Params` impl without a
@@ -29,6 +35,16 @@ Notable changes per release.
   VST3 sends `kIoChanged`. AU drops it for now.
 - **CLAP latency is fixed at `activate`.** A change while active requests a
   restart and is reported after reactivation.
+- **Latency and tail are reported cleanly per format lifecycle.**
+  `moose_core::delay::ReportedDelay` keeps independent atomic `(reported, seen)`
+  lanes for latency and tail so main-thread queries never enter the processor
+  cell. CLAP publishes latency in `activate` (`clap.latency.changed` on
+  activation change; active latency changes request a restart) and publishes
+  tail changes directly from `[audio-thread]` via `clap.tail.changed` without
+  restarting. VST3 and AU commit only the signaled lane on the main-thread
+  drain (`HostSignal::LATENCY` -> `kLatencyChanged` / `kAudioUnitProperty_Latency`;
+  `HostSignal::TAIL` -> `kAudioUnitProperty_TailTime` on AU, silent commit on
+  VST3 without a PDC restart).
 - **Deprecated: `PluginLogic`, `PluginLogic64`, `PurePluginLogic(64)` and
   `moose::plugin! { logic: .. }`** (since 7.1.0, removal planned for 8.0).
   Implement `moose::Plugin` and export with `plugin: X`; tests and runners

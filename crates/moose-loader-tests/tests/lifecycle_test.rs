@@ -3,8 +3,8 @@
 // The asserted values (0.0, 0.5, 1.0, 100.0) are exact in f32 and f64.
 #![allow(clippy::float_cmp)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use moose::prelude::{Editor, PluginContext, PreparationError};
 use moose::{Lifecycle, Plugin};
@@ -15,18 +15,20 @@ use moose_core::events::{EventList, TransportInfo};
 use moose_core::main_thread::{MainThreadHooks, TrackInfo};
 use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::state::StateLoadError;
 use moose_core::tasks::InitContext;
 use moose_core::thread::MainThread;
 use moose_derive::Params;
 use moose_gui::PluginLogicCore;
 use moose_loader::static_shell::StaticShell;
-use moose_params::{FloatParam, FloatParamReadF32 as _};
+use moose_params::{FloatParam, FloatParamReadF32 as _, Params as _};
 
 #[derive(Params)]
 struct LcParams {
     #[param(id = 0, name = "Level", range = "linear(0, 1)", default = 0.5)]
     level: FloatParam,
+    /// Custom state, saved and restored with the params.
+    #[persist = "value"]
+    value: Mutex<u32>,
     /// Main-thread hooks write here so the test can see they ran.
     #[skip]
     track_seen: AtomicBool,
@@ -35,7 +37,7 @@ struct LcParams {
     refuse: AtomicBool,
 }
 
-/// Counts what reached it; `value` is its custom state.
+/// Counts what reached it; `value` is read from `#[persist]` at activation.
 struct Counter {
     blocks: u32,
     resets: u32,
@@ -64,8 +66,6 @@ impl Plugin for Lc {
         Hooks(Arc::clone(shared))
     }
 
-    const SNAPSHOTS: bool = true;
-
     fn activate(
         shared: &LcParams,
         _config: &AudioConfig,
@@ -78,7 +78,7 @@ impl Plugin for Lc {
         Ok(Counter {
             blocks: 0,
             resets: 0,
-            value: 0,
+            value: *shared.value.lock().expect("value lock"),
             changed: 0,
         })
     }
@@ -100,31 +100,9 @@ impl Plugin for Lc {
         ProcessStatus::KeepAlive
     }
 
-    fn save_state(processor: &Counter) -> Vec<u8> {
-        processor.value.to_le_bytes().to_vec()
-    }
-
-    fn load_state(processor: &mut Counter, data: &[u8]) -> Result<(), StateLoadError> {
-        Self::validate_state(data)?;
-        let bytes: [u8; 4] = data.try_into().expect("validated length");
-        processor.value = u32::from_le_bytes(bytes);
-        Ok(())
-    }
-
-    fn state_changed(processor: &mut Counter, _shared: &LcParams) {
+    fn state_changed(processor: &mut Counter, shared: &LcParams) {
         processor.changed += 1;
-    }
-
-    fn snapshot_version(processor: &Counter) -> Option<u64> {
-        Some(u64::from(processor.value))
-    }
-
-    fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
-        if data.len() == 4 {
-            Ok(())
-        } else {
-            Err(StateLoadError::Malformed("Counter expects 4 bytes"))
-        }
+        processor.value = *shared.value.lock().expect("value lock");
     }
 
     fn editor(_shared: Arc<LcParams>) -> Box<dyn Editor> {
@@ -218,29 +196,13 @@ fn reset_and_process_reach_the_processor() {
 }
 
 #[test]
-fn state_loaded_before_activate_reaches_the_processor() {
-    let (mut plugin, _params) = shell();
-    assert!(
-        plugin.load_state(&[1, 2]).is_err(),
-        "validated while inactive"
-    );
-    plugin
-        .load_state(&7u32.to_le_bytes())
-        .expect("valid state queues");
-    assert_eq!(
-        plugin.save_state(),
-        7u32.to_le_bytes(),
-        "pending state saves"
-    );
+fn persist_state_set_before_activate_reaches_the_processor() {
+    let (mut plugin, params) = shell();
+    *params.value.lock().unwrap() = 7;
     plugin.prepare(&config()).expect("activates");
     assert_eq!(plugin.state_ref().processor().map(|p| p.value), Some(7));
-    assert_eq!(
-        plugin.state_ref().processor().map(|p| p.changed),
-        Some(1),
-        "state_changed follows the deferred load"
-    );
 
-    // Re-activation (new sample rate) carries the state to the new processor.
+    // Re-activation (new sample rate) builds a new processor from `shared`.
     let before = ACTIVATIONS.load(Ordering::Relaxed);
     plugin
         .prepare(&config_at(96_000.0, 64))
@@ -262,40 +224,40 @@ fn main_thread_hooks_object_is_returned() {
 
 #[test]
 fn state_changed_follows_a_live_load() {
-    let (mut plugin, _params) = shell();
+    let (mut plugin, params) = shell();
     plugin.prepare(&config()).expect("activates");
-    plugin.load_state(&9u32.to_le_bytes()).expect("loads");
+    // A host load restores `#[persist]` on the params, then the shell runs
+    // the custom-state step, which ends in `state_changed`.
+    params.load_persist(&params_with_value(9).serialize_persist());
+    plugin.load_state(&[]).expect("loads");
     let processor = plugin.state_ref().processor().expect("active");
     assert_eq!((processor.value, processor.changed), (9, 1));
 }
 
+fn params_with_value(value: u32) -> LcParams {
+    let params = LcParams::new();
+    *params.value.lock().unwrap() = value;
+    params
+}
+
+/// `moose::Plugin` keeps its custom state in `#[persist]`, so the processor
+/// never publishes a snapshot or a save blob of its own.
 #[test]
-fn snapshot_capability_is_static_and_tracks_the_processor() {
+fn processor_side_custom_state_is_gone() {
     type Logic = Lifecycle<Lc>;
     let (mut plugin, _params) = shell();
+    plugin.prepare(&config()).expect("activates");
     let mut buf = Vec::new();
-    // Probed before any processor exists: still a publisher.
-    assert!(<Logic as PluginLogicCore<f32>>::snapshot_into(
+    assert!(!<Logic as PluginLogicCore<f32>>::snapshot_into(
         plugin.state_ref(),
         &mut buf
     ));
-    assert!(buf.is_empty(), "no state yet");
+    assert_eq!(buf, [] as [u8; 0]);
     assert_eq!(
         <Logic as PluginLogicCore<f32>>::snapshot_version(plugin.state_ref()),
         None
     );
-
-    plugin.prepare(&config()).expect("activates");
-    plugin.load_state(&3u32.to_le_bytes()).expect("loads");
-    assert!(<Logic as PluginLogicCore<f32>>::snapshot_into(
-        plugin.state_ref(),
-        &mut buf
-    ));
-    assert_eq!(buf, 3u32.to_le_bytes());
-    assert_eq!(
-        <Logic as PluginLogicCore<f32>>::snapshot_version(plugin.state_ref()),
-        Some(3)
-    );
+    assert_eq!(plugin.save_state(), [] as [u8; 0]);
 }
 
 #[test]

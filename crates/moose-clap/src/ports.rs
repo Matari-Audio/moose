@@ -6,8 +6,8 @@ use crate::data_from_plugin;
 
 use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_AUDIO_PORT_PREFERS_64BITS, CLAP_AUDIO_PORT_SUPPORTS_64BITS,
-    CLAP_AUDIO_PORTS_RESCAN_LIST, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO,
-    clap_audio_port_info, clap_host_audio_ports, clap_plugin_audio_ports,
+    CLAP_AUDIO_PORTS_RESCAN_LIST, CLAP_PORT_MONO, CLAP_PORT_STEREO, clap_audio_port_info,
+    clap_plugin_audio_ports,
 };
 use clap_sys::ext::audio_ports_config::{clap_audio_ports_config, clap_plugin_audio_ports_config};
 use clap_sys::ext::configurable_audio_ports::clap_audio_port_configuration_request;
@@ -280,25 +280,18 @@ pub(crate) unsafe extern "C" fn audio_ports_config_select<P: PluginExport>(
 ///
 /// # Safety
 /// `data.host` is null or the live host of this instance.
-pub(crate) unsafe fn host_rescan_audio_ports<P: PluginExport>(data: &ClapPluginData<P>) {
+pub(crate) unsafe fn host_rescan_audio_ports<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    main: &moose_core::thread::MainThread,
+) {
     // Per `clap.audio-ports-activation`, `CLAP_AUDIO_PORTS_RESCAN_LIST`
     // invalidates the activation state and resets ports to active.
     clear_ports_inactive(data);
-    let host = data.host;
-    // SAFETY: caller contract; `get_extension` is [thread-safe].
+    // SAFETY: caller contract; `audio_ports_rescan` is `[main-thread]`.
     unsafe {
-        if host.is_null() {
-            return;
-        }
-        let Some(get) = (*host).get_extension else {
-            return;
-        };
-        let ext = get(host, CLAP_EXT_AUDIO_PORTS.as_ptr()).cast::<clap_host_audio_ports>();
-        if !ext.is_null()
-            && let Some(rescan) = (*ext).rescan
-        {
-            rescan(host, CLAP_AUDIO_PORTS_RESCAN_LIST);
-        }
+        data.host
+            .on_main_thread(main)
+            .audio_ports_rescan(CLAP_AUDIO_PORTS_RESCAN_LIST);
     }
 }
 

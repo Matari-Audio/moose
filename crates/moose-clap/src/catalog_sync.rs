@@ -120,7 +120,7 @@ pub(crate) unsafe fn sync_parameters<P: PluginExport>(
     let republished = list_dirty && unsafe { publish_list(data, main) };
     if revised && !republished {
         // SAFETY: forwarded caller contract.
-        unsafe { refresh_remote_control_pages(data) };
+        unsafe { refresh_remote_control_pages(data, main) };
     }
 
     let mut flags = 0;
@@ -133,15 +133,14 @@ pub(crate) unsafe fn sync_parameters<P: PluginExport>(
     if revised || changes.flags.contains(CatalogChange::INFO) {
         flags |= CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT;
     }
-    if flags != 0
-        && !data.host_params.is_null()
-        && !data.host.is_null()
-        // SAFETY: a non-null host extension stays valid for the instance.
-        && let Some(rescan) = unsafe { (*data.host_params).rescan }
-    {
-        // SAFETY: `rescan` is [main-thread]; RESCAN_ALL is set only after
-        // `publish_list` ran inactive.
-        unsafe { rescan(data.host, flags) };
+    if flags != 0 {
+        // SAFETY: `params_rescan` is [main-thread]; RESCAN_ALL is set only
+        // after `publish_list` ran inactive.
+        unsafe {
+            data.host
+                .on_main_thread(main)
+                .params_rescan(data.host_params, flags);
+        }
     }
 }
 
@@ -159,12 +158,9 @@ unsafe fn publish_list<P: PluginExport>(data: &ClapPluginData<P>, main: &MainThr
         };
         if (structure || list_changed)
             && !data.parameter_restart_pending.swap(true, Ordering::Relaxed)
-            && !data.host.is_null()
-            // SAFETY: the host outlives the instance.
-            && let Some(restart) = unsafe { (*data.host).request_restart }
         {
             // SAFETY: `request_restart` is [thread-safe].
-            unsafe { restart(data.host) };
+            unsafe { data.host.request_restart() };
         }
         return false;
     }
@@ -192,15 +188,12 @@ unsafe fn publish_list<P: PluginExport>(data: &ClapPluginData<P>, main: &MainThr
         *exposed = next;
     }
     // SAFETY: main thread, live instance.
-    unsafe { refresh_remote_control_pages(data) };
-    if let Some(removed) = removed
-        && !data.host_params.is_null()
-        // SAFETY: a non-null host extension stays valid for the instance.
-        && let Some(clear) = unsafe { (*data.host_params).clear }
-    {
+    unsafe { refresh_remote_control_pages(data, main) };
+    if let Some(removed) = removed {
+        let host = data.host.on_main_thread(main);
         for id in removed {
             // SAFETY: `clear` is [main-thread].
-            unsafe { clear(data.host, id, CLAP_PARAM_CLEAR_ALL) };
+            unsafe { host.params_clear(data.host_params, id, CLAP_PARAM_CLEAR_ALL) };
         }
     }
     true

@@ -59,6 +59,7 @@ pub mod draft;
 mod events;
 mod gui;
 mod host_context;
+mod host_handle;
 mod note_name;
 mod param_indication;
 mod params_ext;
@@ -102,7 +103,6 @@ use clap_sys::plugin_features::{
 use moose_core::TransportSlot;
 use moose_core::bus_routing::{BusRouting, bus_layouts_fit_routing};
 use moose_core::config::ProcessMode;
-use moose_core::editor::SendPtr;
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
@@ -110,7 +110,7 @@ use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
 use moose_core::main_thread::HostNotifier;
 use moose_core::state;
 use moose_core::thread::MainThreadCell;
-use moose_core::wrapper::{PluginCell, copy_c_str, run_extern_callback_with, shared_plugin};
+use moose_core::wrapper::{PluginCell, copy_c_str, run_extern_callback_with};
 use moose_params::Params;
 
 #[cfg(test)]
@@ -1159,6 +1159,10 @@ pub struct DescriptorHolder {
     _features_storage: Vec<CString>,
 }
 
+// SAFETY: every raw pointer inside `desc` and `_features` points into the
+// owned `CString` fields stored alongside it in this struct, which are
+// immutable after construction and never moved out while `DescriptorHolder`
+// lives inside its process-wide `OnceLock`.
 unsafe impl Send for DescriptorHolder {}
 unsafe impl Sync for DescriptorHolder {}
 
@@ -1318,23 +1322,13 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let hooks = MainThreadCell::new(instance.main_thread());
-        let host_queue = Arc::new(HostQueue::new({
-            // SAFETY: the host outlives the instance, and its
-            // `request_callback` is [thread-safe] (host.h), so the audio
-            // thread may call it too.
-            let host = unsafe { SendPtr::new(host) };
-            move || {
-                let host = host.as_ptr();
-                // SAFETY: `destroy` closes the queue before the instance and
-                // its host pointer go away.
-                unsafe {
-                    if !host.is_null()
-                        && let Some(request) = (*host).request_callback
-                    {
-                        request(host);
-                    }
-                }
-            }
+        // SAFETY: the host outlives the instance, and `HostHandle<Any>`
+        // exposes only `[thread-safe]` host calls (`request_callback`).
+        let host = unsafe { host_handle::HostHandle::any(host) };
+        let host_queue = Arc::new(HostQueue::new(move || {
+            // SAFETY: `destroy` closes the queue before the instance and
+            // its host pointer go away.
+            unsafe { host.request_callback() };
         }));
         let host_notifier = HostNotifier::from_queue(Arc::clone(&host_queue));
         let exposed = Mutex::new(catalog_sync::ExposedParams::new(
@@ -1348,9 +1342,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let snapshot = instance.snapshot_slot();
         let task_spawner = instance.task_spawner();
         let editor_builder = instance.editor_builder();
-        let latency_cache = AtomicU32::new(instance.latency());
-        let latency_live = AtomicU32::new(instance.latency());
-        let tail_cache = AtomicU32::new(instance.tail());
+        let delay = moose_core::delay::ReportedDelay::new(instance.latency(), instance.tail());
 
         // Pre-size the per-block channel-slice scratch from the worst-case
         // bus layout the plugin advertises. Without this, the first
@@ -1373,15 +1365,13 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         let data = Box::new(ClapPluginData::<P> {
             persist_signal: None,
             host_state: ptr::null(),
-            plugin: shared_plugin(instance),
+            plugin: PluginCell::new(instance),
             params_arc,
             meter_store,
             snapshot,
             task_spawner,
             editor_builder,
-            latency_cache,
-            latency_live,
-            tail_cache,
+            delay,
             selected_config: AtomicU32::new(0),
             ports_inactive: [AtomicU32::new(0), AtomicU32::new(0)],
             ports_activation_used: AtomicBool::new(false),

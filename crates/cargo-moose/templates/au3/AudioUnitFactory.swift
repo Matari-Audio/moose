@@ -177,11 +177,15 @@ class MooseAUAudioUnit: AUAudioUnit {
     private var _sampleRate: Double = 44100.0
     private var _maxFrames: UInt32 = 1024
     /// Last latency (samples) pushed to the host via KVO. The framework
-    /// refreshes its latency cache each block; a main-thread timer
+    /// commits observed delay changes on the main thread; a timer
     /// compares against this and fires KVO on `latency` when it moves, so
     /// a plugin that varies its latency reaches the host.
     private var _lastLatencySamples: UInt32 = 0
-    /// Polls `latency` while render resources are allocated, so a latency
+    /// Last tail time (seconds) pushed to the host via KVO.
+    private var _lastTailTime: TimeInterval = 0
+    /// Host-visible value, published between the KVO will/did notifications.
+    private var _publishedTailTime: TimeInterval = 0
+    /// Polls latency and tail while render resources are allocated, so a delay
     /// change driven by host automation (no editor open) still notifies.
     /// Slow (a few Hz) - latency moves on mode switches, not per block.
     private var _latencyTimer: Timer?
@@ -203,6 +207,12 @@ class MooseAUAudioUnit: AUAudioUnit {
         }
 
         rustCtx = callbacks.pointee.create()
+        guard rustCtx != nil else {
+            throw NSError(domain: NSOSStatusErrorDomain,
+                          code: Int(kAudioUnitErr_FailedInitialization))
+        }
+        _publishedTailTime = reportedTailTime
+        _lastTailTime = _publishedTailTime
         logger.info("AU init: in=\(descriptor.pointee.num_inputs) out=\(descriptor.pointee.num_outputs)")
         let numIn = descriptor.pointee.num_inputs
         let numOut = descriptor.pointee.num_outputs
@@ -462,15 +472,16 @@ class MooseAUAudioUnit: AUAudioUnit {
             }
             cb.pointee.reset(ctx, _sampleRate, _maxFrames)
         }
-        // Watch for dynamic-latency changes on the main thread while
+        // Watch for latency and tail changes on the main thread while
         // rendering (KVO must fire off the audio thread). Scheduled on
         // the main run loop even if the host allocates on another thread.
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.notifyDelayIfChanged()
             self._latencyTimer?.invalidate()
             self._latencyTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) {
                 [weak self] _ in
-                self?.notifyLatencyIfChanged()
+                self?.notifyDelayIfChanged()
             }
         }
     }
@@ -1193,7 +1204,7 @@ class MooseAUAudioUnit: AUAudioUnit {
     override var canProcessInPlace: Bool { g_descriptor?.pointee.num_inputs ?? 0 > 0 }
     // Report the plugin's latency / release tail so the host aligns
     // delay compensation. Samples come from a cache the framework
-    // refreshes each block; divide by the sample rate for seconds. The
+    // commits on the main thread; divide by the sample rate for seconds. The
     // `latency_samples` / `tail_samples` callbacks are ABI version 3,
     // so gate on the (magic-validated) reported version - this appex
     // may be newer than the framework binary it binds.
@@ -1202,21 +1213,23 @@ class MooseAUAudioUnit: AUAudioUnit {
               mooseAbiTailVersion(cb) >= 3, _sampleRate > 0 else { return 0 }
         return TimeInterval(cb.pointee.latency_samples(ctx)) / _sampleRate
     }
-    override var tailTime: TimeInterval {
+    override var tailTime: TimeInterval { _publishedTailTime }
+
+    private var reportedTailTime: TimeInterval {
         guard let ctx = rustCtx, let cb = g_callbacks,
               mooseAbiTailVersion(cb) >= 3, _sampleRate > 0 else { return 0 }
         return TimeInterval(cb.pointee.tail_samples(ctx)) / _sampleRate
     }
     override var shouldBypassEffect: Bool { get { false } set { } }
 
-    // AUAudioUnit.latency is KVO-observed by hosts for delay
+    // AUAudioUnit latency and tailTime are KVO-observed by hosts for delay
     // compensation, but the value comes from a callback (a computed
     // property) so re-assignment can't fire the notification. Called on
     // the main thread from the param-sync timer: when the framework's
-    // reported latency moves, fire KVO manually so the host re-reads the
-    // fresh `latency`. This is AU v3's push path - the audio thread only
-    // refreshes the cache, never touches KVO.
-    func notifyLatencyIfChanged() {
+    // reported latency or tail moves, fire KVO so the host re-reads the
+    // fresh delay values. This is AU v3's push path - the audio thread only
+    // observes delay changes, never touches KVO.
+    func notifyDelayIfChanged() {
         guard let ctx = rustCtx, let cb = g_callbacks,
               mooseAbiTailVersion(cb) >= 3 else { return }
         let now = cb.pointee.latency_samples(ctx)
@@ -1224,6 +1237,15 @@ class MooseAUAudioUnit: AUAudioUnit {
             _lastLatencySamples = now
             willChangeValue(forKey: "latency")
             didChangeValue(forKey: "latency")
+        }
+        // Compare the host-visible seconds so reallocation at a different
+        // sample rate notifies even when the tail sample count is unchanged.
+        let tail = reportedTailTime
+        if tail != _lastTailTime {
+            willChangeValue(forKey: "tailTime")
+            _publishedTailTime = tail
+            _lastTailTime = tail
+            didChangeValue(forKey: "tailTime")
         }
     }
 }
@@ -1576,8 +1598,8 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
         }
         au.isSyncingToHost = false
 
-        // Push a latency change (if any) to the host on the same
+        // Push latency and tail changes (if any) to the host on the same
         // main-thread tick.
-        au.notifyLatencyIfChanged()
+        au.notifyDelayIfChanged()
     }
 }

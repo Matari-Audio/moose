@@ -17,7 +17,7 @@ use moose_core::events::{EventList, TransportInfo};
 use moose_core::export::PluginExport;
 use moose_core::plugin::PluginRuntime;
 use moose_core::process::ProcessContext;
-use moose_core::wrapper::{enter_plugin, shared_plugin};
+use moose_core::wrapper::{PluginCell, enter_plugin};
 use moose_example_gain::PluginShell;
 
 const BLOCKS: usize = 2_000;
@@ -34,7 +34,7 @@ fn concurrent_save_never_wedges_the_audio_thread() {
     // The lock-free slot the audio thread publishes into and a host save
     // reads from - the same handle the format wrappers hold.
     let snapshot = plugin.snapshot_slot();
-    let plugin = shared_plugin(plugin);
+    let plugin = PluginCell::new(plugin);
 
     let stop = Arc::new(AtomicBool::new(false));
     let saves = Arc::new(AtomicU32::new(0));

@@ -67,17 +67,14 @@ fn track_info(raw: &clap_track_info) -> TrackInfo {
 /// # Safety
 /// `data` belongs to a live instance; `host_track_info` is null or valid.
 pub(crate) unsafe fn notify<P: PluginExport>(data: &ClapPluginData<P>, main: &MainThread) {
-    if data.host_track_info.is_null() {
-        return;
-    }
-    // SAFETY: non-null host extension, valid for the instance's lifetime.
-    let Some(get) = (unsafe { (*data.host_track_info).get }) else {
-        return;
-    };
     // SAFETY: `clap_track_info` is plain C data; all-zero is a valid value.
     let mut raw: clap_track_info = unsafe { std::mem::zeroed() };
-    // SAFETY: `get` is [main-thread]; `raw` is writable for the call.
-    if !unsafe { get(data.host, &raw mut raw) } {
+    // SAFETY: `track_info_get` is [main-thread]; `raw` is writable for the call.
+    if !unsafe {
+        data.host
+            .on_main_thread(main)
+            .track_info_get(data.host_track_info, &mut raw)
+    } {
         return;
     }
     if let Some(last) = raw.name.last_mut() {

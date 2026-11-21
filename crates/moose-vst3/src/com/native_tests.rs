@@ -239,6 +239,10 @@ fn callbacks() -> Vst3Callbacks {
         gui_event_fd: no_fd,
         gui_on_fd: nop_ctx,
         gui_on_timer: nop_ctx,
+        bind_host_queue: {
+            unsafe extern "C" fn nop_bind(_: *mut c_void, _: *mut c_void) {}
+            nop_bind
+        },
         drain_host_queue: nop_ctx,
         perform_menu: no_menu,
     }
@@ -3273,4 +3277,188 @@ mod input_merge {
         assert_eq!(seen.events.len(), 3);
         DELIVERED.with(|events| assert_eq!(*events.borrow(), [10, 20, 30]));
     }
+}
+
+/// Regression for the VST3 COM teardown wake hazard: a background thread
+/// inside `HostQueue`'s wake must never pin `Arc<Host>`, drop the last `Host`,
+/// and re-enter `Host::drop` -> `HostQueue::close()` (which would deadlock
+/// waiting for itself).
+#[test]
+fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() {
+    use moose_core::host_queue::{HostQueue, HostSignal};
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    struct Ctx {
+        queue: Arc<HostQueue>,
+        target: Arc<AtomicPtr<c_void>>,
+    }
+
+    static ACTIVE_QUEUE: Mutex<Option<Arc<HostQueue>>> = Mutex::new(None);
+    static WAKE_ENTERED: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
+    static DESTROY_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+    static WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn create_ctx() -> *mut c_void {
+        let target = Arc::new(AtomicPtr::<c_void>::new(std::ptr::null_mut()));
+        let target_wake = Arc::clone(&target);
+        let queue = Arc::new(HostQueue::new(move || {
+            let host = target_wake.load(Ordering::Acquire);
+            if !host.is_null() {
+                let first = WAKE_COUNT.fetch_add(1, Ordering::AcqRel) == 0;
+                if first && let Some(barrier) = WAKE_ENTERED.lock().unwrap().clone() {
+                    barrier.wait();
+                    // Hold the wake open briefly while the main thread drops `Host`.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // SAFETY: `bind_host_queue(ctx, null)` closes the queue before
+                // `Host::drop` frees `host`.
+                unsafe { crate::ffi::moose_vst3_wake_host_queue(host) };
+            }
+        }));
+        *ACTIVE_QUEUE.lock().unwrap() = Some(Arc::clone(&queue));
+        Box::into_raw(Box::new(Ctx { queue, target })).cast()
+    }
+
+    unsafe extern "C" fn bind_ctx(ctx: *mut c_void, host: *mut c_void) {
+        let state = unsafe { &*ctx.cast::<Ctx>() };
+        state.target.store(host, Ordering::Release);
+        if host.is_null() {
+            state.queue.close();
+        }
+    }
+
+    unsafe extern "C" fn destroy_ctx(ctx: *mut c_void) {
+        *DESTROY_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        let state = unsafe { Box::from_raw(ctx.cast::<Ctx>()) };
+        state.queue.close();
+        drop(state);
+    }
+
+    let barrier = Arc::new(Barrier::new(2));
+    *WAKE_ENTERED.lock().unwrap() = Some(Arc::clone(&barrier));
+    *DESTROY_THREAD.lock().unwrap() = None;
+    WAKE_COUNT.store(0, Ordering::Release);
+
+    let mut cb = callbacks();
+    cb.create = create_ctx;
+    cb.bind_host_queue = bind_ctx;
+    cb.destroy = destroy_ctx;
+    let reg = registration(descriptor(), cb, Vec::new());
+    let host = Host::new(reg, None).expect("host");
+    let queue = ACTIVE_QUEUE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("queue registered");
+
+    let worker_queue = Arc::clone(&queue);
+    let worker = std::thread::spawn(move || {
+        worker_queue.signal(HostSignal::MARK_DIRTY);
+        // After teardown completes, further signals on a retained queue must
+        // stay harmless no-ops.
+        for _ in 0..32 {
+            worker_queue.signal(HostSignal::RESTART);
+        }
+    });
+
+    // Wait until the worker is actively inside the `HostQueue` wake closure,
+    // then drop the sole COM `Host` reference on the main thread.
+    barrier.wait();
+    let main_id = std::thread::current().id();
+    drop(host);
+    worker.join().expect("worker joined without deadlocking");
+
+    assert!(WAKE_COUNT.load(Ordering::Acquire) >= 1);
+    assert!(queue.is_closed());
+    assert_eq!(
+        *DESTROY_THREAD.lock().unwrap(),
+        Some(main_id),
+        "cb_destroy must run on the dropping thread, never inside the worker wake"
+    );
+}
+
+/// Regression: a `MARK_DIRTY` drained during `Host::new` (before
+/// `setComponentHandler` installs a handler) must remain pending and deliver
+/// `IComponentHandler2::setDirty(1)` once a handler is attached (and only once).
+#[test]
+fn construction_time_mark_dirty_delivers_on_set_component_handler() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use vst3::Steinberg::Vst::{
+        IComponentHandler, IComponentHandler2, IComponentHandler2Trait, IComponentHandlerTrait,
+        IEditControllerTrait, ParamID, ParamValue,
+    };
+
+    struct DirtyHandler {
+        dirty_calls: Arc<AtomicUsize>,
+    }
+    impl Class for DirtyHandler {
+        type Interfaces = (IComponentHandler, IComponentHandler2);
+    }
+    impl IComponentHandlerTrait for DirtyHandler {
+        unsafe fn beginEdit(&self, _: ParamID) -> tresult {
+            kResultOk
+        }
+        unsafe fn performEdit(&self, _: ParamID, _: ParamValue) -> tresult {
+            kResultOk
+        }
+        unsafe fn endEdit(&self, _: ParamID) -> tresult {
+            kResultOk
+        }
+        unsafe fn restartComponent(&self, _: int32) -> tresult {
+            kResultOk
+        }
+    }
+    impl IComponentHandler2Trait for DirtyHandler {
+        unsafe fn setDirty(&self, state: vst3::Steinberg::TBool) -> tresult {
+            if state != 0 {
+                self.dirty_calls.fetch_add(1, Ordering::AcqRel);
+            }
+            kResultOk
+        }
+        unsafe fn requestOpenEditor(&self, _: vst3::Steinberg::FIDString) -> tresult {
+            kResultOk
+        }
+        unsafe fn startGroupEdit(&self) -> tresult {
+            kResultOk
+        }
+        unsafe fn finishGroupEdit(&self) -> tresult {
+            kResultOk
+        }
+    }
+
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn drain_marking_dirty(ctx: *mut c_void) {
+        if !EMITTED.swap(true, Ordering::AcqRel) {
+            crate::ffi::moose_vst3_mark_dirty(ctx);
+        }
+    }
+
+    EMITTED.store(false, Ordering::Release);
+    let mut cb = callbacks();
+    cb.drain_host_queue = drain_marking_dirty;
+    let reg = registration(descriptor(), cb, Vec::new());
+    let com = component(reg);
+    let c: &Component = &com;
+
+    // `Host::new` already drained `MARK_DIRTY` with no handler installed.
+    assert!(EMITTED.load(Ordering::Acquire));
+
+    let dirty_calls = Arc::new(AtomicUsize::new(0));
+    let h = ComWrapper::new(DirtyHandler {
+        dirty_calls: Arc::clone(&dirty_calls),
+    })
+    .to_com_ptr::<IComponentHandler>()
+    .unwrap();
+    assert_eq!(unsafe { c.setComponentHandler(h.as_ptr()) }, kResultOk);
+    assert_eq!(
+        dirty_calls.load(Ordering::Acquire),
+        1,
+        "construction-time MARK_DIRTY must reach setDirty(1) on setComponentHandler"
+    );
+
+    // Re-attaching a handler must not replay an already-delivered dirty bit.
+    assert_eq!(unsafe { c.setComponentHandler(h.as_ptr()) }, kResultOk);
+    assert_eq!(dirty_calls.load(Ordering::Acquire), 1);
 }

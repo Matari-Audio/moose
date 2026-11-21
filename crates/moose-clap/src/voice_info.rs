@@ -1,6 +1,7 @@
 //! `clap.voice-info`: voice count and capacity from
 //! [`MainThreadHooks::voice_info`]. A [`HostNotice::VOICE_INFO`] sends
-//! `clap_host_voice_info.changed` ([`host_changed`]).
+//! `clap_host_voice_info.changed` via
+//! [`crate::host_handle::HostHandle::voice_info_changed`].
 //!
 //! [`HostNotice::VOICE_INFO`]: moose_core::main_thread::HostNotice::VOICE_INFO
 //!
@@ -12,10 +13,8 @@
 //! [`MainThreadHooks::voice_info`]: moose_core::main_thread::MainThreadHooks::voice_info
 
 use clap_sys::ext::voice_info::{
-    CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_host_voice_info,
-    clap_plugin_voice_info, clap_voice_info,
+    CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_plugin_voice_info, clap_voice_info,
 };
-use clap_sys::host::clap_host;
 use clap_sys::plugin::clap_plugin;
 use moose_core::export::PluginExport;
 use moose_core::main_thread::VoiceInfo;
@@ -27,28 +26,6 @@ use crate::{ClapPluginData, data_from_plugin};
 pub(crate) fn make_extension<P: PluginExport>() -> clap_plugin_voice_info {
     clap_plugin_voice_info {
         get: Some(get::<P>),
-    }
-}
-
-/// [main-thread] Tell the host the voice info changed, if it listens.
-///
-/// # Safety
-/// `host` is null or the instance's live host.
-pub(crate) unsafe fn host_changed(host: *const clap_host) {
-    // SAFETY: forwarded caller contract; `get_extension` is [thread-safe].
-    unsafe {
-        if host.is_null() {
-            return;
-        }
-        let Some(get) = (*host).get_extension else {
-            return;
-        };
-        let ext = get(host, CLAP_EXT_VOICE_INFO.as_ptr()).cast::<clap_host_voice_info>();
-        if !ext.is_null()
-            && let Some(changed) = (*ext).changed
-        {
-            changed(host);
-        }
     }
 }
 

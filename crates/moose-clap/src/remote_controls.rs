@@ -6,8 +6,7 @@ use crate::data::ClapPluginData;
 use crate::data_from_plugin;
 
 use clap_sys::ext::remote_controls::{
-    CLAP_EXT_REMOTE_CONTROLS, CLAP_REMOTE_CONTROLS_COUNT, clap_host_remote_controls,
-    clap_plugin_remote_controls, clap_remote_controls_page,
+    CLAP_REMOTE_CONTROLS_COUNT, clap_plugin_remote_controls, clap_remote_controls_page,
 };
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::plugin::clap_plugin;
@@ -101,7 +100,10 @@ pub(crate) fn presented_remote_control_pages(
 }
 
 /// Only structural presentation revisions rebuild the cache, never value flushes.
-pub(crate) unsafe fn refresh_remote_control_pages<P: PluginExport>(data: &ClapPluginData<P>) {
+pub(crate) unsafe fn refresh_remote_control_pages<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    main: &moose_core::thread::MainThread,
+) {
     let exposed = catalog_sync::lock_exposed(&data.exposed);
     let pages = presented_remote_control_pages(exposed.infos(), |id| {
         data.params_arc.parameter_presentation(id)
@@ -116,17 +118,8 @@ pub(crate) unsafe fn refresh_remote_control_pages<P: PluginExport>(data: &ClapPl
     }
     *current = pages;
     drop(current);
-    if !data.host.is_null()
-        && let Some(get_extension) = unsafe { (*data.host).get_extension }
-    {
-        let extension = unsafe { get_extension(data.host, CLAP_EXT_REMOTE_CONTROLS.as_ptr()) }
-            .cast::<clap_host_remote_controls>();
-        if !extension.is_null()
-            && let Some(changed) = unsafe { (*extension).changed }
-        {
-            unsafe { changed(data.host) };
-        }
-    }
+    // SAFETY: caller guarantees `data.host` is live; `changed` is `[main-thread]`.
+    unsafe { data.host.on_main_thread(main).remote_controls_changed() };
 }
 
 /// Deterministic page id from the group name and its chunk index among

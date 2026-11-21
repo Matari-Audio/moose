@@ -5,6 +5,7 @@ pub mod bus_routing;
 pub mod chunked_process;
 pub mod config;
 pub mod custom_state;
+pub mod delay;
 pub mod denormal;
 pub mod editor;
 pub mod events;

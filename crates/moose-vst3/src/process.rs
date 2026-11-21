@@ -308,17 +308,11 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
         scr.scratch
             .finish_widening(outputs, num_output_channels, len_u32(num_frames));
 
-        // Refresh latency / tail caches so the host's main-thread
-        // queries don't have to touch the plugin. On an actual
-        // latency change, flag a restart: `mark_restart` only sets an
-        // atomic bit (RT-safe), and the shim calls `restartComponent` on
-        // the next host main-thread callback.
-        let new_latency = plugin.latency();
-        if inst.latency_cache.swap(new_latency, Ordering::Relaxed) != new_latency {
-            // Wait-free signal; the UI thread drains it as `kLatencyChanged`.
-            inst.host_queue.signal(HostSignal::LATENCY);
-        }
-        inst.tail_cache.store(plugin.tail(), Ordering::Relaxed);
+        // A latency or tail change raises a wait-free signal; the UI thread
+        // drains it as `kLatencyChanged`, and the new values are reported
+        // from the next activation.
+        inst.delay
+            .observe_and_signal(plugin.latency(), plugin.tail(), &inst.host_queue);
     })
     .is_some();
     if !ok {
@@ -419,13 +413,13 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
 pub(crate) unsafe extern "C" fn cb_get_latency<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        inst.latency_cache.load(Ordering::Relaxed)
+        inst.delay.latency()
     }
 }
 
 pub(crate) unsafe extern "C" fn cb_get_tail<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        inst.tail_cache.load(Ordering::Relaxed)
+        inst.delay.tail()
     }
 }
