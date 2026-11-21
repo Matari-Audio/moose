@@ -133,6 +133,12 @@ pub enum HostMessage {
         modifiers: u32,
         pressed: bool,
     },
+    /// Forward a repeat of an XKB key press already sent to the host.
+    ForwardXkbRepeat {
+        keycode: u32,
+        keysym: u32,
+        modifiers: u32,
+    },
 }
 
 /// Set in [`HostQueue::waking`] once [`HostQueue::close`] ran.
@@ -498,6 +504,8 @@ pub trait HostSink {
     fn request_redo(&mut self) {}
     /// [`HostMessage::ForwardXkbKey`]: forward an unhandled XKB key event to the host.
     fn forward_xkb_key(&mut self, _keycode: u32, _keysym: u32, _modifiers: u32, _pressed: bool) {}
+    /// [`HostMessage::ForwardXkbRepeat`]: forward an unhandled XKB repeat.
+    fn forward_xkb_repeat(&mut self, _keycode: u32, _keysym: u32, _modifiers: u32) {}
 }
 
 /// Deliver every raised signal and queued message in `drain` to `sink`.
@@ -559,6 +567,11 @@ pub fn dispatch(drain: Drain<'_>, sink: &mut dyn HostSink) {
                 modifiers,
                 pressed,
             } => sink.forward_xkb_key(keycode, keysym, modifiers, pressed),
+            HostMessage::ForwardXkbRepeat {
+                keycode,
+                keysym,
+                modifiers,
+            } => sink.forward_xkb_repeat(keycode, keysym, modifiers),
         }
     }
 }

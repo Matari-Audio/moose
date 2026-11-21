@@ -2065,6 +2065,25 @@ mod host_features {
             Vec::<String>::new(),
             "no wake, nothing to send"
         );
+        #[cfg(target_os = "linux")]
+        {
+            let frame = ComWrapper::new(LoopFrame::new(FrameCore::new(640, 480)));
+            commit(CatalogChange::INFO);
+            assert_eq!(recorder.take(), Vec::<String>::new());
+            com.host
+                .update_run_loop_registration(Some(frame_ptr(&frame).cast()));
+            let mut fd = libc::pollfd {
+                fd: frame.fd.load(SeqCst),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&raw mut fd, 1, 0) }, 1);
+            assert_eq!(fd.revents, libc::POLLIN);
+            frame.pump();
+            assert_eq!(recorder.take(), restart(kParamTitlesChanged as u32));
+            com.host.update_run_loop_registration(None);
+        }
+
         for (change, flags) in [
             (CatalogChange::VALUES, kParamValuesChanged),
             (CatalogChange::INFO, kParamTitlesChanged),

@@ -1766,6 +1766,15 @@ mod tests {
 
     #[test]
     fn direct_begin_can_destroy_its_instance() {
+        assert_begin_can_destroy(false);
+    }
+
+    #[test]
+    fn gui_open_defers_destroy_until_after_the_gui_borrow() {
+        assert_begin_can_destroy(true);
+    }
+
+    fn assert_begin_can_destroy(during_open: bool) {
         use crate::callbacks::{cb_create_with_sink, cb_destroy};
         use crate::ffi::MooseAuHostSink;
         use crate::large_state_fixture::LargePlugin;
@@ -1796,7 +1805,20 @@ mod tests {
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             host.ctx.set(ctx);
-            crate::gui::editor_context::<P>(ctx).begin_edit(0_u32);
+            let context = crate::gui::editor_context::<P>(ctx);
+            if during_open {
+                let result = crate::gui::with_gui_open::<P, _>(ctx, |_| {
+                    context.begin_edit(0_u32);
+                    assert!(!host.released.get());
+                    let inst = &*ctx.cast::<crate::instance::AuInstance<P>>();
+                    assert!(inst.gui.try_enter().is_none());
+                    assert!(inst.host_queue.is_closed());
+                    context.begin_edit(0_u32); // closed to new host callbacks
+                });
+                assert_eq!(result, None);
+            } else {
+                context.begin_edit(0_u32);
+            }
         }
         assert!(host.released.get());
     }

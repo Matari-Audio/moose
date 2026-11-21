@@ -259,6 +259,8 @@ pub(super) mod windows {
 
     const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
     const WM_CLOSE: u32 = 0x0010;
+    const WM_TIMER: u32 = 0x0113;
+    const WAKE_TIMER_ID: usize = 1;
     const WM_MOOSE_WAKE: u32 = 0x8001; // WM_APP + 1
     const GWLP_USERDATA: i32 = -21;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
@@ -269,6 +271,7 @@ pub(super) mod windows {
     const WAKE_POSTING: u8 = 1;
     const WAKE_RETRY: u8 = 3;
 
+    type TimerProc = unsafe extern "system" fn(*mut c_void, u32, usize, u32);
     type WndProc = unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize;
 
     #[repr(C)]
@@ -317,6 +320,14 @@ pub(super) mod windows {
         ) -> *mut c_void;
         fn DestroyWindow(hwnd: *mut c_void) -> i32;
         fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn SendNotifyMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn SetTimer(
+            hwnd: *mut c_void,
+            id: usize,
+            interval: u32,
+            callback: Option<TimerProc>,
+        ) -> usize;
+        fn KillTimer(hwnd: *mut c_void, id: usize) -> i32;
         fn SendMessageTimeoutW(
             hwnd: *mut c_void,
             msg: u32,
@@ -362,7 +373,12 @@ pub(super) mod windows {
         wparam: usize,
         lparam: isize,
     ) -> isize {
-        if msg == WM_MOOSE_WAKE {
+        let wake_timer = msg == WM_TIMER && wparam == WAKE_TIMER_ID;
+        if msg == WM_MOOSE_WAKE || wake_timer {
+            if wake_timer {
+                // A timer is armed only after a failed post from this thread.
+                unsafe { KillTimer(hwnd, WAKE_TIMER_ID) };
+            }
             let ctx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut c_void;
             if !ctx.is_null()
                 && let Some(handler) = HANDLER.get()
@@ -442,9 +458,9 @@ pub(super) mod windows {
         state: AtomicU8,
     }
 
-    // SAFETY: `PostMessageW` and `SendMessageTimeoutW` are thread-safe per
-    // Win32; `DestroyWindow` runs on the owning thread (directly when dropped
-    // on it, or synchronously via `SendMessageTimeoutW(..., WM_CLOSE, ...)`).
+    // SAFETY: The Win32 message APIs used off-thread are thread-safe.
+    // Timer creation and window destruction run on the owning thread (for
+    // off-thread destruction, via `SendMessageTimeoutW(..., WM_CLOSE, ...)`).
     unsafe impl Send for MessageWake {}
     unsafe impl Sync for MessageWake {}
 
@@ -504,15 +520,13 @@ pub(super) mod windows {
                         {
                             continue;
                         }
-                        let posted = unsafe { PostMessageW(self.hwnd, WM_MOOSE_WAKE, 0, 0) } != 0;
-                        if posted {
+                        if self.schedule_wake() {
                             // The UI may already have cleared this attempt and started
                             // another. Only the UI may clear a successful post.
                             return;
                         }
-                        // `PostMessageW` failed (queue full / closing): restore
-                        // `WAKE_IDLE` so future signals can retry instead of
-                        // wedging on `pending=true`.
+                        // Both delivery attempts failed: allow a later signal
+                        // to retry and honor any signal made during this attempt.
                         let prev = self.state.swap(WAKE_IDLE, Ordering::AcqRel);
                         if prev != WAKE_RETRY {
                             return;
@@ -535,6 +549,21 @@ pub(super) mod windows {
                     }
                     _ => return,
                 }
+            }
+        }
+
+        fn schedule_wake(&self) -> bool {
+            if unsafe { PostMessageW(self.hwnd, WM_MOOSE_WAKE, 0, 0) } != 0 {
+                return true;
+            }
+            if std::thread::current().id() == self.thread {
+                // Sending to our own window would dispatch inline, possibly
+                // while an edit lock is held. Arm a one-shot wake instead.
+                unsafe { SetTimer(self.hwnd, WAKE_TIMER_ID, 10, None) != 0 }
+            } else {
+                // A sent notification uses the window's nonqueued path and
+                // returns immediately when sending across threads.
+                unsafe { SendNotifyMessageW(self.hwnd, WM_MOOSE_WAKE, 0, 0) != 0 }
             }
         }
 

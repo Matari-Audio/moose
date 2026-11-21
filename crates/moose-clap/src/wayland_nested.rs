@@ -51,8 +51,12 @@ struct PluginXdgActivationV1 {
     activate: Option<unsafe extern "C" fn(*const clap_plugin, *const c_char) -> bool>,
 }
 
-const CLAP_XKB_KEY_STATE_RELEASED: u32 = 0;
-const CLAP_XKB_KEY_STATE_PRESSED: u32 = 1;
+#[repr(u32)]
+pub(super) enum XkbKeyState {
+    Released = 0,
+    Pressed = 1,
+    Repeated = 2,
+}
 
 #[repr(C)]
 struct ClapXkbKeyEvent {
@@ -119,7 +123,7 @@ pub(super) unsafe fn forward_xkb_key(
     keycode: u32,
     keysym: u32,
     modifiers: u32,
-    pressed: bool,
+    state: XkbKeyState,
 ) -> bool {
     unsafe {
         let Some(on_key) =
@@ -131,11 +135,7 @@ pub(super) unsafe fn forward_xkb_key(
             keycode,
             keysym,
             modifiers,
-            state: if pressed {
-                CLAP_XKB_KEY_STATE_PRESSED
-            } else {
-                CLAP_XKB_KEY_STATE_RELEASED
-            },
+            state: state as u32,
         };
         on_key(host, &raw const event);
         true
@@ -421,13 +421,14 @@ mod tests {
         true
     }
     unsafe extern "C" fn on_xkb_key(host: *const clap_host, ev: *const ClapXkbKeyEvent) {
-        let ev = unsafe { &*ev };
+        // The public C header declares four consecutive uint32_t fields.
+        let [keycode, keysym, modifiers, state_word] = unsafe { *ev.cast::<[u32; 4]>() };
         unsafe { state(host) }
             .log
             .lock()
             .unwrap()
             .forwarded_keys
-            .push((ev.keycode, ev.keysym, ev.modifiers, ev.state));
+            .push((keycode, keysym, modifiers, state_word));
     }
     unsafe extern "C" fn unregister_fd(host: *const clap_host, fd: i32) -> bool {
         unsafe { state(host) }
@@ -519,6 +520,8 @@ mod tests {
             self.want_write = true;
             if let Some(ctx) = &self.ctx {
                 assert!(ctx.forward_xkb_key(65, 0x20, 0x01, true));
+                assert!(ctx.forward_xkb_repeat(65, 0x20, 0x01));
+                assert!(ctx.forward_xkb_key(65, 0x20, 0x01, false));
             }
         }
         fn wants_write(&self) -> bool {
@@ -643,7 +646,11 @@ mod tests {
                 );
                 assert_eq!(
                     log.forwarded_keys,
-                    [(65, 0x20, 0x01, CLAP_XKB_KEY_STATE_PRESSED)]
+                    [
+                        (65, 0x20, 0x01, 1),
+                        (65, 0x20, 0x01, 2),
+                        (65, 0x20, 0x01, 0)
+                    ]
                 );
             }
 

@@ -326,6 +326,16 @@ impl<P: PluginExport> HostContext for ClapHost<P> {
             })
             .is_ok()
     }
+
+    fn forward_xkb_repeat(&self, keycode: u32, keysym: u32, modifiers: u32) -> bool {
+        self.queue
+            .post(HostMessage::ForwardXkbRepeat {
+                keycode,
+                keysym,
+                modifiers,
+            })
+            .is_ok()
+    }
 }
 
 /// The context handed to the instance's editor.

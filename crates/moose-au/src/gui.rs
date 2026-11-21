@@ -57,11 +57,20 @@ pub(crate) fn defer_host_destroy(ctx: *mut std::ffi::c_void) -> bool {
     })
 }
 
-struct DrainCtxGuard;
+struct DrainCtxGuard<P: PluginExport> {
+    ctx: *mut std::ffi::c_void,
+    registered: bool,
+    plugin: std::marker::PhantomData<P>,
+}
 
-impl Drop for DrainCtxGuard {
+impl<P: PluginExport> Drop for DrainCtxGuard<P> {
     fn drop(&mut self) {
-        ACTIVE_DRAIN_CTX.with_borrow_mut(Vec::pop);
+        if self.registered
+            && let Some((_, true)) = ACTIVE_DRAIN_CTX.with_borrow_mut(Vec::pop)
+        {
+            // The queue gate and the callback's borrows have already unwound.
+            unsafe { crate::callbacks::finalize_destroy::<P>(self.ctx.cast()) };
+        }
     }
 }
 
@@ -72,18 +81,18 @@ pub(crate) unsafe fn with_host_open<P: PluginExport, R>(
     ctx: *mut std::ffi::c_void,
     f: impl FnOnce() -> R,
 ) -> Option<R> {
-    let mut finalize = false;
-    let result = queue.with_open(|| {
+    // Drop this outside with_open so finalization never waits on its own
+    // queue registration, including when plugin code unwinds.
+    let mut guard = DrainCtxGuard::<P> {
+        ctx,
+        registered: false,
+        plugin: std::marker::PhantomData,
+    };
+    queue.with_open(|| {
         ACTIVE_DRAIN_CTX.with_borrow_mut(|stack| stack.push((ctx, false)));
-        let _guard = DrainCtxGuard;
-        let result = f();
-        finalize = ACTIVE_DRAIN_CTX.with_borrow(|stack| stack.last().unwrap().1);
-        result
-    });
-    if finalize {
-        unsafe { crate::callbacks::finalize_destroy::<P>(ctx.cast()) };
-    }
-    result
+        guard.registered = true;
+        f()
+    })
 }
 
 #[cfg_attr(
@@ -616,6 +625,22 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
     });
 }
 
+/// Keep the instance alive across editor code that can synchronously ask
+/// the host to destroy it. Acquire the GUI guard inside the registration.
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+pub(crate) unsafe fn with_gui_open<P: PluginExport, R>(
+    ctx: *mut std::ffi::c_void,
+    f: impl FnOnce(&mut crate::instance::AuGui) -> R,
+) -> Option<R> {
+    if ctx.is_null() {
+        return None;
+    }
+    let raw = ctx.cast::<AuInstance<P>>();
+    let queue = unsafe { Arc::clone(&(*raw).host_queue) };
+    let result = unsafe { with_host_open::<P, R>(&queue, ctx, || f(&mut (*raw).gui.enter())) };
+    if queue.is_closed() { None } else { result }
+}
+
 pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     parent: *mut std::ffi::c_void,
@@ -631,20 +656,21 @@ pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         unsafe {
-            let inst = &*ctx.cast::<AuInstance<P>>();
-            let mut gui = inst.gui.enter();
-            if let Some(ref mut editor) = gui.editor {
-                let context = editor_context::<P>(ctx);
-                #[cfg(target_os = "macos")]
-                let handle = RawWindowHandle::AppKit(parent);
-                #[cfg(target_os = "ios")]
-                let handle = RawWindowHandle::UiKit(parent);
-                editor.open(handle, context);
-                let opened = editor.is_open();
-                gui.view = if opened { parent as usize } else { 0 };
-                return i32::from(opened);
-            }
-            0
+            with_gui_open::<P, _>(ctx, |gui| {
+                if let Some(ref mut editor) = gui.editor {
+                    let context = editor_context::<P>(ctx);
+                    #[cfg(target_os = "macos")]
+                    let handle = RawWindowHandle::AppKit(parent);
+                    #[cfg(target_os = "ios")]
+                    let handle = RawWindowHandle::UiKit(parent);
+                    editor.open(handle, context);
+                    let opened = editor.is_open();
+                    gui.view = if opened { parent as usize } else { 0 };
+                    return i32::from(opened);
+                }
+                0
+            })
+            .unwrap_or(0)
         }
     })
 }

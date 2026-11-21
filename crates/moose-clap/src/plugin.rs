@@ -545,11 +545,31 @@ impl<P: PluginExport> HostSink for ClapSink<'_, P> {
                 keycode,
                 keysym,
                 modifiers,
-                pressed,
+                if pressed {
+                    crate::wayland_nested::XkbKeyState::Pressed
+                } else {
+                    crate::wayland_nested::XkbKeyState::Released
+                },
             )
         };
         #[cfg(not(all(target_os = "linux", feature = "clap-draft")))]
         let _ = (keycode, keysym, modifiers, pressed);
+    }
+
+    fn forward_xkb_repeat(&mut self, keycode: u32, keysym: u32, modifiers: u32) {
+        #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+        // SAFETY: main thread, live host handle.
+        let _ = unsafe {
+            crate::wayland_nested::forward_xkb_key(
+                self.host.as_ptr(),
+                keycode,
+                keysym,
+                modifiers,
+                crate::wayland_nested::XkbKeyState::Repeated,
+            )
+        };
+        #[cfg(not(all(target_os = "linux", feature = "clap-draft")))]
+        let _ = (keycode, keysym, modifiers);
     }
 }
 

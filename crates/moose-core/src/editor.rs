@@ -713,6 +713,11 @@ pub trait HostContext: EditorBridge {
     ) -> bool {
         false
     }
+
+    /// Forward an unhandled repeat after its initial XKB press was forwarded.
+    fn forward_xkb_repeat(&self, _keycode: u32, _keysym: u32, _modifiers: u32) -> bool {
+        false
+    }
 }
 
 /// A [`ClosureBridge`] is a host with no optional notifications.
@@ -869,6 +874,13 @@ impl<P: ?Sized> PluginContext<P> {
     ) -> bool {
         self.host
             .forward_xkb_key(keycode, keysym, modifiers, pressed)
+    }
+
+    /// Queue an unhandled Wayland XKB repeat. Only call this when the
+    /// initial key press was forwarded. Any thread.
+    #[must_use]
+    pub fn forward_xkb_repeat(&self, keycode: u32, keysym: u32, modifiers: u32) -> bool {
+        self.host.forward_xkb_repeat(keycode, keysym, modifiers)
     }
 
     /// Start a group of edits the host treats as one (one undo step), such

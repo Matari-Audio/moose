@@ -1374,9 +1374,9 @@ impl Host {
             self.edit_fd.store(wake.fd(), Ordering::Release);
             let mut e = lock(&self.edits);
             e.wake = Some(wake);
-            if !e.pending.is_empty() {
-                self.wake_edits(&e);
-            }
+            // Work queued before either descriptor was published did not
+            // wake the run loop. This tick also drains catalog and restart work.
+            self.wake_edits(&e);
         } else {
             // Only fall back to a run-loop timer if the host refused eventfd.
             *lock(&self.timer) = TimerWake::bind(rl, Arc::downgrade(self));
