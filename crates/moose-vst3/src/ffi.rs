@@ -62,6 +62,9 @@ pub struct Vst3PluginDescriptor {
     /// and no two output channels alias one discard block.
     pub max_inputs: u32,
     pub max_outputs: u32,
+    /// Optional UTF-8 JSON for VST3 3.7.5+ `IPluginCompatibility`. Null when
+    /// the plugin declares no compatibility class.
+    pub compatibility_json: *const c_char,
 }
 
 /// Parameter descriptor.
@@ -443,6 +446,9 @@ pub struct Vst3Callbacks {
     pub gui_on_fd: unsafe extern "C" fn(ctx: *mut c_void),
     /// `Editor::on_timer`, from the run loop's 16 ms timer. UI thread.
     pub gui_on_timer: unsafe extern "C" fn(ctx: *mut c_void),
+    /// `Editor::set_wayland_sync`: `sync != 0` sets subsurface sync mode
+    /// before a host-driven Wayland resize; `0` returns to desync. UI thread.
+    pub gui_wayland_set_sync: unsafe extern "C" fn(ctx: *mut c_void, sync: i32),
     /// Bind (non-null) or unbind and close (null) the `HostQueue` wake
     /// target to the COM `Host` pointer. Called by `Host::new` and `Host::drop`.
     pub bind_host_queue: unsafe extern "C" fn(ctx: *mut c_void, host: *mut c_void),
@@ -471,6 +477,18 @@ pub struct Vst3Callbacks {
     /// registration descriptor's `step_count`. Main thread.
     pub param_step_count:
         unsafe extern "C" fn(ctx: *mut c_void, id: u32, out_default_norm: *mut f64) -> i32,
+    /// `MainThreadHooks::keyswitches` (`IKeyswitchController`). UI thread.
+    pub keyswitches: unsafe fn(
+        ctx: *mut c_void,
+        bus: u32,
+        channel: u8,
+    ) -> Vec<moose_core::main_thread::Keyswitch>,
+    /// `MainThreadHooks::program_list` (`IUnitInfo` + `IProgramListData`). UI thread.
+    pub program_list: unsafe fn(ctx: *mut c_void) -> Vec<moose_core::main_thread::ProgramPreset>,
+    /// `MainThreadHooks::set_program_data` (`IProgramListData::setProgramData`
+    /// / `IUnitInfo::setUnitProgramData`). UI thread.
+    pub set_program_data:
+        unsafe fn(ctx: *mut c_void, index: usize, data: *const u8, len: usize) -> bool,
 }
 
 /// Register the plugin with the COM layer.

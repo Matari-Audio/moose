@@ -476,7 +476,19 @@ mod writer_tests {
     fn streamed_output_matches_old_envelopes_and_partial_write_errors_are_honest() {
         let ids = [1, 7];
         let values = [-0.0, f64::from_bits(0x3fda_1234_5678_90ab)];
-        let persist = vec![73; 33 * 1024 * 1024];
+        let limit = if cfg!(miri) {
+            16 * 1024
+        } else {
+            32 * 1024 * 1024
+        };
+        let persist = vec![
+            73;
+            if cfg!(miri) {
+                17 * 1024
+            } else {
+                33 * 1024 * 1024
+            }
+        ];
         let expected = crate::state::serialize_state(42, &ids, &values, b"extra", &persist);
         let mut output = Vec::new();
         assert!(write_state_stream(
@@ -499,7 +511,7 @@ mod writer_tests {
             &values,
             b"extra",
             &persist,
-            32 * 1024 * 1024,
+            limit,
             |_| panic!("oversize wrote bytes")
         ));
         for reply in [-1, 0, 10000] {
@@ -511,7 +523,7 @@ mod writer_tests {
     fn prepared_lane_streams_without_staging_and_preserves_float_bits() {
         let ids = [5];
         let values = [-0.0];
-        let payload = vec![31; 65_537];
+        let payload = vec![31; if cfg!(miri) { 8_194 } else { 65_537 }];
         let expected = crate::state::serialize_state(42, &ids, &values, b"extra", &payload);
         let mut output = Vec::new();
         assert!(write_state_stream_with_persist(
@@ -612,7 +624,8 @@ mod prepared_tests {
     }
     #[test]
     fn prepared_fields_do_not_return_a_serialized_staging_buffer() {
-        let payload = vec![37; 100_000];
+        let len = if cfg!(miri) { 10_000 } else { 100_000 };
+        let payload = vec![37; len];
         let blob = crate::state::serialize_state(42, &[7], &[0.25], b"", &payload);
         let mut pos = 0;
         let (state, prepared) = read_state_stream_prepared(
@@ -627,7 +640,7 @@ mod prepared_tests {
             prepare,
         )
         .unwrap();
-        assert_eq!(prepared, Some(37 * 100_000));
+        assert_eq!(prepared, Some(37 * len as u64));
         let StreamState::Envelope(StateParse::WrongPlugin { state, .. }) = state else {
             panic!()
         };

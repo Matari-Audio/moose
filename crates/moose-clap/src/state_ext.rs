@@ -36,34 +36,61 @@ pub(crate) unsafe extern "C" fn state_save<P: PluginExport>(
     // of aborting the host across this `extern "C"` boundary.
     run_extern_callback_with::<P, bool>("CLAP", "save_state", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let (ids, values) = data.params_arc.collect_values();
-        // Live custom state: serialized here when processing is stopped
-        // (the host thread owns the plugin, and drains any queued load
-        // first), otherwise requested from the audio thread's next block.
+        let Some(write_fn) = (*stream).write else {
+            return false;
+        };
+        #[cfg(feature = "clap-draft")]
+        if let Some(snapshot) = {
+            let main = moose_core::thread::MainThread::assume();
+            data.undo_save_state_override.borrow(&main).clone()
+        } {
+            let Ok(snapshot) = snapshot else { return false };
+            let mut rest = snapshot.as_slice();
+            while !rest.is_empty() {
+                let count = write_fn(stream, rest.as_ptr().cast(), rest.len() as u64);
+                let Ok(n) = usize::try_from(count) else {
+                    return false;
+                };
+                if n == 0 || n > rest.len() {
+                    return false;
+                }
+                rest = &rest[n..];
+            }
+            return true;
+        }
         let extra = custom_state_for_save(
             &data.plugin,
             &data.snapshot,
             &data.pending_state,
             !data.processing.load(Ordering::Acquire),
         );
-        let Ok(persist) = data.params_arc.prepare_persist_write() else {
-            return false;
-        };
-        let Some(write_fn) = (*stream).write else {
-            return false;
-        };
-        state::write_plugin_state_stream::<P>(
-            data.plugin_id_hash,
-            &data.params_arc,
-            &ids,
-            &values,
-            &extra,
-            persist.byte_len(),
-            P::max_host_state_bytes(),
-            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
-            |bytes| write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64),
-        )
+        write_snapshot::<P>(data.plugin_id_hash, &data.params_arc, &extra, |bytes| {
+            write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64)
+        })
     })
+}
+
+pub(crate) fn write_snapshot<P: PluginExport>(
+    plugin_id: u64,
+    params: &P::Params,
+    extra: &[u8],
+    write: impl FnMut(&[u8]) -> i64,
+) -> bool {
+    let (ids, values) = params.collect_values();
+    let Ok(persist) = params.prepare_persist_write() else {
+        return false;
+    };
+    state::write_plugin_state_stream::<P>(
+        plugin_id,
+        params,
+        &ids,
+        &values,
+        extra,
+        persist.byte_len(),
+        P::max_host_state_bytes(),
+        |output| moose_params::write_prepared_persist(persist.as_ref(), output),
+        write,
+    )
 }
 
 /// Largest state blob a host stream may hand us. Anything bigger is a

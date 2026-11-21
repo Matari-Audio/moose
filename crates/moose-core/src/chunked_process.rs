@@ -131,7 +131,7 @@ where
     P: PluginRuntime<Sample = S>,
 {
     let infos = args.param_infos;
-    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing, |id| {
+    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing, None, |id| {
         is_chunked(id, infos)
     })
 }
@@ -150,11 +150,45 @@ where
     S: Sample,
     P: PluginRuntime<Sample = S>,
 {
-    process_chunked_with_lookup(plugin, params, buffer, args, bus_routing, |id| {
-        catalog
-            .by_id(id)
-            .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED))
-    })
+    process_chunked_with_bus_routing_catalog_and_pool(
+        plugin,
+        params,
+        buffer,
+        args,
+        bus_routing,
+        catalog,
+        None,
+    )
+}
+
+/// Indexed routed chunker with an optional host RT thread pool
+/// (`ProcessContext::with_thread_pool`).
+pub fn process_chunked_with_bus_routing_catalog_and_pool<S, P>(
+    plugin: &mut P,
+    params: &dyn Params,
+    buffer: &mut AudioBuffer<S>,
+    args: ChunkedProcess<'_>,
+    bus_routing: BusRouting,
+    catalog: &moose_params::ParamCatalog,
+    thread_pool: Option<crate::process::ThreadPoolExec<'_>>,
+) -> ProcessStatus
+where
+    S: Sample,
+    P: PluginRuntime<Sample = S>,
+{
+    process_chunked_with_lookup(
+        plugin,
+        params,
+        buffer,
+        args,
+        bus_routing,
+        thread_pool,
+        |id| {
+            catalog
+                .by_id(id)
+                .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED))
+        },
+    )
 }
 
 fn process_chunked_with_lookup<S, P>(
@@ -163,6 +197,7 @@ fn process_chunked_with_lookup<S, P>(
     buffer: &mut AudioBuffer<S>,
     args: ChunkedProcess<'_>,
     bus_routing: BusRouting,
+    thread_pool: Option<crate::process::ThreadPoolExec<'_>>,
     chunked: impl Fn(u32) -> bool,
 ) -> ProcessStatus
 where
@@ -307,6 +342,9 @@ where
 
         if let Some(request) = latency_change_request {
             ctx = ctx.with_deferred_latency_changes(request);
+        }
+        if let Some(pool) = thread_pool {
+            ctx = ctx.with_thread_pool(pool);
         }
 
         last_status = plugin.process(&mut sub_buffer, sub_event_scratch, &mut ctx);

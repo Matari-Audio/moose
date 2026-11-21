@@ -13,8 +13,10 @@ use crate::ports::make_audio_ports_extension;
 use crate::ports::make_note_ports_extension;
 use crate::ports::ports_activation_set_active;
 use crate::ports::ports_activation_while_processing;
-use crate::ports::surround_map;
-use crate::ports::surround_mask;
+use crate::ports::{
+    ambisonic_get_config, ambisonic_is_config_supported, has_ambisonic_bus, surround_map,
+    surround_mask,
+};
 use crate::remote_controls::make_remote_controls_extension;
 use crate::resolved_name;
 use crate::state_ext::make_preset_load_extension;
@@ -27,6 +29,9 @@ use crate::voice_info;
 use crate::wayland_nested;
 
 pub(crate) use crate::host_context::editor_context;
+use clap_sys::ext::ambisonic::{
+    CLAP_EXT_AMBISONIC, CLAP_EXT_AMBISONIC_COMPAT, clap_plugin_ambisonic,
+};
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_plugin_audio_ports};
 use clap_sys::ext::audio_ports_activation::{
     CLAP_EXT_AUDIO_PORTS_ACTIVATION, CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT,
@@ -62,6 +67,7 @@ use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
 use clap_sys::ext::state_context::{CLAP_EXT_STATE_CONTEXT, clap_plugin_state_context};
 use clap_sys::ext::surround::{CLAP_EXT_SURROUND, CLAP_EXT_SURROUND_COMPAT, clap_plugin_surround};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_plugin_tail};
+use clap_sys::ext::thread_pool::{CLAP_EXT_THREAD_POOL, clap_plugin_thread_pool};
 use clap_sys::ext::track_info::{
     CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, clap_plugin_track_info,
 };
@@ -942,16 +948,22 @@ pub(crate) struct Extensions<P: PluginExport> {
     pub(crate) configurable_audio_ports: clap_plugin_configurable_audio_ports,
     pub(crate) audio_ports_activation: clap_plugin_audio_ports_activation,
     pub(crate) surround: clap_plugin_surround,
+    pub(crate) ambisonic: clap_plugin_ambisonic,
     pub(crate) note_ports: clap_plugin_note_ports,
     pub(crate) gui: clap_plugin_gui,
     pub(crate) latency: clap_plugin_latency,
     pub(crate) tail: clap_plugin_tail,
+    pub(crate) thread_pool: clap_plugin_thread_pool,
     pub(crate) render: clap_plugin_render,
     pub(crate) track_info: clap_plugin_track_info,
     pub(crate) note_name: clap_plugin_note_name,
     pub(crate) voice_info: clap_plugin_voice_info,
     pub(crate) param_indication: clap_plugin_param_indication,
     pub(crate) context_menu: clap_plugin_context_menu,
+    #[cfg(feature = "clap-draft")]
+    pub(crate) params_origin: crate::draft::clap_plugin_params_origin,
+    #[cfg(feature = "clap-draft")]
+    pub(crate) undo_context: crate::draft::clap_plugin_undo_context,
     pub(crate) _phantom: PhantomData<P>,
 }
 
@@ -1021,6 +1033,10 @@ impl<P: PluginExport> Extensions<P> {
                 is_channel_mask_supported: Some(surround_mask::<P>),
                 get_channel_map: Some(surround_map::<P>),
             },
+            ambisonic: clap_plugin_ambisonic {
+                is_config_supported: Some(ambisonic_is_config_supported::<P>),
+                get_config: Some(ambisonic_get_config::<P>),
+            },
             note_ports: make_note_ports_extension::<P>(),
             gui: make_gui_extension::<P>(),
             latency: clap_plugin_latency {
@@ -1028,6 +1044,9 @@ impl<P: PluginExport> Extensions<P> {
             },
             tail: clap_plugin_tail {
                 get: Some(tail_get::<P>),
+            },
+            thread_pool: clap_plugin_thread_pool {
+                exec: Some(crate::process::thread_pool_exec::<P>),
             },
             render: clap_plugin_render {
                 has_hard_realtime_requirement: Some(render_has_hard_realtime::<P>),
@@ -1038,6 +1057,10 @@ impl<P: PluginExport> Extensions<P> {
             voice_info: voice_info::make_extension::<P>(),
             param_indication: param_indication::make_extension::<P>(),
             context_menu: context_menu::make_extension::<P>(),
+            #[cfg(feature = "clap-draft")]
+            params_origin: crate::draft_ext::make_params_origin_extension::<P>(),
+            #[cfg(feature = "clap-draft")]
+            undo_context: crate::draft_ext::make_undo_context_extension::<P>(),
             _phantom: PhantomData,
         }
     }
@@ -1106,6 +1129,13 @@ pub(crate) unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         if ext_id == CLAP_EXT_SURROUND || ext_id == CLAP_EXT_SURROUND_COMPAT {
             return (&raw const extensions.surround).cast::<c_void>();
         }
+        if ext_id == CLAP_EXT_AMBISONIC || ext_id == CLAP_EXT_AMBISONIC_COMPAT {
+            return if has_ambisonic_bus::<P>() {
+                (&raw const extensions.ambisonic).cast::<c_void>()
+            } else {
+                ptr::null()
+            };
+        }
         if ext_id == CLAP_EXT_NOTE_PORTS {
             return (&raw const extensions.note_ports).cast::<c_void>();
         }
@@ -1117,6 +1147,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         }
         if ext_id == CLAP_EXT_TAIL {
             return (&raw const extensions.tail).cast::<c_void>();
+        }
+        if ext_id == CLAP_EXT_THREAD_POOL {
+            return (&raw const extensions.thread_pool).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_RENDER {
             return (&raw const extensions.render).cast::<c_void>();
@@ -1139,6 +1172,14 @@ pub(crate) unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
         }
         if ext_id == CLAP_EXT_CONTEXT_MENU || ext_id == CLAP_EXT_CONTEXT_MENU_COMPAT {
             return (&raw const extensions.context_menu).cast::<c_void>();
+        }
+        #[cfg(feature = "clap-draft")]
+        if ext_id == crate::draft::CLAP_EXT_PARAMS_ORIGIN {
+            return (&raw const extensions.params_origin).cast::<c_void>();
+        }
+        #[cfg(feature = "clap-draft")]
+        if ext_id == crate::draft::CLAP_EXT_UNDO_CONTEXT {
+            return (&raw const extensions.undo_context).cast::<c_void>();
         }
         #[cfg(all(target_os = "linux", feature = "clap-draft"))]
         if let Some(ext) = wayland_nested::extension::<P>(ext_id) {

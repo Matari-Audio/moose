@@ -5,6 +5,8 @@
 //! component interfaces.
 
 use std::ffi::{CStr, c_void};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -23,14 +25,40 @@ pub(super) struct View {
     frame: Mutex<Option<ComPtr<IPlugFrame>>>,
     /// Set while the editor is embedded in a Wayland surface.
     #[cfg(target_os = "linux")]
-    wayland: Mutex<Option<WaylandEmbed>>,
+    wayland: Mutex<WaylandState>,
+    /// Lock-free view of whether a Wayland attachment is active, so re-entrant
+    /// `onSize` / `setContentScaleFactor` callbacks triggered during `attached`
+    /// never reacquire `wayland`.
+    #[cfg(target_os = "linux")]
+    wayland_attached: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+enum WaylandState {
+    Detached,
+    Attaching,
+    Attached(WaylandEmbed),
 }
 
 /// What a Wayland `attached` holds until `removed`.
 #[cfg(target_os = "linux")]
 struct WaylandEmbed {
     hooks: super::wayland::LoopHooks,
+    wayland_frame: Option<ComPtr<IWaylandFrame>>,
     connection: super::wayland::Connection,
+}
+
+#[cfg(target_os = "linux")]
+impl WaylandEmbed {
+    #[allow(dead_code, reason = "used by Wayland popup parenting and unit tests")]
+    fn parent_surface(&self) -> Option<*mut c_void> {
+        super::wayland::parent_xdg_surface(self.wayland_frame.as_ref(), self.connection.display())
+    }
+
+    #[allow(dead_code, reason = "used by Wayland popup parenting and unit tests")]
+    fn parent_toplevel(&self) -> Option<*mut c_void> {
+        super::wayland::parent_xdg_toplevel(self.wayland_frame.as_ref(), self.connection.display())
+    }
 }
 
 impl Class for View {
@@ -89,7 +117,9 @@ impl View {
             id: AtomicUsize::new(0),
             frame: Mutex::new(None),
             #[cfg(target_os = "linux")]
-            wayland: Mutex::new(None),
+            wayland: Mutex::new(WaylandState::Detached),
+            #[cfg(target_os = "linux")]
+            wayland_attached: AtomicBool::new(false),
         });
         let Some(ptr) = wrapper.to_com_ptr::<IPlugView>() else {
             return std::ptr::null_mut();
@@ -114,37 +144,86 @@ impl View {
     }
 
     /// `attached(parent, "WaylandSurfaceID")`: open the editor on the host's
-    /// connection, then drive it from the plug frame's run loop.
+    /// connection, resolve the parent `wl_surface*` (preferring
+    /// `IWaylandFrame::getWaylandSurface` per VST3 3.8, falling back to
+    /// `parent`), then drive it from the plug frame's run loop.
     #[cfg(target_os = "linux")]
     fn attach_wayland(&self, parent: *mut c_void) -> bool {
-        use super::wayland::{Connection, LoopHooks, wayland_host_of};
+        use super::wayland::{Connection, LoopHooks, resolve_parent_surface, wayland_frame_of};
 
-        let mut embed = self.wayland.lock().unwrap_or_else(PoisonError::into_inner);
-        if embed.is_some() || !self.supports_wayland() {
+        struct AttachGuard<'a> {
+            view: &'a View,
+            committed: bool,
+        }
+        impl Drop for AttachGuard<'_> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    self.view.wayland_attached.store(false, Ordering::Release);
+                    let mut state = self
+                        .view
+                        .wayland
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if matches!(*state, WaylandState::Attaching) {
+                        *state = WaylandState::Detached;
+                    }
+                }
+            }
+        }
+
+        // Reserve the attachment slot without holding the mutex across any
+        // external call: VST3 permits synchronous `onSize` / `resizeView`
+        // callbacks while `attached` is running.
+        {
+            let mut state = self.wayland.lock().unwrap_or_else(PoisonError::into_inner);
+            if !matches!(*state, WaylandState::Detached) {
+                return false;
+            }
+            *state = WaylandState::Attaching;
+        }
+        let mut guard = AttachGuard {
+            view: self,
+            committed: false,
+        };
+
+        if !self.supports_wayland() {
             return false;
         }
         // Everything that can fail without side effects comes first: the
         // editor needs both the host connection and the run loop.
-        let Some(wayland_host) = self.host.host_context().and_then(|c| wayland_host_of(&c)) else {
+        let Some(host_context) = self.host.host_context() else {
             return false;
         };
-        let run_loop = self
-            .frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .and_then(|f| super::wake::linux::run_loop_of(f.as_ptr().cast()));
+        let (run_loop, wayland_frame) = {
+            let guard = self.frame.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(frame) = guard.as_ref() else {
+                return false;
+            };
+            (
+                super::wake::linux::run_loop_of(frame.as_ptr().cast()),
+                wayland_frame_of(frame),
+            )
+        };
         let Some(run_loop) = run_loop else {
             return false;
         };
-        let Some(connection) = Connection::open(wayland_host) else {
+        if wayland_frame.is_none() && parent.is_null() {
+            return false;
+        }
+        let Some(connection) = Connection::open(&host_context) else {
+            return false;
+        };
+        let Some(surface) =
+            resolve_parent_surface(wayland_frame.as_ref(), connection.display(), parent)
+        else {
             return false;
         };
         let (ctx, cb) = (self.host.ctx, self.host.reg.cb);
         self.host.attach_view(self.id());
-        // SAFETY: `ctx` is live; `display` and `parent` stay valid until
+        self.wayland_attached.store(true, Ordering::Release);
+        // SAFETY: `ctx` is live; `display` and `surface` stay valid until
         // `gui_close`, which runs before `connection` drops.
-        if unsafe { (cb.gui_open_wayland)(ctx, connection.display().cast(), parent) } == 0 {
+        if unsafe { (cb.gui_open_wayland)(ctx, connection.display().cast(), surface) } == 0 {
             self.host.detach_view(self.id());
             return false;
         }
@@ -160,8 +239,30 @@ impl View {
             unsafe { (cb.gui_close)(ctx) };
             return false;
         };
-        *embed = Some(WaylandEmbed { hooks, connection });
+        let mut state = self.wayland.lock().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*state, WaylandState::Attaching) {
+            // `removed()` ran re-entrantly during `gui_open_wayland`.
+            drop(state);
+            drop(hooks);
+            if self.host.detach_view(self.id()) {
+                // SAFETY: `ctx` is still live until `connection` drops.
+                unsafe { (cb.gui_close)(ctx) };
+            }
+            drop(connection);
+            return false;
+        }
+        *state = WaylandState::Attached(WaylandEmbed {
+            hooks,
+            wayland_frame,
+            connection,
+        });
+        guard.committed = true;
         true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_wayland_attached(&self) -> bool {
+        self.wayland_attached.load(Ordering::Acquire)
     }
 
     fn set_frame(&self, frame: Option<ComPtr<IPlugFrame>>) {
@@ -207,13 +308,16 @@ impl IPlugViewTrait for View {
         let Some(platform) = platform(kind) else {
             return kResultFalse;
         };
-        if parent.is_null() {
-            return kResultFalse;
-        }
         match platform {
-            Platform::Native => {}
+            Platform::Native => {
+                if parent.is_null() {
+                    return kResultFalse;
+                }
+            }
             #[cfg(target_os = "linux")]
             Platform::Wayland => {
+                // VST3 3.8 allows `parent == nullptr` when `IWaylandFrame::getWaylandSurface`
+                // provides the surface for the host's Wayland display.
                 return if self.attach_wayland(parent) {
                     kResultOk
                 } else {
@@ -234,13 +338,17 @@ impl IPlugViewTrait for View {
     /// connection closed (the editor's proxies live on it).
     unsafe fn removed(&self) -> tresult {
         #[cfg(target_os = "linux")]
-        let (hooks, connection) = self
-            .wayland
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .map(|e| (e.hooks, e.connection))
-            .unzip();
+        let (hooks, connection) = {
+            self.wayland_attached.store(false, Ordering::Release);
+            let prev = std::mem::replace(
+                &mut *self.wayland.lock().unwrap_or_else(PoisonError::into_inner),
+                WaylandState::Detached,
+            );
+            match prev {
+                WaylandState::Attached(e) => (Some(e.hooks), Some(e.connection)),
+                WaylandState::Detached | WaylandState::Attaching => (None, None),
+            }
+        };
         #[cfg(target_os = "linux")]
         drop(hooks);
         if self.host.detach_view(self.id()) {
@@ -279,11 +387,28 @@ impl IPlugViewTrait for View {
     }
 
     /// The host has committed a size; there is no refusing it here.
+    ///
+    /// On Wayland (`WaylandSurfaceID`), bracket the resize with `set_sync` /
+    /// `set_desync` and flush the surface so the resized buffer commits
+    /// atomically with the host's parent commit (VST3 3.8 sync-on-resize).
     unsafe fn onSize(&self, size: *mut ViewRect) -> tresult {
         if let Some(r) = unsafe { size.as_ref() } {
             let (w, h) = (r.right - r.left, r.bottom - r.top);
             if w > 0 && h > 0 {
+                #[cfg(target_os = "linux")]
+                let wayland = self.is_wayland_attached();
+                #[cfg(not(target_os = "linux"))]
+                let wayland = false;
+                if wayland {
+                    unsafe { (self.host.reg.cb.gui_wayland_set_sync)(self.host.ctx, 1) };
+                }
                 unsafe { (self.host.reg.cb.gui_set_size)(self.host.ctx, w as u32, h as u32) };
+                if wayland {
+                    unsafe {
+                        (self.host.reg.cb.gui_on_fd)(self.host.ctx);
+                        (self.host.reg.cb.gui_wayland_set_sync)(self.host.ctx, 0);
+                    }
+                }
             }
         }
         kResultOk
@@ -330,9 +455,14 @@ impl IPlugViewTrait for View {
 }
 
 impl IPlugViewContentScaleSupportTrait for View {
-    /// macOS scales through `AppKit`; the host factor is not used there.
+    /// macOS scales through `AppKit`; Wayland scales through the compositor's
+    /// `wp_fractional_scale_v1` / `preferred_buffer_scale`.
     unsafe fn setContentScaleFactor(&self, factor: ScaleFactor) -> tresult {
         if cfg!(target_os = "macos") {
+            return kResultFalse;
+        }
+        #[cfg(target_os = "linux")]
+        if self.is_wayland_attached() {
             return kResultFalse;
         }
         unsafe { (self.host.reg.cb.gui_set_content_scale)(self.host.ctx, f64::from(factor)) };

@@ -285,6 +285,13 @@ impl HostHandle<Any> {
 }
 
 impl HostHandle<MainThread> {
+    /// Raw `*const clap_host` pointer for `[main-thread]` draft extensions.
+    #[cfg(feature = "clap-draft")]
+    #[must_use]
+    pub(crate) fn as_raw(self) -> *const clap_host {
+        self.raw
+    }
+
     /// Widen back to the thread-safe subset.
     #[must_use]
     pub(crate) fn as_any(self) -> HostHandle<Any> {

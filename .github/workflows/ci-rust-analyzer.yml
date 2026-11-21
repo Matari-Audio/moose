@@ -10,14 +10,32 @@ name: Rust Analyzer
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/**']
+    paths:
+      - 'crates/moose-derive/**'
+      - 'crates/moose-params/**'
+      - 'crates/moose-core/**'
+      - 'crates/moose/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-rust-analyzer.yml'
   pull_request:
-    paths-ignore: ['**.md', 'docs/**']
+    paths:
+      - 'crates/moose-derive/**'
+      - 'crates/moose-params/**'
+      - 'crates/moose-core/**'
+      - 'crates/moose/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-rust-analyzer.yml'
   workflow_dispatch:
 
+# Must match ci.yml's CARGO_* env exactly so Swatinem/rust-cache@v2 hits
+# ci.yml's `core-ubuntu-24.04` entry.
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 concurrency:
   group: rust-analyzer-${{ github.ref }}
@@ -42,9 +60,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: rust-analyzer-ubuntu-24.04
+          shared-key: core-ubuntu-24.04
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
 
       - name: Linux system deps
         run: |

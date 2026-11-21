@@ -483,6 +483,13 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Get plain value by ID.
     fn get_plain(&self, id: u32) -> Option<f64>;
 
+    /// Visual/bipolar origin value of `id` in plain units (for example `0.0`
+    /// for a `-24..+24 dB` gain or `-1..+1` pan), used by hosts that support
+    /// CLAP `clap.params-origin/1`. Defaults to `None` (no distinct origin).
+    fn param_origin(&self, _id: u32) -> Option<f64> {
+        None
+    }
+
     /// Get plain value by dense declaration-order index, validated against `id`.
     ///
     /// Format wrappers that already resolved `id` to its dense catalog index

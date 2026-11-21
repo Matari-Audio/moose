@@ -17,6 +17,7 @@ use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_host_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
+use clap_sys::ext::thread_pool::{CLAP_EXT_THREAD_POOL, clap_host_thread_pool};
 use clap_sys::ext::track_info::{
     CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, clap_host_track_info,
 };
@@ -24,8 +25,8 @@ use clap_sys::plugin::clap_plugin;
 use moose_core::bus_routing::{BusActivation, BusRouting};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::export::PluginExport;
-use moose_core::host_queue::{HostMessage, HostSignal};
-use moose_core::main_thread::HostNotice;
+use moose_core::host_queue::{HostSignal, HostSink, dispatch};
+use moose_core::main_thread::MenuTarget;
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
 use moose_core::thread::MainThread;
@@ -108,6 +109,25 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
         {
             data.host_thread_check = ext;
         }
+        if let Some(ext) = data
+            .host
+            .extension::<clap_host_thread_pool>(CLAP_EXT_THREAD_POOL)
+        {
+            data.host_thread_pool = ext;
+        }
+        #[cfg(feature = "clap-draft")]
+        if let Some(ext) = data
+            .host
+            .extension::<crate::draft::clap_host_param_hovered>(
+                crate::draft::CLAP_EXT_PARAM_HOVERED,
+            )
+        {
+            data.host_param_hovered = ext;
+        }
+        // Do NOT eagerly query `clap.undo/4` here: CLAP specifies that
+        // querying `CLAP_EXT_UNDO` disables implicit host undo snapshots from
+        // `state.mark_dirty`. Resolve it lazily only when the plugin actually
+        // starts reporting explicit change groups.
         data.host.debug_assert_main_thread(data.host_thread_check);
         if data.params_arc.wants_persist_notifications() {
             let queue = Arc::clone(&data.host_queue);
@@ -156,6 +176,19 @@ pub(crate) unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *co
                 signal.close();
             }
             (*data_ptr).host_queue.close();
+            #[cfg(feature = "clap-draft")]
+            {
+                let main = MainThread::assume();
+                if let Some(ext) = *(*data_ptr).host_undo.borrow(&main) {
+                    let host = (*data_ptr).host.on_main_thread(&main);
+                    if let Some(subscribe) =
+                        ext.as_ref().and_then(|undo| undo.set_wants_context_updates)
+                    {
+                        subscribe(host.as_raw(), false);
+                    }
+                    (*data_ptr).undo_groups.cancel_open_on_destroy(host, ext);
+                }
+            }
             report_latched_panic(&*data_ptr);
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
@@ -366,6 +399,185 @@ pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *cons
     });
 }
 
+struct ClapSink<'a, P: PluginExport> {
+    plugin: *const clap_plugin,
+    data: &'a ClapPluginData<P>,
+    main: &'a MainThread,
+    host: crate::host_handle::HostHandle<crate::host_handle::MainThread>,
+    active: bool,
+    pending: HostSignal,
+}
+
+impl<P: PluginExport> HostSink for ClapSink<'_, P> {
+    fn persist_changed(&mut self) {
+        if let Some((id, value)) = self.data.params_arc.take_persist_change()
+            && value.is_finite()
+            && (0.0..=1.0).contains(&value)
+            && self.data.params_arc.get_normalized(id).is_some()
+        {
+            // The ordinary gesture queue works independently of GUI creation.
+            // SAFETY: `self.plugin` is live for the duration of `on_main_thread`.
+            let context = unsafe { editor_context::<P>(self.plugin) };
+            context.begin_edit(id);
+            context.set_param(id, value);
+            context.end_edit(id);
+            // State dirtiness must also reach an inactive host that does not
+            // implement params/request_flush.
+            // SAFETY: main thread, live host handle.
+            unsafe { self.host.mark_dirty(self.data.host_state) };
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.mark_dirty(self.data.host_state) };
+    }
+
+    fn floating_closed(&mut self) {
+        self.data.gui.enter().visible = false;
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.gui_closed(false) };
+    }
+
+    fn param_values_changed(&mut self) {
+        self.pending |= HostSignal::PARAM_RESCAN;
+    }
+
+    fn note_names_changed(&mut self) {
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.note_name_changed() };
+    }
+
+    fn voice_info_changed(&mut self) {
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.voice_info_changed() };
+    }
+
+    fn audio_ports_changed(&mut self) {
+        self.data.ports_rescan.store(true, Ordering::Relaxed);
+        if self.active {
+            self.pending |= HostSignal::RESTART;
+        }
+    }
+
+    fn latency_changed(&mut self) {
+        self.pending |= HostSignal::LATENCY;
+    }
+
+    fn request_restart(&mut self) {
+        self.pending |= HostSignal::RESTART;
+    }
+
+    fn flush_signals(&mut self) {
+        // Catalog changes, presentation revisions and value rescans. A
+        // structure change requests a restart and is published inactive.
+        // SAFETY: main thread, live instance.
+        unsafe {
+            catalog_sync::sync_parameters(
+                self.data,
+                self.main,
+                self.pending.contains(HostSignal::PARAM_RESCAN),
+            );
+        }
+        if !self.active && self.data.ports_rescan.swap(false, Ordering::Relaxed) {
+            // SAFETY: main thread, live instance, inactive.
+            unsafe { host_rescan_audio_ports(self.data, self.main) };
+        }
+        // CLAP 1.2 `clap_host_latency.changed` is `[main-thread & being-activated]`,
+        // so an active latency change requests a restart and `activate` emits
+        // `latency.changed` once the new latency is published.
+        if self.pending.contains(HostSignal::LATENCY) && !self.host.is_null() && self.active {
+            self.pending |= HostSignal::RESTART;
+        }
+        if self.pending.contains(HostSignal::RESTART) {
+            // SAFETY: `request_restart` is [thread-safe].
+            unsafe { self.host.as_any().request_restart() };
+        }
+    }
+
+    fn context_menu(&mut self, target: MenuTarget, x: i32, y: i32) {
+        context_menu::popup(self.data, self.main, target, x, y);
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn param_hovered(&mut self, id: Option<u32>) {
+        // SAFETY: main thread, live host handle and cached extension pointer.
+        unsafe {
+            crate::draft_ext::notify_param_hovered(self.host, self.data.host_param_hovered, id);
+        }
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn edit_group(&mut self, edge: moose_core::editor::EditGroup) {
+        let ext = resolve_host_undo(self.data, self.main);
+        // SAFETY: main thread, live host handle and resolved extension pointer.
+        unsafe { crate::draft_ext::notify_edit_group(self.host, ext, edge) };
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn request_undo(&mut self) {
+        let ext = self
+            .data
+            .host_undo
+            .borrow(self.main)
+            .unwrap_or(std::ptr::null());
+        // SAFETY: main thread, live host handle and resolved extension pointer.
+        unsafe { crate::draft_ext::notify_request_undo(self.host, ext) };
+    }
+
+    #[cfg(feature = "clap-draft")]
+    fn request_redo(&mut self) {
+        let ext = self
+            .data
+            .host_undo
+            .borrow(self.main)
+            .unwrap_or(std::ptr::null());
+        // SAFETY: main thread, live host handle and resolved extension pointer.
+        unsafe { crate::draft_ext::notify_request_redo(self.host, ext) };
+    }
+
+    fn forward_xkb_key(&mut self, keycode: u32, keysym: u32, modifiers: u32, pressed: bool) {
+        #[cfg(all(target_os = "linux", feature = "clap-draft"))]
+        // SAFETY: main thread, live host handle.
+        let _ = unsafe {
+            crate::wayland_nested::forward_xkb_key(
+                self.host.as_ptr(),
+                keycode,
+                keysym,
+                modifiers,
+                pressed,
+            )
+        };
+        #[cfg(not(all(target_os = "linux", feature = "clap-draft")))]
+        let _ = (keycode, keysym, modifiers, pressed);
+    }
+}
+
+/// Lazily query `clap.undo/4` on the host main thread once the plugin actually
+/// uses explicit undo operations, preserving implicit `state.mark_dirty` undo
+/// for dirty-only plugins.
+#[cfg(feature = "clap-draft")]
+fn resolve_host_undo<P: PluginExport>(
+    data: &ClapPluginData<P>,
+    main: &MainThread,
+) -> *const crate::draft::clap_host_undo {
+    if let Some(ext) = *data.host_undo.borrow(main) {
+        return ext;
+    }
+    // SAFETY: the explicit reporting feature is first activated on the main thread.
+    unsafe {
+        let ext = data
+            .host
+            .extension::<crate::draft::clap_host_undo>(crate::draft::CLAP_EXT_UNDO)
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        *data.host_undo.borrow_mut(main) = Some(ext);
+        if let Some(subscribe) = ext.as_ref().and_then(|undo| undo.set_wants_context_updates) {
+            subscribe(data.host.as_ptr(), true);
+        }
+        ext
+    }
+}
+
 pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
     plugin: *const clap_plugin,
 ) {
@@ -378,61 +590,46 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
         let host = data.host.on_main_thread(&main);
         // Everything raised from here on wakes the host again.
         let drain = data.host_queue.drain(&main);
-        let signals = drain.signals;
-        if signals.contains(HostSignal::PERSIST)
-            && let Some((id, value)) = data.params_arc.take_persist_change()
-            && value.is_finite()
-            && (0.0..=1.0).contains(&value)
-            && data.params_arc.get_normalized(id).is_some()
+        let mut sink = ClapSink {
+            plugin,
+            data,
+            main: &main,
+            host,
+            active: data.active.load(Ordering::Relaxed),
+            pending: HostSignal::empty(),
+        };
+        dispatch(drain, &mut sink);
+        #[cfg(feature = "clap-draft")]
+        match data.hovered_param.swap(0, Ordering::AcqRel) {
+            0 => {}
+            1 => crate::draft_ext::notify_param_hovered(host, data.host_param_hovered, None),
+            encoded => crate::draft_ext::notify_param_hovered(
+                host,
+                data.host_param_hovered,
+                u32::try_from(encoded - 2).ok(),
+            ),
+        }
+        #[cfg(feature = "clap-draft")]
         {
-            // The ordinary gesture queue works independently of GUI creation.
-            let context = editor_context::<P>(plugin);
-            context.begin_edit(id);
-            context.set_param(id, value);
-            context.end_edit(id);
-            // State dirtiness must also reach an inactive host that does not
-            // implement params/request_flush.
-            host.mark_dirty(data.host_state);
-        }
-        if signals.contains(HostSignal::MARK_DIRTY) {
-            host.mark_dirty(data.host_state);
-        }
-        if signals.contains(HostSignal::FLOATING_CLOSED) {
-            data.gui.enter().visible = false;
-            host.gui_closed(false);
-        }
-        // Catalog changes, presentation revisions and value rescans. A
-        // structure change requests a restart and is published inactive.
-        catalog_sync::sync_parameters(data, &main, signals.contains(HostSignal::PARAM_RESCAN));
-        let notices = signals.notices();
-        if notices.contains(HostNotice::NOTE_NAMES) {
-            host.note_name_changed();
-        }
-        if notices.contains(HostNotice::VOICE_INFO) {
-            host.voice_info_changed();
-        }
-        let active = data.active.load(Ordering::Relaxed);
-        let mut restart = signals.contains(HostSignal::RESTART);
-        if notices.contains(HostNotice::AUDIO_PORTS) {
-            data.ports_rescan.store(true, Ordering::Relaxed);
-            restart |= active;
-        }
-        if !active && data.ports_rescan.swap(false, Ordering::Relaxed) {
-            host_rescan_audio_ports(data, &main);
-        }
-        // CLAP 1.2 `clap_host_latency.changed` is `[main-thread & being-activated]`,
-        // so an active latency change requests a restart and `activate` emits
-        // `latency.changed` once the new latency is published.
-        if signals.contains(HostSignal::LATENCY) && !host.is_null() && active {
-            restart = true;
-        }
-        if restart {
-            host.as_any().request_restart();
-        }
-        for message in drain {
-            // Messages added to moose after this wrapper are dropped.
-            if let HostMessage::ContextMenu { target, x, y } = message {
-                context_menu::popup(data, &main, target, x, y);
+            let flush = if data.undo_groups.has_pending() {
+                let ext = resolve_host_undo(data, &main);
+                // SAFETY: main thread, live host handle and resolved extension.
+                data.undo_groups
+                    .drain_main_thread(host, ext, &data.undo_save_state_override, &main)
+            } else {
+                false
+            };
+            if flush || !data.undo_groups.retry_gui_change.is_empty() {
+                // SAFETY: `params.request_flush` is [thread-safe] and host is live.
+                if data.host_params.is_null() {
+                    // A host without clap.params can still consume gestures in process().
+                    if let Some(process) = (*host.as_ptr()).request_process {
+                        process(host.as_ptr());
+                    }
+                } else {
+                    host.as_any()
+                        .request_flush(crate::host_handle::HostParamsHandle::new(data.host_params));
+                }
             }
         }
     }

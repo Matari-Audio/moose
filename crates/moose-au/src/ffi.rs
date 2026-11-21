@@ -111,8 +111,12 @@ pub struct AuParamDescriptor {
 /// appends wrapper-time preflight and transactional parameter feedback. v10
 /// appends explicit parameter-feedback carrier negotiation. v11 appends
 /// process-time audio-bus activation metadata. v12 makes `state_load` return
-/// acceptance so the `AUv2` property setter can report malformed state.
-pub const MOOSE_AU_ABI_VERSION: u32 = 0x5441_750C;
+/// acceptance so the `AUv2` property setter can report malformed state. v13
+/// appends `create_with_sink` (`MooseAuHostSink`), `set_active`,
+/// `set_context_name`, live per-instance parameter catalog callbacks
+/// (`param_ids`, `param_info_by_id`, `param_clump_name`), and ramp-aware
+/// `process_native_v13`.
+pub const MOOSE_AU_ABI_VERSION: u32 = 0x5441_750D;
 
 /// Callbacks from the `ObjC` shim into Rust.
 #[repr(C)]
@@ -374,6 +378,47 @@ pub struct AuCallbacks {
         param_overflow: u32,
         transport: *const AuTransportSnapshot,
     ) -> u32,
+    /// v13 append-only tail: create an instance wired to a host notification
+    /// vtable. Offset 1 (`create`) stays untouched for older `AUv3` appexes.
+    pub create_with_sink: unsafe extern "C" fn(sink: *const MooseAuHostSink) -> *mut c_void,
+    /// v13: 1 on `Initialize`/`allocateRenderResources`, 0 on
+    /// `Uninitialize`/`deallocateRenderResources`.
+    pub set_active: unsafe extern "C" fn(ctx: *mut c_void, active: u32),
+    /// v13: host track/channel name (`kAudioUnitProperty_ContextName` /
+    /// `AUAudioUnit.contextName`). Null clears the name.
+    pub set_context_name: unsafe extern "C" fn(ctx: *mut c_void, name_utf8: *const c_char),
+    /// v13: live exposed parameter IDs. Returns total count; writes up to `cap`
+    /// IDs when `out_ids` is non-null.
+    pub param_ids: unsafe extern "C" fn(ctx: *mut c_void, out_ids: *mut u32, cap: u32) -> u32,
+    /// v13: live per-instance parameter info copied by value. Returns 1 if
+    /// exposed, 0 otherwise.
+    pub param_info_by_id:
+        unsafe extern "C" fn(ctx: *mut c_void, id: u32, out: *mut AuParamInfoOut) -> i32,
+    /// v13: live per-instance clump name by 1-based `clump_id`.
+    pub param_clump_name: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        clump_id: u32,
+        out: *mut c_char,
+        out_len: u32,
+    ) -> u32,
+    /// v13: ramp-aware native process entry.
+    pub process_native_v13: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        inputs: *const *const f32,
+        outputs: *mut *mut f32,
+        num_input_channels: u32,
+        num_output_channels: u32,
+        input_bus_active: u32,
+        output_bus_active: u32,
+        num_frames: u32,
+        events: *const AuNativeEvent,
+        num_events: u32,
+        input_overflow: u32,
+        param_events: *const AuParamEventV2,
+        num_param_events: u32,
+        param_overflow: u32,
+        transport: *const AuTransportSnapshot,
+    ) -> u32,
 }
 
 /// A MIDI event passed across the Rust ↔ `ObjC` boundary in both
@@ -507,6 +552,125 @@ pub struct AuParamEvent {
     /// the `EventBody::ParamChange`.
     pub value: f32,
 }
+
+pub const AU_PARAM_EVENT_HAS_START_VALUE: u32 = 1 << 0;
+
+/// Unified step/ramp parameter event (ABI v13). Mirrors `AuParamEventV2` in
+/// `au_shim_types.h`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AuParamEventV2 {
+    pub start_offset: i32,
+    pub duration_frames: u32,
+    pub param_id: u32,
+    pub flags: u32,
+    pub start_value: f32,
+    pub end_value: f32,
+}
+
+pub const AU_PARAM_FLAG_READ_ONLY: u32 = 1 << 0;
+pub const AU_PARAM_FLAG_HIDDEN: u32 = 1 << 1;
+pub const AU_PARAM_FLAG_IS_BYPASS: u32 = 1 << 2;
+pub const AU_PARAM_FLAG_CAN_RAMP: u32 = 1 << 3;
+
+/// Per-instance live parameter info copied by value (ABI v13). Mirrors
+/// `AuParamInfoOut` in `au_shim_types.h`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(
+    clippy::pub_underscore_fields,
+    reason = "mirrors C ABI padding field in au_shim_types.h"
+)]
+pub struct AuParamInfoOut {
+    pub id: u32,
+    pub step_count: u32,
+    pub clump_id: u32,
+    pub flags: u32,
+    pub min: f64,
+    pub max: f64,
+    pub default_value: f64,
+    pub midi_status: u8,
+    pub midi_data1: u8,
+    pub midi_channel: i16,
+    pub _reserved: u32,
+    pub name: [c_char; 128],
+    pub unit: [c_char; 32],
+    pub group: [c_char; 128],
+}
+
+impl Default for AuParamInfoOut {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            step_count: 0,
+            clump_id: 0,
+            flags: 0,
+            min: 0.0,
+            max: 0.0,
+            default_value: 0.0,
+            midi_status: 0,
+            midi_data1: 0,
+            midi_channel: -1,
+            _reserved: 0,
+            name: [0; 128],
+            unit: [0; 32],
+            group: [0; 128],
+        }
+    }
+}
+
+/// Host notification vtable passed into `create_with_sink` (ABI v13).
+/// Mirrors `MooseAuHostSink` in `au_shim_types.h`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(
+    clippy::pub_underscore_fields,
+    reason = "mirrors C ABI padding field in au_shim_types.h"
+)]
+pub struct MooseAuHostSink {
+    pub size: u32,
+    pub _reserved: u32,
+    pub user_data: *mut c_void,
+    pub release_user_data: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    pub begin_edit: Option<unsafe extern "C" fn(user_data: *mut c_void, param_id: u32)>,
+    pub set_param:
+        Option<unsafe extern "C" fn(user_data: *mut c_void, param_id: u32, plain_value: f32)>,
+    pub end_edit: Option<unsafe extern "C" fn(user_data: *mut c_void, param_id: u32)>,
+    pub latency_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    pub tail_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    pub param_values_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    pub param_presentation_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    pub request_resize:
+        Option<unsafe extern "C" fn(user_data: *mut c_void, width: u32, height: u32)>,
+}
+
+impl Default for MooseAuHostSink {
+    fn default() -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let size = std::mem::size_of::<Self>() as u32;
+        Self {
+            size,
+            _reserved: 0,
+            user_data: std::ptr::null_mut(),
+            release_user_data: None,
+            begin_edit: None,
+            set_param: None,
+            end_edit: None,
+            latency_changed: None,
+            tail_changed: None,
+            param_values_changed: None,
+            param_presentation_changed: None,
+            request_resize: None,
+        }
+    }
+}
+
+// SAFETY: `MooseAuHostSink` is copied by value into `AuInstance` and its
+// callbacks are only invoked on the host main/UI thread while `HostQueue::with_open`
+// holds the instance open (or `release_user_data` once in `cb_destroy` after
+// `HostQueue::close()`).
+unsafe impl Send for MooseAuHostSink {}
+unsafe impl Sync for MooseAuHostSink {}
 
 /// Transport snapshot filled by the shim from `HostCallbackInfo` (AU v2)
 /// or `AUAudioUnit.musicalContextBlock` / `transportStateBlock` (AU v3).

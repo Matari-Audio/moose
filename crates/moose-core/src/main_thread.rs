@@ -34,6 +34,9 @@ bitflags::bitflags! {
         /// `kIoChanged`). An active plugin is restarted first; the host
         /// re-reads the ports while it is inactive.
         const AUDIO_PORTS = 0b100;
+        /// [`MainThreadHooks::keyswitches`] changed (VST3
+        /// `kKeyswitchChanged`).
+        const KEYSWITCHES = 0b1000;
     }
 }
 
@@ -251,6 +254,45 @@ pub enum BusDirection {
     Output,
 }
 
+/// Articulation trigger kind exposed through VST3 `IKeyswitchController`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum KeyswitchKind {
+    /// Triggered by a note-on event (`kNoteOnKeyswitchTypeID`).
+    #[default]
+    NoteOn,
+    /// Triggered while playing (`kOnTheFlyKeyswitchTypeID`).
+    OnTheFly,
+    /// Triggered on note release (`kOnReleaseKeyswitchTypeID`).
+    OnRelease,
+    /// Covers a key range (`kKeyRangeTypeID`).
+    KeyRange,
+}
+
+/// One keyswitch articulation advertised to the host (`IKeyswitchController`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Keyswitch {
+    pub kind: KeyswitchKind,
+    pub title: String,
+    pub short_title: String,
+    /// Lowest triggering MIDI key (`0..=127`).
+    pub min_key: u8,
+    /// Highest triggering MIDI key (`0..=127`).
+    pub max_key: u8,
+    /// Optional remapped key (`-1` when not remapped).
+    pub remapped_key: i32,
+    /// Unit ID this keyswitch applies to (`0` for the root unit).
+    pub unit_id: i32,
+}
+
+/// One program-list entry exposed via VST3 `IUnitInfo` + `IProgramListData`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramPreset {
+    pub name: String,
+    pub category: String,
+    /// Serialized MOOSE state envelope bytes for this program.
+    pub state: Vec<u8>,
+}
+
 /// The main-thread part of a plugin. See the module docs.
 pub trait MainThreadHooks: Send + 'static {
     /// The wrapper's [`HostNotifier`], passed once after the hooks are
@@ -264,6 +306,28 @@ pub trait MainThreadHooks: Send + 'static {
     /// with [`HostNotice::NOTE_NAMES`].
     fn note_names(&self, _cx: &MainThread) -> Vec<NoteName> {
         Vec::new()
+    }
+
+    /// Articulation keyswitches for `(bus, channel)` (VST3
+    /// `IKeyswitchController`). Ask the host to re-read them with
+    /// [`HostNotice::KEYSWITCHES`].
+    fn keyswitches(&self, _cx: &MainThread, _bus: u32, _channel: u8) -> Vec<Keyswitch> {
+        Vec::new()
+    }
+
+    /// Host-visible program list exposed via VST3 `IUnitInfo` and
+    /// `IProgramListData`. Returning an empty list keeps `getProgramListCount`
+    /// at `0`.
+    fn program_list(&self, _cx: &MainThread) -> Vec<ProgramPreset> {
+        Vec::new()
+    }
+
+    /// Replace the stored data for program `index` (VST3
+    /// `IProgramListData::setProgramData` / `IUnitInfo::setUnitProgramData`).
+    /// Return `true` if the bank accepted the update, or `false` if the bank
+    /// is immutable or `index` is out of range.
+    fn set_program_data(&mut self, _cx: &MainThread, _index: usize, _data: &[u8]) -> bool {
+        false
     }
 
     /// Voice usage; `None` when the plugin doesn't report it. Tell the host

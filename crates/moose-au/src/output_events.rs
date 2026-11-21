@@ -12,7 +12,6 @@ use crate::ffi::{
     AU_NATIVE_EVENT_UMP, AU_OUTPUT_EMITTED, AU_OUTPUT_END, AU_OUTPUT_INVALID, AU_OUTPUT_QUEUE_FULL,
     AU_OUTPUT_UNSUPPORTED, AuMidiEvent, AuNativeEvent, AuUmpEvent,
 };
-#[cfg(target_os = "macos")]
 use moose_core::Float;
 use moose_core::cast::len_u32;
 use moose_core::events::{
@@ -29,6 +28,7 @@ use moose_core::ump::{
     encode_ump_channel_voice_2, sysex7_packet_count,
 };
 use moose_core::wrapper::run_extern_callback_with;
+use moose_params::Params;
 use std::slice;
 
 // ---------------------------------------------------------------------------
@@ -819,7 +819,6 @@ pub(crate) fn begin_output_events<P: PluginExport>(
         return;
     }
 
-    #[cfg(target_os = "macos")]
     let mut param_count = 0usize;
     let status = audio.output_events.lossless_iter().find_map(|event| {
         if let LosslessEventRef::Typed(Event {
@@ -830,23 +829,18 @@ pub(crate) fn begin_output_events<P: PluginExport>(
         {
             if *sample_offset >= num_frames
                 || !value.is_finite()
-                || !inst.param_infos.iter().any(|info| info.id == *id)
+                || audio.catalog.by_id(*id).is_none()
             {
                 return Some(AU_OUTPUT_INVALID);
             }
-            #[cfg(target_os = "macos")]
-            {
-                if !f32::from_f64(*value).is_finite() {
-                    return Some(AU_OUTPUT_INVALID);
-                }
-                if !audio.native_output_param_feedback_available || inst.param_notify.is_none() {
-                    return Some(AU_OUTPUT_UNSUPPORTED);
-                }
-                param_count += 1;
-                return None;
+            if !f32::from_f64(*value).is_finite() {
+                return Some(AU_OUTPUT_INVALID);
             }
-            #[cfg(not(target_os = "macos"))]
-            return Some(AU_OUTPUT_UNSUPPORTED);
+            if !audio.native_output_param_feedback_available || !inst.host_sink.has_set_param() {
+                return Some(AU_OUTPUT_UNSUPPORTED);
+            }
+            param_count += 1;
+            return None;
         }
         match encode_native_output_checked::<P>(
             event,
@@ -864,14 +858,12 @@ pub(crate) fn begin_output_events<P: PluginExport>(
     });
     audio.native_output_status = status.unwrap_or(AU_OUTPUT_END);
 
-    #[cfg(target_os = "macos")]
     if audio.native_output_status == AU_OUTPUT_END
         && param_count > 0
-        && let Some(notifier) = &inst.param_notify
-        && notifier
-            .queue
+        && inst
+            .param_out_queue
             .capacity()
-            .saturating_sub(notifier.queue.len())
+            .saturating_sub(inst.param_out_queue.len())
             < param_count
     {
         audio.native_output_status = AU_OUTPUT_QUEUE_FULL;
@@ -1022,46 +1014,41 @@ pub(crate) unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(
             return AU_OUTPUT_UNSUPPORTED;
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            let mut emitted = false;
-            for event in audio.output_events.lossless_iter() {
-                let LosslessEventRef::Typed(Event {
-                    body: EventBody::ParamChange { id, value },
-                    ..
-                }) = event
-                else {
-                    continue;
-                };
-                let Some(notifier) = &inst.param_notify else {
-                    return AU_OUTPUT_UNSUPPORTED;
-                };
-                if notifier.queue.push((*id, f32::from_f64(*value))).is_err() {
-                    return AU_OUTPUT_QUEUE_FULL;
-                }
-                emitted = true;
+        let epoch = audio.feedback_epoch;
+        let mut emitted = false;
+        for event in audio.output_events.lossless_iter() {
+            let LosslessEventRef::Typed(Event {
+                body: EventBody::ParamChange { id, value },
+                ..
+            }) = event
+            else {
+                continue;
+            };
+            if !inst.host_sink.has_set_param() {
+                return AU_OUTPUT_UNSUPPORTED;
             }
-            if emitted {
-                AU_OUTPUT_EMITTED
-            } else {
-                AU_OUTPUT_END
+            // Check the epoch and update the store under one reservation.
+            // Render never waits for an edit. Publish before notifying the
+            // host so synchronous parameter getters see the committed value.
+            if !inst.publish_feedback(*id, epoch, || inst.params_arc.set_plain(*id, *value)) {
+                continue;
             }
+            if inst
+                .param_out_queue
+                .push((*id, f32::from_f64(*value), epoch))
+                .is_err()
+            {
+                return AU_OUTPUT_QUEUE_FULL;
+            }
+            emitted = true;
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            if audio.output_events.lossless_iter().any(|event| {
-                matches!(
-                    event,
-                    LosslessEventRef::Typed(Event {
-                        body: EventBody::ParamChange { .. },
-                        ..
-                    })
-                )
-            }) {
-                AU_OUTPUT_UNSUPPORTED
-            } else {
-                AU_OUTPUT_END
+        if emitted {
+            if let Some(dispatch) = &inst.host_dispatch {
+                dispatch.trigger_now();
             }
+            AU_OUTPUT_EMITTED
+        } else {
+            AU_OUTPUT_END
         }
     }
 }

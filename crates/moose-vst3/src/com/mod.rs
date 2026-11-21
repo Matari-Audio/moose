@@ -292,12 +292,6 @@ pub(crate) fn pin(ctx: *mut c_void) -> Option<Arc<Host>> {
         .and_then(|(_, weak)| weak.upgrade())
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn find_instance(pred: impl Fn(&Host) -> bool) -> Option<Arc<Host>> {
-    let snapshot: Vec<_> = instances().iter().map(|(_, weak)| weak.clone()).collect();
-    snapshot.iter().filter_map(Weak::upgrade).find(|h| pred(h))
-}
-
 // ---------------------------------------------------------------------------
 // Calls from lib.rs
 // ---------------------------------------------------------------------------

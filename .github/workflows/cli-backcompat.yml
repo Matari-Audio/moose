@@ -51,11 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
       # Latest non-prerelease tag on the moose repo, e.g. `v0.43.0`.
       # Sort by semver-ish descending; pick the first plain
-      # `vN.M.P` (skip alpha/beta/rc).
+      # `vN.M.P` (skip alpha/beta/rc). Runs before rust-toolchain so
+      # no-tag runs exit in ~5s without installing Rust.
       - name: Resolve latest released tag
         id: latest
         shell: bash
@@ -109,6 +108,9 @@ jobs:
         with:
           path: ${{ runner.temp }}/old-cargo-moose
           key: old-cargo-moose-${{ steps.latest.outputs.tag }}-ubuntu
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.bump.outputs.skip != 'true' && steps.cache-old-cargo-moose.outputs.cache-hit != 'true'
 
       - name: Install released cargo-moose
         if: steps.bump.outputs.skip != 'true' && steps.cache-old-cargo-moose.outputs.cache-hit != 'true'

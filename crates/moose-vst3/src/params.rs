@@ -35,7 +35,11 @@ pub(crate) unsafe extern "C" fn cb_param_get_value<P: PluginExport>(
         {
             return f64::from_bits(slot.load(Ordering::Relaxed));
         }
-        inst.params_arc.get_plain(id).unwrap_or(0.0)
+        match inst.param_index_of(id) {
+            Some(index) => inst.params_arc.get_plain_by_index(index, id),
+            None => inst.params_arc.get_plain(id),
+        }
+        .unwrap_or(0.0)
     }
 }
 
@@ -52,7 +56,10 @@ pub(crate) unsafe extern "C" fn cb_param_set_value<P: PluginExport>(
             slot.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
             return;
         }
-        inst.params_arc.set_plain(id, value);
+        match inst.param_index_of(id) {
+            Some(index) => inst.params_arc.set_plain_by_index(index, id, value),
+            None => inst.params_arc.set_plain(id, value),
+        }
     }
 }
 
@@ -104,10 +111,11 @@ pub(crate) unsafe extern "C" fn cb_param_is_chunked<P: PluginExport>(
 ) -> i32 {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let chunked = inst
-            .param_infos
-            .by_id(id)
-            .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED));
+        let info = inst
+            .param_index_of(id)
+            .and_then(|idx| inst.param_infos.by_index(idx))
+            .or_else(|| inst.param_infos.by_id(id));
+        let chunked = info.is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED));
         i32::from(chunked)
     }
 }
@@ -194,7 +202,11 @@ pub(crate) unsafe extern "C" fn cb_param_format<P: PluginExport>(
             return 0;
         }
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        match inst.params_arc.format_value(id, value) {
+        let formatted = match inst.param_index_of(id) {
+            Some(index) => inst.params_arc.format_value_by_index(index, id, value),
+            None => inst.params_arc.format_value(id, value),
+        };
+        match formatted {
             Some(text) => len_u32(copy_c_str(out, out_len as usize, &text)),
             None => 0,
         }
@@ -234,7 +246,11 @@ pub(crate) unsafe extern "C" fn cb_param_parse<P: PluginExport>(
                 None => 0,
             };
         }
-        match inst.params_arc.parse_value(id, text) {
+        let parsed = match inst.param_index_of(id) {
+            Some(index) => inst.params_arc.parse_value_by_index(index, id, text),
+            None => inst.params_arc.parse_value(id, text),
+        };
+        match parsed {
             Some(v) => {
                 *out_plain = v;
                 1
@@ -242,4 +258,37 @@ pub(crate) unsafe extern "C" fn cb_param_parse<P: PluginExport>(
             None => 0,
         }
     })
+}
+
+#[cfg(test)]
+mod dense_index_tests {
+    use super::*;
+    use crate::lifecycle::{cb_create, cb_destroy};
+    use moose_test_fixtures::host_value_fixture::TestPlugin;
+
+    #[test]
+    fn vst3_callbacks_resolve_params_via_sorted_dense_index_and_fallback() {
+        let ctx = unsafe { cb_create::<TestPlugin>() };
+        assert!(!ctx.is_null());
+        let inst = unsafe { &*ctx.cast::<Vst3Instance<TestPlugin>>() };
+        let param_id = inst.param_infos[0].id;
+        assert_eq!(inst.param_index_of(param_id), Some(0));
+        assert_eq!(inst.param_index_of(999_999), None);
+
+        unsafe {
+            cb_param_set_value::<TestPlugin>(ctx, param_id, 0.5);
+            let got = cb_param_get_value::<TestPlugin>(ctx, param_id);
+            assert!((got - 0.5).abs() < 1e-6, "got {got}");
+            // Unknown ID degrades cleanly without panicking.
+            assert!((cb_param_get_value::<TestPlugin>(ctx, 999_999)).abs() < 1e-12);
+            let mut buf = [0 as c_char; 64];
+            let written = cb_param_format::<TestPlugin>(ctx, param_id, 0.5, buf.as_mut_ptr(), 64);
+            assert!(written > 0);
+            let mut parsed = 0.0;
+            let ok = cb_param_parse::<TestPlugin>(ctx, param_id, buf.as_ptr(), &raw mut parsed);
+            assert_eq!(ok, 1);
+            assert!((parsed - 0.5).abs() < 1e-2, "parsed {parsed}");
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
 }

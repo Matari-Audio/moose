@@ -239,6 +239,10 @@ fn callbacks() -> Vst3Callbacks {
         gui_event_fd: no_fd,
         gui_on_fd: nop_ctx,
         gui_on_timer: nop_ctx,
+        gui_wayland_set_sync: {
+            unsafe extern "C" fn nop_sync(_: *mut c_void, _: i32) {}
+            nop_sync
+        },
         bind_host_queue: {
             unsafe extern "C" fn nop_bind(_: *mut c_void, _: *mut c_void) {}
             nop_bind
@@ -260,6 +264,33 @@ fn callbacks() -> Vst3Callbacks {
                 -1
             }
             static_step_count
+        },
+        keyswitches: {
+            unsafe fn no_keyswitches(
+                _: *mut c_void,
+                _: u32,
+                _: u8,
+            ) -> Vec<moose_core::main_thread::Keyswitch> {
+                Vec::new()
+            }
+            no_keyswitches
+        },
+        program_list: {
+            unsafe fn no_programs(_: *mut c_void) -> Vec<moose_core::main_thread::ProgramPreset> {
+                Vec::new()
+            }
+            no_programs
+        },
+        set_program_data: {
+            unsafe fn reject_program_data(
+                _: *mut c_void,
+                _: usize,
+                _: *const u8,
+                _: usize,
+            ) -> bool {
+                false
+            }
+            reject_program_data
         },
     }
 }
@@ -908,14 +939,35 @@ mod editor_lifetime {
             let base = refs(old_frame);
             let com = raw_component(reg);
             let old = create_view(com);
-            assert!(set_frame(old, old_frame) == kResultOk && timers(0) == 1);
+            assert!(
+                set_frame(old, old_frame) == kResultOk && loops[0].has_handler() && timers(0) == 0
+            );
             let view = create_view(com);
-            assert!(set_frame(view, current_frame) == kResultOk && timers(1) == 1);
+            assert!(
+                set_frame(view, current_frame) == kResultOk
+                    && loops[1].has_handler()
+                    && timers(1) == 0
+            );
             assert!(timers(0) == 0 && !loops[0].has_handler());
-            assert!(set_frame(old, std::ptr::null_mut()) == kResultOk && timers(1) == 1);
+            assert!(
+                set_frame(old, std::ptr::null_mut()) == kResultOk
+                    && loops[1].has_handler()
+                    && timers(1) == 0
+            );
             assert_eq!(refs(old_frame), base);
-            assert!(set_frame(old, old_frame) == kResultOk && timers(1) == 1 && timers(0) == 0);
-            assert!(release(old) == 0 && timers(1) == 1 && refs(current_frame) > base);
+            assert!(
+                set_frame(old, old_frame) == kResultOk
+                    && loops[1].has_handler()
+                    && !loops[0].has_handler()
+                    && timers(1) == 0
+                    && timers(0) == 0
+            );
+            assert!(
+                release(old) == 0
+                    && loops[1].has_handler()
+                    && timers(1) == 0
+                    && refs(current_frame) > base
+            );
             assert!(release(view) == 0 && timers(1) == 0 && !loops[1].has_handler());
             assert!(refs(old_frame) == base && refs(current_frame) == base);
             assert!(release(com) == 0 && !alive() && DESTROYS.load(SeqCst) == 103);
@@ -1489,7 +1541,7 @@ mod threads {
         let view = unsafe { ComPtr::from_raw(c.createView(c"editor".as_ptr())) }.unwrap();
         let set_frame = |f: *mut IPlugFrame| unsafe { view.setFrame(f) };
         assert!(
-            set_frame(fp) == kResultOk && frame.has_handler() && frame.timers.load(SeqCst) == 1
+            set_frame(fp) == kResultOk && frame.has_handler() && frame.timers.load(SeqCst) == 0
         );
         let edits = || com.host.edit_counts();
         let fd = || frame.fd.load(SeqCst);
@@ -2674,6 +2726,56 @@ mod wayland_embed {
         }
     }
 
+    struct WaylandFrame {
+        inner: Frame,
+        surface: *mut vst3::wl_surface,
+    }
+    unsafe impl Send for WaylandFrame {}
+    unsafe impl Sync for WaylandFrame {}
+    impl Class for WaylandFrame {
+        type Interfaces = (IPlugFrame, IRunLoop, IWaylandFrame);
+    }
+    impl IPlugFrameTrait for WaylandFrame {
+        unsafe fn resizeView(&self, view: *mut IPlugView, size: *mut ViewRect) -> tresult {
+            unsafe { self.inner.resizeView(view, size) }
+        }
+    }
+    impl IRunLoopTrait for WaylandFrame {
+        unsafe fn registerEventHandler(
+            &self,
+            handler: *mut IEventHandler,
+            fd: FileDescriptor,
+        ) -> tresult {
+            unsafe { self.inner.registerEventHandler(handler, fd) }
+        }
+        unsafe fn unregisterEventHandler(&self, handler: *mut IEventHandler) -> tresult {
+            unsafe { self.inner.unregisterEventHandler(handler) }
+        }
+        unsafe fn registerTimer(&self, handler: *mut ITimerHandler, ms: TimerInterval) -> tresult {
+            unsafe { self.inner.registerTimer(handler, ms) }
+        }
+        unsafe fn unregisterTimer(&self, handler: *mut ITimerHandler) -> tresult {
+            unsafe { self.inner.unregisterTimer(handler) }
+        }
+    }
+    impl IWaylandFrameTrait for WaylandFrame {
+        unsafe fn getWaylandSurface(&self, d: *mut wl_display) -> *mut vst3::wl_surface {
+            assert_eq!(d.cast(), display());
+            log("frame getWaylandSurface");
+            self.surface
+        }
+        unsafe fn getParentSurface(
+            &self,
+            _: *mut ViewRect,
+            _: *mut wl_display,
+        ) -> *mut vst3::xdg_surface {
+            std::ptr::null_mut()
+        }
+        unsafe fn getParentToplevel(&self, _: *mut wl_display) -> *mut vst3::xdg_toplevel {
+            std::ptr::null_mut()
+        }
+    }
+
     /// Only the Wayland view's entries: the instance's own edit wake
     /// (`fd wake`, `timer 30`) shares the run loop.
     fn wayland_log() -> Vec<String> {
@@ -2681,6 +2783,10 @@ mod wayland_embed {
             .into_iter()
             .filter(|e| !e.ends_with("wake") && !e.ends_with("timer 30"))
             .collect()
+    }
+
+    unsafe extern "C" fn set_sync(_: *mut c_void, sync: i32) {
+        log(format!("sync {sync}"));
     }
 
     #[test]
@@ -2698,6 +2804,7 @@ mod wayland_embed {
                 gui_event_fd: event_fd,
                 gui_on_fd: on_fd,
                 gui_on_timer: on_timer,
+                gui_wayland_set_sync: set_sync,
                 ..callbacks()
             },
             Vec::new(),
@@ -2766,8 +2873,16 @@ mod wayland_embed {
                 right: 640,
                 bottom: 480,
             };
+            take_log();
             assert_eq!(view.onSize(&raw mut rect), kResultOk);
             assert_eq!(*SIZE.lock().unwrap(), (640, 480));
+            assert_eq!(wayland_log(), ["sync 1", "on_fd", "sync 0"]);
+
+            // Wayland HiDPI comes from the compositor, not VST3 `setContentScaleFactor`.
+            let scale_ext = view
+                .cast::<IPlugViewContentScaleSupport>()
+                .expect("IPlugViewContentScaleSupport");
+            assert_eq!(scale_ext.setContentScaleFactor(2.0), kResultFalse);
 
             assert_eq!(view.removed(), kResultOk);
             assert_eq!(wayland_log(), teardown);
@@ -2787,6 +2902,139 @@ mod wayland_embed {
         drop(view);
         assert_eq!(wayland_log(), teardown);
         assert!(frame.handlers.lock().unwrap().is_empty());
+
+        // VST3 3.8 `IWaylandFrame::getWaylandSurface`: attached(nullptr, "WaylandSurfaceID")
+        // resolves the parent surface from the plug frame, and two concurrent views on the
+        // same host context share one `openWaylandConnection` / `closeWaylandConnection` pair.
+        let mut frame_surface_token = 0u8;
+        let frame_surface: *mut c_void = (&raw mut frame_surface_token).cast();
+        let wframe = ComWrapper::new(WaylandFrame {
+            inner: Frame::default(),
+            surface: frame_surface.cast(),
+        });
+        let wframe_ptr = wframe.as_com_ref::<IPlugFrame>().unwrap().as_ptr();
+        let opened_from_frame = format!("open {:p} {frame_surface:p}", display());
+
+        let com2 = component(registration(
+            descriptor(),
+            Vst3Callbacks {
+                gui_has_editor: has_editor,
+                gui_open: native_open,
+                gui_close: close,
+                gui_set_size: set_size,
+                gui_supports_wayland: supports,
+                gui_open_wayland: open,
+                gui_event_fd: event_fd,
+                gui_on_fd: on_fd,
+                gui_on_timer: on_timer,
+                ..callbacks()
+            },
+            Vec::new(),
+        ));
+        assert_eq!(unsafe { com2.initialize(context) }, kResultOk);
+
+        let v1 = unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("v1");
+        let v2 = unsafe { ComPtr::from_raw(com2.createView(c"editor".as_ptr())) }.expect("v2");
+        assert_eq!(unsafe { v1.setFrame(wframe_ptr) }, kResultOk);
+        assert_eq!(unsafe { v2.setFrame(wframe_ptr) }, kResultOk);
+        take_log();
+
+        assert_eq!(
+            unsafe { v1.attached(std::ptr::null_mut(), wayland.as_ptr()) },
+            kResultOk
+        );
+        assert_eq!(
+            wayland_log(),
+            [
+                "connection open",
+                "frame getWaylandSurface",
+                &opened_from_frame,
+                "register timer 16",
+                "register fd editor",
+            ]
+        );
+        // Second view on the same host context reuses the open connection.
+        assert_eq!(
+            unsafe { v2.attached(std::ptr::null_mut(), wayland.as_ptr()) },
+            kResultOk
+        );
+        assert_eq!(
+            wayland_log(),
+            [
+                "frame getWaylandSurface",
+                &opened_from_frame,
+                "register timer 16",
+                "register fd editor",
+            ]
+        );
+        // Closing the first view keeps the shared connection open.
+        drop(v1);
+        assert_eq!(
+            wayland_log(),
+            [
+                "unregister fd editor",
+                "unregister timer 16",
+                "editor close"
+            ]
+        );
+        // Closing the last view closes the shared host connection once.
+        drop(v2);
+        assert_eq!(wayland_log(), teardown);
+        assert!(wframe.inner.handlers.lock().unwrap().is_empty());
+
+        // Synchronous `onSize` during `gui_open_wayland` (permitted by VST3 `attached`)
+        // must not deadlock on `View::wayland` and still brackets Wayland sync.
+        {
+            static REENTRANT_VIEW: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "C" fn open_with_reentrant_resize(
+                _ctx: *mut c_void,
+                _d: *mut c_void,
+                _s: *mut c_void,
+            ) -> i32 {
+                let ptr = REENTRANT_VIEW.load(SeqCst) as *mut IPlugView;
+                if !ptr.is_null() {
+                    let mut rect = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: 512,
+                        bottom: 384,
+                    };
+                    unsafe { ((*(*ptr).vtbl).onSize)(ptr, &raw mut rect) };
+                }
+                1
+            }
+            let com3 = component(registration(
+                descriptor(),
+                Vst3Callbacks {
+                    gui_has_editor: has_editor,
+                    gui_open: native_open,
+                    gui_close: close,
+                    gui_set_size: set_size,
+                    gui_supports_wayland: supports,
+                    gui_open_wayland: open_with_reentrant_resize,
+                    gui_event_fd: event_fd,
+                    gui_on_fd: on_fd,
+                    gui_on_timer: on_timer,
+                    gui_wayland_set_sync: set_sync,
+                    ..callbacks()
+                },
+                Vec::new(),
+            ));
+            assert_eq!(unsafe { com3.initialize(context) }, kResultOk);
+            let v3 = unsafe { ComPtr::from_raw(com3.createView(c"editor".as_ptr())) }.expect("v3");
+            assert_eq!(unsafe { v3.setFrame(wframe_ptr) }, kResultOk);
+            REENTRANT_VIEW.store(v3.as_ptr() as usize, SeqCst);
+            take_log();
+            assert_eq!(
+                unsafe { v3.attached(std::ptr::null_mut(), wayland.as_ptr()) },
+                kResultOk
+            );
+            REENTRANT_VIEW.store(0, SeqCst);
+            assert_eq!(*SIZE.lock().unwrap(), (512, 384));
+            assert!(wayland_log().contains(&"sync 1".to_string()));
+            drop(v3);
+            take_log();
+        }
     }
 }
 
@@ -3652,4 +3900,429 @@ fn get_parameter_info_prefers_live_step_count_when_present() {
     );
     assert_eq!(info.stepCount, 0, "unrelated param keeps static step_count");
     assert!((info.defaultNormalizedValue - 0.5).abs() < 1e-12);
+}
+
+struct MemStream {
+    data: std::sync::Mutex<Vec<u8>>,
+    pos: std::sync::Mutex<usize>,
+}
+
+impl MemStream {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            data: std::sync::Mutex::new(bytes),
+            pos: std::sync::Mutex::new(0),
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.data.lock().unwrap().clone()
+    }
+}
+
+impl Class for MemStream {
+    type Interfaces = (IBStream,);
+}
+
+impl IBStreamTrait for MemStream {
+    unsafe fn read(&self, buffer: *mut c_void, num_bytes: int32, num_read: *mut int32) -> tresult {
+        if buffer.is_null() || num_bytes < 0 {
+            return kInvalidArgument;
+        }
+        let data = self.data.lock().unwrap();
+        let mut pos = self.pos.lock().unwrap();
+        let avail = data.len().saturating_sub(*pos);
+        let n = (num_bytes as usize).min(avail);
+        if n > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data[*pos..].as_ptr(), buffer.cast::<u8>(), n);
+            }
+            *pos += n;
+        }
+        if !num_read.is_null() {
+            unsafe { *num_read = n as int32 };
+        }
+        kResultOk
+    }
+
+    unsafe fn write(
+        &self,
+        buffer: *mut c_void,
+        num_bytes: int32,
+        num_written: *mut int32,
+    ) -> tresult {
+        if buffer.is_null() || num_bytes < 0 {
+            return kInvalidArgument;
+        }
+        let n = num_bytes as usize;
+        let slice = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
+        self.data.lock().unwrap().extend_from_slice(slice);
+        if !num_written.is_null() {
+            unsafe { *num_written = n as int32 };
+        }
+        kResultOk
+    }
+
+    unsafe fn seek(&self, _pos: int64, _mode: int32, _result: *mut int64) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn tell(&self, result: *mut int64) -> tresult {
+        if !result.is_null() {
+            unsafe { *result = *self.pos.lock().unwrap() as int64 };
+        }
+        kResultOk
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() {
+    static LOADED_PROGRAM: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    static BANK: std::sync::Mutex<Vec<moose_core::main_thread::ProgramPreset>> =
+        std::sync::Mutex::new(Vec::new());
+
+    unsafe fn test_keyswitches(
+        _: *mut c_void,
+        bus: u32,
+        channel: u8,
+    ) -> Vec<moose_core::main_thread::Keyswitch> {
+        if bus == 0 && channel == 0 {
+            vec![
+                moose_core::main_thread::Keyswitch {
+                    kind: moose_core::main_thread::KeyswitchKind::NoteOn,
+                    title: "Legato".into(),
+                    short_title: "Leg".into(),
+                    min_key: 24,
+                    max_key: 24,
+                    remapped_key: -1,
+                    unit_id: 0,
+                },
+                moose_core::main_thread::Keyswitch {
+                    kind: moose_core::main_thread::KeyswitchKind::KeyRange,
+                    title: "Staccato".into(),
+                    short_title: "Stac".into(),
+                    min_key: 25,
+                    max_key: 27,
+                    remapped_key: 36,
+                    unit_id: 0,
+                },
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    unsafe fn test_programs(_: *mut c_void) -> Vec<moose_core::main_thread::ProgramPreset> {
+        BANK.lock().unwrap().clone()
+    }
+
+    unsafe fn test_set_program_data(
+        _: *mut c_void,
+        index: usize,
+        data: *const u8,
+        len: usize,
+    ) -> bool {
+        let mut bank = BANK.lock().unwrap();
+        let Some(slot) = bank.get_mut(index) else {
+            return false;
+        };
+        slot.state = if data.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+        };
+        true
+    }
+
+    unsafe extern "C" fn capture_load_stream(
+        _: *mut c_void,
+        stream: *mut c_void,
+        read: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i64,
+    ) -> i32 {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = unsafe { read(stream, buf.as_mut_ptr(), buf.len() as u32) };
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        if out == b"MOOSE_STATE_A" {
+            return 0;
+        }
+        *LOADED_PROGRAM.lock().unwrap() = out;
+        1
+    }
+
+    *BANK.lock().unwrap() = vec![
+        moose_core::main_thread::ProgramPreset {
+            name: "Init Pad".into(),
+            category: "Pads".into(),
+            state: b"MOOSE_STATE_A".to_vec(),
+        },
+        moose_core::main_thread::ProgramPreset {
+            name: "Bright Lead".into(),
+            category: "Leads".into(),
+            state: b"MOOSE_STATE_B".to_vec(),
+        },
+    ];
+    LOADED_PROGRAM.lock().unwrap().clear();
+
+    let compat_json = c"{\"New\":[{\"ClassID\":\"00112233445566778899AABBCCDDEEFF\"}]}";
+    let mut desc = descriptor();
+    desc.name = c"ParityTest".as_ptr();
+    desc.vendor = c"Matari".as_ptr();
+    desc.category = c"Audio Module Class".as_ptr();
+    desc.subcategories = c"Instrument|Synth".as_ptr();
+    desc.version = c"1.0.0".as_ptr();
+    desc.cid = [1; 16];
+    desc.midi_input_ports = 1;
+    desc.compatibility_json = compat_json.as_ptr();
+
+    let reg = registration(
+        desc,
+        Vst3Callbacks {
+            keyswitches: test_keyswitches,
+            program_list: test_programs,
+            set_program_data: test_set_program_data,
+            state_load_stream: capture_load_stream,
+            ..callbacks()
+        },
+        vec![],
+    );
+
+    let comp = component(reg);
+    let comp_unk = comp.to_com_ptr::<IComponent>().expect("IComponent");
+
+    // 1. INoteExpressionPhysicalUIMapping
+    let pui = comp_unk
+        .cast::<INoteExpressionPhysicalUIMapping>()
+        .expect("INoteExpressionPhysicalUIMapping");
+    let mut maps = [
+        PhysicalUIMap {
+            physicalUITypeID: PhysicalUITypeIDs_::kPUIXMovement as u32,
+            noteExpressionTypeID: NoteExpressionTypeIDs_::kInvalidTypeID as u32,
+        },
+        PhysicalUIMap {
+            physicalUITypeID: PhysicalUITypeIDs_::kPUIYMovement as u32,
+            noteExpressionTypeID: NoteExpressionTypeIDs_::kInvalidTypeID as u32,
+        },
+        PhysicalUIMap {
+            physicalUITypeID: PhysicalUITypeIDs_::kPUIPressure as u32,
+            noteExpressionTypeID: NoteExpressionTypeIDs_::kInvalidTypeID as u32,
+        },
+        PhysicalUIMap {
+            physicalUITypeID: 99,
+            noteExpressionTypeID: 0,
+        },
+    ];
+    let mut list = PhysicalUIMapList {
+        count: maps.len() as u32,
+        map: maps.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { pui.getPhysicalUIMapping(0, 0, &raw mut list) },
+        kResultOk
+    );
+    assert_eq!(
+        maps[0].noteExpressionTypeID,
+        NoteExpressionTypeIDs_::kTuningTypeID as u32
+    );
+    assert_eq!(
+        maps[1].noteExpressionTypeID,
+        NoteExpressionTypeIDs_::kBrightnessTypeID as u32
+    );
+    assert_eq!(
+        maps[2].noteExpressionTypeID,
+        NoteExpressionTypeIDs_::kExpressionTypeID as u32
+    );
+    assert_eq!(
+        maps[3].noteExpressionTypeID,
+        NoteExpressionTypeIDs_::kInvalidTypeID as u32
+    );
+    assert_eq!(
+        unsafe { pui.getPhysicalUIMapping(1, 0, &raw mut list) },
+        kInvalidArgument
+    );
+
+    // 2. IKeyswitchController
+    let ks = comp_unk
+        .cast::<IKeyswitchController>()
+        .expect("IKeyswitchController");
+    assert_eq!(unsafe { ks.getKeyswitchCount(0, 0) }, 2);
+    assert_eq!(unsafe { ks.getKeyswitchCount(0, 1) }, 0);
+    assert_eq!(unsafe { ks.getKeyswitchCount(1, 0) }, 0);
+    let mut ks_info: KeyswitchInfo = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { ks.getKeyswitchInfo(0, 0, 1, &raw mut ks_info) },
+        kResultOk
+    );
+    assert_eq!(ks_info.typeId, KeyswitchTypeIDs_::kKeyRangeTypeID as u32);
+    assert_eq!(
+        unsafe { super::utf16_from(ks_info.title.as_ptr(), 128) },
+        "Staccato"
+    );
+    assert_eq!(ks_info.keyswitchMin, 25);
+    assert_eq!(ks_info.keyswitchMax, 27);
+    assert_eq!(ks_info.keyRemapped, 36);
+    assert_eq!(
+        unsafe { ks.getKeyswitchInfo(0, 0, 2, &raw mut ks_info) },
+        kInvalidArgument
+    );
+
+    // 3. IUnitInfo + IProgramListData
+    let units = comp_unk.cast::<IUnitInfo>().expect("IUnitInfo");
+    assert_eq!(unsafe { units.getProgramListCount() }, 1);
+    let mut unit_info: UnitInfo = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { units.getUnitInfo(0, &raw mut unit_info) },
+        kResultOk
+    );
+    assert_eq!(unit_info.programListId, 0);
+    let mut pl_info: ProgramListInfo = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { units.getProgramListInfo(0, &raw mut pl_info) },
+        kResultOk
+    );
+    assert_eq!(pl_info.programCount, 2);
+    let mut pname: String128 = [0; 128];
+    assert_eq!(
+        unsafe { units.getProgramName(0, 0, &raw mut pname) },
+        kResultOk
+    );
+    assert_eq!(
+        unsafe { super::utf16_from(pname.as_ptr(), 128) },
+        "Init Pad"
+    );
+    let mut pcat: String128 = [0; 128];
+    assert_eq!(
+        unsafe { units.getProgramInfo(0, 0, c"Category".as_ptr(), &raw mut pcat) },
+        kResultOk
+    );
+    assert_eq!(unsafe { super::utf16_from(pcat.as_ptr(), 128) }, "Pads");
+
+    // Root unit must also export a `kIsProgramChange` selector parameter.
+    let ctrl = comp_unk.cast::<IEditController>().expect("IEditController");
+    assert_eq!(unsafe { ctrl.getParameterCount() }, 1);
+    let mut pinfo: ParameterInfo = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { ctrl.getParameterInfo(0, &raw mut pinfo) },
+        kResultOk
+    );
+    assert_eq!(pinfo.unitId, 0);
+    assert_eq!(pinfo.stepCount, 1);
+    assert_ne!(
+        pinfo.flags & ParameterInfo_::ParameterFlags_::kIsProgramChange as i32,
+        0
+    );
+    let mut label: String128 = [0; 128];
+    assert_eq!(
+        unsafe { ctrl.getParamStringByValue(pinfo.id, 1.0, &raw mut label) },
+        kResultOk
+    );
+    assert_eq!(
+        unsafe { super::utf16_from(label.as_ptr(), 128) },
+        "Bright Lead"
+    );
+    assert_eq!(unsafe { ctrl.setParamNormalized(pinfo.id, 1.0) }, kResultOk);
+    assert!((unsafe { ctrl.getParamNormalized(pinfo.id) } - 1.0).abs() < 1e-12);
+    assert_eq!(
+        unsafe { ctrl.setParamNormalized(pinfo.id, 0.0) },
+        kResultFalse
+    );
+    assert!((unsafe { ctrl.getParamNormalized(pinfo.id) } - 1.0).abs() < 1e-12);
+    assert_eq!(*LOADED_PROGRAM.lock().unwrap(), b"MOOSE_STATE_B");
+
+    let pdata = comp_unk
+        .cast::<IProgramListData>()
+        .expect("IProgramListData");
+    assert_eq!(unsafe { pdata.programDataSupported(0) }, kResultTrue);
+    assert_eq!(unsafe { pdata.programDataSupported(1) }, kResultFalse);
+    let out_stream = ComWrapper::new(MemStream::new(Vec::new()));
+    let out_ptr = out_stream.to_com_ptr::<IBStream>().expect("IBStream");
+    assert_eq!(
+        unsafe { pdata.getProgramData(0, 0, out_ptr.as_ptr()) },
+        kResultOk
+    );
+    assert_eq!(out_stream.bytes(), b"MOOSE_STATE_A");
+
+    // `setProgramData` replaces the indexed bank entry without calling instance state load.
+    LOADED_PROGRAM.lock().unwrap().clear();
+    let in_stream = ComWrapper::new(MemStream::new(b"MOOSE_STATE_B_UPDATED".to_vec()));
+    let in_ptr = in_stream.to_com_ptr::<IBStream>().expect("IBStream");
+    assert_eq!(
+        unsafe { pdata.setProgramData(0, 1, in_ptr.as_ptr()) },
+        kResultOk
+    );
+    assert!(LOADED_PROGRAM.lock().unwrap().is_empty());
+    let updated_stream = ComWrapper::new(MemStream::new(Vec::new()));
+    let updated_ptr = updated_stream.to_com_ptr::<IBStream>().expect("IBStream");
+    assert_eq!(
+        unsafe { pdata.getProgramData(0, 1, updated_ptr.as_ptr()) },
+        kResultOk
+    );
+    assert_eq!(updated_stream.bytes(), b"MOOSE_STATE_B_UPDATED");
+
+    // Immutable banks (default `set_program_data` returning false) reject writes.
+    let mut ro_desc = descriptor();
+    ro_desc.name = c"ParityTest".as_ptr();
+    ro_desc.cid = [2; 16];
+    let ro_reg = registration(
+        ro_desc,
+        Vst3Callbacks {
+            program_list: test_programs,
+            ..callbacks()
+        },
+        vec![],
+    );
+    let ro_comp = component(ro_reg);
+    let ro_pdata = ro_comp
+        .to_com_ptr::<IProgramListData>()
+        .expect("IProgramListData");
+    let ro_in = ComWrapper::new(MemStream::new(b"NEW".to_vec()));
+    let ro_in_ptr = ro_in.to_com_ptr::<IBStream>().expect("IBStream");
+    assert_eq!(
+        unsafe { ro_pdata.setProgramData(0, 0, ro_in_ptr.as_ptr()) },
+        kResultFalse
+    );
+
+    // 4. IPluginCompatibility via Factory
+    let factory = super::factory::new_test_factory(reg);
+    let f2 = factory
+        .to_com_ptr::<IPluginFactory2>()
+        .expect("IPluginFactory2");
+    assert_eq!(unsafe { f2.countClasses() }, 2);
+    let mut cls: PClassInfo2 = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { f2.getClassInfo2(1, &raw mut cls) }, kResultOk);
+    assert_eq!(
+        unsafe { super::cstr(cls.category.as_ptr()) },
+        "Plugin Compatibility Class"
+    );
+    let expected_cid = super::factory::compatibility_cid([1; 16]);
+    assert_eq!(cls.cid.map(|b| b as u8), expected_cid);
+
+    let mut raw_compat: *mut c_void = std::ptr::null_mut();
+    let compat_iid = <IPluginCompatibility as vst3::com_scrape_types::Interface>::IID;
+    assert_eq!(
+        unsafe {
+            f2.createInstance(
+                expected_cid.as_ptr().cast(),
+                compat_iid.as_ptr().cast(),
+                &raw mut raw_compat,
+            )
+        },
+        kResultOk
+    );
+    assert!(!raw_compat.is_null());
+    let compat = unsafe { ComPtr::<IPluginCompatibility>::from_raw(raw_compat.cast()) }
+        .expect("IPluginCompatibility");
+    let json_stream = ComWrapper::new(MemStream::new(Vec::new()));
+    let json_ptr = json_stream.to_com_ptr::<IBStream>().expect("IBStream");
+    assert_eq!(
+        unsafe { compat.getCompatibilityJSON(json_ptr.as_ptr()) },
+        kResultOk
+    );
+    assert_eq!(json_stream.bytes(), compat_json.to_bytes());
 }

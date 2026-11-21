@@ -33,6 +33,11 @@ pub struct Bridge<P: ?Sized = dyn Params> {
     /// The ids `bind` saw this build: an open gesture not among them lost
     /// its widget, and nothing else would ever end it.
     bound: Vec<u32>,
+    /// Widget-id to parameter-id pairs collected during the current build.
+    building_widgets: Vec<(Id, u32)>,
+    /// Widget-id to parameter-id pairs from the last finished build, used by
+    /// `MuiEditor::param_at` (`IParameterFinder`) to map hit surfaces to params.
+    bound_widgets: Vec<(Id, u32)>,
     /// Every parameter and meter as last seen, bit for bit: `changed`
     /// compares against it without hashing or allocating.
     seen: Box<[u64]>,
@@ -52,6 +57,8 @@ impl<P: Params + ?Sized> Bridge<P> {
             open: Vec::new(),
             held: Vec::new(),
             bound: Vec::new(),
+            building_widgets: Vec::new(),
+            bound_widgets: Vec::new(),
             seen,
         }
     }
@@ -104,6 +111,17 @@ impl<P: Params + ?Sized> Bridge<P> {
             }
         }
         self.held.clear();
+    }
+
+    /// Look up the parameter id bound to widget surface key `widget` in the
+    /// most recently completed build.
+    #[must_use]
+    pub fn param_for_widget(&self, widget: &str) -> Option<u32> {
+        self.bound_widgets
+            .iter()
+            .rev()
+            .find(|(w, _)| w.as_str() == widget)
+            .map(|&(_, id)| id)
     }
 
     fn info(&self, id: u32) -> Option<&ParamInfo> {
@@ -211,13 +229,19 @@ impl<P: Params + ?Sized> Bridge<P> {
     ) -> El {
         let id = param.into();
         self.bound.push(id);
+        let (known, range) = match self.info(id) {
+            Some(info) => (
+                true,
+                (!info.flags.contains(ParamFlags::READONLY)).then_some(info.range),
+            ),
+            None => (false, None),
+        };
+        if known {
+            self.building_widgets.push((widget.clone(), id));
+        }
         let before = self.value(id);
         let mut value = before;
-        let Some(range) = self
-            .info(id)
-            .filter(|info| !info.flags.contains(ParamFlags::READONLY))
-            .map(|info| info.range)
-        else {
+        let Some(range) = range else {
             return control(ui, widget, &mut value).into_el();
         };
         // At most a cancel's End, an End and a Begin reach one id per frame.
@@ -328,6 +352,8 @@ impl<P: Params + ?Sized> Bridge<P> {
             self.end(id);
         }
         self.bound.clear();
+        std::mem::swap(&mut self.bound_widgets, &mut self.building_widgets);
+        self.building_widgets.clear();
     }
 
     fn is_open(&self, id: u32) -> bool {

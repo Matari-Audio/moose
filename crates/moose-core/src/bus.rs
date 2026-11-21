@@ -47,6 +47,12 @@ pub enum BusKind {
 pub enum ChannelConfig {
     Mono,
     Stereo,
+    /// Ambisonic bus of spherical-harmonic order `order` (ACN ordering, SN3D
+    /// normalization), with `(order + 1)^2` channels (e.g. order 1 = 4 ch,
+    /// order 3 = 16 ch).
+    Ambisonic {
+        order: u32,
+    },
     Custom(u32),
 }
 
@@ -56,8 +62,18 @@ impl ChannelConfig {
         match self {
             Self::Mono => 1,
             Self::Stereo => 2,
+            Self::Ambisonic { order } => {
+                let n = order.saturating_add(1);
+                n.saturating_mul(n)
+            }
             Self::Custom(n) => *n,
         }
+    }
+
+    /// Ambisonic channel configuration of the given order (ACN / SN3D).
+    #[must_use]
+    pub const fn ambisonic(order: u32) -> Self {
+        Self::Ambisonic { order }
     }
 }
 
@@ -86,6 +102,15 @@ impl BusLayout {
         Self::new()
             .with_input("Main", ChannelConfig::Stereo)
             .with_output("Main", ChannelConfig::Stereo)
+    }
+
+    /// Main Ambisonic input and output buses of `order` (ACN / SN3D,
+    /// `(order + 1)^2` channels).
+    #[must_use]
+    pub fn ambisonic(order: u32) -> Self {
+        Self::new()
+            .with_input("Main", ChannelConfig::ambisonic(order))
+            .with_output("Main", ChannelConfig::ambisonic(order))
     }
 
     /// The default audio-effect layout set: stereo and mono (stereo

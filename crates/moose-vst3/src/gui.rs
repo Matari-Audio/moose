@@ -742,6 +742,21 @@ pub(crate) unsafe extern "C" fn cb_gui_on_timer<P: PluginExport>(ctx: *mut std::
     });
 }
 
+/// `Editor::set_wayland_sync` around host-driven `IPlugView::onSize`.
+pub(crate) unsafe extern "C" fn cb_gui_wayland_set_sync<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    sync: i32,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "gui_wayland_set_sync", (), || unsafe {
+        let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if let Some(mut gui) = inst.gui.try_enter()
+            && let Some(editor) = gui.editor.as_mut()
+        {
+            editor.set_wayland_sync(sync != 0);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,10 +47,18 @@ impl ExposedParams {
         self.indices.len()
     }
 
-    /// The info at host index `index`.
-    pub(crate) fn info(&self, index: u32) -> Option<&ParamInfo> {
-        let index = *self.indices.get(usize::try_from(index).ok()?)?;
-        Some(&self.catalog[index])
+    /// The `(catalog_index, &ParamInfo)` pair at host index `index`.
+    ///
+    /// `catalog_index` is the parameter's dense slot inside `self.catalog`
+    /// (encoded into `clap_param_info::cookie` via `ParamCatalog::cookie_for_index`).
+    pub(crate) fn info_with_index(&self, index: u32) -> Option<(usize, &ParamInfo)> {
+        let catalog_index = *self.indices.get(usize::try_from(index).ok()?)?;
+        Some((catalog_index, &self.catalog[catalog_index]))
+    }
+
+    /// Dense catalog index of `id`, if present in the exposed catalog.
+    pub(crate) fn index_of(&self, id: u32) -> Option<usize> {
+        self.catalog.index_of(id)
     }
 
     /// The exposed infos in host order.

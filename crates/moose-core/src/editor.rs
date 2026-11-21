@@ -126,6 +126,32 @@ pub trait Editor: Send {
     /// [`Self::event_fd`] became readable. Host UI thread.
     fn on_fd(&mut self) {}
 
+    /// Whether [`Self::event_fd`] has buffered outgoing Wayland requests
+    /// awaiting writability (`EAGAIN` flush -> `CLAP_POSIX_FD_WRITE`).
+    /// Host UI thread.
+    fn wants_write(&self) -> bool {
+        false
+    }
+
+    /// Synchronize or desynchronize an embedded Wayland subsurface around a
+    /// host-driven resize (VST3 3.8 `onSize`: `set_sync` before committing the
+    /// resized buffer, `set_desync` after). Host UI thread.
+    fn set_wayland_sync(&mut self, _sync: bool) {}
+
+    /// Bind a floating Wayland window as transient to a host-exported
+    /// `xdg-foreign-v2` handle (`clap.gui-xdg-foreign-v2/1`). Return `true`
+    /// when accepted. Host UI thread.
+    fn set_wayland_transient(&mut self, _handle: &str) -> bool {
+        false
+    }
+
+    /// Apply a Wayland `xdg-activation-v1` focus token from the host
+    /// (`clap.gui-xdg-activation-v1/1`). Return `true` when accepted. Host UI
+    /// thread.
+    fn set_wayland_activation_token(&mut self, _token: &str) -> bool {
+        false
+    }
+
     /// The host's ~16 ms UI timer (VST3 `IRunLoop::registerTimer`, CLAP
     /// `timer-support`), while an
     /// embedded Wayland editor is open. The host may read the shared display
@@ -356,6 +382,18 @@ impl Editor for TaskBoundEditor {
     }
     fn on_fd(&mut self) {
         self.editor.on_fd();
+    }
+    fn wants_write(&self) -> bool {
+        self.editor.wants_write()
+    }
+    fn set_wayland_sync(&mut self, sync: bool) {
+        self.editor.set_wayland_sync(sync);
+    }
+    fn set_wayland_transient(&mut self, handle: &str) -> bool {
+        self.editor.set_wayland_transient(handle)
+    }
+    fn set_wayland_activation_token(&mut self, token: &str) -> bool {
+        self.editor.set_wayland_activation_token(token)
     }
     fn on_timer(&mut self) {
         self.editor.on_timer();
@@ -622,8 +660,19 @@ pub trait HostContext: EditorBridge {
     fn mark_dirty(&self) {}
 
     /// Open or close a group of edits the host treats as one undo step
-    /// (VST3 `IComponentHandler2::startGroupEdit` / `finishGroupEdit`).
+    /// (VST3 `IComponentHandler2::startGroupEdit` / `finishGroupEdit`,
+    /// CLAP `clap.undo/4`).
     fn group_edits(&self, _edge: EditGroup) {}
+
+    /// Inform the host which parameter control is currently hovered by the
+    /// pointer (`None` when no control is hovered; CLAP `clap.param-hovered/1`).
+    fn param_hovered(&self, _id: Option<u32>) {}
+
+    /// Ask the host to perform an undo step (CLAP `clap.undo/4`).
+    fn request_undo(&self) {}
+
+    /// Ask the host to perform a redo step (CLAP `clap.undo/4`).
+    fn request_redo(&self) {}
 
     /// Ask the host to deactivate and reactivate the plugin, for a change
     /// the processor can only pick up in `activate` (CLAP
@@ -650,6 +699,18 @@ pub trait HostContext: EditorBridge {
     /// A key the editor's own top-level window didn't use; `true` when the
     /// host took it. See [`PluginContext::unhandled_key`].
     fn unhandled_key(&self, _key: &keyboard_types::KeyboardEvent) -> bool {
+        false
+    }
+
+    /// Forward an unhandled Wayland XKB key event to the host
+    /// (`clap.gui-xkb-key-forwarding/1`). Any thread.
+    fn forward_xkb_key(
+        &self,
+        _keycode: u32,
+        _keysym: u32,
+        _modifiers: u32,
+        _pressed: bool,
+    ) -> bool {
         false
     }
 }
@@ -795,6 +856,21 @@ impl<P: ?Sized> PluginContext<P> {
         self.host.unhandled_key(key)
     }
 
+    /// Forward an unhandled XKB key event from an embedded/nested Wayland
+    /// editor to the host (`clap.gui-xkb-key-forwarding/1`). Returns `true`
+    /// when queued for host delivery. Any thread.
+    #[must_use]
+    pub fn forward_xkb_key(
+        &self,
+        keycode: u32,
+        keysym: u32,
+        modifiers: u32,
+        pressed: bool,
+    ) -> bool {
+        self.host
+            .forward_xkb_key(keycode, keysym, modifiers, pressed)
+    }
+
     /// Start a group of edits the host treats as one (one undo step), such
     /// as a preset morph that moves several parameters. Close it with
     /// [`Self::end_group`]; the gestures inside still need
@@ -807,6 +883,23 @@ impl<P: ?Sized> PluginContext<P> {
     /// Close the group started by [`Self::begin_group`].
     pub fn end_group(&self) {
         self.host.group_edits(EditGroup::End);
+    }
+
+    /// Report the parameter control currently under the pointer (`None` when
+    /// none is hovered). Forwarded to CLAP `clap.param-hovered/1` when enabled.
+    /// Any thread.
+    pub fn param_hovered(&self, id: Option<u32>) {
+        self.host.param_hovered(id);
+    }
+
+    /// Ask the host to undo the last step (CLAP `clap.undo/4`). Any thread.
+    pub fn request_undo(&self) {
+        self.host.request_undo();
+    }
+
+    /// Ask the host to redo the last undone step (CLAP `clap.undo/4`). Any thread.
+    pub fn request_redo(&self) {
+        self.host.request_redo();
     }
 
     /// Ask the host to deactivate and reactivate the plugin, for a change

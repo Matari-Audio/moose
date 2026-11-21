@@ -5,18 +5,19 @@ use crate::gui::{
     cb_gui_can_resize, cb_gui_check_size_constraint, cb_gui_close, cb_gui_event_fd,
     cb_gui_get_size, cb_gui_has_editor, cb_gui_on_fd, cb_gui_on_timer, cb_gui_open,
     cb_gui_open_wayland, cb_gui_param_at, cb_gui_set_content_scale, cb_gui_set_size,
-    cb_gui_supports_wayland, cb_midi_mapping_get_param_id,
+    cb_gui_supports_wayland, cb_gui_wayland_set_sync, cb_midi_mapping_get_param_id,
 };
 use crate::host_state::{
     cb_state_free, cb_state_load, cb_state_load_stream, cb_state_save, cb_state_save_stream,
 };
 use crate::input_events::{cb_begin_input_events, cb_push_input_event, cb_push_param_change};
 use crate::lifecycle::{
-    cb_bind_host_queue, cb_create, cb_destroy, cb_drain_host_queue, cb_layout_bus_channels,
-    cb_match_bus_layout, cb_match_bus_layout_perbus, cb_midi_learn, cb_param_affects_presentation,
-    cb_param_function_name, cb_perform_menu, cb_prepare, cb_remap_param_id, cb_reset,
-    cb_set_active, cb_set_audio_presentation_latency, cb_set_catalog_waker, cb_set_persist_waker,
-    cb_set_processing, cb_take_catalog_changes, cb_take_persist_change, cb_track_info_changed,
+    cb_bind_host_queue, cb_create, cb_destroy, cb_drain_host_queue, cb_keyswitches,
+    cb_layout_bus_channels, cb_match_bus_layout, cb_match_bus_layout_perbus, cb_midi_learn,
+    cb_param_affects_presentation, cb_param_function_name, cb_perform_menu, cb_prepare,
+    cb_program_list, cb_remap_param_id, cb_reset, cb_set_active, cb_set_audio_presentation_latency,
+    cb_set_catalog_waker, cb_set_persist_waker, cb_set_processing, cb_set_program_data,
+    cb_take_catalog_changes, cb_take_persist_change, cb_track_info_changed,
     cb_wants_persist_notifications, descriptor_buses, vst3_topology_consistent,
 };
 use crate::midi_proxy::{
@@ -296,6 +297,11 @@ pub(crate) fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs:
     let (num_input_buses, num_output_buses, input_bus_kinds, output_bus_kinds) =
         descriptor_buses::<P>();
 
+    let compatibility_json = P::vst3_compatibility_json()
+        .filter(|json| !json.is_empty())
+        .and_then(|json| CString::new(json).ok())
+        .map_or(std::ptr::null(), |s| s.into_raw().cast_const());
+
     let descriptor = Box::leak(Box::new(Vst3PluginDescriptor {
         name: name.into_raw(),
         vendor: vendor.into_raw(),
@@ -319,6 +325,7 @@ pub(crate) fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs:
         // any negotiable layout (see the field's `ffi` doc).
         max_inputs: max_layout_channels(&P::bus_layouts()).0,
         max_outputs: max_layout_channels(&P::bus_layouts()).1,
+        compatibility_json,
     }));
 
     let callbacks = Box::leak(Box::new(Vst3Callbacks {
@@ -383,12 +390,16 @@ pub(crate) fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs:
         gui_event_fd: cb_gui_event_fd::<P>,
         gui_on_fd: cb_gui_on_fd::<P>,
         gui_on_timer: cb_gui_on_timer::<P>,
+        gui_wayland_set_sync: cb_gui_wayland_set_sync::<P>,
         bind_host_queue: cb_bind_host_queue::<P>,
         drain_host_queue: cb_drain_host_queue::<P>,
         perform_menu: cb_perform_menu::<P>,
         gui_param_at: cb_gui_param_at::<P>,
         set_audio_presentation_latency: cb_set_audio_presentation_latency::<P>,
         param_step_count: cb_param_step_count::<P>,
+        keyswitches: cb_keyswitches::<P>,
+        program_list: cb_program_list::<P>,
+        set_program_data: cb_set_program_data::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every

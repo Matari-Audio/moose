@@ -22,7 +22,7 @@ use moose_core::events::EventBody;
 use moose_core::export::PluginExport;
 use moose_core::wrapper::{copy_c_str, run_extern_callback_with};
 use moose_params::Params;
-use moose_params::{ParamFlags, ParamRange};
+use moose_params::{ParamCatalog, ParamFlags, ParamRange};
 use std::ffi::{CStr, c_char};
 use std::ptr;
 
@@ -50,13 +50,16 @@ pub(crate) unsafe extern "C" fn params_get_info<P: PluginExport>(
         }
         let data = data_from_plugin::<P>(plugin);
         let exposed = catalog_sync::lock_exposed(&data.exposed);
-        let Some(info) = exposed.info(param_index) else {
+        let Some((catalog_index, info)) = exposed.info_with_index(param_index) else {
             return false;
         };
         let out = &mut *out;
 
         out.id = info.id;
-        out.cookie = ptr::null_mut();
+        // Strict-provenance non-null cookie encoding the dense catalog slot
+        // (`catalog_index + 1`). Validated with `ParamCatalog::validate_cookie`
+        // so stale cookies across a dynamic rescan degrade safely to ID lookup.
+        out.cookie = ptr::without_provenance_mut(ParamCatalog::cookie_for_index(catalog_index));
 
         // Convert flags
         let mut flags: u32 = 0;
@@ -78,29 +81,7 @@ pub(crate) unsafe extern "C" fn params_get_info<P: PluginExport>(
         if info.flags.contains(ParamFlags::MODULATABLE_PER_NOTE) {
             flags |= CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID;
         }
-        match info.range.base() {
-            ParamRange::Enum { .. } => {
-                flags |= CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM;
-            }
-            ParamRange::Discrete { .. } => {
-                flags |= CLAP_PARAM_IS_STEPPED;
-            }
-            // CLAP's stepped flag means every plain value is an integer.
-            // Keep fractional fixed-step ranges quantized in Moose, but
-            // advertise them as continuous to CLAP hosts so the descriptor
-            // stays valid and the plug-in remains loadable.
-            ParamRange::Stepped { min, max, step }
-                if min.is_finite()
-                    && max.is_finite()
-                    && step.is_finite()
-                    && min.fract() == 0.0
-                    && max.fract() == 0.0
-                    && step.fract() == 0.0 =>
-            {
-                flags |= CLAP_PARAM_IS_STEPPED;
-            }
-            _ => {}
-        }
+        flags |= range_flags(&info.range);
         let presentation = data.params_arc.parameter_presentation(info.id);
         out.flags = presented_flags(flags, presentation.as_ref());
 
@@ -128,6 +109,22 @@ pub(crate) unsafe extern "C" fn params_get_info<P: PluginExport>(
     })
 }
 
+/// Flags determined solely by the plain value range.
+pub(crate) fn range_flags(range: &ParamRange) -> u32 {
+    match range.base() {
+        ParamRange::Enum { .. } => CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM,
+        ParamRange::Discrete { .. } => CLAP_PARAM_IS_STEPPED,
+        ParamRange::Stepped { min, max, step }
+            if [min, max, step]
+                .iter()
+                .all(|v| v.is_finite() && v.fract() == 0.0) =>
+        {
+            CLAP_PARAM_IS_STEPPED
+        }
+        _ => 0,
+    }
+}
+
 /// A runtime presentation's `hidden` overrides the static flag.
 pub(crate) fn presented_flags(
     flags: u32,
@@ -147,7 +144,12 @@ pub(crate) unsafe extern "C" fn params_get_value<P: PluginExport>(
 ) -> bool {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        match data.params_arc.get_plain(param_id) {
+        let idx = catalog_sync::lock_exposed(&data.exposed).index_of(param_id);
+        let value = match idx {
+            Some(index) => data.params_arc.get_plain_by_index(index, param_id),
+            None => data.params_arc.get_plain(param_id),
+        };
+        match value {
             Some(v) => {
                 *out_value = v;
                 true
@@ -173,7 +175,14 @@ pub(crate) unsafe extern "C" fn params_value_to_text<P: PluginExport>(
             return false;
         }
         let data = data_from_plugin::<P>(plugin);
-        match data.params_arc.format_value(param_id, value) {
+        let idx = catalog_sync::lock_exposed(&data.exposed).index_of(param_id);
+        let formatted = match idx {
+            Some(index) => data
+                .params_arc
+                .format_value_by_index(index, param_id, value),
+            None => data.params_arc.format_value(param_id, value),
+        };
+        match formatted {
             Some(text) => {
                 let _ = copy_c_str(out_buffer, out_buffer_capacity as usize, &text);
                 true
@@ -198,7 +207,12 @@ pub(crate) unsafe extern "C" fn params_text_to_value<P: PluginExport>(
         let Ok(text) = CStr::from_ptr(param_value_text).to_str() else {
             return false;
         };
-        match data.params_arc.parse_value(param_id, text) {
+        let idx = catalog_sync::lock_exposed(&data.exposed).index_of(param_id);
+        let parsed = match idx {
+            Some(index) => data.params_arc.parse_value_by_index(index, param_id, text),
+            None => data.params_arc.parse_value(param_id, text),
+        };
+        match parsed {
             Some(v) => {
                 *out_value = v;
                 true
@@ -239,7 +253,10 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
         for ev in scr.event_list.iter() {
             match ev.body {
                 EventBody::ParamChange { id, value } => {
-                    params.set_plain(id, value);
+                    match scr.catalog.index_of(id) {
+                        Some(index) => params.set_plain_by_index(index, id, value),
+                        None => params.set_plain(id, value),
+                    }
                     defer_param_change(&mut scr.deferred_params, id, value);
                 }
                 // Conversion accepts wildcard note IDs only for fully global
@@ -298,5 +315,52 @@ mod presentation_tests {
             presented_flags(CLAP_PARAM_IS_AUTOMATABLE, Some(&hidden)),
             base
         );
+    }
+
+    #[test]
+    fn cookie_round_trips_strict_provenance_and_rejects_stale_id() {
+        use moose_params::{ParamInfo, ParamUnit, ParamValueKind};
+        let info_a = ParamInfo {
+            id: 101,
+            name: "Gain",
+            short_name: "Gain",
+            group: "",
+            range: ParamRange::Linear { min: 0.0, max: 1.0 },
+            default_plain: 0.5,
+            unit: ParamUnit::None,
+            flags: ParamFlags::AUTOMATABLE,
+            kind: ParamValueKind::Float,
+            midi_map: None,
+            midi_channel: None,
+        };
+        let info_b = ParamInfo {
+            id: 42,
+            name: "Mix",
+            short_name: "Mix",
+            group: "",
+            ..info_a
+        };
+        let catalog = ParamCatalog::new(vec![info_a, info_b]);
+        let cookie_b: *mut std::ffi::c_void =
+            ptr::without_provenance_mut(ParamCatalog::cookie_for_index(1));
+        assert!(!cookie_b.is_null());
+        let (idx, info) = catalog
+            .validate_cookie(cookie_b.addr(), 42)
+            .expect("valid cookie");
+        assert_eq!(idx, 1);
+        assert_eq!(info.id, 42);
+        // Stale cookie pointing at slot 1 when host passes id 101 is rejected,
+        // and `resolve_cookie` falls back cleanly to slot 0.
+        assert!(catalog.validate_cookie(cookie_b.addr(), 101).is_none());
+        let (fallback_idx, fallback_info) = catalog
+            .resolve_cookie(cookie_b.addr(), 101)
+            .expect("fallback by id");
+        assert_eq!(fallback_idx, 0);
+        assert_eq!(fallback_info.id, 101);
+        // Null cookie also falls back cleanly.
+        let (null_idx, _) = catalog
+            .resolve_cookie(ptr::null_mut::<std::ffi::c_void>().addr(), 42)
+            .expect("null cookie fallback");
+        assert_eq!(null_idx, 1);
     }
 }

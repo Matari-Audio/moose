@@ -5,15 +5,17 @@
 //! editor's fd goes to `IRunLoop::registerEventHandler` and a 16 ms
 //! `IRunLoop` timer covers events the host read off the shared display.
 
+use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::Weak;
+use std::sync::{Mutex, OnceLock, PoisonError, Weak};
 
 use vst3::Steinberg::Linux::{
     IEventHandler, IEventHandlerTrait, IRunLoop, IRunLoopTrait, ITimerHandler, ITimerHandlerTrait,
 };
 use vst3::Steinberg::Vst::{IHostApplication, IHostApplicationTrait};
 use vst3::Steinberg::{
-    FUnknown, IWaylandHost, IWaylandHost_iid, IWaylandHostTrait, TUID, kResultOk,
+    FUnknown, IPlugFrame, IWaylandFrame, IWaylandFrameTrait, IWaylandHost, IWaylandHost_iid,
+    IWaylandHostTrait, TUID, kResultOk,
 };
 use vst3::{Class, ComPtr, ComWrapper, wl_display};
 
@@ -44,17 +46,128 @@ pub(super) fn wayland_host_of(context: &ComPtr<FUnknown>) -> Option<ComPtr<IWayl
     }
 }
 
-/// An open `openWaylandConnection`, closed on drop.
-pub(super) struct Connection {
+/// The plug frame's `IWaylandFrame`, when the host exposes VST3 3.8 Wayland
+/// frame queries (`getWaylandSurface`, `getParentSurface`, `getParentToplevel`).
+pub(super) fn wayland_frame_of(frame: &ComPtr<IPlugFrame>) -> Option<ComPtr<IWaylandFrame>> {
+    frame.cast::<IWaylandFrame>()
+}
+
+/// Resolve the parent `wl_surface*` on `display` for `attached(parent, "WaylandSurfaceID")`.
+///
+/// Per VST3 3.8 `IWaylandFrame`, when the host exposes `IWaylandFrame`,
+/// `getWaylandSurface(display)` returns the parent surface for that display
+/// (even if `attached` passed a null `parent`). Otherwise fall back to the
+/// `parent` pointer passed to `attached`.
+pub(super) fn resolve_parent_surface(
+    frame: Option<&ComPtr<IWaylandFrame>>,
+    display: *mut wl_display,
+    parent: *mut c_void,
+) -> Option<*mut c_void> {
+    if let Some(wf) = frame {
+        // SAFETY: `wf` and `display` are live host Wayland interfaces on the UI thread.
+        let surface = unsafe { wf.getWaylandSurface(display) };
+        if !surface.is_null() {
+            return Some(surface.cast());
+        }
+    }
+    (!parent.is_null()).then_some(parent)
+}
+
+/// Resolve the host's parent `xdg_surface*` on `display` for popup positioning
+/// via VST3 3.8 `IWaylandFrame::getParentSurface`.
+#[allow(dead_code, reason = "queried by Wayland popup helpers and unit tests")]
+pub(super) fn parent_xdg_surface(
+    frame: Option<&ComPtr<IWaylandFrame>>,
+    display: *mut wl_display,
+) -> Option<*mut c_void> {
+    let wf = frame?;
+    let mut size: vst3::Steinberg::ViewRect = unsafe { std::mem::zeroed() };
+    // SAFETY: `wf` and `display` are live host Wayland interfaces on the UI thread.
+    let surface = unsafe { wf.getParentSurface(&raw mut size, display) };
+    (!surface.is_null()).then_some(surface.cast())
+}
+
+/// Resolve the host's parent `xdg_toplevel*` on `display` for dialogs/popups
+/// via VST3 3.8 `IWaylandFrame::getParentToplevel`.
+#[allow(dead_code, reason = "queried by Wayland popup helpers and unit tests")]
+pub(super) fn parent_xdg_toplevel(
+    frame: Option<&ComPtr<IWaylandFrame>>,
+    display: *mut wl_display,
+) -> Option<*mut c_void> {
+    let wf = frame?;
+    // SAFETY: `wf` and `display` are live host Wayland interfaces on the UI thread.
+    let toplevel = unsafe { wf.getParentToplevel(display) };
+    (!toplevel.is_null()).then_some(toplevel.cast())
+}
+
+/// One shared `IWaylandHost::openWaylandConnection` entry keyed by the host
+/// context pointer, so multiple open plugin views inside the same host share
+/// one Wayland connection (matching VSTGUI's `useCount`) and close it only
+/// when the last view detaches.
+struct SharedEntry {
+    context_key: usize,
     host: ComPtr<IWaylandHost>,
+    display: NonNull<wl_display>,
+    refs: usize,
+}
+
+// SAFETY: `open` and `drop` only run on the host's UI thread (attached /
+// removed); the mutex protects the process-wide table across instances.
+unsafe impl Send for SharedEntry {}
+
+fn shared_connections() -> &'static Mutex<Vec<SharedEntry>> {
+    static TABLE: OnceLock<Mutex<Vec<SharedEntry>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A refcounted handle to the host's `openWaylandConnection`, closed once the
+/// last view using the same host context drops.
+pub(super) struct Connection {
+    context_key: usize,
     display: NonNull<wl_display>,
 }
 
 impl Connection {
-    pub(super) fn open(host: ComPtr<IWaylandHost>) -> Option<Self> {
-        // SAFETY: `host` is a live interface.
+    pub(super) fn open(context: &ComPtr<FUnknown>) -> Option<Self> {
+        let context_key = context.as_ptr() as usize;
+        {
+            let mut table = shared_connections()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = table.iter_mut().find(|e| e.context_key == context_key) {
+                entry.refs += 1;
+                return Some(Self {
+                    context_key,
+                    display: entry.display,
+                });
+            }
+        }
+        let host = wayland_host_of(context)?;
+        // SAFETY: `host` is a live interface on the UI thread.
         let display = NonNull::new(unsafe { host.openWaylandConnection() })?;
-        Some(Self { host, display })
+        let mut table = shared_connections()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = table.iter_mut().find(|e| e.context_key == context_key) {
+            // Another view raced us (should not happen on one UI thread, but handle cleanly).
+            // SAFETY: close the redundant connection we just opened.
+            unsafe { host.closeWaylandConnection(display.as_ptr()) };
+            entry.refs += 1;
+            return Some(Self {
+                context_key,
+                display: entry.display,
+            });
+        }
+        table.push(SharedEntry {
+            context_key,
+            host,
+            display,
+            refs: 1,
+        });
+        Some(Self {
+            context_key,
+            display,
+        })
     }
 
     pub(super) fn display(&self) -> *mut wl_display {
@@ -64,9 +177,27 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // SAFETY: `display` came from this host's `openWaylandConnection`
-        // and is closed exactly once.
-        unsafe { self.host.closeWaylandConnection(self.display.as_ptr()) };
+        let closing = {
+            let mut table = shared_connections()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            table
+                .iter()
+                .position(|e| e.context_key == self.context_key)
+                .and_then(|idx| {
+                    table[idx].refs -= 1;
+                    if table[idx].refs == 0 {
+                        Some(table.swap_remove(idx))
+                    } else {
+                        None
+                    }
+                })
+        };
+        if let Some(entry) = closing {
+            // SAFETY: `display` came from this host's `openWaylandConnection`
+            // and is closed exactly once after the last view's surfaces are gone.
+            unsafe { entry.host.closeWaylandConnection(entry.display.as_ptr()) };
+        }
     }
 }
 

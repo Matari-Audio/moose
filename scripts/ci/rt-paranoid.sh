@@ -43,16 +43,11 @@ fi
 
 echo "rt-paranoid: checking ${#pkgs[@]} example crates"
 
-fail=0
+pkg_args=()
 for pkg in "${pkgs[@]}"; do
-    echo "::group::rt-paranoid $pkg"
-    # The generated screenshot tests need a GPU adapter, which headless CI
-    # runners lack; they check the editor, not the audio thread.
-    if ! "$CARGO" test -p "$pkg" --features rt-paranoid --lib -- --skip gui_screenshot; then
-        echo "::error::$pkg allocates on the audio thread in process()"
-        fail=1
-    fi
-    echo "::endgroup::"
+    pkg_args+=(-p "$pkg")
 done
 
-exit "$fail"
+# The generated screenshot tests need a GPU adapter, which headless CI
+# runners lack; they check the editor, not the audio thread.
+"$CARGO" test "${pkg_args[@]}" --features rt-paranoid --lib --no-fail-fast -- --skip gui_screenshot

@@ -40,7 +40,9 @@ use moose_core::Float;
 use moose_core::buffer::AudioBuffer;
 use moose_core::bus_routing::BusRoute;
 use moose_core::cast::{len_u32, size_of_u32};
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
+use moose_core::chunked_process::{
+    ChunkedProcess, process_chunked_with_bus_routing_catalog_and_pool,
+};
 use moose_core::config::ProcessMode;
 use moose_core::events::{EventBody, LosslessEventRef, OutputEventStatus, TransportInfo};
 use moose_core::export::PluginExport;
@@ -73,8 +75,30 @@ pub(crate) unsafe fn flush_gui_changes<P: PluginExport>(
             return true;
         };
 
-        while let Some(change) = data.gui_changes.pop() {
-            match change {
+        // Take a bounded snapshot before reading the gate. A later producer
+        // cannot substitute its new event for one in this FIFO prefix.
+        #[cfg(feature = "clap-draft")]
+        let limit = data.undo_groups.gui_drained()
+            + (data.undo_groups.retry_gui_change.len() + data.gui_changes.len()) as u64;
+        #[cfg(feature = "clap-draft")]
+        let limit = limit.min(data.undo_groups.begin_gate());
+        loop {
+            #[cfg(feature = "clap-draft")]
+            if data.undo_groups.gui_drained() >= limit {
+                break;
+            }
+            #[cfg(feature = "clap-draft")]
+            let next = data
+                .undo_groups
+                .retry_gui_change
+                .pop()
+                .or_else(|| data.gui_changes.pop());
+            #[cfg(not(feature = "clap-draft"))]
+            let next = data.gui_changes.pop();
+            let Some(change) = next else {
+                break;
+            };
+            let accepted = match change {
                 GuiParamChange::GestureBegin(id) => {
                     let event = clap_event_param_gesture {
                         header: clap_event_header {
@@ -86,9 +110,7 @@ pub(crate) unsafe fn flush_gui_changes<P: PluginExport>(
                         },
                         param_id: id,
                     };
-                    if !try_push(out_events, &raw const event.header) {
-                        return false;
-                    }
+                    try_push(out_events, &raw const event.header)
                 }
                 GuiParamChange::Value(id, plain) => {
                     let event = clap_event_param_value {
@@ -107,12 +129,12 @@ pub(crate) unsafe fn flush_gui_changes<P: PluginExport>(
                         key: -1,
                         value: plain,
                     };
-                    if plain.is_finite() && !try_push(out_events, &raw const event.header) {
-                        // Popped and refused: the host never hears this
-                        // value as an event, so ask it to re-read values.
+                    let accepted =
+                        !plain.is_finite() || try_push(out_events, &raw const event.header);
+                    if !accepted {
                         request_value_rescan(data);
-                        return false;
                     }
+                    accepted
                 }
                 GuiParamChange::GestureEnd(id) => {
                     let event = clap_event_param_gesture {
@@ -125,19 +147,74 @@ pub(crate) unsafe fn flush_gui_changes<P: PluginExport>(
                         },
                         param_id: id,
                     };
-                    if !try_push(out_events, &raw const event.header) {
-                        return false;
-                    }
+                    try_push(out_events, &raw const event.header)
                 }
+            };
+            if !accepted {
+                #[cfg(feature = "clap-draft")]
+                {
+                    // Only this consumer accesses the retry slot. Keep the refused event first.
+                    let _ = data.undo_groups.retry_gui_change.push(change);
+                    data.host_queue.signal(HostSignal::UNDO_GROUP);
+                }
+                return false;
             }
+            #[cfg(feature = "clap-draft")]
+            data.undo_groups.note_gui_drained();
+        }
+        #[cfg(feature = "clap-draft")]
+        if data.undo_groups.should_wake_main_thread() {
+            data.host_queue.signal(HostSignal::UNDO_GROUP);
         }
         // A rescan before draining could be overwritten by older FIFO values.
         // Re-read only after all of those events have reached the host.
-        if data.gui_overflow.swap(false, Ordering::AcqRel) {
+        if data.gui_changes.is_empty() && data.gui_overflow.swap(false, Ordering::AcqRel) {
             request_value_rescan(data);
         }
         true
     }
+}
+
+/// Stack-pinned thin wrapper around `&dyn Fn(u32) + Sync` stored in
+/// `ClapPluginData::active_pool_task` for the exact duration of
+/// `clap_host_thread_pool.request_exec`.
+struct PoolTask<'a> {
+    f: &'a (dyn Fn(u32) + Sync),
+}
+
+struct ClearPoolTask<'a>(&'a std::sync::atomic::AtomicPtr<c_void>);
+
+impl Drop for ClearPoolTask<'_> {
+    fn drop(&mut self) {
+        self.0.store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// `clap.thread-pool::exec` — invoked concurrently on host RT worker threads
+/// while `request_exec` is active on the audio thread.
+pub(crate) unsafe extern "C" fn thread_pool_exec<P: PluginExport>(
+    plugin: *const clap_plugin,
+    task_index: u32,
+) {
+    if plugin.is_null() {
+        return;
+    }
+    // SAFETY: the host passes its live plugin instance while `request_exec`
+    // is active on the audio thread.
+    let data = unsafe { data_from_plugin::<P>(plugin) };
+    // Route worker panics through the same silent latched audio boundary as
+    // `clap_plugin_process` so a panicking worker records to `panic_latch`
+    // without printing on a host RT thread.
+    let _ = run_audio_block_latched::<P, ()>(&data.panic_latch, "CLAP", || unsafe {
+        let raw = data.active_pool_task.load(Ordering::Acquire);
+        if raw.is_null() {
+            return;
+        }
+        // SAFETY: `raw` points to a stack-pinned `PoolTask` kept alive by
+        // `request_exec` on the audio thread until all worker `exec` calls join.
+        let task = &*raw.cast::<PoolTask<'_>>();
+        (task.f)(task_index);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -430,14 +507,52 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             param_infos: &scr.catalog,
             automation: data.info.automation,
         };
-        let status = process_chunked_with_bus_routing_and_catalog(
+        let thread_pool_exec = |num_tasks: u32, f: &(dyn Fn(u32) + Sync)| -> bool {
+            let ext = data.host_thread_pool;
+            if ext.is_null() {
+                return false;
+            }
+            let Some(request_exec) = (*ext).request_exec else {
+                return false;
+            };
+            let host_ptr = data.host.as_ptr();
+            if host_ptr.is_null() {
+                return false;
+            }
+            let task = PoolTask { f };
+            let ptr = (&raw const task).cast_mut().cast::<c_void>();
+            if data
+                .active_pool_task
+                .compare_exchange(ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed)
+                .is_err()
+            {
+                return false;
+            }
+            let _clear = ClearPoolTask(&data.active_pool_task);
+            request_exec(host_ptr, num_tasks)
+        };
+        let pool_arg: Option<moose_core::process::ThreadPoolExec<'_>> =
+            (!chunk_args.process_mode.is_offline() && !data.host_thread_pool.is_null())
+                .then_some(&thread_pool_exec);
+        let status = process_chunked_with_bus_routing_catalog_and_pool(
             &mut *instance,
             data.params_arc.as_ref() as &dyn Params,
             &mut audio_buffer,
             chunk_args,
             bus_routing,
             &scr.catalog,
+            pool_arg,
         );
+        if data.panic_latch.is_failed() {
+            // A host thread-pool worker panicked during `parallel_for`: do not
+            // emit partially written scratch buffers or audio; return
+            // `CLAP_PROCESS_ERROR` so `zero_clap_output_buffers` silences this
+            // block and `request_callback` reports the latched panic.
+            scr.input_slices.clear();
+            scr.output_slices.clear();
+            data.host.on_audio_thread().as_any().request_callback();
+            return CLAP_PROCESS_ERROR;
+        }
 
         // Parameters have reached their sample offsets before discovery is
         // scheduled. No metadata lookup or catalog walk runs on audio.
@@ -731,7 +846,11 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
                                 flags: 0,
                             },
                             param_id: *id,
-                            cookie: ptr::null_mut(),
+                            cookie: scr.catalog.index_of(*id).map_or(ptr::null_mut(), |idx| {
+                                ptr::without_provenance_mut(
+                                    moose_params::ParamCatalog::cookie_for_index(idx),
+                                )
+                            }),
                             note_id: -1,
                             port_index: -1,
                             channel: -1,
@@ -1035,5 +1154,417 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
             "CLAP smoke harness produced silent output - process did not run"
         );
         count
+    }
+}
+
+#[cfg(test)]
+mod thread_pool_tests {
+    use super::*;
+    use clap_sys::ext::thread_pool::{
+        CLAP_EXT_THREAD_POOL, clap_host_thread_pool, clap_plugin_thread_pool,
+    };
+    use moose_core::bus::BusLayout;
+    use moose_core::events::EventList;
+    use moose_core::info::{Automation, MidiDialect, PluginCategory, PluginInfo};
+    use moose_core::meters::MeterStore;
+    use moose_core::plugin::PluginRuntime;
+    use moose_core::process::ProcessContext;
+    use moose_core::snapshot::SnapshotSlot;
+    use moose_params::DynamicParams;
+    use std::ffi::CStr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    static PARALLEL_SUM: AtomicU32 = AtomicU32::new(0);
+
+    struct PoolPlugin {
+        params: Arc<DynamicParams<1>>,
+        meters: Arc<MeterStore>,
+        snapshot: Arc<SnapshotSlot>,
+    }
+
+    impl PluginRuntime for PoolPlugin {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            PluginInfo {
+                name: "PoolTest",
+                vendor: "Matari",
+                url: "",
+                version: "1.0.0",
+                category: PluginCategory::Effect,
+                description: None,
+                clap_manual_url: None,
+                clap_support_url: None,
+                clap_features: &[],
+                accepts_midi_in: false,
+                emits_midi: false,
+                midi_input_dialect: MidiDialect::Midi1,
+                midi_output_dialect: MidiDialect::Midi1,
+                midi_input_ports: 0,
+                midi_output_ports: 0,
+                bundle_id: "pool-test",
+                vst3_id: "com.matari.pooltest",
+                clap_id: "com.matari.pooltest",
+                fourcc: *b"PlTs",
+                au_type: *b"aufx",
+                au_manufacturer: *b"Mtri",
+                vst3_subcategory: None,
+                preset_user_dir: None,
+                preset_extension: "preset",
+                vst3_name: None,
+                clap_name: None,
+                au_name: None,
+                au3_name: None,
+                mute_preview_output: false,
+                automation: Automation::DEFAULT,
+                legacy_au_keys: &[],
+            }
+        }
+        fn bus_layouts() -> Vec<BusLayout> {
+            vec![BusLayout::stereo()]
+        }
+        fn reset(&mut self, _: &moose_core::AudioConfig) {}
+        fn process(
+            &mut self,
+            _buffer: &mut AudioBuffer<f32>,
+            _events: &EventList,
+            ctx: &mut ProcessContext<'_>,
+        ) -> ProcessStatus {
+            ctx.parallel_for(8, |i| {
+                PARALLEL_SUM.fetch_add(i + 1, Ordering::Relaxed);
+            });
+            ProcessStatus::Normal
+        }
+    }
+
+    impl PluginExport for PoolPlugin {
+        type Params = DynamicParams<1>;
+        fn create() -> Self {
+            Self {
+                params: Arc::new(DynamicParams::new()),
+                meters: MeterStore::new(),
+                snapshot: SnapshotSlot::new(),
+            }
+        }
+        fn params(&self) -> &DynamicParams<1> {
+            &self.params
+        }
+        fn params_arc(&self) -> Arc<DynamicParams<1>> {
+            Arc::clone(&self.params)
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            Arc::clone(&self.meters)
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            Arc::clone(&self.snapshot)
+        }
+    }
+
+    struct HostState {
+        plugin: *const clap_plugin,
+        plugin_pool: *const clap_plugin_thread_pool,
+        requests: AtomicU32,
+    }
+
+    unsafe extern "C" fn host_request_exec(host: *const clap_host, num_tasks: u32) -> bool {
+        unsafe {
+            let state = &*(*host).host_data.cast::<HostState>();
+            state.requests.fetch_add(1, Ordering::Relaxed);
+            let exec = (*state.plugin_pool).exec.unwrap();
+            let plugin_addr = state.plugin as usize;
+            std::thread::scope(|s| {
+                for i in 0..num_tasks {
+                    s.spawn(move || {
+                        exec(plugin_addr as *const clap_plugin, i);
+                    });
+                }
+            });
+        }
+        true
+    }
+
+    static HOST_POOL: clap_host_thread_pool = clap_host_thread_pool {
+        request_exec: Some(host_request_exec),
+    };
+
+    unsafe extern "C" fn host_get_ext(
+        _host: *const clap_host,
+        ext_id: *const c_char,
+    ) -> *const c_void {
+        if unsafe { CStr::from_ptr(ext_id) } == CLAP_EXT_THREAD_POOL {
+            (&raw const HOST_POOL).cast()
+        } else {
+            ptr::null()
+        }
+    }
+
+    unsafe extern "C" fn nop_host(_: *const clap_host) {}
+
+    #[test]
+    fn clap_thread_pool_executes_tasks_across_host_workers() {
+        PARALLEL_SUM.store(0, Ordering::Relaxed);
+
+        let desc = clap_plugin_descriptor {
+            clap_version: CLAP_VERSION,
+            id: c"com.matari.pooltest".as_ptr(),
+            name: c"PoolTest".as_ptr(),
+            vendor: c"Matari".as_ptr(),
+            url: c"".as_ptr(),
+            manual_url: c"".as_ptr(),
+            support_url: c"".as_ptr(),
+            version: c"1.0.0".as_ptr(),
+            description: c"".as_ptr(),
+            features: [ptr::null()].as_ptr(),
+        };
+        let host_state = std::cell::UnsafeCell::new(HostState {
+            plugin: ptr::null(),
+            plugin_pool: ptr::null(),
+            requests: AtomicU32::new(0),
+        });
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: host_state.get().cast(),
+            name: c"TestHost".as_ptr(),
+            vendor: c"".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"".as_ptr(),
+            get_extension: Some(host_get_ext),
+            request_restart: Some(nop_host),
+            request_process: Some(nop_host),
+            request_callback: Some(nop_host),
+        };
+
+        unsafe {
+            let plugin = create_plugin_instance::<PoolPlugin>(&raw const desc, &raw const host);
+            assert!(!plugin.is_null());
+            let vtable = &*plugin;
+            assert!((vtable.init.unwrap())(plugin));
+
+            let ext = (vtable.get_extension.unwrap())(plugin, CLAP_EXT_THREAD_POOL.as_ptr())
+                .cast::<clap_plugin_thread_pool>();
+            assert!(!ext.is_null());
+            (*host_state.get()).plugin = plugin;
+            (*host_state.get()).plugin_pool = ext;
+
+            // Stray `exec` outside `request_exec` is a safe no-op.
+            ((*ext).exec.unwrap())(plugin, 0);
+            assert_eq!(PARALLEL_SUM.load(Ordering::Relaxed), 0);
+
+            assert!((vtable.activate.unwrap())(plugin, 48_000.0, 1, 64));
+            assert!((vtable.start_processing.unwrap())(plugin));
+
+            let mut in_l = [0.0f32; 16];
+            let mut in_r = [0.0f32; 16];
+            let mut out_l = [0.0f32; 16];
+            let mut out_r = [0.0f32; 16];
+            let mut in_ptrs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+            let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            let in_bus = clap_audio_buffer {
+                data32: in_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let mut out_bus = clap_audio_buffer {
+                data32: out_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let process = clap_process {
+                steady_time: 0,
+                frames_count: 16,
+                transport: ptr::null(),
+                audio_inputs: &raw const in_bus,
+                audio_outputs: &raw mut out_bus,
+                audio_inputs_count: 1,
+                audio_outputs_count: 1,
+                in_events: ptr::null(),
+                out_events: ptr::null(),
+            };
+
+            let status = (vtable.process.unwrap())(plugin, &raw const process);
+            assert_eq!(status, CLAP_PROCESS_CONTINUE);
+            assert_eq!((*host_state.get()).requests.load(Ordering::Relaxed), 1);
+            assert_eq!(PARALLEL_SUM.load(Ordering::Relaxed), 36);
+
+            // Pointer is cleared immediately after `request_exec` returns.
+            ((*ext).exec.unwrap())(plugin, 0);
+            assert_eq!(PARALLEL_SUM.load(Ordering::Relaxed), 36);
+
+            assert!(crate::gui::render_set::<PoolPlugin>(
+                plugin,
+                clap_sys::ext::render::CLAP_RENDER_OFFLINE
+            ));
+            assert_eq!(
+                (vtable.process.unwrap())(plugin, &raw const process),
+                CLAP_PROCESS_CONTINUE
+            );
+            assert_eq!((*host_state.get()).requests.load(Ordering::Relaxed), 1);
+            assert_eq!(PARALLEL_SUM.load(Ordering::Relaxed), 72);
+
+            (vtable.stop_processing.unwrap())(plugin);
+            (vtable.deactivate.unwrap())(plugin);
+            (vtable.destroy.unwrap())(plugin);
+        }
+    }
+
+    #[test]
+    fn clap_thread_pool_worker_panic_latches_and_silences_outputs() {
+        struct PanicPoolPlugin(PoolPlugin);
+        impl PluginRuntime for PanicPoolPlugin {
+            type Sample = f32;
+            fn info() -> PluginInfo {
+                PoolPlugin::info()
+            }
+            fn bus_layouts() -> Vec<BusLayout> {
+                PoolPlugin::bus_layouts()
+            }
+            fn reset(&mut self, config: &moose_core::AudioConfig) {
+                self.0.reset(config);
+            }
+            fn process(
+                &mut self,
+                buffer: &mut AudioBuffer<f32>,
+                _events: &EventList,
+                context: &mut ProcessContext<'_>,
+            ) -> ProcessStatus {
+                // Pre-fill outputs with non-zero sentinel samples so the test
+                // proves a worker panic zeroes the block rather than leaking
+                // partial samples.
+                for ch in 0..buffer.num_output_channels() {
+                    buffer.output(ch).fill(0.75);
+                }
+                context.parallel_for(4, |idx| {
+                    assert!(idx != 2, "worker task exploded");
+                });
+                ProcessStatus::Normal
+            }
+        }
+        impl PluginExport for PanicPoolPlugin {
+            type Params = DynamicParams<1>;
+            fn create() -> Self {
+                Self(PoolPlugin::create())
+            }
+            fn params(&self) -> &Self::Params {
+                self.0.params()
+            }
+            fn params_arc(&self) -> Arc<Self::Params> {
+                self.0.params_arc()
+            }
+            fn meter_store(&self) -> Arc<MeterStore> {
+                self.0.meter_store()
+            }
+            fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+                self.0.snapshot_slot()
+            }
+        }
+
+        let desc = clap_plugin_descriptor {
+            clap_version: CLAP_VERSION,
+            id: c"com.matari.panicpooltest".as_ptr(),
+            name: c"PanicPoolTest".as_ptr(),
+            vendor: c"Matari".as_ptr(),
+            url: c"".as_ptr(),
+            manual_url: c"".as_ptr(),
+            support_url: c"".as_ptr(),
+            version: c"1.0.0".as_ptr(),
+            description: c"".as_ptr(),
+            features: [ptr::null()].as_ptr(),
+        };
+        let host_state = std::cell::UnsafeCell::new(HostState {
+            plugin: ptr::null(),
+            plugin_pool: ptr::null(),
+            requests: AtomicU32::new(0),
+        });
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: host_state.get().cast(),
+            name: c"TestHost".as_ptr(),
+            vendor: c"".as_ptr(),
+            url: c"".as_ptr(),
+            version: c"".as_ptr(),
+            get_extension: Some(host_get_ext),
+            request_restart: Some(nop_host),
+            request_process: Some(nop_host),
+            request_callback: Some(nop_host),
+        };
+
+        unsafe {
+            let plugin =
+                create_plugin_instance::<PanicPoolPlugin>(&raw const desc, &raw const host);
+            assert!(!plugin.is_null());
+            let vtable = &*plugin;
+            assert!((vtable.init.unwrap())(plugin));
+            let ext = (vtable.get_extension.unwrap())(plugin, CLAP_EXT_THREAD_POOL.as_ptr())
+                .cast::<clap_plugin_thread_pool>();
+            assert!(!ext.is_null());
+            (*host_state.get()).plugin = plugin;
+            (*host_state.get()).plugin_pool = ext;
+
+            assert!((vtable.activate.unwrap())(plugin, 48_000.0, 1, 64));
+            assert!((vtable.start_processing.unwrap())(plugin));
+
+            let mut in_l = [0.5f32; 16];
+            let mut in_r = [0.5f32; 16];
+            let mut out_l = [1.0f32; 16];
+            let mut out_r = [1.0f32; 16];
+            let mut in_ptrs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+            let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            let in_bus = clap_audio_buffer {
+                data32: in_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let mut out_bus = clap_audio_buffer {
+                data32: out_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let process = clap_process {
+                steady_time: 0,
+                frames_count: 16,
+                transport: ptr::null(),
+                audio_inputs: &raw const in_bus,
+                audio_outputs: &raw mut out_bus,
+                audio_inputs_count: 1,
+                audio_outputs_count: 1,
+                in_events: ptr::null(),
+                out_events: ptr::null(),
+            };
+
+            // Worker panic latches, returns error, and zeroes output buffers.
+            assert_eq!(
+                (vtable.process.unwrap())(plugin, &raw const process),
+                CLAP_PROCESS_ERROR
+            );
+            assert!(
+                data_from_plugin::<PanicPoolPlugin>(plugin)
+                    .panic_latch
+                    .is_failed()
+            );
+            assert!(out_l.iter().all(|&s| s == 0.0));
+            assert!(out_r.iter().all(|&s| s == 0.0));
+
+            // Subsequent block stays latched & silent without invoking process().
+            out_l.fill(0.5);
+            out_r.fill(0.5);
+            assert_eq!(
+                (vtable.process.unwrap())(plugin, &raw const process),
+                CLAP_PROCESS_SLEEP
+            );
+            assert!(out_l.iter().all(|&s| s == 0.0));
+            assert!(out_r.iter().all(|&s| s == 0.0));
+
+            (vtable.stop_processing.unwrap())(plugin);
+            (vtable.deactivate.unwrap())(plugin);
+            (vtable.destroy.unwrap())(plugin);
+        }
     }
 }

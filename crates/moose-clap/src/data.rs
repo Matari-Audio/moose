@@ -13,6 +13,7 @@ use clap_sys::ext::params::clap_host_params;
 use clap_sys::ext::state::clap_host_state;
 use clap_sys::ext::tail::clap_host_tail;
 use clap_sys::ext::thread_check::clap_host_thread_check;
+use clap_sys::ext::thread_pool::clap_host_thread_pool;
 use clap_sys::ext::track_info::clap_host_track_info;
 use clap_sys::process::clap_process;
 use moose_core::Sample;
@@ -32,7 +33,8 @@ use moose_core::state;
 use moose_core::tasks::AnyTaskSpawner;
 use moose_core::thread::{MainThread, MainThreadCell};
 use moose_core::wrapper::PluginCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -186,6 +188,35 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     pub(crate) host_log: *const clap_host_log,
     /// Host thread-check extension (`clap.thread-check`). Null if omitted.
     pub(crate) host_thread_check: *const clap_host_thread_check,
+    /// Host RT thread-pool extension (`clap.thread-pool`). Null if omitted.
+    pub(crate) host_thread_pool: *const clap_host_thread_pool,
+    /// Stack-pinned `PoolTask` pointer live only during `request_exec`.
+    pub(crate) active_pool_task: AtomicPtr<c_void>,
+    /// Host `clap.param-hovered/1` draft extension. Null if omitted.
+    #[cfg(feature = "clap-draft")]
+    pub(crate) host_param_hovered: *const crate::draft::clap_host_param_hovered,
+    /// Coalesced latest-wins pending hover notification for `clap.param-hovered/1`:
+    /// `0` = none pending, `1` = `None` (`CLAP_INVALID_ID`), `id + 2` = `Some(id)`.
+    #[cfg(feature = "clap-draft")]
+    pub(crate) hovered_param: AtomicU64,
+    /// Host `clap.undo/4` draft extension, queried lazily on the main thread
+    /// only when the plugin actually uses explicit undo calls so dirty-only
+    /// plugins keep host-implicit `mark_dirty` undo behavior.
+    #[cfg(feature = "clap-draft")]
+    pub(crate) host_undo: MainThreadCell<Option<*const crate::draft::clap_host_undo>>,
+    /// Ordered, reservation-backed `clap.undo/4` edit-group queue and sequence
+    /// counters keeping `begin_change` / `change_made` ordered around enclosed
+    /// `gui_changes` flushes.
+    #[cfg(feature = "clap-draft")]
+    pub(crate) undo_groups: Arc<crate::draft_ext::UndoGroupQueue>,
+    /// Temporary full-state override installed only during a synchronous
+    /// `clap_host_undo.change_made` call so each deferred edit group's `state.save`
+    /// captures that group's exact state instead of a later queued write.
+    #[cfg(feature = "clap-draft")]
+    pub(crate) undo_save_state_override: MainThreadCell<Option<crate::draft_ext::UndoSnapshot>>,
+    /// Latest host-reported undo context (`clap.undo_context/4`).
+    #[cfg(feature = "clap-draft")]
+    pub(crate) undo_context: Mutex<crate::draft_ext::UndoContextState>,
     /// A `HostNotice::AUDIO_PORTS` waits for the plugin to be inactive,
     /// where the host may rescan the port list.
     pub(crate) ports_rescan: AtomicBool,

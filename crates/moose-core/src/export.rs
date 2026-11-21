@@ -51,6 +51,15 @@ pub trait PluginExport: PluginRuntime + Sized {
         None
     }
 
+    /// Optional Steinberg VST3 3.7.5+ `IPluginCompatibility` JSON payload
+    /// describing replaced legacy VST2/VST3 class IDs. When `Some` (and
+    /// non-empty), `moose-vst3` registers a `"Plugin Compatibility Class"`
+    /// alongside the audio component in `IPluginFactory`.
+    #[must_use]
+    fn vst3_compatibility_json() -> Option<&'static str> {
+        None
+    }
+
     /// The instance's main-thread part. Called once at instantiation; the
     /// wrapper keeps it in a `MainThreadCell` and calls it only from host
     /// main-thread callbacks.

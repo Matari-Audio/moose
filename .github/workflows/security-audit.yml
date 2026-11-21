@@ -3,7 +3,17 @@ name: Supply chain
 on:
   push:
     branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/security-audit.yml'
   pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/security-audit.yml'
   workflow_dispatch:
   # Advisory databases change independently of the code, so re-run weekly
   # to surface newly-published RustSec advisories against the committed
