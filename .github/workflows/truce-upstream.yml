@@ -1,7 +1,7 @@
 name: Truce upstream review
 on:
   schedule:
-    - cron: '23 8 * * *'
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 permissions:
   contents: read

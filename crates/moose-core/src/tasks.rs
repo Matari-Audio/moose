@@ -1574,7 +1574,8 @@ mod tests {
 
         // First task is picked up and blocks a worker; fill the rest.
         let mut rejected = 0u32;
-        for n in 0..(TASK_QUEUE_PREALLOC as u32 + 64) {
+        let attempts = TASK_QUEUE_PREALLOC as u32 + if cfg!(miri) { 4 } else { 64 };
+        for n in 0..attempts {
             if spawner.try_spawn(n).is_err() {
                 rejected += 1;
             }
@@ -1607,10 +1608,15 @@ mod tests {
         let spawner = TaskSpawner::<u32>::new(move |n| {
             l.store(n, Ordering::Relaxed);
         });
-        for n in 0..(TASK_QUEUE_PREALLOC as u32 * 4) {
+        let count = if cfg!(miri) {
+            32
+        } else {
+            TASK_QUEUE_PREALLOC as u32 * 4
+        };
+        for n in 0..count {
             spawner.spawn_coalescing(n); // never panics, never blocks
         }
-        let target = TASK_QUEUE_PREALLOC as u32 * 4 - 1;
+        let target = count - 1;
         assert!(
             wait_until(Duration::from_secs(2), || last.load(Ordering::Relaxed)
                 == target),
@@ -1622,7 +1628,7 @@ mod tests {
     fn serialized_runs_one_at_a_time_and_drops_nothing() {
         // One-slot mode: the handler must never run concurrently with
         // itself for this instance, and every FIFO task must still run.
-        const N: u32 = 64;
+        const N: u32 = if cfg!(miri) { 8 } else { 64 };
         warm_pool(); // never lazy; Miri runs tests one at a time
         let in_flight = Arc::new(AtomicU32::new(0));
         let peak = Arc::new(AtomicU32::new(0));
@@ -1674,13 +1680,14 @@ mod tests {
         // the burst collapses in the slot rather than racing a worker.
         // Then drain once and confirm the whole burst ran a single time,
         // as the newest target.
-        for n in 1..=1000 {
+        let count = if cfg!(miri) { 32 } else { 1000 };
+        for n in 1..=count {
             let _ = spawner.sink.coalesced.force_push(n);
         }
         spawner.sink.drain();
 
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the burst ran once");
-        assert_eq!(last.load(Ordering::Relaxed), 1000, "and it was the newest");
+        assert_eq!(last.load(Ordering::Relaxed), count, "and it was the newest");
     }
 }
 
