@@ -245,6 +245,22 @@ fn callbacks() -> Vst3Callbacks {
         },
         drain_host_queue: nop_ctx,
         perform_menu: no_menu,
+        gui_param_at: {
+            unsafe extern "C" fn no_param_at(_: *mut c_void, _: i32, _: i32, _: *mut u32) -> i32 {
+                0
+            }
+            no_param_at
+        },
+        set_audio_presentation_latency: {
+            unsafe extern "C" fn no_pres_lat(_: *mut c_void, _: i32, _: u32, _: u32) {}
+            no_pres_lat
+        },
+        param_step_count: {
+            unsafe extern "C" fn static_step_count(_: *mut c_void, _: u32, _: *mut f64) -> i32 {
+                -1
+            }
+            static_step_count
+        },
     }
 }
 
@@ -3461,4 +3477,179 @@ fn construction_time_mark_dirty_delivers_on_set_component_handler() {
     // Re-attaching a handler must not replay an already-delivered dirty bit.
     assert_eq!(unsafe { c.setComponentHandler(h.as_ptr()) }, kResultOk);
     assert_eq!(dirty_calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn parameter_finder_and_audio_presentation_latency_interfaces() {
+    use std::sync::Mutex;
+
+    static LATENCY_CALLS: Mutex<Vec<(i32, u32, u32)>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
+        1
+    }
+    unsafe extern "C" fn fake_param_at(_: *mut c_void, x: i32, y: i32, out_id: *mut u32) -> i32 {
+        if x == 120 && y == 80 {
+            unsafe { *out_id = 42 };
+            1
+        } else {
+            0
+        }
+    }
+    unsafe extern "C" fn record_pres_latency(
+        _: *mut c_void,
+        is_input: i32,
+        bus_index: u32,
+        latency: u32,
+    ) {
+        LATENCY_CALLS
+            .lock()
+            .unwrap()
+            .push((is_input, bus_index, latency));
+    }
+
+    LATENCY_CALLS.lock().unwrap().clear();
+    let mut cb = callbacks();
+    cb.gui_has_editor = has_editor;
+    cb.gui_param_at = fake_param_at;
+    cb.set_audio_presentation_latency = record_pres_latency;
+    let mut desc = descriptor();
+    desc.num_input_buses = 2;
+    desc.num_output_buses = 1;
+    let reg = registration(desc, cb, Vec::new());
+    let host = Host::new(reg, None).expect("host");
+
+    // IAudioPresentationLatency on Component
+    let comp = ComWrapper::new(Component { host: host.clone() });
+    let pres = comp
+        .to_com_ptr::<IAudioPresentationLatency>()
+        .expect("Component exposes IAudioPresentationLatency");
+    assert_eq!(
+        unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kOutput as i32, 0, 512) },
+        kResultOk
+    );
+    assert_eq!(
+        unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kInput as i32, 1, 64) },
+        kResultOk
+    );
+    assert_eq!(
+        unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kOutput as i32, 1, 128) },
+        kInvalidArgument
+    );
+    assert_eq!(
+        unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kInput as i32, 2, 128) },
+        kInvalidArgument
+    );
+    assert_eq!(
+        unsafe { pres.setAudioPresentationLatencySamples(99, 0, 128) },
+        kInvalidArgument
+    );
+    assert_eq!(
+        unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kOutput as i32, -1, 128) },
+        kInvalidArgument
+    );
+    assert_eq!(*LATENCY_CALLS.lock().unwrap(), [(0, 0, 512), (1, 1, 64)]);
+
+    // IParameterFinder on View
+    let raw_view = super::view::View::create(&host);
+    assert!(!raw_view.is_null());
+    let view = unsafe { ComPtr::from_raw(raw_view) }.expect("view");
+    let finder = view
+        .cast::<IParameterFinder>()
+        .expect("View exposes IParameterFinder");
+    let mut found: ParamID = 0;
+    assert_eq!(
+        unsafe { finder.findParameter(120, 80, &raw mut found) },
+        kResultOk
+    );
+    assert_eq!(found, 42);
+    assert_eq!(
+        unsafe { finder.findParameter(10, 10, &raw mut found) },
+        kResultFalse
+    );
+    assert_eq!(
+        unsafe { finder.findParameter(120, 80, std::ptr::null_mut()) },
+        kInvalidArgument
+    );
+}
+
+#[test]
+fn get_parameter_info_prefers_live_step_count_when_present() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static LIVE_STEPS: AtomicI32 = AtomicI32::new(-1);
+
+    unsafe extern "C" fn live_step(_: *mut c_void, id: u32, out_default_norm: *mut f64) -> i32 {
+        if id == 7 {
+            let steps = LIVE_STEPS.load(Ordering::Acquire);
+            if steps > 0
+                && let Some(out) = unsafe { out_default_norm.as_mut() }
+            {
+                *out = 1.0 / f64::from(steps);
+            }
+            steps
+        } else {
+            -1
+        }
+    }
+
+    LIVE_STEPS.store(-1, Ordering::Release);
+    let mut cb = callbacks();
+    cb.param_step_count = live_step;
+    let params = vec![
+        Vst3ParamDescriptor {
+            id: 7,
+            name: c"Bank".as_ptr(),
+            short_name: c"Bank".as_ptr(),
+            units: c"".as_ptr(),
+            min: 0.0,
+            max: 2.0,
+            default_normalized: 0.5,
+            step_count: 2,
+            flags: 0,
+            group: c"".as_ptr(),
+        },
+        Vst3ParamDescriptor {
+            id: 8,
+            name: c"Gain".as_ptr(),
+            short_name: c"Gain".as_ptr(),
+            units: c"".as_ptr(),
+            min: 0.0,
+            max: 1.0,
+            default_normalized: 0.5,
+            step_count: 0,
+            flags: 0,
+            group: c"".as_ptr(),
+        },
+    ];
+    let reg = registration(descriptor(), cb, params);
+    let host = Host::new(reg, None).expect("host");
+    let comp = ComWrapper::new(Component { host });
+    let ctrl = comp.to_com_ptr::<IEditController>().expect("controller");
+
+    let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { ctrl.getParameterInfo(0, &raw mut info) },
+        kResultOk
+    );
+    assert_eq!(info.stepCount, 2, "-1 falls back to static step_count");
+    assert!((info.defaultNormalizedValue - 0.5).abs() < 1e-12);
+
+    LIVE_STEPS.store(4, Ordering::Release);
+    assert_eq!(
+        unsafe { ctrl.getParameterInfo(0, &raw mut info) },
+        kResultOk
+    );
+    assert_eq!(info.stepCount, 4, "live step_count overrides static count");
+    assert!(
+        (info.defaultNormalizedValue - 0.25).abs() < 1e-12,
+        "live defaultNormalizedValue updates alongside live step_count"
+    );
+
+    assert_eq!(
+        unsafe { ctrl.getParameterInfo(1, &raw mut info) },
+        kResultOk
+    );
+    assert_eq!(info.stepCount, 0, "unrelated param keeps static step_count");
+    assert!((info.defaultNormalizedValue - 0.5).abs() < 1e-12);
 }

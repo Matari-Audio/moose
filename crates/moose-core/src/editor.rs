@@ -254,6 +254,14 @@ pub trait Editor: Send {
     /// custom state stored outside the parameter system.
     fn state_changed(&mut self) {}
 
+    /// Parameter ID under logical editor coordinates `(x, y)` (top-left
+    /// origin), for host "learn by mouse position" (VST3 `IParameterFinder`).
+    /// Returns `None` when no parameter control is at `(x, y)` or the editor
+    /// does not expose hit-testing.
+    fn param_at(&self, _x: i32, _y: i32) -> Option<u32> {
+        None
+    }
+
     /// Render a headless screenshot of the editor at its natural size.
     ///
     /// `params` is a type-erased default-state instance the caller
@@ -407,6 +415,10 @@ impl Editor for TaskBoundEditor {
 
     fn state_changed(&mut self) {
         self.editor.state_changed();
+    }
+
+    fn param_at(&self, x: i32, y: i32) -> Option<u32> {
+        self.editor.param_at(x, y)
     }
 
     fn screenshot(&mut self, params: Arc<dyn Params>) -> Option<(Vec<u8>, u32, u32)> {

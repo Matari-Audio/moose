@@ -1990,6 +1990,7 @@ impl Class for Component {
     type Interfaces = (
         IComponent,
         IAudioProcessor,
+        IAudioPresentationLatency,
         IEditController,
         IEditControllerHostEditing,
         IMidiMapping,
@@ -2003,6 +2004,40 @@ impl Class for Component {
         IMidiLearn,
         IMidiLearn2,
     );
+}
+
+impl IAudioPresentationLatencyTrait for Component {
+    unsafe fn setAudioPresentationLatencySamples(
+        &self,
+        dir: BusDirection,
+        bus_index: int32,
+        latency_in_samples: uint32,
+    ) -> tresult {
+        let Some(is_in) = is_dir(dir) else {
+            return kInvalidArgument;
+        };
+        let d = self.host.reg.desc;
+        let bus_count = if is_in {
+            d.num_input_buses
+        } else {
+            d.num_output_buses
+        };
+        let Ok(bus) = u32::try_from(bus_index) else {
+            return kInvalidArgument;
+        };
+        if bus >= bus_count {
+            return kInvalidArgument;
+        }
+        unsafe {
+            (self.host.reg.cb.set_audio_presentation_latency)(
+                self.host.ctx,
+                i32::from(is_in),
+                bus,
+                latency_in_samples,
+            );
+        }
+        kResultOk
+    }
 }
 
 fn is_dir(dir: BusDirection) -> Option<bool> {
@@ -2424,6 +2459,13 @@ impl IEditControllerTrait for Component {
         utf16_into(&mut info.units, unsafe { cstr(p.units) });
         info.stepCount = p.step_count;
         info.defaultNormalizedValue = p.default_normalized;
+        let mut live_default = p.default_normalized;
+        let live_step =
+            unsafe { (reg.cb.param_step_count)(self.host.ctx, p.id, &raw mut live_default) };
+        if live_step >= 0 {
+            info.stepCount = live_step;
+            info.defaultNormalizedValue = live_default;
+        }
         info.unitId = reg.param_unit[index];
         info.flags = p.flags;
         let mut title = [0 as c_char; 512];

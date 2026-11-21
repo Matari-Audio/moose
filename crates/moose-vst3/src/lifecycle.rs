@@ -21,7 +21,7 @@ use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
 use moose_core::main_thread::{
-    HostColor, HostNotice, HostNotifier, LearnSource, MenuTarget, Midi2Controller,
+    BusDirection, HostColor, HostNotice, HostNotifier, LearnSource, MenuTarget, Midi2Controller,
     Midi2ControllerKind, TrackInfo,
 };
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
@@ -540,6 +540,30 @@ pub(crate) unsafe extern "C" fn cb_remap_param_id<P: PluginExport>(
             0
         }
     })
+}
+
+pub(crate) unsafe extern "C" fn cb_set_audio_presentation_latency<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    is_input: i32,
+    bus_index: u32,
+    latency_samples: u32,
+) {
+    run_extern_callback_with::<P, ()>("vst3", "audio_presentation_latency", (), || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return;
+        };
+        let direction = if is_input != 0 {
+            BusDirection::Input
+        } else {
+            BusDirection::Output
+        };
+        // SAFETY: `IAudioPresentationLatency::setAudioPresentationLatencySamples`
+        // is a component setup call on the host main thread.
+        let main = MainThread::assume();
+        if let Some(mut hooks) = inst.main_thread.try_borrow_mut(&main) {
+            hooks.audio_presentation_latency_changed(&main, direction, bus_index, latency_samples);
+        }
+    });
 }
 
 /// A VST3 `ControllerNumbers` value (`ivstmidicontrollers.h`): 0..=127 are

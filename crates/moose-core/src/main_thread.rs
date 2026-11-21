@@ -243,6 +243,14 @@ pub enum MenuItem {
     },
 }
 
+/// Direction of an audio bus reported by the host (e.g. VST3
+/// `IAudioPresentationLatency`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BusDirection {
+    Input,
+    Output,
+}
+
 /// The main-thread part of a plugin. See the module docs.
 pub trait MainThreadHooks: Send + 'static {
     /// The wrapper's [`HostNotifier`], passed once after the hooks are
@@ -301,6 +309,18 @@ pub trait MainThreadHooks: Send + 'static {
         _old_id: u32,
     ) -> Option<u32> {
         None
+    }
+
+    /// The host reported upstream/downstream presentation latency in samples
+    /// for one audio bus (VST3 `IAudioPresentationLatency`). Useful for
+    /// visualizers and meters that align UI frames with audible output.
+    fn audio_presentation_latency_changed(
+        &mut self,
+        _cx: &MainThread,
+        _direction: BusDirection,
+        _bus_index: u32,
+        _latency_samples: u32,
+    ) {
     }
 }
 

@@ -1981,7 +1981,7 @@ fn value_list_runtime_labels_round_trip<H: Harness>() {
     let params = fixture::live();
     // Same-count relabeling tests live formatting/parsing across all formats;
     // range growth (3 -> 4) is covered separately by
-    // `value_list_grown_range_reaches_new_index` and `divergences::vst3_value_list_growth`.
+    // `value_list_grown_range_reaches_new_index`.
     assert!(params.bank.set_labels(["Sine", "Saw", "Square"]));
     let changes = params.take_catalog_changes();
     // The CLAP wrapper may already have consumed them through its signal;
@@ -2019,17 +2019,7 @@ fn value_list_grown_range_reaches_new_index<H: Harness>() {
     assert_eq!(h.get_plain(BANK), 3.0, "{}: index 3 after growth", H::NAME);
     assert_eq!(params.bank.index(), 3, "{}", H::NAME);
 }
-// CLAP + AU only; VST3 diverges, see `divergences::vst3_value_list_growth`.
-mod value_list_grown_range_reaches_new_index {
-    #[test]
-    fn clap() {
-        super::value_list_grown_range_reaches_new_index::<super::ClapH>();
-    }
-    #[test]
-    fn au() {
-        super::value_list_grown_range_reaches_new_index::<super::AuH>();
-    }
-}
+for_each_format!(value_list_grown_range_reaches_new_index);
 
 #[test]
 fn catalog_signal_flags_and_clap_rescan_wake() {
@@ -2698,13 +2688,5 @@ mod divergences {
     #[ignore = "moose-au: idle state load queues for a render thread that never runs (see report)"]
     fn au_idle_load_state_rejection() {
         state_load_state_rejection_rolls_back_when_idle::<AuH>();
-    }
-
-    /// VST3: a `ValueListParam` that grows at runtime keeps its
-    /// registration-time step count.
-    #[test]
-    #[ignore = "moose-vst3: value-list range is fixed at registration (see report)"]
-    fn vst3_value_list_growth() {
-        value_list_grown_range_reaches_new_index::<Vst3H>();
     }
 }

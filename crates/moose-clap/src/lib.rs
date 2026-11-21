@@ -1391,6 +1391,8 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             host_latency: ptr::null(),
             host_tail: ptr::null(),
             host_track_info: ptr::null(),
+            host_log: ptr::null(),
+            host_thread_check: ptr::null(),
             ports_rescan: AtomicBool::new(false),
             gui_changes: Arc::new(GuiChangeQueue::new(GUI_QUEUE_CAPACITY)),
             gui_overflow: Arc::new(AtomicBool::new(false)),

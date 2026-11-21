@@ -455,6 +455,22 @@ pub struct Vst3Callbacks {
         target: moose_core::main_thread::MenuTarget,
         action: u32,
     ) -> i32,
+    /// `Editor::param_at` (`IParameterFinder::findParameter`). Converts host
+    /// physical view coordinates `(x, y)` to logical coordinates and writes
+    /// `*out_id` when a parameter control is under the point. Returns 1 when
+    /// found, 0 otherwise. UI thread.
+    pub gui_param_at:
+        unsafe extern "C" fn(ctx: *mut c_void, x: i32, y: i32, out_id: *mut u32) -> i32,
+    /// `MainThreadHooks::audio_presentation_latency_changed`
+    /// (`IAudioPresentationLatency::setAudioPresentationLatencySamples`).
+    /// `is_input != 0` for input buses, `0` for output buses. Main thread.
+    pub set_audio_presentation_latency:
+        unsafe extern "C" fn(ctx: *mut c_void, is_input: i32, bus_index: u32, latency_samples: u32),
+    /// Live `stepCount` for a parameter whose range changes at runtime
+    /// (`ValueListParam`, `DynamicParams`), or `-1` to keep the static
+    /// registration descriptor's `step_count`. Main thread.
+    pub param_step_count:
+        unsafe extern "C" fn(ctx: *mut c_void, id: u32, out_default_norm: *mut f64) -> i32,
 }
 
 /// Register the plugin with the COM layer.

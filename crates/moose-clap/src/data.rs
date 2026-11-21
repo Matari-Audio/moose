@@ -8,9 +8,11 @@ use crate::host_handle::{Any, HostHandle};
 use crate::wayland_nested;
 
 use clap_sys::ext::latency::clap_host_latency;
+use clap_sys::ext::log::clap_host_log;
 use clap_sys::ext::params::clap_host_params;
 use clap_sys::ext::state::clap_host_state;
 use clap_sys::ext::tail::clap_host_tail;
+use clap_sys::ext::thread_check::clap_host_thread_check;
 use clap_sys::ext::track_info::clap_host_track_info;
 use clap_sys::process::clap_process;
 use moose_core::Sample;
@@ -180,6 +182,10 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     pub(crate) host_tail: *const clap_host_tail,
     /// Host track-info extension. Null if the host doesn't expose it.
     pub(crate) host_track_info: *const clap_host_track_info,
+    /// Host log extension (`clap.log`). Null if the host doesn't expose it.
+    pub(crate) host_log: *const clap_host_log,
+    /// Host thread-check extension (`clap.thread-check`). Null if omitted.
+    pub(crate) host_thread_check: *const clap_host_thread_check,
     /// A `HostNotice::AUDIO_PORTS` waits for the plugin to be inactive,
     /// where the host may rescan the port list.
     pub(crate) ports_rescan: AtomicBool,

@@ -123,10 +123,20 @@ impl MidiMap {
 /// plugin expects. VST3 has no native input event for channel MIDI, so
 /// the host delivers it as a parameter change on the mapped id.
 // `normalize` yields a `0.0..=1.0` value; the MIDI encoders take `f32`.
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn midi_event_from_map(map: &MidiMap, plain: f64) -> EventBody {
+    midi_event_from_map_with_range(map, map.range, plain)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn midi_event_from_map_with_range(
+    map: &MidiMap,
+    range: moose_params::ParamRange,
+    plain: f64,
+) -> EventBody {
     let channel = map.channel;
-    let norm = map.range.normalize(plain) as f32; // 0.0..=1.0
+    let norm = range.normalize(plain) as f32; // 0.0..=1.0
     match map.source {
         // Host-normalized `0..1` is the pitch-wheel position (0 = full
         // down, 0.5 = center, 1 = full up); shift to `[-1, 1]` for the
@@ -187,6 +197,7 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
                             event,
                             audio.input_num_frames,
                             &inst.param_infos,
+                            inst.params_arc.as_ref(),
                         )
                         .is_none()
                         .then_some(VST3_EVENT_INVALID);
@@ -811,10 +822,11 @@ pub(crate) fn unit_to_u32(v: f64) -> u32 {
     scaled
 }
 
-fn valid_output_param(
+fn valid_output_param<P: moose_params::Params>(
     event: &Event,
     input_num_frames: u32,
     param_infos: &moose_params::ParamCatalog,
+    params: &P,
 ) -> Option<(u32, i32, f64)> {
     let EventBody::ParamChange { id, value } = event.body else {
         return None;
@@ -824,7 +836,8 @@ fn valid_output_param(
     }
     let info = param_infos.by_id(id)?;
     let sample_offset = i32::try_from(event.sample_offset).unwrap_or(0);
-    Some((id, sample_offset, info.range.normalize(value)))
+    let range = params.live_param_range(id).unwrap_or(info.range);
+    Some((id, sample_offset, range.normalize(value)))
 }
 
 pub(crate) unsafe extern "C" fn cb_get_output_param_count<P: PluginExport>(
@@ -838,7 +851,13 @@ pub(crate) unsafe extern "C" fn cb_get_output_param_count<P: PluginExport>(
                 .output_events
                 .iter()
                 .filter(|e| {
-                    valid_output_param(e, audio.input_num_frames, &inst.param_infos).is_some()
+                    valid_output_param(
+                        e,
+                        audio.input_num_frames,
+                        &inst.param_infos,
+                        inst.params_arc.as_ref(),
+                    )
+                    .is_some()
                 })
                 .count(),
         )
@@ -858,7 +877,14 @@ pub(crate) unsafe extern "C" fn cb_get_output_param<P: PluginExport>(
         if let Some((id, sample_offset, normalized)) = audio
             .output_events
             .iter()
-            .filter_map(|e| valid_output_param(e, audio.input_num_frames, &inst.param_infos))
+            .filter_map(|e| {
+                valid_output_param(
+                    e,
+                    audio.input_num_frames,
+                    &inst.param_infos,
+                    inst.params_arc.as_ref(),
+                )
+            })
             .nth(index as usize)
         {
             *out_id = id;

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use vst3::Steinberg::IPlugViewContentScaleSupport_::ScaleFactor;
+use vst3::Steinberg::Vst::{IParameterFinder, IParameterFinderTrait, ParamID};
 use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComWrapper};
 
@@ -33,7 +34,7 @@ struct WaylandEmbed {
 }
 
 impl Class for View {
-    type Interfaces = (IPlugView, IPlugViewContentScaleSupport);
+    type Interfaces = (IPlugView, IPlugViewContentScaleSupport, IParameterFinder);
 }
 
 /// The native platform type this build embeds into.
@@ -336,5 +337,26 @@ impl IPlugViewContentScaleSupportTrait for View {
         }
         unsafe { (self.host.reg.cb.gui_set_content_scale)(self.host.ctx, f64::from(factor)) };
         kResultOk
+    }
+}
+
+impl IParameterFinderTrait for View {
+    unsafe fn findParameter(
+        &self,
+        x_pos: int32,
+        y_pos: int32,
+        result_tag: *mut ParamID,
+    ) -> tresult {
+        let Some(out) = (unsafe { result_tag.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        let mut id = 0u32;
+        if unsafe { (self.host.reg.cb.gui_param_at)(self.host.ctx, x_pos, y_pos, &raw mut id) } != 0
+        {
+            *out = id;
+            kResultOk
+        } else {
+            kResultFalse
+        }
     }
 }
