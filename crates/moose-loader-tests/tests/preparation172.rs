@@ -34,22 +34,19 @@ fn build(out: &Path, name: &str, required: bool) -> PathBuf {
         std::env::consts::DLL_PREFIX,
         suffix()
     ));
-    let text=r#"
+    let text=r"
 use moose::prelude::*;
 use reload_fixture_common::{CounterLogic,CounterState,FxParams};
 const REQUIRED:bool=__CLASS__;
 struct Logic;
-#[expect(
-    deprecated,
-    reason = "covers the hot-reload preparation gate on the legacy `PluginLogic` path"
-)]
-impl PluginLogic for Logic{
+impl moose_loader::PluginLogicCore<f32> for Logic{
  type Params=FxParams;type DspState=CounterState;
+ fn init(_:&FxParams,_:&InitContext)->CounterState{CounterState::default()}
  fn requires_fallible_preparation()->bool{REQUIRED}
  fn reset(state:&mut CounterState,_:&FxParams,_:&AudioConfig){state.counter+=1000;}
  fn prepare(state:&mut CounterState,params:&FxParams,config:&moose::core::plugin::PreparationConfig)->Result<(),moose::core::plugin::PreparationError>{
   config.validate()?;if REQUIRED{return Err(moose::core::plugin::PreparationError::MissingPolicy);}
-  <Self as PluginLogic>::reset(state,params,&config.audio);Ok(())
+  <Self as moose_loader::PluginLogicCore<f32>>::reset(state,params,&config.audio);Ok(())
  }
  fn process(state:&mut CounterState,params:&FxParams,buffer:&mut AudioBuffer,events:&EventList,cx:&mut ProcessContext)->ProcessStatus{
   <CounterLogic as moose_loader::PluginLogicCore<f32>>::process(state,params,buffer,events,cx)
@@ -57,10 +54,13 @@ impl PluginLogic for Logic{
  fn latency(state:&CounterState)->u32{<CounterLogic as moose_loader::PluginLogicCore<f32>>::latency(state)}
  fn save_state(state:&CounterState)->Vec<u8>{<CounterLogic as moose_loader::PluginLogicCore<f32>>::save_state(state)}
  fn load_state(state:&mut CounterState,data:&[u8])->Result<(),StateLoadError>{<CounterLogic as moose_loader::PluginLogicCore<f32>>::load_state(state,data)}
+}
+impl moose_loader::__macro_deps::moose_plugin::PluginEditor<f32> for Logic{
+ type Params=FxParams;
  fn editor(params:Arc<FxParams>)->Box<dyn Editor>{<CounterLogic as moose_loader::__macro_deps::moose_plugin::PluginEditor<f32>>::editor(params)}
 }
 moose_loader::export_plugin!(Logic,FxParams);
-"#.replace("__CLASS__",if required{"true"}else{"false"});
+".replace("__CLASS__",if required{"true"}else{"false"});
     std::fs::write(&source, text).unwrap();
     let mut command = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
     command.args([
@@ -164,13 +164,12 @@ fn real_complete_exports_gate_initial_and_reload_and_direct_hot_prepare() {
 }
 
 struct RequiredStatic;
-#[expect(
-    deprecated,
-    reason = "covers the fallible preparation gate on the legacy `PluginLogic` path"
-)]
-impl moose::prelude::PluginLogic for RequiredStatic {
+impl moose_loader::PluginLogicCore<f32> for RequiredStatic {
     type Params = FxParams;
     type DspState = reload_fixture_common::CounterState;
+    fn init(_: &Self::Params, _: &moose::prelude::InitContext) -> Self::DspState {
+        reload_fixture_common::CounterState::default()
+    }
     fn requires_fallible_preparation() -> bool {
         true
     }
@@ -194,9 +193,6 @@ impl moose::prelude::PluginLogic for RequiredStatic {
         <reload_fixture_common::CounterLogic as moose_loader::PluginLogicCore<f32>>::process(
             state, params, buffer, events, cx,
         )
-    }
-    fn editor(params: Arc<FxParams>) -> Box<dyn moose::prelude::Editor> {
-        <reload_fixture_common::CounterLogic as moose_loader::__macro_deps::moose_plugin::PluginEditor<f32>>::editor(params)
     }
 }
 #[test]

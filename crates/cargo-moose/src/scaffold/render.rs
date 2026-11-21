@@ -16,6 +16,8 @@ pub mod tpl {
     pub const PLUGIN_CARGO_CONFIG: &str = "plugin/.cargo/config.toml";
     pub const WORKSPACE_CARGO_TOML: &str = "workspace/Cargo.toml";
     pub const MOOSE_TOML: &str = "moose.toml";
+    pub const CI_YML: &str = "ci.yml";
+    pub const PROJECT_README: &str = "README.md";
 }
 
 pub struct Renderer {
@@ -72,6 +74,16 @@ impl Renderer {
             include_str!("../../templates/scaffold/moose.toml.tpl"),
         )
         .expect("scaffold template parse: moose.toml");
+        tt.add_template(
+            tpl::CI_YML,
+            include_str!("../../templates/scaffold/ci.yml.tpl"),
+        )
+        .expect("scaffold template parse: ci.yml");
+        tt.add_template(
+            tpl::PROJECT_README,
+            include_str!("../../templates/scaffold/README.md.tpl"),
+        )
+        .expect("scaffold template parse: README.md");
 
         Self { tt }
     }

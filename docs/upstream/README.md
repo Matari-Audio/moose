@@ -1,6 +1,6 @@
 # Tracking Truce upstream
 
-MOOSE tracks https://github.com/truce-audio/truce as a selective upstream,
+Moose tracks https://github.com/truce-audio/truce as a selective upstream,
 not as an automatically merged branch. Local setup:
 
 ```sh

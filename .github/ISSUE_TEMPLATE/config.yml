@@ -3,8 +3,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://truce.audio/docs/
+    url: https://github.com/Matari-Audio/moose#readme
     about: Guides, format and feature reference, and examples. Check here before filing.
   - name: API reference (rustdoc)
-    url: https://truce-audio.github.io/truce/
+    url: https://matari-audio.github.io/moose/
     about: Type-level docs for the moose crates.

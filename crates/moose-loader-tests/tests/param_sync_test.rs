@@ -1,18 +1,17 @@
 //! Regression test: `ParamChange` events carry PLAIN values.
 //! `StaticShell` must use `set_plain()`, not `set_normalized()`.
 //! Bug: double-denormalization caused gain to slam to extremes in VST3.
-#![expect(
-    deprecated,
-    reason = "covers the deprecated `PluginLogic` path, still supported until it is removed"
-)]
 
+use moose::{Lifecycle, Plugin};
 use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;
 use moose_core::events::{Event, EventBody, EventList, TransportInfo};
-use moose_core::plugin::PluginRuntime;
+use moose_core::plugin::{
+    PluginRuntime, PreparationConfig, PreparationError, PreparationFrameBound,
+};
 use moose_core::process::{ProcessContext, ProcessStatus};
+use moose_core::tasks::InitContext;
 use moose_derive::Params;
-use moose_gui::PluginLogic;
 use moose_params::{FloatParamReadF32, Params};
 use std::sync::Arc;
 
@@ -29,12 +28,20 @@ struct TestDspState {
     last_gain_plain: f64,
 }
 
-impl PluginLogic for TestPlugin {
-    type Params = TestParams;
-    type DspState = TestDspState;
+impl Plugin for TestPlugin {
+    type Shared = TestParams;
+    type MainThread = ();
+    type Processor = TestDspState;
 
-    fn reset(_state: &mut TestDspState, params: &TestParams, config: &AudioConfig) {
-        params.set_sample_rate(config.sample_rate);
+    fn main_thread(_shared: &Arc<TestParams>) {}
+
+    fn activate(
+        shared: &TestParams,
+        config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<TestDspState, PreparationError> {
+        shared.set_sample_rate(config.sample_rate);
+        Ok(TestDspState::default())
     }
 
     fn process(
@@ -74,8 +81,15 @@ fn plain_param_not_double_denormalized() {
 
     let params = Arc::new(TestParams::new());
     let mut shell =
-        moose_loader::static_shell::StaticShell::<TestParams, TestPlugin>::from_parts(params, None);
-    shell.reset(&AudioConfig::new(44100.0, 512));
+        moose_loader::static_shell::StaticShell::<TestParams, Lifecycle<TestPlugin>>::from_parts(
+            params, None,
+        );
+    shell
+        .prepare(&PreparationConfig::new(
+            AudioConfig::new(44100.0, 512),
+            PreparationFrameBound::ExplicitDriver,
+        ))
+        .unwrap();
 
     let input = vec![0.5f32; 512];
     let mut output = vec![0.0f32; 512];
@@ -105,7 +119,7 @@ fn plain_param_not_double_denormalized() {
 
     // The plugin should see -27.0 dB (the plain value), NOT some
     // double-denormalized extreme.
-    let gain = shell.state_ref().last_gain_plain;
+    let gain = shell.state_ref().processor().unwrap().last_gain_plain;
     assert!(
         (gain - (-27.0)).abs() < 0.1,
         "Expected gain ≈ -27.0 dB, got {gain}. Likely double-denormalization bug."

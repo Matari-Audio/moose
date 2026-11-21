@@ -90,16 +90,7 @@ use moose_params::Params;
 #[cfg(any(feature = "cpu", feature = "gpu", target_os = "ios"))]
 use std::sync::Arc;
 
-// Re-export plugin-logic traits from `moose-plugin` for the same
-// backward-compat reason.
-#[allow(
-    deprecated,
-    reason = "re-exported for code still on the deprecated leaf traits"
-)]
-pub use moose_plugin::{PluginLogic, PluginLogic64, PluginLogicCore, default_hit_test};
-
-#[doc(hidden)]
-pub use moose_plugin::__plugin_logic_deps;
+pub use moose_plugin::default_hit_test;
 
 pub use editor::BuiltinEditor;
 #[cfg(all(feature = "gpu", not(target_os = "ios")))]

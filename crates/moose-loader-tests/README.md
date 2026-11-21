@@ -18,4 +18,4 @@ Holding the tests in this separate crate breaks the loop: the
 edges run `moose-loader-tests -> moose-loader` and
 `moose-loader-tests -> moose`, with no back-edge into either.
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

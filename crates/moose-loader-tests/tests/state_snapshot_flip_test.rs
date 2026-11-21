@@ -1,37 +1,27 @@
 //! Custom-state save contract (audit 2026-11-18, step 1).
 //!
-//! This is a deprecated [`PluginLogic`] adapter test on purpose: processor-side
-//! `save_state` / `load_state` / snapshot hooks were removed from
-//! `moose::Plugin` (custom state lives in `#[persist]`) and survive only on
-//! `PluginLogic` for one release.
+//! Exercises the low-level `PluginLogicCore::save_state` / `load_state` /
+//! snapshot hooks on `StaticShell` directly: a core impl that overrides only
+//! `save_state` must round-trip without serializing on the audio thread every
+//! block (publishes a baseline at creation, serializes on demand when a host
+//! save asks for a fresh snapshot, and serializes live on the host thread via
+//! `republish_snapshot`).
 //!
-//! A plugin that overrides only `save_state` must round-trip on every
-//! format without serializing on the audio thread every block: the shell
-//! publishes a baseline at creation, serializes on demand when a host save
-//! asks for a fresh snapshot, and serializes live on the host thread when
-//! the wrapper owns the plugin (`republish_snapshot`).
-//!
-//! Run with `--features rt-paranoid` to also prove the steady-state
-//! blocks make no audio-thread allocation.
-#![expect(
-    deprecated,
-    reason = "covers the deprecated `PluginLogic` path, still supported until it is removed"
-)]
+//! Run with `--features rt-paranoid` to also prove the steady-state blocks
+//! make no audio-thread allocation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use moose::prelude::{Editor, PluginContext};
 use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;
-use moose_core::editor::RawWindowHandle;
-use moose_core::events::EventList;
-use moose_core::events::TransportInfo;
+use moose_core::events::{EventList, TransportInfo};
 use moose_core::plugin::PluginRuntime;
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::state::StateLoadError;
+use moose_core::tasks::InitContext;
 use moose_derive::Params;
-use moose_gui::PluginLogic;
+use moose_loader::PluginLogicCore;
 use moose_loader::static_shell::StaticShell;
 use moose_params::FloatParam;
 
@@ -53,13 +43,18 @@ struct Counter {
     value: u32,
 }
 
-/// Overrides only the legacy `save_state` / `load_state` - never
-/// `snapshot_into`. The flipped default is what carries its state.
+/// Overrides only `save_state` / `load_state` - never `snapshot_into`.
 struct LegacyStatePlugin;
 
-impl PluginLogic for LegacyStatePlugin {
+impl PluginLogicCore<f32> for LegacyStatePlugin {
     type Params = StateParams;
     type DspState = Counter;
+
+    fn init(_params: &StateParams, _cx: &InitContext) -> Counter {
+        Counter::default()
+    }
+
+    fn reset(_state: &mut Counter, _params: &StateParams, _config: &AudioConfig) {}
 
     fn process(
         _state: &mut Counter,
@@ -83,19 +78,19 @@ impl PluginLogic for LegacyStatePlugin {
         state.value = u32::from_le_bytes(bytes);
         Ok(())
     }
-
-    fn editor(_params: Arc<StateParams>) -> Box<dyn Editor> {
-        Box::new(NoEditor)
-    }
 }
 
 /// A plugin with no custom state at all - both `save_state` and
 /// `snapshot_into` keep their defaults, so it must never publish.
 struct PlainPlugin;
 
-impl PluginLogic for PlainPlugin {
+impl PluginLogicCore<f32> for PlainPlugin {
     type Params = StateParams;
     type DspState = ();
+
+    fn init(_params: &StateParams, _cx: &InitContext) {}
+
+    fn reset(_state: &mut (), _params: &StateParams, _config: &AudioConfig) {}
 
     fn process(
         _state: &mut (),
@@ -106,38 +101,26 @@ impl PluginLogic for PlainPlugin {
     ) -> ProcessStatus {
         ProcessStatus::Normal
     }
-
-    fn editor(_params: Arc<StateParams>) -> Box<dyn Editor> {
-        Box::new(NoEditor)
-    }
-}
-
-struct NoEditor;
-impl Editor for NoEditor {
-    fn size(&self) -> (u32, u32) {
-        (0, 0)
-    }
-    fn open(&mut self, _: RawWindowHandle, _: PluginContext) {}
-    fn close(&mut self) {}
-    fn idle(&mut self) {}
 }
 
 fn shell<L>() -> StaticShell<StateParams, L>
 where
-    L: PluginLogic<Params = StateParams>,
+    L: PluginLogicCore<f32, Params = StateParams>,
 {
     let mut shell = StaticShell::<StateParams, L>::from_parts(Arc::new(StateParams::new()), None);
     shell.reset(&AudioConfig::new(44100.0, 64));
     shell
 }
 
-fn run_block<L: PluginLogic<Params = StateParams>>(shell: &mut StaticShell<StateParams, L>) {
+fn run_block<L: PluginLogicCore<f32, Params = StateParams>>(
+    shell: &mut StaticShell<StateParams, L>,
+) {
     run_block_audited(shell, false);
 }
 
 /// One block; with `audited`, only the shell's `process` call runs inside
 /// a real-time section (the harness's own buffers and lists allocate).
-fn run_block_audited<L: PluginLogic<Params = StateParams>>(
+fn run_block_audited<L: PluginLogicCore<f32, Params = StateParams>>(
     shell: &mut StaticShell<StateParams, L>,
     audited: bool,
 ) {
@@ -155,9 +138,6 @@ fn run_block_audited<L: PluginLogic<Params = StateParams>>(
     shell.process(&mut buffer, &events, &mut ctx);
 }
 
-/// A `save_state`-only plugin does not opt into the per-block publish:
-/// blocks never call `save_state`, yet the slot holds its creation-time
-/// state.
 #[test]
 fn save_state_only_plugin_does_not_serialize_per_block() {
     let _serial = SERIAL
@@ -179,8 +159,6 @@ fn save_state_only_plugin_does_not_serialize_per_block() {
     assert!(!plugin.snapshot_into(&mut buf), "not opted in");
 }
 
-/// Steady-state blocks of a `save_state`-only plugin make no audio-thread
-/// allocation. Vacuous without `--features rt-paranoid`.
 #[test]
 fn save_state_only_plugin_blocks_are_allocation_free() {
     let _serial = SERIAL
@@ -194,8 +172,6 @@ fn save_state_only_plugin_blocks_are_allocation_free() {
         }
     });
     assert_eq!(allocs, 0, "per-block path allocated {allocs} times");
-    // The checker is live under the feature, so the zero above means
-    // something.
     let ((), probe) = moose::rt::audit(|| {
         let _rt = moose::rt::RtSection::enter();
         std::hint::black_box(Box::new(std::hint::black_box(1_u8)));
@@ -203,8 +179,6 @@ fn save_state_only_plugin_blocks_are_allocation_free() {
     assert_eq!(probe > 0, moose::rt::is_active());
 }
 
-/// A host save that can't own the plugin asks for a fresh snapshot; the
-/// next block serves it with live state, once.
 #[test]
 fn requested_snapshot_is_served_by_the_next_block() {
     let _serial = SERIAL
@@ -227,8 +201,6 @@ fn requested_snapshot_is_served_by_the_next_block() {
     );
 }
 
-/// A host-owned republish (load applied while not processing) stores live
-/// state, so a save that falls back to the slot sees the load.
 #[test]
 fn republish_stores_live_state_after_load() {
     let _serial = SERIAL
@@ -243,8 +215,6 @@ fn republish_stores_live_state_after_load() {
     );
 }
 
-/// A plugin with no custom state publishes an empty baseline and never
-/// opts into the per-block publish.
 #[test]
 fn plugin_without_custom_state_does_not_publish() {
     let plugin = shell::<PlainPlugin>();

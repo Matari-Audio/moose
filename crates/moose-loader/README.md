@@ -70,4 +70,4 @@ so you'll pick up every `7.0.x` patch release without re-editing.
 To track an unreleased checkout, swap for
 `git = "https://github.com/Matari-Audio/moose", branch = "main"`.)
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

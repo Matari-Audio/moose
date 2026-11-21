@@ -52,10 +52,20 @@ impl ProjectLayout {
     pub fn moose_toml(&self) -> PathBuf {
         self.plugin_root.join("moose.toml")
     }
+    pub fn readme_md(&self) -> PathBuf {
+        self.plugin_root.join("README.md")
+    }
+    pub fn github_workflows_dir(&self) -> PathBuf {
+        self.plugin_root.join(".github/workflows")
+    }
+    pub fn ci_yml(&self) -> PathBuf {
+        self.plugin_root.join(".github/workflows/ci.yml")
+    }
 }
 
 /// Workspace-root paths - `Cargo.toml`, `moose.toml`, `.gitignore`,
-/// `.cargo/config.toml` at the root of a `--workspace` scaffold.
+/// `.cargo/config.toml`, `README.md`, `.github/workflows/ci.yml` at
+/// the root of a `--workspace` scaffold.
 pub struct WorkspaceLayout {
     root: PathBuf,
 }
@@ -78,5 +88,14 @@ impl WorkspaceLayout {
     }
     pub fn cargo_config(&self) -> PathBuf {
         self.root.join(".cargo/config.toml")
+    }
+    pub fn readme_md(&self) -> PathBuf {
+        self.root.join("README.md")
+    }
+    pub fn github_workflows_dir(&self) -> PathBuf {
+        self.root.join(".github/workflows")
+    }
+    pub fn ci_yml(&self) -> PathBuf {
+        self.root.join(".github/workflows/ci.yml")
     }
 }

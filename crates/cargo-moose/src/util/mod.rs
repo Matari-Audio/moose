@@ -249,20 +249,28 @@ pub(crate) fn parse_target_cpu_arg(raw: &str) -> TargetCpu {
 /// `x86-64-v3`, everything else gets `None`. This is why per-target
 /// resolution matters - a global `RUSTFLAGS=-C target-cpu=x86-64-v3`
 /// would error on an aarch64 slice of a universal macOS build.
+///
+/// `Default` passes nothing for `debug` builds: injecting a flag there
+/// would change the rustflags fingerprint relative to plain `cargo
+/// build` / `cargo test` / `cargo clippy` / rust-analyzer, so every
+/// switch between `cargo moose run --debug` and plain cargo rebuilt the
+/// whole dependency graph (wgpu, egui, cpal, ...). Release builds and an
+/// explicit `--target-cpu` are unaffected.
 pub(crate) fn resolve_target_cpu(triple: &str) -> Option<String> {
     let choice = TARGET_CPU.get().cloned().unwrap_or_default();
     match choice {
-        TargetCpu::Default => {
-            if triple.starts_with("x86_64") || triple.starts_with("i686") {
-                Some("x86-64-v3".to_string())
-            } else {
-                None
-            }
-        }
+        TargetCpu::Default => default_target_cpu(triple, is_debug_profile()),
         TargetCpu::Baseline => None,
         TargetCpu::Named(value) => Some(value),
         TargetCpu::Native => Some("native".to_string()),
     }
+}
+
+/// [`TargetCpu::Default`]'s per-triple choice: `x86-64-v3` on x86
+/// release builds, nothing on debug builds or other arches.
+fn default_target_cpu(triple: &str, debug: bool) -> Option<String> {
+    let x86 = triple.starts_with("x86_64") || triple.starts_with("i686");
+    (x86 && !debug).then(|| "x86-64-v3".to_string())
 }
 
 /// Extra Cargo features to enable for every build in this invocation, on
@@ -1118,6 +1126,17 @@ pub(crate) fn check_cmd(cmd: &str, args: &[&OsStr], label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_target_cpu_only_applies_to_x86_release_builds() {
+        let v3 = Some("x86-64-v3".to_string());
+        assert_eq!(default_target_cpu("x86_64-unknown-linux-gnu", false), v3);
+        assert_eq!(default_target_cpu("x86_64-pc-windows-msvc", false), v3);
+        // Debug builds must match plain `cargo`'s rustflags so the dev
+        // loop shares one target cache.
+        assert_eq!(default_target_cpu("x86_64-unknown-linux-gnu", true), None);
+        assert_eq!(default_target_cpu("aarch64-apple-darwin", false), None);
+    }
     use std::sync::atomic::AtomicU64;
 
     #[test]

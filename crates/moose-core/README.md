@@ -36,4 +36,4 @@ format wrappers or GUI backends.
 - `db_to_linear` / `linear_to_db` -- gain conversion helpers (re-exported from `moose-params::sample::Float`)
 - `midi_note_to_freq` -- MIDI note number to frequency in Hz
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

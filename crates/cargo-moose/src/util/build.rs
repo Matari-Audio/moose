@@ -637,24 +637,91 @@ fn extract_target_triples<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
 }
 
 /// Apply the active [`crate::util::TargetCpu`] choice to a `cargo build`
-/// command. When `--target <triple>` is in play we set
-/// `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` per target so a multi-arch
-/// invocation (lipo universal builds) can give each slice the right
-/// flag; otherwise we set plain `RUSTFLAGS` since cargo's
-/// per-target rustflags don't apply to host builds that omit
-/// `--target`.
+/// command. See [`rustflags_env_plan`] for how the flags reach cargo.
 fn apply_target_cpu(cmd: &mut Command, targets: &[&str]) {
+    let plan = rustflags_env_plan(targets, target_rustflags, |k| std::env::var(k).ok());
+    for (k, v) in plan {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        };
+    }
+}
+
+/// Decide which rustflags env vars to set (`Some`) or clear (`None`) so
+/// `flags_for(triple)` reaches cargo without dropping the user's own
+/// flags (read through `env`).
+///
+/// Without `--target`, the flags go into plain `RUSTFLAGS` (or
+/// `CARGO_ENCODED_RUSTFLAGS` when the user set that), appended to any
+/// prior value, since per-target rustflags don't apply to host builds
+/// that omit `--target`.
+///
+/// With `--target`, each triple gets `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`
+/// so a multi-arch invocation (lipo universal builds) gives each slice
+/// the right flag. Cargo ignores those per-target vars whenever
+/// `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` is set, which used to drop
+/// `target-cpu` and the Windows `+crt-static` silently. So when either is
+/// set, its flags are folded into every per-target var and the global
+/// var is cleared. With `--target`, the global vars only ever reached
+/// the target units anyway, so the user's flags still apply exactly
+/// where they did.
+fn rustflags_env_plan(
+    targets: &[&str],
+    flags_for: impl Fn(&str) -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, Option<String>)> {
+    const ENCODED: &str = "CARGO_ENCODED_RUSTFLAGS";
+    let env = |k: &str| env(k).filter(|v| !v.is_empty());
+    let join = |prior: Option<String>, sep: &str, ours: String| match prior {
+        Some(p) => format!("{p}{sep}{ours}"),
+        None => ours,
+    };
+
     if targets.is_empty() {
-        if let Some(flags) = target_rustflags(moose_build::host_triple()) {
-            append_rustflags_env(cmd, "RUSTFLAGS", &flags);
-        }
-        return;
+        let Some(ours) = flags_for(moose_build::host_triple()) else {
+            return Vec::new();
+        };
+        return vec![match env(ENCODED) {
+            Some(prior) => {
+                let ours = ours.split_whitespace().collect::<Vec<_>>().join("\x1f");
+                (ENCODED.into(), Some(join(Some(prior), "\x1f", ours)))
+            }
+            None => ("RUSTFLAGS".into(), Some(join(env("RUSTFLAGS"), " ", ours))),
+        }];
     }
-    for triple in targets {
-        if let Some(flags) = target_rustflags(triple) {
-            append_rustflags_env(cmd, &cargo_target_rustflags_var(triple), &flags);
-        }
+
+    let ours: Vec<(&str, Option<String>)> = targets.iter().map(|t| (*t, flags_for(t))).collect();
+    if ours.iter().all(|(_, f)| f.is_none()) {
+        return Vec::new();
     }
+    // ponytail: encoded flags containing spaces get split when folded
+    // into the space-separated per-target var; no real flag does that.
+    let global = env(ENCODED)
+        .map(|e| e.split('\x1f').collect::<Vec<_>>().join(" "))
+        .or_else(|| env("RUSTFLAGS"));
+    let mut plan = Vec::new();
+    for (triple, flags) in ours {
+        let var = cargo_target_rustflags_var(triple);
+        // A global override means cargo never read the per-target var,
+        // so its old value is replaced by what cargo actually used.
+        let prior = if global.is_some() {
+            global.clone()
+        } else {
+            env(&var)
+        };
+        let value = match (prior, flags) {
+            (prior, Some(f)) => join(prior, " ", f),
+            (Some(p), None) => p,
+            (None, None) => continue,
+        };
+        plan.push((var, Some(value)));
+    }
+    if global.is_some() {
+        plan.push(("RUSTFLAGS".into(), None));
+        plan.push((ENCODED.into(), None));
+    }
+    plan
 }
 
 /// Extra rustflags cargo-moose adds for `triple`: the resolved
@@ -689,19 +756,6 @@ fn cargo_target_rustflags_var(triple: &str) -> String {
         })
         .collect();
     format!("CARGO_TARGET_{normalised}_RUSTFLAGS")
-}
-
-/// Append `flag` to env var `var` (space-separated). Reads the prior
-/// value from the process env so a user-set `RUSTFLAGS` is preserved
-/// instead of clobbered.
-fn append_rustflags_env(cmd: &mut Command, var: &str, flag: &str) {
-    let prior = std::env::var(var).unwrap_or_default();
-    let combined = if prior.is_empty() {
-        flag.to_string()
-    } else {
-        format!("{prior} {flag}")
-    };
-    cmd.env(var, combined);
 }
 
 /// Resolve a path to `sccache` if it's available and the user hasn't
@@ -871,7 +925,69 @@ pub(crate) fn cargo_build_multi_arch_with_profile(
 
 #[cfg(test)]
 mod rustflags_tests {
-    use super::target_rustflags;
+    use super::{rustflags_env_plan, target_rustflags};
+
+    fn plan(
+        targets: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, Option<String>> {
+        let flags = |t: &str| {
+            t.starts_with("x86_64")
+                .then(|| "-C target-cpu=x86-64-v3".to_string())
+        };
+        let lookup = |k: &str| {
+            env.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        };
+        rustflags_env_plan(targets, flags, lookup)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn user_rustflags_no_longer_mask_per_target_flags() {
+        let p = plan(
+            &["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+            &[("RUSTFLAGS", "-D warnings")],
+        );
+        assert_eq!(
+            p["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"].as_deref(),
+            Some("-D warnings -C target-cpu=x86-64-v3"),
+        );
+        // A triple with no moose flags still keeps the user's flags.
+        assert_eq!(
+            p["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS"].as_deref(),
+            Some("-D warnings"),
+        );
+        assert_eq!(p["RUSTFLAGS"], None);
+        assert_eq!(p["CARGO_ENCODED_RUSTFLAGS"], None);
+    }
+
+    #[test]
+    fn encoded_rustflags_are_folded_too() {
+        let p = plan(
+            &["x86_64-unknown-linux-gnu"],
+            &[("CARGO_ENCODED_RUSTFLAGS", "-C\x1fdebuginfo=1")],
+        );
+        assert_eq!(
+            p["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"].as_deref(),
+            Some("-C debuginfo=1 -C target-cpu=x86-64-v3"),
+        );
+        assert_eq!(p["CARGO_ENCODED_RUSTFLAGS"], None);
+    }
+
+    #[test]
+    fn per_target_var_is_appended_without_a_global_override() {
+        let var = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS";
+        let p = plan(&["x86_64-unknown-linux-gnu"], &[(var, "-C debuginfo=1")]);
+        assert_eq!(
+            p[var].as_deref(),
+            Some("-C debuginfo=1 -C target-cpu=x86-64-v3")
+        );
+        assert!(!p.contains_key("RUSTFLAGS"));
+        assert!(plan(&["aarch64-apple-darwin"], &[("RUSTFLAGS", "-D warnings")]).is_empty());
+    }
 
     #[test]
     fn windows_targets_link_the_crt_statically() {
