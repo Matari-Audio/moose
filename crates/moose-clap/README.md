@@ -33,4 +33,4 @@ pointer validity describe audio storage, not whether the host routed a bus.
 
 - **`export_clap!`** -- generates the CLAP entry point for a `PluginExport` type
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

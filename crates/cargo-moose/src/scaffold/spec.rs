@@ -41,6 +41,7 @@ pub enum DepForm {
 #[derive(Clone, Copy)]
 pub struct FeatureSet {
     pub standalone: bool,
+    pub ci: bool,
 }
 
 /// Vendor identity baked into `moose.toml`.

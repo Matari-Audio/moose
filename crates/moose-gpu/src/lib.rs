@@ -7,7 +7,7 @@
 //! GPU pipeline backing `moose_gui::default_editor`.
 //!
 //! Plugin authors don't depend on this crate directly - they call
-//! `moose_gui::default_editor(...)` from their `PluginLogic::editor`
+//! `moose_gui::default_editor(...)` from their `Plugin::editor`
 //! impl, which pulls `WgpuBackend` transitively.
 
 // wgpu's auto-trait (`Send`) evaluation needs more depth than the default 128.

@@ -7,10 +7,11 @@ pub use moose_core as core;
 pub use moose_core::rt;
 pub use moose_derive::{ParamEnum, Params, State};
 // `moose` is renderer-agnostic - it no longer re-exports `moose-gui`.
-// Plugins pick a renderer crate (moose-gui, moose-egui) directly in their Cargo.toml and use it inside their
-// `PluginLogic::editor()` impl. The prelude below sources GUI types
-// from the lightweight `moose-gui-types` so layout / interaction /
-// theme remain available without dragging tiny-skia + baseview + wgpu.
+// Plugins pick a renderer crate (moose-gui, moose-egui, moose-mui) directly
+// in their Cargo.toml and use it inside `Plugin::editor()`. The prelude
+// below sources GUI types from the lightweight `moose-gui-types` so layout /
+// interaction / theme remain available without dragging tiny-skia + baseview
+// + wgpu.
 pub use moose_params as params;
 pub use moose_plugin::{Lifecycle, Plugin, ProcessorSlot};
 
@@ -26,8 +27,6 @@ pub use moose_vst3 as vst3_wrapper;
 pub use moose_mui as mui;
 
 mod plugin_macro;
-#[doc(hidden)]
-pub use plugin_macro::__deprecated;
 
 /// Re-exports used by the plugin! macro internals.
 #[doc(hidden)]
@@ -132,10 +131,6 @@ mod prelude_impl {
         TransportInfo,
     };
     pub use moose_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
-    // `PluginLogic` itself is *not* re-exported here - each prelude
-    // chooses its own leaf trait (`PluginLogic` for f32, aliased
-    // `PluginLogic64 as PluginLogic` for f64) so plugin authors write
-    // `impl PluginLogic for X { ... }` without naming a precision.
     // Source from `moose_gui_types` (types only, no rasterizer or
     // windowing) so the prelude doesn't drag the heavy `moose_gui`
     // crate in for plugins that just describe a layout.
@@ -152,12 +147,8 @@ mod prelude_impl {
 // Stamps a prelude module from one template - all four preludes
 // (default / 32 / 64 / 64m) only differ in:
 //   - `$sample` - the buffer type (`f32` / `f64`)
-//   - `$leaf`   - which `PluginLogic` leaf trait to alias as
-//                  `PluginLogic` in the user's scope
-//   - `$pure`   - which `PurePluginLogic` leaf trait to alias as
-//                  `PurePluginLogic` (the stateless sugar over `$leaf`)
 //   - `$float_read` / `$ctx_read` - which precision-routed read
-//                  traits to bring in via `as _`
+//     traits to bring in via `as _`
 //
 // Keeping the bodies in one place means a future addition (new
 // extension trait, additional re-export) lands once instead of
@@ -165,29 +156,13 @@ mod prelude_impl {
 macro_rules! define_prelude {
     (
         $(#[$attr:meta])*
-        $name:ident, sample = $sample:ty, leaf = $leaf:ident, pure = $pure:ident,
+        $name:ident, sample = $sample:ty,
         float_read = $float_read:ident, ctx_read = $ctx_read:ident
     ) => {
         $(#[$attr])*
         pub mod $name {
             pub use super::prelude_impl::*;
             pub use moose_core::editor::$ctx_read as _;
-            /// User-facing leaf trait. The prelude renames the
-            /// precision-pinned leaf to `PluginLogic` so plugin
-            /// authors write the same `impl PluginLogic for X { ... }`
-            /// header regardless of which prelude they imported.
-            // `PluginLogic` lives in `moose_plugin`; sourcing it
-            // directly (rather than via the `moose_gui` re-export)
-            // means the prelude doesn't pin a dep on the renderer
-            // crate just to name the leaf trait.
-            #[allow(deprecated, reason = "re-exported for code still on the deprecated leaf traits")]
-            pub use moose_plugin::$leaf as PluginLogic;
-            /// Stateless leaf trait, precision-renamed like
-            /// `PluginLogic`. A plugin with no DSP state implements
-            /// this instead and skips `type DspState` / `init` /
-            /// the `_state` arguments entirely.
-            #[allow(deprecated, reason = "re-exported for code still on the deprecated leaf traits")]
-            pub use moose_plugin::$pure as PurePluginLogic;
             pub use moose_params::$float_read as _;
             /// Audio sample type for this prelude.
             pub type Sample = $sample;
@@ -208,7 +183,7 @@ macro_rules! define_prelude {
 define_prelude! {
     /// Default prelude. Same shape as [`prelude32`] - `f32` audio
     /// path. Use whichever name reads better at the import site.
-    prelude, sample = f32, leaf = PluginLogic, pure = PurePluginLogic,
+    prelude, sample = f32,
     float_read = FloatParamReadF32, ctx_read = PluginContextReadF32
 }
 
@@ -217,7 +192,7 @@ define_prelude! {
     /// via [`FloatParamReadF32`](moose_params::FloatParamReadF32);
     /// the audio buffer is `f32` (the host wire format for nearly
     /// every plugin format).
-    prelude32, sample = f32, leaf = PluginLogic, pure = PurePluginLogic,
+    prelude32, sample = f32,
     float_read = FloatParamReadF32, ctx_read = PluginContextReadF32
 }
 
@@ -233,7 +208,7 @@ define_prelude! {
     /// file** - the two `read` / `value` / `current` traits will
     /// collide on method dispatch. That collision is the right
     /// error if the file hasn't committed to a precision.
-    prelude64, sample = f64, leaf = PluginLogic64, pure = PurePluginLogic64,
+    prelude64, sample = f64,
     float_read = FloatParamReadF64, ctx_read = PluginContextReadF64
 }
 
@@ -263,6 +238,6 @@ define_prelude! {
     /// actually shows up in the profiler (very high channel counts,
     /// very small blocks); otherwise [`prelude64`] is the cleaner
     /// choice.
-    prelude64m, sample = f32, leaf = PluginLogic, pure = PurePluginLogic,
+    prelude64m, sample = f32,
     float_read = FloatParamReadF64, ctx_read = PluginContextReadF64
 }

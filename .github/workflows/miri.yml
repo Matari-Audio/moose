@@ -102,5 +102,5 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: cargo +nightly miri test -p moose-utils -p moose-params
 
-      # Fuzz corpus replay dropped until MOOSE has its own harness repo
+      # Fuzz corpus replay dropped until moose has its own harness repo
       # (truce-audio/truce-fuzz-tests path-depends on truce-* crates).

@@ -378,23 +378,44 @@ pub(crate) fn cargo_build_with_profile(
 fn cargo_build_inner(
     env_vars: &[(&str, &str)],
     extra_args: &[&str],
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] deployment_target: &str,
+    deployment_target: &str,
     profile: &str,
 ) -> crate::Res {
     let targets = extract_target_triples(extra_args);
-    for triple in &targets {
+    let has_global_override = [ENCODED_RUSTFLAGS, "RUSTFLAGS"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some());
+    let flags_for = |triple: &str| target_rustflags(triple, profile);
+    if has_global_override && targets_need_different_flags(&targets, flags_for) {
+        for triple in targets {
+            let args = args_for_target(extra_args, triple);
+            cargo_build_one(env_vars, &args, &[triple], deployment_target, profile)?;
+        }
+        return Ok(());
+    }
+    cargo_build_one(env_vars, extra_args, &targets, deployment_target, profile)
+}
+
+fn cargo_build_one(
+    env_vars: &[(&str, &str)],
+    extra_args: &[&str],
+    targets: &[&str],
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] deployment_target: &str,
+    profile: &str,
+) -> crate::Res {
+    for triple in targets {
         // Catches the common "cross-arch build fails with E0463 can't
         // find crate for core" failure mode.
         ensure_rustup_target(triple)?;
     }
 
     #[cfg(target_os = "windows")]
-    let msvc_plan = resolve_msvc_plan(&targets)?;
+    let msvc_plan = resolve_msvc_plan(targets)?;
 
     let mut cmd = build_cargo_command(profile);
     #[cfg(target_os = "macos")]
     cmd.env("MACOSX_DEPLOYMENT_TARGET", deployment_target);
-    apply_target_cpu(&mut cmd, &targets);
+    apply_target_cpu(&mut cmd, targets, profile);
     if let Some(wrapper) = sccache_wrapper() {
         // Cache rustc invocations at the input-hash level. Wins
         // every time cargo's fingerprint flips but the rustc inputs
@@ -589,7 +610,7 @@ pub(crate) fn cargo_rustc_bin(
     }
     cmd.arg("-p").arg(package);
     cmd.arg("--bin").arg(bin_name);
-    apply_target_cpu(&mut cmd, &targets);
+    apply_target_cpu(&mut cmd, &targets, &build_profile_name());
     if let Some(wrapper) = sccache_wrapper() {
         cmd.env("RUSTC_WRAPPER", wrapper);
     }
@@ -636,25 +657,84 @@ fn extract_target_triples<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
     out
 }
 
-/// Apply the active [`crate::util::TargetCpu`] choice to a `cargo build`
-/// command. When `--target <triple>` is in play we set
-/// `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` per target so a multi-arch
-/// invocation (lipo universal builds) can give each slice the right
-/// flag; otherwise we set plain `RUSTFLAGS` since cargo's
-/// per-target rustflags don't apply to host builds that omit
-/// `--target`.
-fn apply_target_cpu(cmd: &mut Command, targets: &[&str]) {
-    if targets.is_empty() {
-        if let Some(flags) = target_rustflags(moose_build::host_triple()) {
-            append_rustflags_env(cmd, "RUSTFLAGS", &flags);
+const ENCODED_RUSTFLAGS: &str = "CARGO_ENCODED_RUSTFLAGS";
+
+fn targets_need_different_flags(
+    targets: &[&str],
+    flags_for: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some((first, rest)) = targets.split_first() else {
+        return false;
+    };
+    let first = flags_for(first);
+    rest.iter().any(|triple| flags_for(triple) != first)
+}
+
+fn args_for_target<'a>(extra_args: &[&'a str], triple: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["--target", triple];
+    let mut original = extra_args.iter().copied();
+    while let Some(arg) = original.next() {
+        if arg == "--target" {
+            original.next();
+        } else if !arg.starts_with("--target=") {
+            args.push(arg);
         }
-        return;
     }
-    for triple in targets {
-        if let Some(flags) = target_rustflags(triple) {
-            append_rustflags_env(cmd, &cargo_target_rustflags_var(triple), &flags);
-        }
+    args
+}
+
+/// Apply Moose flags for the profile the command actually builds.
+fn apply_target_cpu(cmd: &mut Command, targets: &[&str], profile: &str) {
+    cmd.envs(rustflags_env_plan(
+        targets,
+        |triple| target_rustflags(triple, profile),
+        |key| std::env::var(key).ok(),
+    ));
+}
+
+/// Append to Cargo's active global override when present. The caller
+/// groups targets with identical Moose flags in that case (or builds one
+/// target at a time), since Cargo ignores target config under an override.
+/// Without an override, explicit targets can use their own variables.
+fn rustflags_env_plan(
+    targets: &[&str],
+    flags_for: impl Fn(&str) -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let join = |prior: Option<String>, sep: &str, ours: String| match prior {
+        Some(p) if !p.is_empty() => format!("{p}{sep}{ours}"),
+        _ => ours,
+    };
+
+    let encoded = env(ENCODED_RUSTFLAGS);
+    let plain = env("RUSTFLAGS");
+    // Even an empty global override takes precedence over target config.
+    if targets.is_empty() || encoded.is_some() || plain.is_some() {
+        let triple = targets
+            .first()
+            .copied()
+            .unwrap_or_else(|| moose_build::host_triple());
+        let Some(ours) = flags_for(triple) else {
+            return Vec::new();
+        };
+        return vec![match encoded {
+            Some(prior) => {
+                let ours = ours.split_whitespace().collect::<Vec<_>>().join("\x1f");
+                (ENCODED_RUSTFLAGS.into(), join(Some(prior), "\x1f", ours))
+            }
+            None => ("RUSTFLAGS".into(), join(plain, " ", ours)),
+        }];
     }
+
+    targets
+        .iter()
+        .filter_map(|triple| {
+            let flags = flags_for(triple)?;
+            let var = cargo_target_rustflags_var(triple);
+            let value = join(env(&var), " ", flags);
+            Some((var, value))
+        })
+        .collect()
 }
 
 /// Extra rustflags cargo-moose adds for `triple`: the resolved
@@ -664,8 +744,9 @@ fn apply_target_cpu(cmd: &mut Command, targets: &[&str]) {
 /// (FL Studio's scanner) cannot find. The VST3 shim's build script
 /// follows the same `crt-static` setting. (windows-gnu ignores the
 /// feature; the shim links libstdc++ statically there instead.)
-fn target_rustflags(triple: &str) -> Option<String> {
-    let cpu = crate::util::resolve_target_cpu(triple).map(|cpu| format!("-C target-cpu={cpu}"));
+fn target_rustflags(triple: &str, profile: &str) -> Option<String> {
+    let cpu =
+        crate::util::resolve_target_cpu(triple, profile).map(|cpu| format!("-C target-cpu={cpu}"));
     let crt = triple
         .ends_with("-windows-msvc")
         .then(|| "-C target-feature=+crt-static".to_string());
@@ -689,19 +770,6 @@ fn cargo_target_rustflags_var(triple: &str) -> String {
         })
         .collect();
     format!("CARGO_TARGET_{normalised}_RUSTFLAGS")
-}
-
-/// Append `flag` to env var `var` (space-separated). Reads the prior
-/// value from the process env so a user-set `RUSTFLAGS` is preserved
-/// instead of clobbered.
-fn append_rustflags_env(cmd: &mut Command, var: &str, flag: &str) {
-    let prior = std::env::var(var).unwrap_or_default();
-    let combined = if prior.is_empty() {
-        flag.to_string()
-    } else {
-        format!("{prior} {flag}")
-    };
-    cmd.env(var, combined);
 }
 
 /// Resolve a path to `sccache` if it's available and the user hasn't
@@ -821,8 +889,10 @@ pub(crate) fn cargo_build_for_arch(
     cargo_build(env_vars, &arg_refs, dt)
 }
 
-/// Build for every Apple arch in `archs` in a single cargo invocation
-/// by passing multiple `--target <triple>` flags. Cargo 1.64+ accepts
+/// Build for every Apple arch in `archs`. Normally this passes all
+/// `--target <triple>` flags to one Cargo invocation; a global rustflags
+/// override with different Moose flags requires separate invocations.
+/// Cargo 1.64+ accepts
 /// this and parallelizes codegen across targets internally - shared
 /// `.rmeta` is computed once, target-specific codegen runs per-arch
 /// inside the same process - so the user gets:
@@ -871,15 +941,128 @@ pub(crate) fn cargo_build_multi_arch_with_profile(
 
 #[cfg(test)]
 mod rustflags_tests {
-    use super::target_rustflags;
+    use super::{
+        args_for_target, extract_target_triples, rustflags_env_plan, target_rustflags,
+        targets_need_different_flags,
+    };
+
+    const X86: &str = "x86_64-pc-windows-msvc";
+    const ARM: &str = "aarch64-pc-windows-msvc";
+
+    fn flags(triple: &str) -> Option<String> {
+        target_rustflags(triple, "release")
+    }
+
+    fn plan(targets: &[&str], env: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        let lookup = |k: &str| {
+            env.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        };
+        rustflags_env_plan(targets, flags, lookup)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn mixed_targets_keep_global_overrides_and_target_specific_flags() {
+        let args = ["--target", X86, "--lib", "--target=aarch64-pc-windows-msvc"];
+        let targets = extract_target_triples(&args);
+        assert!(targets_need_different_flags(&targets, flags));
+        assert!(!targets_need_different_flags(&[X86, X86], flags));
+        let encoded = "-Clink-arg=/tmp/My SDK/libextra.a";
+        for triple in targets {
+            let args = args_for_target(&args, triple);
+            assert_eq!(args, ["--target", triple, "--lib"]);
+            let targets = extract_target_triples(&args);
+
+            let p = plan(
+                &targets,
+                &[
+                    ("CARGO_ENCODED_RUSTFLAGS", encoded),
+                    ("RUSTFLAGS", "-C opt-level=0"),
+                ],
+            );
+            let mut expected = vec![encoded];
+            if triple == X86 {
+                expected.extend(["-C", "target-cpu=x86-64-v3"]);
+            }
+            expected.extend(["-C", "target-feature=+crt-static"]);
+            assert_eq!(p.len(), 1);
+            assert_eq!(
+                p["CARGO_ENCODED_RUSTFLAGS"]
+                    .split('\x1f')
+                    .collect::<Vec<_>>(),
+                expected
+            );
+
+            let p = plan(&targets, &[("RUSTFLAGS", "-D warnings")]);
+            expected[0] = "-D warnings";
+            assert_eq!(p.len(), 1);
+            assert_eq!(p["RUSTFLAGS"], expected.join(" "));
+        }
+        assert!(plan(&["aarch64-apple-darwin"], &[("RUSTFLAGS", "-D warnings")]).is_empty());
+        assert!(targets_need_different_flags(
+            &[ARM, "aarch64-apple-darwin"],
+            flags
+        ));
+    }
+
+    #[test]
+    fn encoded_rustflags_keep_flags_with_spaces_for_one_target() {
+        let p = plan(
+            &["x86_64-unknown-linux-gnu"],
+            &[("CARGO_ENCODED_RUSTFLAGS", "--cfg\x1ffeature=\"a b\"")],
+        );
+        assert_eq!(
+            p["CARGO_ENCODED_RUSTFLAGS"],
+            "--cfg\x1ffeature=\"a b\"\x1f-C\x1ftarget-cpu=x86-64-v3",
+        );
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn global_rustflags_stay_global_when_every_target_matches() {
+        let p = plan(
+            &["x86_64-unknown-linux-gnu"],
+            &[("RUSTFLAGS", "-C debuginfo=1")],
+        );
+        assert_eq!(p["RUSTFLAGS"], "-C debuginfo=1 -C target-cpu=x86-64-v3",);
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn empty_encoded_rustflags_still_mask_rustflags() {
+        let p = plan(
+            &["x86_64-unknown-linux-gnu"],
+            &[
+                ("CARGO_ENCODED_RUSTFLAGS", ""),
+                ("RUSTFLAGS", "-C opt-level=0"),
+            ],
+        );
+        assert_eq!(p["CARGO_ENCODED_RUSTFLAGS"], "-C\x1ftarget-cpu=x86-64-v3",);
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn per_target_var_is_appended_without_a_global_override() {
+        let var = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS";
+        let p = plan(&["x86_64-unknown-linux-gnu"], &[(var, "-C debuginfo=1")]);
+        assert_eq!(p[var], "-C debuginfo=1 -C target-cpu=x86-64-v3");
+        assert!(!p.contains_key("RUSTFLAGS"));
+        assert!(plan(&["aarch64-apple-darwin"], &[("RUSTFLAGS", "-D warnings")]).is_empty());
+    }
 
     #[test]
     fn windows_targets_link_the_crt_statically() {
         for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-            let flags = target_rustflags(triple).unwrap_or_default();
+            let flags = target_rustflags(triple, "release").unwrap_or_default();
             assert!(flags.contains("+crt-static"), "{triple}: {flags}");
         }
-        let linux = target_rustflags("x86_64-unknown-linux-gnu").unwrap_or_default();
+        let linux = target_rustflags("x86_64-unknown-linux-gnu", "release").unwrap_or_default();
         assert!(!linux.contains("crt-static"));
+        // The command's own profile decides, not the process-global one.
+        let debug = target_rustflags("x86_64-unknown-linux-gnu", "debug").unwrap_or_default();
+        assert!(!debug.contains("target-cpu"), "{debug}");
     }
 }

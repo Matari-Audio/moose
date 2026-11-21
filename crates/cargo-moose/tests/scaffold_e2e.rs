@@ -1179,6 +1179,134 @@ fn scan_diagnostics_strips_ansi_color() {
 }
 
 #[test]
+fn scaffold_emits_fast_profiles_readme_and_ci() {
+    let single = Scaffold::new("dx-single", "demo_dx");
+    single.run().unwrap();
+    let cargo_toml = read_scaffold_text(single.generated.join("Cargo.toml"));
+    assert!(cargo_toml.contains("[profile.dev]\ndebug = \"line-tables-only\""));
+    assert!(cargo_toml.contains("[profile.dev.package.\"*\"]\nopt-level = 1\ndebug = 0"));
+    let readme = std::fs::read_to_string(single.generated.join("README.md")).unwrap();
+    assert!(readme.contains("# DemoDx"));
+    assert!(readme.contains(".github/workflows/ci.yml"));
+    let ci = read_scaffold_text(single.generated.join(".github/workflows/ci.yml"));
+    assert!(ci.contains("${{ github.workflow }}"));
+    assert!(ci.contains("${{ matrix.os }}"));
+    assert!(ci.contains("cargo nextest run -p demo_dx --features rt-paranoid --no-tests=pass"));
+    assert!(!ci.contains(r"\{"));
+
+    let no_ci = Scaffold::new("dx-no-ci", "demo_no_ci").arg("--no-ci");
+    no_ci.run().unwrap();
+    assert!(!no_ci.generated.join(".github/workflows/ci.yml").exists());
+    let no_ci_readme = std::fs::read_to_string(no_ci.generated.join("README.md")).unwrap();
+    assert!(!no_ci_readme.contains("## CI"));
+
+    let ws = Scaffold::new_workspace("dx-ws", "acme", &["gain", "synth"]);
+    ws.run().unwrap();
+    let ws_toml = read_scaffold_text(ws.generated.join("Cargo.toml"));
+    assert!(ws_toml.contains("[profile.dev]\ndebug = \"line-tables-only\""));
+    assert!(ws_toml.contains("[profile.dev.package.\"*\"]\nopt-level = 1\ndebug = 0"));
+    let ws_ci = read_scaffold_text(ws.generated.join(".github/workflows/ci.yml"));
+    assert!(
+        ws_ci.contains("cargo nextest run -p acme-gain --features rt-paranoid --no-tests=pass")
+    );
+    assert!(
+        ws_ci.contains("cargo nextest run -p acme-synth --features rt-paranoid --no-tests=pass")
+    );
+    assert!(!ws_ci.contains(r"\{"));
+    assert_ci_well_formed("dx-single", &ci);
+    assert_ci_well_formed("dx-ws", &ws_ci);
+}
+
+// Templates are embedded as checked out by Git, so their line endings can vary.
+fn read_scaffold_text(path: PathBuf) -> String {
+    std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+}
+
+/// Structural check on a generated workflow without a YAML dep: no
+/// template leftovers, no tabs, two-space indentation, the expected
+/// top-level keys and jobs, and none of the env overrides that would
+/// mask `[target.*].rustflags` / `[profile.dev]`.
+fn assert_ci_well_formed(label: &str, ci: &str) {
+    for (n, line) in ci.lines().enumerate() {
+        let n = n + 1;
+        // Every `{{` must open a GitHub `${{ }}` expression.
+        assert!(
+            !line.replace("${{", "").contains("{{"),
+            "[{label}] ci.yml:{n} template artifact: {line}"
+        );
+        assert!(!line.contains('\t'), "[{label}] ci.yml:{n} has a tab");
+        let indent = line.len() - line.trim_start().len();
+        assert!(indent % 2 == 0, "[{label}] ci.yml:{n} odd indent: {line}");
+        assert_eq!(line, line.trim_end(), "[{label}] ci.yml:{n} trailing space");
+    }
+    assert_eq!(
+        ci.matches("{{").count(),
+        ci.matches("}}").count(),
+        "[{label}]"
+    );
+    let top: Vec<&str> = ci
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with([' ', '#']))
+        .collect();
+    assert_eq!(
+        top,
+        [
+            "name: CI",
+            "on:",
+            "permissions:",
+            "concurrency:",
+            "env:",
+            "jobs:"
+        ],
+        "[{label}] top-level keys"
+    );
+    assert!(
+        ci.contains("\non:\n  push:\n    branches: ['**']\n  pull_request:\n"),
+        "[{label}] CI must run on every branch push and on pull requests"
+    );
+    for job in ["\n  check:\n", "\n  test:\n", "\n  build:\n"] {
+        assert!(ci.contains(job), "[{label}] missing job {job:?}");
+    }
+    for banned in ["RUSTFLAGS=", "mold", "CARGO_PROFILE_", "windows-latest"] {
+        assert!(!ci.contains(banned), "[{label}] ci.yml still has {banned}");
+    }
+    assert!(ci.contains("windows-2025"), "[{label}]");
+}
+
+#[test]
+fn readme_without_standalone_keeps_code_fence_intact() {
+    let s = Scaffold::new("readme-no-standalone", "demo_fence").arg("--no-standalone");
+    s.run().unwrap();
+    let readme = read_scaffold_text(s.generated.join("README.md"));
+    assert!(readme.contains("```sh\n# Build & install"), "{readme}");
+    assert!(!readme.contains("standalone launch"), "{readme}");
+    assert_eq!(
+        readme.matches("```").count() % 2,
+        0,
+        "unbalanced fences: {readme}"
+    );
+
+    let with = Scaffold::new("readme-standalone", "demo_fence_sa");
+    with.run().unwrap();
+    let readme = read_scaffold_text(with.generated.join("README.md"));
+    assert!(
+        readme.contains("```sh\n# Fast-compile standalone launch"),
+        "{readme}"
+    );
+    assert!(readme.contains("cargo moose run --debug\n\n# Build & install"));
+}
+
+#[test]
+fn workspace_no_ci_skips_workflow() {
+    let ws = Scaffold::new_workspace("ws-no-ci", "acme_noci", &["gain"]).arg("--no-ci");
+    ws.run().unwrap();
+    assert!(!ws.generated.join(".github").exists());
+    let readme = std::fs::read_to_string(ws.generated.join("README.md")).unwrap();
+    assert!(!readme.contains("## CI"), "{readme}");
+    assert!(readme.contains("## Plugins"), "{readme}");
+}
+
+#[test]
 fn rewrite_leaves_commented_lines_alone() {
     let input = r#"# moose-lv2 = { git = "https://github.com/Matari-Audio/moose" }
 #   moose-au = { git = "https://github.com/Matari-Audio/moose" }

@@ -63,4 +63,4 @@ let result = PluginDriver::<MyPlugin>::new()
     .run();
 ```
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

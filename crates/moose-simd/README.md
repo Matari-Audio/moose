@@ -37,4 +37,4 @@ audio-thread allocation. They're the inner-loop complement to a
 [block-gain example](https://github.com/Matari-Audio/moose/tree/main/examples/moose-example-block-gain)
 for the canonical fast-path / slow-path shape.
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

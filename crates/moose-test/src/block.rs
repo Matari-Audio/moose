@@ -6,11 +6,8 @@
 //! [`crate::driver!`] instead when the test needs the real host path
 //! (sub-block splitting, transport advance, meter capture).
 //!
-//! Routing through the single [`PluginLogicCore`] trait sidesteps the
-//! `PluginLogic` / `PurePluginLogic` name collision: a pure plugin
-//! satisfies both leaf traits, so a bare `Logic::process(...)` is
-//! ambiguous, but `PluginLogicCore` is the one trait every leaf forwards
-//! into and is never in the plugin author's prelude scope.
+//! For a plugin that implements `Plugin<S>`, pass its `Lifecycle` adapter
+//! as the logic type.
 
 use std::marker::PhantomData;
 

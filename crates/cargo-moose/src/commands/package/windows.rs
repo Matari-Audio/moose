@@ -150,7 +150,7 @@ pub(crate) fn cmd_package_windows(args: &[String], selection: &super::SuiteSelec
              installer will be unsigned. Pass --no-sign to silence this warning, or \
              set MOOSE_AZURE_ACCOUNT (+ MOOSE_AZURE_PROFILE), MOOSE_CERT_SHA1, or \
              MOOSE_PFX_PATH in .cargo/config.toml [env]. See \
-             https://truce.audio/ for the full list."
+             https://github.com/Matari-Audio/moose for the full list."
         );
     }
 

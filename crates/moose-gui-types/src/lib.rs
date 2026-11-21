@@ -8,7 +8,7 @@
 //! (tiny-skia, baseview, moose-font/skrifa) stays in `moose-gui`.
 //!
 //! The split exists so `moose-plugin` (the user-facing
-//! `PluginLogic` trait crate) can name `GridLayout` /
+//! `Plugin` trait crate) can name `GridLayout` /
 //! `RenderBackend` / `WidgetRegion` without pulling in a software
 //! rasterizer + windowing toolkit. Plugin authors who supply a
 //! custom editor (egui, iced, slint, raw window handle) end up

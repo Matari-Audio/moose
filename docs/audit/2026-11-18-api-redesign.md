@@ -1,4 +1,4 @@
-# MOOSE API redesign: from the truce port to official, typed foundations
+# moose API redesign: from the truce port to official, typed foundations
 
 Companion to `2026-11-18-audit.md`. That file lists bugs; this one lists what
 is structurally wrong or fragile in the inherited truce design and what the
@@ -15,7 +15,7 @@ the current design. This document is the next pass.
   - `vst3` 0.3.0 (coupler-rs/vst3-rs, MIT/Apache): generated from the SDK
     headers by `com-scrape`, with COM helpers for implementing interfaces.
     Low level, pre-1.0.
-  - `clap-sys` 0.5.0 (January 2025): what MOOSE uses. Plain C bindings.
+  - `clap-sys` 0.5.0 (January 2025): what moose uses. Plain C bindings.
   - `clack` 0.2.0 (September 2026, MIT/Apache): safe wrappers over `clap-sys`
     that encode CLAP's thread rules in types (`Shared`, `MainThread`,
     `AudioProcessor` created by `activate` and consumed by `deactivate`).
@@ -32,7 +32,7 @@ the current design. This document is the next pass.
   `kPlatformTypeWaylandSurfaceID`), and in 3.8.1 `ITransportControl` and
   MIDI 2.0 note-expression IDs.
 
-## What MOOSE implements today
+## What moose implements today
 
 CLAP (via `clap-sys` 0.5): params, state, preset-load, remote-controls,
 audio-ports, audio-ports-config, surround, note-ports, gui, latency, tail,
@@ -72,7 +72,7 @@ safety or scaling hazard; **S3** missing capability a modern host expects;
 |---|---|---|---|
 | A1 | S1 | VST3 is a hand-written C++ COM implementation with hand-typed IIDs, result codes and vtable offsets (`qVtbl[5]`). The changelog already lists fixed wrong IIDs and wrong `tresult` codes. Every new interface means hand-writing another vtable. | Build on the official MIT SDK. Either the `vst3` crate (generated from the SDK headers, implement interfaces in Rust, no C++) or vendored `pluginterfaces` with real C++ classes. Recommended: `vst3` crate, pinned, with its SDK commit recorded. Delete `vst3_shim.cpp`. |
 | A2 | S2 | 512 parameter points per block in a fixed stack array; excess dropped silently. 32 channels per direction. A global descriptor allows one class per binary. | Read `IParamValueQueue` lazily during the block-splitting walk instead of copying into a fixed array: merge the queues by offset with a small cursor heap sized at activate. Size channel scratch from `bus_layouts()` at activate. Factory holds a slice of classes. |
-| A3 | S2 | CLAP extension vtables, thread rules and host pointers are handled through raw `*const clap_host` in a 7.6k-line file. Thread correctness depends on comments. | Move to `clack-plugin` + `clack-extensions`, or reproduce its model inside MOOSE: a `Shared` part (any thread), a `MainThread` part, and an `AudioProcessor` value that `activate` creates and `deactivate` takes back. The audio state then belongs to the audio side by ownership, not by a flag. Wrap host extensions in thread-typed handles. |
+| A3 | S2 | CLAP extension vtables, thread rules and host pointers are handled through raw `*const clap_host` in a 7.6k-line file. Thread correctness depends on comments. | Move to `clack-plugin` + `clack-extensions`, or reproduce its model inside moose: a `Shared` part (any thread), a `MainThread` part, and an `AudioProcessor` value that `activate` creates and `deactivate` takes back. The audio state then belongs to the audio side by ownership, not by a flag. Wrap host extensions in thread-typed handles. |
 | A4 | S3 | No `moduleinfo.json` (VST3 3.7.5+), so hosts must load the binary to scan. | Generate `Contents/Resources/moduleinfo.json` from `PluginInfo` and the param catalog in `cargo moose build`, and run the SDK's `moduleinfotool` validation in CI. |
 | A5 | S3 | `clap-sys` 0.5 is from January 2025 and predates the 1.2.x drafts. | Track CLAP headers directly (bindgen against a pinned `free-audio/clap` tag) or move to clack. Keep draft extensions behind a `clap-draft` feature. |
 | A6 | S4 | AU v2 is a 2.4k-line C shim; AUv3 needs `xcodebuild`. | Keep AU (no MIT alternative is better), but generate it against Apple's AudioUnitSDK (Apache-2.0) rather than a custom C shim, and make the AUv3 appex a thin wrapper over the same Rust core. Lower priority than A1. |
@@ -156,7 +156,7 @@ to a real target, renames it through the "rename" column above (supported
 everywhere), hides unused slots, and carries the binding in state so
 automation keeps pointing at the same target after reload.
 
-MOOSE already has pieces of this: array params (`[FloatParam; 8]`), the
+moose already has pieces of this: array params (`[FloatParam; 8]`), the
 presentation hook (rename, hide, regroup), and projections. What is missing
 is one API on top: the plugin describes the parameters it wants, and each
 wrapper reports its capability (`Full` for CLAP, `Reload` for VST3 hosts

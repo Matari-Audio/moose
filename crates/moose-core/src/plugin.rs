@@ -55,22 +55,25 @@ impl PreparationConfig {
 ///
 /// `PluginRuntime` is the surface every format wrapper (CLAP, VST3,
 /// VST2, LV2, AU, AAX) consumes. The `moose::plugin!` macro generates
-/// an `impl PluginRuntime for __HotShellWrapper` from the user's
-/// `moose_plugin::PluginLogic` impl, bridging the user-facing trait
-/// into this GUI-free format-wrapper surface so `moose-core` doesn't
-/// pull in `moose-gui` types.
+/// an `impl PluginRuntime` for its shell wrapper from the user's
+/// `moose::Plugin` impl (via `moose_plugin::PluginLogicCore`), bridging
+/// the user-facing trait into this GUI-free format-wrapper surface so
+/// `moose-core` doesn't pull in `moose-gui` types.
 ///
 /// What plugin authors implement instead:
 ///
 /// ```ignore
-/// impl moose::prelude::PluginLogic for MyPlugin {
-///     type Params = MyPluginParams;
-///     fn reset(&mut self, config: &AudioConfig) { /* ... */ }
-///     fn process(&mut self, /* ... */) -> ProcessStatus { /* ... */ }
+/// impl moose::prelude::Plugin for MyPlugin {
+///     type Shared = MyPluginParams;
+///     type MainThread = ();
+///     type Processor = MyProcessor;
+///     fn main_thread(_shared: &Arc<MyPluginParams>) {}
+///     fn activate(/* ... */) -> Result<MyProcessor, PreparationError> { /* ... */ }
+///     fn process(/* ... */) -> ProcessStatus { /* ... */ }
 ///     fn editor(params: Arc<MyPluginParams>) -> Box<dyn Editor> { /* ... */ }
 /// }
 ///
-/// moose::plugin! { logic: MyPlugin, params: MyPluginParams }
+/// moose::plugin! { plugin: MyPlugin, params: MyPluginParams }
 /// ```
 ///
 /// The macro-emitted `impl PluginRuntime` routes each method directly
@@ -199,7 +202,7 @@ pub trait PluginRuntime: Send + 'static {
 
     /// Save extra state beyond parameter values. Empty `Vec` means
     /// "no extra state": matches the user-facing
-    /// `moose_plugin::PluginLogic::save_state` shape so the wrapper
+    /// `moose_plugin::PluginLogicCore::save_state` shape so the wrapper
     /// bridge is a passthrough rather than an `Option<Vec<u8>>` to
     /// `Vec<u8>` translation.
     ///
@@ -214,7 +217,7 @@ pub trait PluginRuntime: Send + 'static {
     /// Serialize the plugin's custom state into `buf` (cleared on entry) -
     /// the real-time path CLAP / VST3 / AU publish to the lock-free slot.
     /// Returns whether the plugin publishes snapshots at all (see
-    /// `moose_plugin::PluginLogic::snapshot_into`), whose default delegates
+    /// `moose_plugin::PluginLogicCore::snapshot_into`), whose default delegates
     /// to `save_state`, so this covers legacy `save_state`-only plugins
     /// too. Exposed so non-realtime save paths (LV2, the standalone host)
     /// can compute live state here instead of reading the version-gated
@@ -225,7 +228,7 @@ pub trait PluginRuntime: Send + 'static {
     }
 
     /// Restore extra state. Matches the user-facing
-    /// `moose_plugin::PluginLogic::load_state` `Result` shape so the
+    /// `moose_plugin::PluginLogicCore::load_state` `Result` shape so the
     /// wrapper bridge is a passthrough.
     ///
     /// **Concurrency contract.** Called on the audio thread between
@@ -236,7 +239,7 @@ pub trait PluginRuntime: Send + 'static {
     /// # Errors
     ///
     /// Returns `Err` when the macro-generated impl forwards a
-    /// `PluginLogic::load_state` failure (malformed bytes, version
+    /// `PluginLogicCore::load_state` failure (malformed bytes, version
     /// skew between session file and plugin build, etc).
     fn load_state(&mut self, _data: &[u8]) -> Result<(), crate::state::StateLoadError> {
         Ok(())

@@ -32,4 +32,4 @@ impl<P: Params> EditorUi<P> for MyUi {
 }
 ```
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

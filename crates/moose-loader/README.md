@@ -21,10 +21,10 @@ plugin, in two modes:
   Preserves audio continuity.
 
 Plugin authors don't reach into this crate directly. They write
-a single `impl PluginLogic` (from `moose-plugin`) on their plugin
-struct -- one trait covering both DSP (`reset`, `process`, ...) and
-GUI (`editor`) -- and `moose::plugin!` emits
-the right `export_*!` call based on the `shell` Cargo feature.
+an `impl Plugin` (from `moose-plugin`) on their plugin struct,
+covering both DSP (`reset`, `process`, ...) and GUI (`editor`).
+`moose::plugin!` adapts it through `Lifecycle` and selects the
+static or hot-reload wrapper based on the `shell` Cargo feature.
 
 ## Key types and macros
 
@@ -70,4 +70,4 @@ so you'll pick up every `7.0.x` patch release without re-editing.
 To track an unreleased checkout, swap for
 `git = "https://github.com/Matari-Audio/moose", branch = "main"`.)
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).
