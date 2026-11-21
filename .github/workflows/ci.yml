@@ -22,11 +22,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Trim debug info: keeps target/ under the runners' disk ceiling and
-  # cuts link time (the MSVC linker + PDBs dominated the Windows job).
-  # line-tables-only still gives file:line in panic backtraces. CI-only.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # Strip debug info in CI: keeps target/ under the runners' disk/cache
+  # ceiling and cuts link time (the MSVC linker + PDBs dominated the
+  # Windows job). PanicLatch uses std::panic::Location, not DWARF.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,6 +39,7 @@ jobs:
       # JSON lists of runner labels, e.g. ["macos-15"]
       oses: ${{ steps.pick.outputs.oses }}
       rt_oses: ${{ steps.pick.outputs.rt_oses }}
+      gui: ${{ steps.pick.outputs.gui }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,10 +50,31 @@ jobs:
             # HEAD is the PR merge commit: HEAD^1 is the base it merges into.
             git diff --name-only --no-renames HEAD^1 HEAD > changed.txt
             picked=$(scripts/ci/changed-oses.sh < changed.txt)
+            gui=false
+            while IFS= read -r p; do
+              case "$p" in
+                crates/moose-gui/* | \
+                crates/moose-gpu/* | \
+                crates/moose-mui/* | \
+                crates/moose-egui/* | \
+                crates/moose-baseview/* | \
+                crates/moose-standalone/* | \
+                examples/gain/* | \
+                scripts/gui-window-test.sh | \
+                scripts/macos-cursor-poke.swift | \
+                .github/workflows/ci.yml | \
+                Cargo.toml | \
+                Cargo.lock)
+                  gui=true
+                  break
+                  ;;
+              esac
+            done < changed.txt
           else
             picked="macos windows linux"
+            gui=true
           fi
-          echo "OSes: ${picked:-none (docs only)}"
+          echo "OSes: ${picked:-none (docs only)} (gui=$gui)"
           oses=(); rt=()
           for o in $picked; do
             case $o in
@@ -64,6 +86,7 @@ jobs:
           json() { printf '%s\n' "$@" | jq -Rnc '[inputs | select(. != "")]'; }
           echo "oses=$(json "${oses[@]}")" >> "$GITHUB_OUTPUT"
           echo "rt_oses=$(json "${rt[@]}")" >> "$GITHUB_OUTPUT"
+          echo "gui=$gui" >> "$GITHUB_OUTPUT"
 
   test:
     name: test (${{ matrix.os }})
@@ -82,8 +105,13 @@ jobs:
       - name: Free runner disk
         if: runner.os == 'macOS'
         run: |
-          sudo xcrun simctl runtime delete all 2>/dev/null || true
+          avail_gb=$(df -g / | awk 'NR==2 {print $4}')
+          if [ "${avail_gb:-0}" -ge 40 ]; then
+            echo "Disk OK (${avail_gb} GiB free); skipping Xcode cleanup"
+            exit 0
+          fi
           keep="$(xcode-select -p)"; keep="${keep%/Contents/Developer}"
+          sudo xcrun simctl runtime delete all 2>/dev/null || true
           for x in /Applications/Xcode*.app; do
             [ "$(readlink -f "$x")" = "$(readlink -f "$keep")" ] || sudo rm -rf "$x" &
           done
@@ -192,9 +220,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cargo-moose
+          shared-key: core-windows-latest
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - name: cargo test -p cargo-moose
         run: cargo test -p cargo-moose
 
@@ -203,16 +231,16 @@ jobs:
     # isa-swizzling regression that only surfaced on a new OS.
     name: gui hitTest (windowed, newest macOS)
     needs: changes
-    if: contains(needs.changes.outputs.oses, 'macos')
+    if: needs.changes.outputs.gui == 'true' && contains(needs.changes.outputs.oses, 'macos')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: gui-window
+          shared-key: core-macos-15
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       - name: windowed hitTest smoke
         run: ./scripts/gui-window-test.sh
 

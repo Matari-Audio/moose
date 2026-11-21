@@ -5,18 +5,25 @@
 //! plugin logic via C FFI.
 
 use crate::callbacks::cb_create;
+use crate::callbacks::cb_create_with_sink;
 use crate::callbacks::cb_destroy;
 use crate::callbacks::cb_legacy_state_key_at;
 use crate::callbacks::cb_legacy_state_key_count;
+use crate::callbacks::cb_param_clump_name;
 use crate::callbacks::cb_param_count;
 use crate::callbacks::cb_param_format_value;
 use crate::callbacks::cb_param_get_value;
+use crate::callbacks::cb_param_ids;
+use crate::callbacks::cb_param_info_by_id;
 use crate::callbacks::cb_param_parse_value;
 use crate::callbacks::cb_param_set_value;
 use crate::callbacks::cb_process;
 use crate::callbacks::cb_process_native;
 use crate::callbacks::cb_process_native_v11;
+use crate::callbacks::cb_process_native_v13;
 use crate::callbacks::cb_reset;
+use crate::callbacks::cb_set_active;
+use crate::callbacks::cb_set_context_name;
 use crate::callbacks::cb_set_render_mode;
 use crate::callbacks::cb_state_free;
 use crate::callbacks::cb_state_load;
@@ -55,8 +62,10 @@ use moose_core::events::EventBody;
 use moose_core::events::EventList;
 
 mod callbacks;
+mod catalog;
 pub mod ffi;
 mod gui;
+mod host_drain;
 mod instance;
 mod output_events;
 mod presets;
@@ -86,9 +95,6 @@ use moose_core::wrapper::{
 use moose_params::{MidiSource, ParamFlags};
 
 use ffi::{AuCallbacks, AuParamDescriptor, AuPluginDescriptor};
-
-#[cfg(target_vendor = "apple")]
-mod persist_notify;
 
 // ---------------------------------------------------------------------------
 // Registration: called once from the export_au! macro
@@ -158,6 +164,13 @@ pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
         commit_output_params: cb_commit_output_params::<P>,
         begin_output_events_v10: cb_begin_output_events_v10::<P>,
         process_native_v11: cb_process_native_v11::<P>,
+        create_with_sink: cb_create_with_sink::<P>,
+        set_active: cb_set_active::<P>,
+        set_context_name: cb_set_context_name::<P>,
+        param_ids: cb_param_ids::<P>,
+        param_info_by_id: cb_param_info_by_id::<P>,
+        param_clump_name: cb_param_clump_name::<P>,
+        process_native_v13: cb_process_native_v13::<P>,
     }
 }
 
@@ -818,42 +831,1158 @@ mod tests {
         );
     }
 
-    /// The AU v2 param-notify pump drains what the audio thread queues
-    /// and joins cleanly on drop (no teardown hang). Uses a dummy,
-    /// never-registered `ctx`: the C-side map lookup compares it by
-    /// pointer identity and returns NULL, so the host-set FFI is a safe
-    /// no-op - we exercise the queue/thread lifecycle, not `CoreAudio`.
-    #[cfg(target_os = "macos")]
     #[test]
-    fn param_notifier_drains_and_joins() {
-        use std::time::{Duration, Instant};
+    fn v13_sink_lifecycle_context_name_live_catalog_and_rt_drain() {
+        use std::ffi::{CStr, CString};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        use super::ParamNotifier;
-        use crate::instance::AuCtx;
+        use crate::callbacks::{
+            cb_create_with_sink, cb_destroy, cb_param_clump_name, cb_param_ids,
+            cb_param_info_by_id, cb_reset, cb_set_active, cb_set_context_name,
+        };
+        use crate::ffi::{AuParamInfoOut, MooseAuHostSink};
+        use crate::gui::editor_context;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use crate::output_events::{cb_latency_samples, cb_tail_samples};
+        use moose_core::editor::PluginContextReadF64;
+        use moose_core::host_queue::HostSignal;
 
-        let dummy = core::ptr::dangling_mut::<std::ffi::c_void>();
-        // SAFETY: `dummy` is only ever compared (never dereferenced) by
-        // the C map lookup, and the notifier is dropped (joined) below
-        // while still in scope.
-        let notifier = unsafe { ParamNotifier::spawn(AuCtx(dummy)) }.expect("spawn notifier");
+        type P = LargePlugin<16>;
 
-        // Payload value is irrelevant (the host-set FFI no-ops here).
-        for i in 0..100u32 {
-            assert!(notifier.queue.push((i, 1.0)).is_ok());
+        #[derive(Default)]
+        struct FakeAuHost {
+            edits: Mutex<Vec<(&'static str, u32, f32)>>,
+            latency_notifs: AtomicUsize,
+            tail_notifs: AtomicUsize,
+            param_values_notifs: AtomicUsize,
+            param_pres_notifs: AtomicUsize,
+            released: AtomicBool,
+            seen_latency_in_cb: AtomicUsize,
+            seen_tail_in_cb: AtomicUsize,
+            ctx: Mutex<usize>,
         }
-        notifier.thread.unpark();
 
-        let start = Instant::now();
-        while !notifier.queue.is_empty() {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "notifier did not drain the queue"
+        unsafe extern "C" fn on_begin(ud: *mut std::ffi::c_void, id: u32) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            h.edits.lock().unwrap().push(("begin", id, 0.0));
+        }
+        unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, id: u32, val: f32) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            h.edits.lock().unwrap().push(("set", id, val));
+        }
+        unsafe extern "C" fn on_end(ud: *mut std::ffi::c_void, id: u32) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            h.edits.lock().unwrap().push(("end", id, 0.0));
+        }
+        unsafe extern "C" fn on_latency(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            let ctx = *h.ctx.lock().unwrap() as *mut std::ffi::c_void;
+            // AU hosts re-read latency synchronously inside the notification!
+            let lat = unsafe { cb_latency_samples::<P>(ctx) };
+            h.seen_latency_in_cb.store(lat as usize, Ordering::Relaxed);
+            h.latency_notifs.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_tail(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            let ctx = *h.ctx.lock().unwrap() as *mut std::ffi::c_void;
+            let tail = unsafe { cb_tail_samples::<P>(ctx) };
+            h.seen_tail_in_cb.store(tail as usize, Ordering::Relaxed);
+            h.tail_notifs.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_values(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            h.param_values_notifs.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_pres(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            h.param_pres_notifs.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_release(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<FakeAuHost>() };
+            h.released.store(true, Ordering::Release);
+        }
+
+        let host = Box::new(FakeAuHost::default());
+        let host_ptr = std::ptr::from_ref(&*host)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        let sink = MooseAuHostSink {
+            user_data: host_ptr,
+            release_user_data: Some(on_release),
+            begin_edit: Some(on_begin),
+            set_param: Some(on_set),
+            end_edit: Some(on_end),
+            latency_changed: Some(on_latency),
+            tail_changed: Some(on_tail),
+            param_values_changed: Some(on_values),
+            param_presentation_changed: Some(on_pres),
+            ..MooseAuHostSink::default()
+        };
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            assert!(!ctx.is_null());
+            *host.ctx.lock().unwrap() = ctx as usize;
+
+            // Live per-instance parameter catalog query
+            let count = cb_param_ids::<P>(ctx, std::ptr::null_mut(), 0);
+            assert!(count >= 1);
+            let mut ids = vec![0_u32; count as usize];
+            assert_eq!(cb_param_ids::<P>(ctx, ids.as_mut_ptr(), count), count);
+            let mut info = AuParamInfoOut::default();
+            assert_eq!(cb_param_info_by_id::<P>(ctx, ids[0], &raw mut info), 1);
+            assert_eq!(info.id, ids[0]);
+            let name = CStr::from_ptr(info.name.as_ptr()).to_str().unwrap();
+            assert_ne!(name, "");
+            assert_eq!(cb_param_info_by_id::<P>(ctx, 0xDEAD_BEEF, &raw mut info), 0);
+            let mut clump_buf = [0 as std::os::raw::c_char; 64];
+            assert_eq!(
+                cb_param_clump_name::<P>(ctx, 9999, clump_buf.as_mut_ptr(), 64),
+                0
             );
-            std::thread::yield_now();
+
+            // Context name forwarding (safe with valid UTF-8 and NULL)
+            let track = CString::new("Lead Synth").unwrap();
+            cb_set_context_name::<P>(ctx, track.as_ptr());
+            cb_set_context_name::<P>(ctx, std::ptr::null());
+
+            // Editor gestures flow through MooseAuHostSink on Linux too!
+            // On macOS, `libtest` runs unit tests on worker threads where
+            // `pthread_main_np() == 0`, so gestures queue for the main-queue
+            // drain; drain explicitly so the assertion works on every OS.
+            let ed = editor_context::<P>(ctx);
+            ed.automate(ids[0], 0.5);
+            assert!((PluginContextReadF64::get_param(&ed, ids[0]) - 0.5).abs() < 1e-6);
+            let main = moose_core::thread::MainThread::assume();
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            {
+                let edits = host.edits.lock().unwrap();
+                assert_eq!(edits.len(), 3);
+                assert_eq!(edits[0].0, "begin");
+                assert_eq!(edits[1].0, "set");
+                assert_eq!(edits[2].0, "end");
+            }
+
+            // Activate, simulate RT latency + tail change + process param feedback,
+            // drain via the event-driven main-queue handler, and verify synchronous
+            // re-read sees the new values!
+            cb_reset::<P>(ctx, 48_000.0, 512);
+            cb_set_active::<P>(ctx, 1);
+
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            inst.delay.observe_and_signal(256, 4096, &inst.host_queue);
+            let epoch = crate::instance::FeedbackEpoch {
+                edits: inst.current_edit_seq(),
+                automation: inst.current_edit_seq(),
+            };
+            assert!(inst.param_out_queue.push((ids[0], 0.25, epoch)).is_ok());
+            inst.host_queue.signal(HostSignal::PARAM_RESCAN);
+
+            let main = moose_core::thread::MainThread::assume();
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(host.latency_notifs.load(Ordering::Relaxed), 1);
+            assert_eq!(host.seen_latency_in_cb.load(Ordering::Relaxed), 256);
+            assert_eq!(host.tail_notifs.load(Ordering::Relaxed), 1);
+            assert_eq!(host.seen_tail_in_cb.load(Ordering::Relaxed), 4096);
+            assert_eq!(host.param_values_notifs.load(Ordering::Relaxed), 1);
+            assert_eq!(host.param_pres_notifs.load(Ordering::Relaxed), 0);
+
+            // Deactivate clears `prepared`.
+            cb_set_active::<P>(ctx, 0);
+            assert!(!inst.audio.enter().prepared);
+
+            assert!(!host.released.load(Ordering::Acquire));
+            cb_destroy::<P>(ctx);
+            assert!(host.released.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exercises both ramp modes end-to-end"
+    )]
+    fn v13_ramps_emit_param_ramp_for_per_sample_and_subdivide_for_block_split() {
+        use crate::callbacks::push_param_events_v2;
+        use crate::ffi::{AU_PARAM_EVENT_HAS_START_VALUE, AU_PROCESS_OK, AuParamEventV2};
+        use crate::large_state_fixture::LargePlugin;
+        use moose_core::export::PluginExport;
+        use moose_core::info::Automation;
+        use moose_params::Params;
+
+        type P = LargePlugin<16>;
+        let plugin = P::create();
+        let params = plugin.params_arc();
+        params.set_plain(0, 0.0);
+
+        // 1. PerSample + AUv2 cross-block ramp starting at -256 for 1024 frames (0.0 -> 1.0)
+        // Over block [0, 512): t0 = 256/1024 = 0.25, t1 = 768/1024 = 0.75.
+        let mut list = EventList::with_capacity(64);
+        let mut active_ramps = Vec::with_capacity(64);
+        let mut tracker = Vec::with_capacity(512);
+        let auv2_ramp = [AuParamEventV2 {
+            start_offset: -256,
+            duration_frames: 1024,
+            param_id: 0,
+            flags: AU_PARAM_EVENT_HAS_START_VALUE,
+            start_value: 0.0,
+            end_value: 1.0,
+        }];
+        let (status, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &auv2_ramp,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(status, AU_PROCESS_OK);
+        assert!(
+            active_ramps.is_empty(),
+            "AUv2 ramps with explicit start are not retained"
+        );
+        assert_eq!(list.len(), 1);
+        match list.get(0).unwrap().body {
+            EventBody::ParamRamp {
+                id,
+                start,
+                end,
+                len,
+            } => {
+                assert_eq!(id, 0);
+                assert!((start - 0.25).abs() < 1e-6);
+                assert!((end - 0.75).abs() < 1e-6);
+                assert_eq!(len, 512);
+            }
+            other => panic!("expected ParamRamp, got {other:?}"),
         }
 
-        // Must stop + join without hanging.
-        drop(notifier);
+        // 2. PerSample + AUv3 multi-block ramp (no start_value):
+        // Block 1 [0..512): start=256, dur=512, target=1.0 -> ramps 0.0..0.5 over 256 frames
+        // Block 2a (empty input, real AUv3 host): retained ramp finishes 0.5..1.0 over 256 frames
+        list.clear();
+        let auv3_b1 = [AuParamEventV2 {
+            start_offset: 256,
+            duration_frames: 512,
+            param_id: 0,
+            flags: 0,
+            start_value: 0.0,
+            end_value: 1.0,
+        }];
+        let (s1, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &auv3_b1,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s1, AU_PROCESS_OK);
+        assert_eq!(active_ramps.len(), 1);
+        match list.get(0).unwrap().body {
+            EventBody::ParamRamp {
+                start, end, len, ..
+            } => {
+                assert_eq!(list.get(0).unwrap().sample_offset, 256);
+                assert!((start - 0.0).abs() < 1e-6);
+                assert!((end - 0.5).abs() < 1e-6);
+                assert_eq!(len, 256);
+                params.set_plain(0, end);
+            }
+            other => panic!("expected ParamRamp, got {other:?}"),
+        }
+        // Real AUv3 host delivers empty `input` in Block 2: retained ramp finishes cleanly.
+        let mut active_ramps_empty = active_ramps.clone();
+        list.clear();
+        let (s2_empty, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &[],
+            512,
+            &mut active_ramps_empty,
+            &mut tracker,
+        );
+        assert_eq!(s2_empty, AU_PROCESS_OK);
+        assert!(active_ramps_empty.is_empty());
+        assert_eq!(list.len(), 1);
+        match list.get(0).unwrap().body {
+            EventBody::ParamRamp {
+                start, end, len, ..
+            } => {
+                assert_eq!(list.get(0).unwrap().sample_offset, 0);
+                assert!((start - 0.5).abs() < 1e-6);
+                assert!((end - 1.0).abs() < 1e-6);
+                assert_eq!(len, 256);
+            }
+            other => panic!("expected ParamRamp, got {other:?}"),
+        }
+        // Host that DOES re-deliver Block 2 with start=-256: retained ramp defers without duplicating.
+        list.clear();
+        let auv3_b2 = [AuParamEventV2 {
+            start_offset: -256,
+            duration_frames: 512,
+            param_id: 0,
+            flags: 0,
+            start_value: 0.0,
+            end_value: 1.0,
+        }];
+        let (s2, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &auv3_b2,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s2, AU_PROCESS_OK);
+        assert!(active_ramps.is_empty());
+        assert_eq!(list.len(), 1);
+        match list.get(0).unwrap().body {
+            EventBody::ParamRamp {
+                start, end, len, ..
+            } => {
+                assert_eq!(list.get(0).unwrap().sample_offset, 0);
+                assert!((start - 0.5).abs() < 1e-6);
+                assert!((end - 1.0).abs() < 1e-6);
+                assert_eq!(len, 256);
+            }
+            other => panic!("expected ParamRamp, got {other:?}"),
+        }
+
+        // 3. BlockSplit { min: 32 } subdivides a 512-sample ramp into 16 stepped ParamChanges
+        list.clear();
+        let full_ramp = [AuParamEventV2 {
+            start_offset: 0,
+            duration_frames: 512,
+            param_id: 0,
+            flags: AU_PARAM_EVENT_HAS_START_VALUE,
+            start_value: 0.0,
+            end_value: 1.0,
+        }];
+        let (s3, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::BlockSplit { min: 32 },
+            &full_ramp,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s3, AU_PROCESS_OK);
+        assert_eq!(list.len(), 16);
+        assert_eq!(list.get(0).unwrap().sample_offset, 0);
+        assert_eq!(list.get(15).unwrap().sample_offset, 480);
+        match list.get(15).unwrap().body {
+            EventBody::ParamChange { value, .. } => assert!((value - 1.0).abs() < 1e-6),
+            other => panic!("expected ParamChange, got {other:?}"),
+        }
+
+        // 4. Future ramp is ignored; past-ended ramp snaps to target at offset 0
+        list.clear();
+        let edge_ramps = [
+            AuParamEventV2 {
+                start_offset: 600,
+                duration_frames: 100,
+                param_id: 0,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 0.9,
+            },
+            AuParamEventV2 {
+                start_offset: -200,
+                duration_frames: 100,
+                param_id: 0,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 0.8,
+            },
+        ];
+        let (s4, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &edge_ramps,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s4, AU_PROCESS_OK);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.get(0).unwrap().sample_offset, 0);
+        match list.get(0).unwrap().body {
+            EventBody::ParamChange { value, .. } => assert!((value - 0.8).abs() < 1e-6),
+            other => panic!("expected ParamChange, got {other:?}"),
+        }
+
+        // 5. Mid-ramp replacement at frame 256 derives exact midpoint 0.5 (not end 1.0)
+        params.set_plain(0, 0.0);
+        list.clear();
+        active_ramps.clear();
+        let mid_replace = [
+            AuParamEventV2 {
+                start_offset: 0,
+                duration_frames: 512,
+                param_id: 0,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 1.0,
+            },
+            AuParamEventV2 {
+                start_offset: 256,
+                duration_frames: 256,
+                param_id: 0,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 0.0,
+            },
+        ];
+        let (s5, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &mid_replace,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s5, AU_PROCESS_OK);
+        assert_eq!(list.len(), 2);
+        match list.get(0).unwrap().body {
+            EventBody::ParamRamp {
+                start, end, len, ..
+            } => {
+                assert_eq!(list.get(0).unwrap().sample_offset, 0);
+                assert!((start - 0.0).abs() < 1e-6);
+                assert!(
+                    (end - 0.5).abs() < 1e-6,
+                    "preceding ramp must end at replacement midpoint 0.5, got {end}"
+                );
+                assert_eq!(
+                    len, 256,
+                    "preceding ramp must truncate at replacement frame"
+                );
+            }
+            other => panic!("expected truncated ParamRamp, got {other:?}"),
+        }
+        match list.get(1).unwrap().body {
+            EventBody::ParamRamp {
+                start, end, len, ..
+            } => {
+                assert_eq!(list.get(1).unwrap().sample_offset, 256);
+                assert!(
+                    (start - 0.5).abs() < 1e-6,
+                    "mid-ramp start must be 0.5, got {start}"
+                );
+                assert!((end - 0.0).abs() < 1e-6);
+                assert_eq!(len, 256);
+            }
+            other => panic!("expected ParamRamp, got {other:?}"),
+        }
+
+        // Both explicit ramps start before the slice. Only the newer ramp's
+        // remaining 16 frames should be audible.
+        list.clear();
+        let overlapping = [
+            AuParamEventV2 {
+                start_offset: -64,
+                duration_frames: 512,
+                ..full_ramp[0]
+            },
+            AuParamEventV2 {
+                start_offset: -16,
+                duration_frames: 32,
+                end_value: 0.25,
+                ..full_ramp[0]
+            },
+        ];
+        let (status, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::BlockSplit { min: 32 },
+            &overlapping,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(status, AU_PROCESS_OK);
+        assert_eq!(list.len(), 1);
+        assert!(
+            matches!(list.get(0).unwrap().body, EventBody::ParamChange { value, .. } if (value - 0.25).abs() < 1e-6)
+        );
+
+        // 6. Tracker supports >64 distinct parameters without truncating
+        let mut big_list = EventList::with_capacity(256);
+        let mut many_events = Vec::with_capacity(81);
+        for id in 0..80_u32 {
+            many_events.push(AuParamEventV2 {
+                start_offset: 0,
+                duration_frames: 0,
+                param_id: id,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 0.75,
+            });
+        }
+        many_events.push(AuParamEventV2 {
+            start_offset: 16,
+            duration_frames: 64,
+            param_id: 79,
+            flags: 0,
+            start_value: 0.0,
+            end_value: 1.0,
+        });
+        let (s6, _) = push_param_events_v2(
+            &mut big_list,
+            params.as_ref(),
+            Automation::PerSample,
+            &many_events,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s6, AU_PROCESS_OK);
+        match big_list.get(80).unwrap().body {
+            EventBody::ParamRamp {
+                id,
+                start,
+                end,
+                len,
+            } => {
+                assert_eq!(id, 79);
+                assert!((start - 0.75).abs() < 1e-6);
+                assert!((end - 1.0).abs() < 1e-6);
+                assert_eq!(len, 64);
+            }
+            other => panic!("expected ParamRamp, got {other:?}"),
+        }
+
+        // 7. Retained active_ramps overflow reports AU_PROCESS_QUEUE_FULL instead of dropping
+        let mut tiny_ramps = Vec::with_capacity(1);
+        list.clear();
+        let two_continuing = [
+            AuParamEventV2 {
+                start_offset: 256,
+                duration_frames: 512,
+                param_id: 0,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 1.0,
+            },
+            AuParamEventV2 {
+                start_offset: 256,
+                duration_frames: 512,
+                param_id: 1,
+                flags: 0,
+                start_value: 0.0,
+                end_value: 1.0,
+            },
+        ];
+        let (s7, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::PerSample,
+            &two_continuing,
+            512,
+            &mut tiny_ramps,
+            &mut tracker,
+        );
+        assert_eq!(s7, crate::ffi::AU_PROCESS_QUEUE_FULL);
+    }
+
+    #[test]
+    fn catalog_growth_preserves_independent_feedback_sequences() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use moose_params::{ParamCatalog, Params};
+        type P = LargePlugin<16>;
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(std::ptr::null());
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let original = inst.params_arc.param_catalog()[0];
+            let catalog = ParamCatalog::new(vec![
+                original,
+                moose_params::ParamInfo {
+                    id: 10_001,
+                    ..original
+                },
+                moose_params::ParamInfo {
+                    id: 10_002,
+                    ..original
+                },
+            ]);
+            inst.edit_param(original.id, || ());
+            let first = inst.param_edit_seq(original.id);
+            inst.param_edit_seqs.extend_catalog(&catalog);
+            inst.edit_param(10_001, || ());
+            assert_eq!(inst.param_edit_seq(original.id), first);
+            assert!(inst.param_edit_seq(10_001) > first);
+            assert_eq!(inst.param_edit_seq(10_002), 0);
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn v13_feedback_epoch_skips_stale_and_allows_reentrant_siblings() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_param_set_value};
+        use crate::ffi::MooseAuHostSink;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use std::sync::Mutex;
+
+        type P = LargePlugin<16>;
+
+        #[derive(Default)]
+        struct ReentrantHost {
+            intervening_edit: std::cell::Cell<bool>,
+            ctx: Mutex<usize>,
+            received: Mutex<Vec<(u32, f32)>>,
+        }
+
+        unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, id: u32, val: f32) {
+            let h = unsafe { &*ud.cast::<ReentrantHost>() };
+            h.received.lock().unwrap().push((id, val));
+            // Simulate AUv2 AudioUnitSetParameter synchronously calling back
+            // into cb_param_set_value during feedback drain.
+            let ctx = *h.ctx.lock().unwrap() as *mut std::ffi::c_void;
+            if h.intervening_edit.replace(false) {
+                unsafe { cb_param_set_value::<P>(ctx, id, 0.875) };
+            }
+            unsafe { cb_param_set_value::<P>(ctx, id, f64::from(val)) };
+        }
+
+        let host = Box::new(ReentrantHost::default());
+        let sink = MooseAuHostSink {
+            user_data: std::ptr::from_ref(&*host)
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            set_param: Some(on_set),
+            ..MooseAuHostSink::default()
+        };
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            *host.ctx.lock().unwrap() = ctx as usize;
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let main = moose_core::thread::MainThread::assume();
+
+            // Two sibling feedback entries from the same render block share a block_seq:
+            // re-entrant `cb_param_set_value` during the first must NOT cancel the second.
+            let ep0 = crate::instance::FeedbackEpoch {
+                edits: inst.current_edit_seq(),
+                automation: inst.current_edit_seq(),
+            };
+            assert!(inst.param_out_queue.push((0, 0.25, ep0)).is_ok());
+            assert!(inst.param_out_queue.push((0, 0.40, ep0)).is_ok());
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(*host.received.lock().unwrap(), vec![(0, 0.25), (0, 0.40)]);
+
+            // Editing an unrelated param ID (233) must NOT cancel feedback for param ID 0
+            // (collision-free per-ID sequence tracking).
+            host.received.lock().unwrap().clear();
+            let ep_unrelated = crate::instance::FeedbackEpoch {
+                edits: inst.current_edit_seq(),
+                automation: inst.current_edit_seq(),
+            };
+            assert!(inst.param_out_queue.push((0, 0.35, ep_unrelated)).is_ok());
+            cb_param_set_value::<P>(ctx, 233, 0.5);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(*host.received.lock().unwrap(), vec![(0, 0.35)]);
+
+            // The drain has already checked the sequence when the sink reenters.
+            host.intervening_edit.set(true);
+            assert!(inst.param_out_queue.push((0, 0.20, ep_unrelated)).is_ok());
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert!((crate::callbacks::cb_param_get_value::<P>(ctx, 0) - 0.875).abs() < 1e-6);
+
+            // Now a newer host write to the SAME param ID 0 bumps its sequence BEFORE drain:
+            // stale feedback must be skipped.
+            host.received.lock().unwrap().clear();
+            let stale_ep = crate::instance::FeedbackEpoch {
+                edits: inst.current_edit_seq(),
+                automation: inst.current_edit_seq(),
+            };
+            assert!(inst.param_out_queue.push((0, 0.10, stale_ep)).is_ok());
+            cb_param_set_value::<P>(ctx, 0, 0.90);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert!(
+                host.received.lock().unwrap().is_empty(),
+                "stale feedback must not overwrite a newer host edit"
+            );
+
+            // And a host edit to param 0 that happens DURING process (after the edit cutoff
+            // was captured) must be skipped by `cb_commit_output_params` without clobbering `params_arc`.
+            let block_seq = inst.current_edit_seq();
+            cb_param_set_value::<P>(ctx, 0, 0.88);
+            {
+                let mut audio = inst.audio.enter();
+                audio.feedback_epoch.edits = block_seq;
+                audio.native_output_param_feedback_available = true;
+                audio.output_events.clear();
+                audio
+                    .output_events
+                    .push(Event::new(0, EventBody::ParamChange { id: 0, value: 0.12 }));
+            }
+            assert_eq!(
+                crate::output_events::cb_commit_output_params::<P>(ctx),
+                crate::ffi::AU_OUTPUT_END
+            );
+            assert!((crate::callbacks::cb_param_get_value::<P>(ctx, 0) - 0.88).abs() < 1e-6);
+
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn feedback_publication_yields_to_an_in_flight_edit() {
+        use crate::callbacks::{cb_create, cb_destroy, cb_param_get_value};
+        use crate::instance::{AuInstance, FeedbackEpoch};
+        use crate::large_state_fixture::LargePlugin;
+        use moose_params::Params;
+
+        type P = LargePlugin<16>;
+        unsafe {
+            let ctx = cb_create::<P>();
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let epoch = FeedbackEpoch::default();
+            inst.edit_param(0, || {
+                inst.params_arc.set_plain(0, 0.875);
+                // The edit's sequence has not advanced yet. Holding the
+                // write reservation alone must stop concurrent publication.
+                assert!(!inst.publish_feedback(0, epoch, || inst.params_arc.set_plain(0, 0.25)));
+                assert!(!inst.feedback_is_current(0, epoch));
+            });
+            assert!(!inst.publish_feedback(0, epoch, || inst.params_arc.set_plain(0, 0.25)));
+            assert!((cb_param_get_value::<P>(ctx, 0) - 0.875).abs() < 1e-6);
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn accepted_automation_does_not_hide_an_edit_during_staging() {
+        use crate::callbacks::{cb_create, cb_destroy};
+        use crate::instance::{AuInstance, FeedbackEpoch};
+        use crate::large_state_fixture::LargePlugin;
+
+        type P = LargePlugin<16>;
+        unsafe {
+            let ctx = cb_create::<P>();
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let edits = inst.current_edit_seq();
+            inst.accept_automation(0);
+            let epoch = FeedbackEpoch {
+                edits,
+                automation: inst.current_edit_seq(),
+            };
+            assert!(inst.publish_feedback(0, epoch, || ()));
+            // The same accepted automation must invalidate older queued feedback.
+            assert!(!inst.feedback_is_current(0, FeedbackEpoch::default()));
+            assert!(inst.feedback_is_current(0, epoch));
+
+            // An asynchronous edit lands after staging read the old value.
+            inst.edit_param(0, || ());
+            inst.accept_automation(0);
+            let epoch = FeedbackEpoch {
+                edits,
+                automation: inst.current_edit_seq(),
+            };
+            assert!(!inst.publish_feedback(0, epoch, || panic!("stale feedback published")));
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn v13_truncated_host_sink_copies_only_complete_fields() {
+        use crate::ffi::MooseAuHostSink;
+        use crate::host_drain::HostSink;
+
+        unsafe extern "C" fn dummy_set(_ud: *mut std::ffi::c_void, _id: u32, _v: f32) {}
+
+        // Declare a size that ends halfway through `set_param`: `set_param` must NOT be copied.
+        let truncated_size = std::mem::offset_of!(MooseAuHostSink, set_param) + 4;
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = MooseAuHostSink {
+            size: truncated_size as u32,
+            set_param: Some(dummy_set),
+            ..MooseAuHostSink::default()
+        };
+        let sink = unsafe { HostSink::from_raw(&raw const raw) };
+        assert!(!sink.has_set_param());
+
+        // Full size copies `set_param` normally.
+        let full = MooseAuHostSink {
+            set_param: Some(dummy_set),
+            ..MooseAuHostSink::default()
+        };
+        let sink_full = unsafe { HostSink::from_raw(&raw const full) };
+        assert!(sink_full.has_set_param());
+    }
+
+    #[test]
+    fn v13_combined_presentation_and_rescan_fires_both_and_defers_active_catalog() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_set_active};
+        use crate::ffi::MooseAuHostSink;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use moose_core::host_queue::HostSignal;
+        use moose_params::Params;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        type P = LargePlugin<16>;
+
+        #[derive(Default)]
+        struct NotifCounts {
+            values: AtomicUsize,
+            pres: AtomicUsize,
+        }
+        unsafe extern "C" fn on_values(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<NotifCounts>() }
+                .values
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_pres(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<NotifCounts>() }
+                .pres
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let counts = Box::new(NotifCounts::default());
+        let sink = MooseAuHostSink {
+            user_data: std::ptr::from_ref(&*counts)
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            param_values_changed: Some(on_values),
+            param_presentation_changed: Some(on_pres),
+            ..MooseAuHostSink::default()
+        };
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let main = moose_core::thread::MainThread::assume();
+
+            // Activate, stash a pending audio catalog update, and verify it is
+            // installed into `audio.catalog` on deactivation.
+            cb_set_active::<P>(ctx, 1);
+            let replacement = inst.params_arc.param_catalog();
+            let replacement_ptr = std::sync::Arc::as_ptr(&replacement);
+            *inst.pending_audio_catalog.lock().unwrap() = Some(replacement);
+            cb_set_active::<P>(ctx, 0);
+            assert!(inst.pending_audio_catalog.lock().unwrap().is_none());
+            assert_eq!(
+                std::sync::Arc::as_ptr(&inst.audio.enter().catalog),
+                replacement_ptr
+            );
+
+            // Combined PRESENTATION + PARAM_RESCAN must still deliver PARAM_RESCAN
+            // even when presentation didn't change, and vice versa.
+            inst.host_queue
+                .signal(HostSignal::PRESENTATION | HostSignal::PARAM_RESCAN);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(counts.values.load(Ordering::Relaxed), 1);
+
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn v13_reentrant_destroy_inside_host_drain_does_not_deadlock() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::ffi::MooseAuHostSink;
+        use crate::host_drain::run_host_drain;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        type P = LargePlugin<16>;
+
+        #[derive(Default)]
+        struct ReentrantTeardownHost {
+            ctx: AtomicUsize,
+            latency_hits: AtomicUsize,
+            tail_hits: AtomicUsize,
+            released: AtomicBool,
+        }
+
+        unsafe extern "C" fn on_latency(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<ReentrantTeardownHost>() };
+            h.latency_hits.fetch_add(1, Ordering::Relaxed);
+            // Simulate a host dropping its last AU reference inside KVO ->
+            // synchronous `deinit` -> `cb_destroy` on the same main queue.
+            let ctx = h.ctx.load(Ordering::Acquire) as *mut std::ffi::c_void;
+            unsafe { cb_destroy::<P>(ctx) };
+        }
+        unsafe extern "C" fn on_tail(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<ReentrantTeardownHost>() }
+                .tail_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_release(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<ReentrantTeardownHost>() }
+                .released
+                .store(true, Ordering::Release);
+        }
+
+        let host = Box::new(ReentrantTeardownHost::default());
+        let sink = MooseAuHostSink {
+            user_data: std::ptr::from_ref(&*host)
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            release_user_data: Some(on_release),
+            latency_changed: Some(on_latency),
+            tail_changed: Some(on_tail),
+            ..MooseAuHostSink::default()
+        };
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            assert!(!ctx.is_null());
+            host.ctx.store(ctx as usize, Ordering::Release);
+            let queue = Arc::clone(&(*ctx.cast::<AuInstance<P>>()).host_queue);
+            (*ctx.cast::<AuInstance<P>>())
+                .delay
+                .observe_and_signal(128, 2048, &queue);
+
+            run_host_drain::<P>(&queue, ctx);
+        }
+        assert_eq!(host.latency_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            host.tail_hits.load(Ordering::Relaxed),
+            0,
+            "callbacks after re-entrant destroy must be skipped"
+        );
+        assert!(
+            host.released.load(Ordering::Acquire),
+            "deferred destroy must finalize and invoke release_user_data once with_open exits"
+        );
+    }
+
+    #[test]
+    fn direct_begin_can_destroy_its_instance() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::ffi::MooseAuHostSink;
+        use crate::large_state_fixture::LargePlugin;
+        use std::cell::Cell;
+        type P = LargePlugin<16>;
+        struct Host {
+            ctx: Cell<*mut std::ffi::c_void>,
+            released: Cell<bool>,
+        }
+        unsafe extern "C" fn begin(data: *mut std::ffi::c_void, _: u32) {
+            let host = unsafe { &*data.cast::<Host>() };
+            unsafe { cb_destroy::<P>(host.ctx.get()) };
+            assert!(!host.released.get());
+        }
+        unsafe extern "C" fn release(data: *mut std::ffi::c_void) {
+            unsafe { &*data.cast::<Host>() }.released.set(true);
+        }
+        let mut host = Host {
+            ctx: Cell::default(),
+            released: Cell::default(),
+        };
+        let sink = MooseAuHostSink {
+            user_data: (&raw mut host).cast(),
+            begin_edit: Some(begin),
+            release_user_data: Some(release),
+            ..MooseAuHostSink::default()
+        };
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            host.ctx.set(ctx);
+            crate::gui::editor_context::<P>(ctx).begin_edit(0_u32);
+        }
+        assert!(host.released.get());
+    }
+
+    #[test]
+    fn saturated_gesture_queue_keeps_end() {
+        use crate::instance::{EditorGesture, GestureQueue};
+        let mut q = GestureQueue::default();
+        q.push(EditorGesture::BeginEdit(3));
+        q.pending.pop_front();
+        for _ in 0..300 {
+            q.push(EditorGesture::SetParam(3, 1.0));
+        }
+        q.push(EditorGesture::EndEdit(3));
+        assert_eq!(q.pending.len(), 256);
+        assert!(matches!(q.pending.back(), Some(EditorGesture::EndEdit(3))));
+    }
+
+    #[test]
+    fn v13_worker_thread_editor_gestures_queue_for_ui_thread() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::ffi::MooseAuHostSink;
+        use crate::gui::editor_context;
+        use crate::large_state_fixture::LargePlugin;
+        use std::sync::Mutex;
+        use std::thread::ThreadId;
+
+        type P = LargePlugin<16>;
+
+        struct ThreadCaptureHost {
+            calls: Mutex<Vec<(&'static str, u32, ThreadId)>>,
+        }
+
+        unsafe extern "C" fn on_begin(ud: *mut std::ffi::c_void, id: u32) {
+            unsafe { &*ud.cast::<ThreadCaptureHost>() }
+                .calls
+                .lock()
+                .unwrap()
+                .push(("begin", id, std::thread::current().id()));
+        }
+        unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, id: u32, _v: f32) {
+            unsafe { &*ud.cast::<ThreadCaptureHost>() }
+                .calls
+                .lock()
+                .unwrap()
+                .push(("set", id, std::thread::current().id()));
+        }
+        unsafe extern "C" fn on_end(ud: *mut std::ffi::c_void, id: u32) {
+            unsafe { &*ud.cast::<ThreadCaptureHost>() }
+                .calls
+                .lock()
+                .unwrap()
+                .push(("end", id, std::thread::current().id()));
+        }
+
+        let main_tid = std::thread::current().id();
+        let host = Box::new(ThreadCaptureHost {
+            calls: Mutex::new(Vec::new()),
+        });
+        let sink = MooseAuHostSink {
+            user_data: std::ptr::from_ref(&*host)
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            begin_edit: Some(on_begin),
+            set_param: Some(on_set),
+            end_edit: Some(on_end),
+            ..MooseAuHostSink::default()
+        };
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            let ed = editor_context::<P>(ctx);
+
+            std::thread::spawn(move || {
+                ed.automate(0_u32, 0.75);
+            })
+            .join()
+            .unwrap();
+
+            assert!(
+                host.calls.lock().unwrap().is_empty(),
+                "worker thread must NOT call host_sink callbacks inline"
+            );
+
+            let main = moose_core::thread::MainThread::assume();
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            let calls = host.calls.lock().unwrap();
+            assert_eq!(
+                *calls,
+                vec![
+                    ("begin", 0, main_tid),
+                    ("set", 0, main_tid),
+                    ("end", 0, main_tid),
+                ]
+            );
+            drop(calls);
+
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn v13_legacy_lifecycle_store_sync_and_can_ramp_flag() {
+        use crate::callbacks::{
+            cb_create, cb_create_with_sink, cb_destroy, cb_param_get_value, cb_set_active,
+        };
+        use crate::catalog::AuExposedParams;
+        use crate::ffi::{
+            AU_OUTPUT_EMITTED, AU_PARAM_FLAG_CAN_RAMP, AuParamInfoOut, MooseAuHostSink,
+        };
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use crate::output_events::cb_commit_output_params;
+        use moose_core::events::{Event, EventBody};
+        use moose_core::info::Automation;
+        use moose_params::Params;
+
+        type P = LargePlugin<16>;
+
+        unsafe extern "C" fn dummy_set(_ud: *mut std::ffi::c_void, _id: u32, _v: f32) {}
+
+        unsafe {
+            // Legacy `cb_create()` must NOT treat missing `set_active` as known-inactive.
+            let legacy = cb_create::<P>();
+            assert!(!(*legacy.cast::<AuInstance<P>>()).is_known_inactive());
+            cb_destroy::<P>(legacy);
+
+            // v13 `cb_create_with_sink` starts known-inactive, flips active, and back.
+            let sink = MooseAuHostSink {
+                set_param: Some(dummy_set),
+                ..MooseAuHostSink::default()
+            };
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            assert!(inst.is_known_inactive());
+            cb_set_active::<P>(ctx, 1);
+            assert!(!inst.is_known_inactive());
+            cb_set_active::<P>(ctx, 0);
+            assert!(inst.is_known_inactive());
+
+            // Output ParamChange commit must update `params_arc` BEFORE queuing so
+            // synchronous host `implementorValueProvider` reads see the emitted value.
+            {
+                let mut audio = inst.audio.enter();
+                audio.native_output_param_feedback_available = true;
+                audio.output_events.clear();
+                audio.output_events.push(Event::new(
+                    0,
+                    EventBody::ParamChange {
+                        id: 0,
+                        value: 0.625,
+                    },
+                ));
+            }
+            assert_eq!(cb_commit_output_params::<P>(ctx), AU_OUTPUT_EMITTED);
+            assert!((cb_param_get_value::<P>(ctx, 0) - 0.625).abs() < 1e-6);
+
+            // CAN_RAMP is advertised in PerSample mode for continuous params,
+            // and in BlockSplit mode only when the param carries ParamFlags::CHUNKED.
+            let catalog = inst.params_arc.param_catalog();
+            let first_id = catalog[0].id;
+            let first_chunked = catalog[0].flags.contains(moose_params::ParamFlags::CHUNKED);
+            let mut per_sample_info = AuParamInfoOut::default();
+            let per_sample_exposed = AuExposedParams::new(
+                std::sync::Arc::clone(&catalog),
+                inst.params_arc.as_ref(),
+                Automation::PerSample,
+            );
+            assert!(per_sample_exposed.fill_info(first_id, &mut per_sample_info));
+            assert_ne!(per_sample_info.flags & AU_PARAM_FLAG_CAN_RAMP, 0);
+
+            let mut block_split_info = AuParamInfoOut::default();
+            let block_split_exposed = AuExposedParams::new(
+                catalog,
+                inst.params_arc.as_ref(),
+                Automation::BlockSplit { min: 32 },
+            );
+            assert!(block_split_exposed.fill_info(first_id, &mut block_split_info));
+            assert_eq!(
+                (block_split_info.flags & AU_PARAM_FLAG_CAN_RAMP) != 0,
+                first_chunked,
+                "BlockSplit CAN_RAMP must match ParamFlags::CHUNKED"
+            );
+
+            cb_destroy::<P>(ctx);
+        }
     }
 
     /// Build a prefilled free-list mirroring the constructor.
@@ -931,6 +2060,268 @@ mod tests {
         // Unparseable components fall back per position (major -> 1).
         assert_eq!(au_version_u32(""), 0x0001_0000);
         assert_eq!(au_version_u32("1.2.3-beta"), 0x0001_0200);
+    }
+
+    #[test]
+    fn v13_200_instances_sink_lifecycle_and_release() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::ffi::MooseAuHostSink;
+        use crate::gui::editor_context;
+        use crate::large_state_fixture::LargePlugin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const N: usize = 200;
+        type P = LargePlugin<16>;
+
+        struct BulkCounters {
+            edits: AtomicUsize,
+            releases: AtomicUsize,
+        }
+
+        unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, _id: u32, _v: f32) {
+            unsafe { &*ud.cast::<BulkCounters>() }
+                .edits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_release(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<BulkCounters>() }
+                .releases
+                .fetch_add(1, Ordering::AcqRel);
+        }
+
+        let counters = Box::new(BulkCounters {
+            edits: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+        });
+        let ud = std::ptr::from_ref(&*counters)
+            .cast_mut()
+            .cast::<std::ffi::c_void>();
+        let sink = MooseAuHostSink {
+            user_data: ud,
+            release_user_data: Some(on_release),
+            set_param: Some(on_set),
+            ..MooseAuHostSink::default()
+        };
+
+        let mut ctxs = Vec::with_capacity(N);
+        unsafe {
+            let main = moose_core::thread::MainThread::assume();
+            for _ in 0..N {
+                let ctx = cb_create_with_sink::<P>(&raw const sink);
+                assert!(!ctx.is_null());
+                let ed = editor_context::<P>(ctx);
+                ed.automate(0_u32, 0.5);
+                crate::gui::drain_host_queue::<P>(ctx, &main);
+                ctxs.push(ctx);
+            }
+            assert_eq!(counters.edits.load(Ordering::Relaxed), N);
+            assert_eq!(counters.releases.load(Ordering::Acquire), 0);
+            for ctx in ctxs {
+                cb_destroy::<P>(ctx);
+            }
+        }
+        assert_eq!(counters.releases.load(Ordering::Acquire), N);
+    }
+
+    #[test]
+    fn v13_stopped_latency_and_tail_change_notifies_independently() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::ffi::MooseAuHostSink;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use crate::output_events::{cb_latency_samples, cb_tail_samples};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        type P = LargePlugin<16>;
+
+        #[derive(Default)]
+        struct DelayHost {
+            ctx: AtomicUsize,
+            lat_calls: AtomicUsize,
+            tail_calls: AtomicUsize,
+            lat_seen: AtomicUsize,
+            tail_seen: AtomicUsize,
+        }
+
+        unsafe extern "C" fn on_lat(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<DelayHost>() };
+            let ctx = h.ctx.load(Ordering::Acquire) as *mut std::ffi::c_void;
+            h.lat_seen.store(
+                unsafe { cb_latency_samples::<P>(ctx) } as usize,
+                Ordering::Relaxed,
+            );
+            h.lat_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_tail(ud: *mut std::ffi::c_void) {
+            let h = unsafe { &*ud.cast::<DelayHost>() };
+            let ctx = h.ctx.load(Ordering::Acquire) as *mut std::ffi::c_void;
+            h.tail_seen.store(
+                unsafe { cb_tail_samples::<P>(ctx) } as usize,
+                Ordering::Relaxed,
+            );
+            h.tail_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let host = Box::new(DelayHost::default());
+        let sink = MooseAuHostSink {
+            user_data: std::ptr::from_ref(&*host)
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            latency_changed: Some(on_lat),
+            tail_changed: Some(on_tail),
+            ..MooseAuHostSink::default()
+        };
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            assert!(!ctx.is_null());
+            host.ctx.store(ctx as usize, Ordering::Release);
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let main = moose_core::thread::MainThread::assume();
+
+            // Stopped latency-only change must NOT notify tail.
+            inst.delay.observe_and_signal(512, 0, &inst.host_queue);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(host.lat_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(host.lat_seen.load(Ordering::Relaxed), 512);
+            assert_eq!(host.tail_calls.load(Ordering::Relaxed), 0);
+
+            // Stopped tail-only change must NOT re-notify latency.
+            inst.delay.observe_and_signal(512, 2048, &inst.host_queue);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(host.lat_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(host.tail_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(host.tail_seen.load(Ordering::Relaxed), 2048);
+
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
+    fn v13_main_thread_hooks_connected_and_context_name_forwarded() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_set_context_name};
+        use crate::ffi::MooseAuHostSink;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::{LargeParams, LargePlugin};
+        use moose_core::buffer::AudioBuffer;
+        use moose_core::config::AudioConfig;
+        use moose_core::events::EventList;
+        use moose_core::export::PluginExport;
+        use moose_core::host_queue::HostSignal;
+        use moose_core::info::PluginInfo;
+        use moose_core::main_thread::{HostNotice, HostNotifier, MainThreadHooks, TrackInfo};
+        use moose_core::meters::MeterStore;
+        use moose_core::plugin::PluginRuntime;
+        use moose_core::process::{ProcessContext, ProcessStatus};
+        use moose_core::snapshot::SnapshotSlot;
+        use std::ffi::CString;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        static HOOK_LOG: std::sync::OnceLock<Mutex<Vec<Option<String>>>> =
+            std::sync::OnceLock::new();
+        static CONNECTED: AtomicBool = AtomicBool::new(false);
+
+        struct HookRecorder {
+            notifier: Option<HostNotifier>,
+        }
+        impl MainThreadHooks for HookRecorder {
+            fn connect(&mut self, host: HostNotifier) {
+                CONNECTED.store(true, Ordering::Release);
+                host.notify(HostNotice::NOTE_NAMES);
+                self.notifier = Some(host);
+            }
+            fn track_info_changed(
+                &mut self,
+                _main: &moose_core::thread::MainThread,
+                info: &TrackInfo,
+            ) {
+                HOOK_LOG
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock()
+                    .unwrap()
+                    .push(info.name.clone());
+            }
+        }
+
+        struct HookPlugin {
+            params: Arc<LargeParams>,
+            meters: Arc<MeterStore>,
+            snapshot: Arc<SnapshotSlot>,
+        }
+        impl PluginRuntime for HookPlugin {
+            type Sample = f32;
+            fn info() -> PluginInfo {
+                LargePlugin::<16>::info()
+            }
+            fn reset(&mut self, _: &AudioConfig) {}
+            fn process(
+                &mut self,
+                _: &mut AudioBuffer<'_, f32>,
+                _: &EventList,
+                _: &mut ProcessContext,
+            ) -> ProcessStatus {
+                ProcessStatus::Normal
+            }
+        }
+        impl PluginExport for HookPlugin {
+            type Params = LargeParams;
+            fn create() -> Self {
+                Self {
+                    params: Arc::new(LargeParams::new()),
+                    meters: MeterStore::new(),
+                    snapshot: SnapshotSlot::new(),
+                }
+            }
+            fn params(&self) -> &LargeParams {
+                &self.params
+            }
+            fn params_arc(&self) -> Arc<LargeParams> {
+                Arc::clone(&self.params)
+            }
+            fn meter_store(&self) -> Arc<MeterStore> {
+                Arc::clone(&self.meters)
+            }
+            fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+                Arc::clone(&self.snapshot)
+            }
+            fn main_thread(&self) -> Box<dyn MainThreadHooks> {
+                Box::new(HookRecorder { notifier: None })
+            }
+        }
+
+        let sink = MooseAuHostSink::default();
+
+        HOOK_LOG
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clear();
+        CONNECTED.store(false, Ordering::Release);
+
+        unsafe {
+            let ctx = cb_create_with_sink::<HookPlugin>(&raw const sink);
+            assert!(!ctx.is_null());
+            assert!(
+                CONNECTED.load(Ordering::Acquire),
+                "MainThreadHooks::connect must run during cb_create_with_sink"
+            );
+
+            let inst = &*ctx.cast::<AuInstance<HookPlugin>>();
+            assert!(
+                inst.host_queue.pending().contains(HostSignal::NOTE_NAMES),
+                "HostNotifier passed to connect() must target the instance's HostQueue"
+            );
+
+            let track = CString::new("Bass Bus").unwrap();
+            cb_set_context_name::<HookPlugin>(ctx, track.as_ptr());
+            cb_set_context_name::<HookPlugin>(ctx, std::ptr::null());
+
+            let seen = HOOK_LOG.get().unwrap().lock().unwrap().clone();
+            assert_eq!(seen, vec![Some("Bass Bus".to_string()), None]);
+
+            cb_destroy::<HookPlugin>(ctx);
+        }
     }
 }
 

@@ -24,8 +24,8 @@ use clap_sys::plugin::clap_plugin;
 use moose_core::bus_routing::{BusActivation, BusRouting};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::export::PluginExport;
-use moose_core::host_queue::{HostMessage, HostSignal};
-use moose_core::main_thread::HostNotice;
+use moose_core::host_queue::{HostSignal, HostSink, dispatch};
+use moose_core::main_thread::MenuTarget;
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
 use moose_core::thread::MainThread;
@@ -366,6 +366,107 @@ pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *cons
     });
 }
 
+struct ClapSink<'a, P: PluginExport> {
+    plugin: *const clap_plugin,
+    data: &'a ClapPluginData<P>,
+    main: &'a MainThread,
+    host: crate::host_handle::HostHandle<crate::host_handle::MainThread>,
+    active: bool,
+    pending: HostSignal,
+}
+
+impl<P: PluginExport> HostSink for ClapSink<'_, P> {
+    fn persist_changed(&mut self) {
+        if let Some((id, value)) = self.data.params_arc.take_persist_change()
+            && value.is_finite()
+            && (0.0..=1.0).contains(&value)
+            && self.data.params_arc.get_normalized(id).is_some()
+        {
+            // The ordinary gesture queue works independently of GUI creation.
+            // SAFETY: `self.plugin` is live for the duration of `on_main_thread`.
+            let context = unsafe { editor_context::<P>(self.plugin) };
+            context.begin_edit(id);
+            context.set_param(id, value);
+            context.end_edit(id);
+            // State dirtiness must also reach an inactive host that does not
+            // implement params/request_flush.
+            // SAFETY: main thread, live host handle.
+            unsafe { self.host.mark_dirty(self.data.host_state) };
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.mark_dirty(self.data.host_state) };
+    }
+
+    fn floating_closed(&mut self) {
+        self.data.gui.enter().visible = false;
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.gui_closed(false) };
+    }
+
+    fn param_values_changed(&mut self) {
+        self.pending |= HostSignal::PARAM_RESCAN;
+    }
+
+    fn note_names_changed(&mut self) {
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.note_name_changed() };
+    }
+
+    fn voice_info_changed(&mut self) {
+        // SAFETY: main thread, live host handle.
+        unsafe { self.host.voice_info_changed() };
+    }
+
+    fn audio_ports_changed(&mut self) {
+        self.data.ports_rescan.store(true, Ordering::Relaxed);
+        if self.active {
+            self.pending |= HostSignal::RESTART;
+        }
+    }
+
+    fn latency_changed(&mut self) {
+        self.pending |= HostSignal::LATENCY;
+    }
+
+    fn request_restart(&mut self) {
+        self.pending |= HostSignal::RESTART;
+    }
+
+    fn flush_signals(&mut self) {
+        // Catalog changes, presentation revisions and value rescans. A
+        // structure change requests a restart and is published inactive.
+        // SAFETY: main thread, live instance.
+        unsafe {
+            catalog_sync::sync_parameters(
+                self.data,
+                self.main,
+                self.pending.contains(HostSignal::PARAM_RESCAN),
+            );
+        }
+        if !self.active && self.data.ports_rescan.swap(false, Ordering::Relaxed) {
+            // SAFETY: main thread, live instance, inactive.
+            unsafe { host_rescan_audio_ports(self.data, self.main) };
+        }
+        // CLAP 1.2 `clap_host_latency.changed` is `[main-thread & being-activated]`,
+        // so an active latency change requests a restart and `activate` emits
+        // `latency.changed` once the new latency is published.
+        if self.pending.contains(HostSignal::LATENCY) && !self.host.is_null() && self.active {
+            self.pending |= HostSignal::RESTART;
+        }
+        if self.pending.contains(HostSignal::RESTART) {
+            // SAFETY: `request_restart` is [thread-safe].
+            unsafe { self.host.as_any().request_restart() };
+        }
+    }
+
+    fn context_menu(&mut self, target: MenuTarget, x: i32, y: i32) {
+        context_menu::popup(self.data, self.main, target, x, y);
+    }
+}
+
 pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
     plugin: *const clap_plugin,
 ) {
@@ -378,63 +479,15 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
         let host = data.host.on_main_thread(&main);
         // Everything raised from here on wakes the host again.
         let drain = data.host_queue.drain(&main);
-        let signals = drain.signals;
-        if signals.contains(HostSignal::PERSIST)
-            && let Some((id, value)) = data.params_arc.take_persist_change()
-            && value.is_finite()
-            && (0.0..=1.0).contains(&value)
-            && data.params_arc.get_normalized(id).is_some()
-        {
-            // The ordinary gesture queue works independently of GUI creation.
-            let context = editor_context::<P>(plugin);
-            context.begin_edit(id);
-            context.set_param(id, value);
-            context.end_edit(id);
-            // State dirtiness must also reach an inactive host that does not
-            // implement params/request_flush.
-            host.mark_dirty(data.host_state);
-        }
-        if signals.contains(HostSignal::MARK_DIRTY) {
-            host.mark_dirty(data.host_state);
-        }
-        if signals.contains(HostSignal::FLOATING_CLOSED) {
-            data.gui.enter().visible = false;
-            host.gui_closed(false);
-        }
-        // Catalog changes, presentation revisions and value rescans. A
-        // structure change requests a restart and is published inactive.
-        catalog_sync::sync_parameters(data, &main, signals.contains(HostSignal::PARAM_RESCAN));
-        let notices = signals.notices();
-        if notices.contains(HostNotice::NOTE_NAMES) {
-            host.note_name_changed();
-        }
-        if notices.contains(HostNotice::VOICE_INFO) {
-            host.voice_info_changed();
-        }
-        let active = data.active.load(Ordering::Relaxed);
-        let mut restart = signals.contains(HostSignal::RESTART);
-        if notices.contains(HostNotice::AUDIO_PORTS) {
-            data.ports_rescan.store(true, Ordering::Relaxed);
-            restart |= active;
-        }
-        if !active && data.ports_rescan.swap(false, Ordering::Relaxed) {
-            host_rescan_audio_ports(data, &main);
-        }
-        // CLAP 1.2 `clap_host_latency.changed` is `[main-thread & being-activated]`,
-        // so an active latency change requests a restart and `activate` emits
-        // `latency.changed` once the new latency is published.
-        if signals.contains(HostSignal::LATENCY) && !host.is_null() && active {
-            restart = true;
-        }
-        if restart {
-            host.as_any().request_restart();
-        }
-        for message in drain {
-            // Messages added to moose after this wrapper are dropped.
-            if let HostMessage::ContextMenu { target, x, y } = message {
-                context_menu::popup(data, &main, target, x, y);
-            }
-        }
+        let mut sink = ClapSink {
+            plugin,
+            data,
+            main: &main,
+            host,
+            active: data.active.load(Ordering::Relaxed),
+            pending: HostSignal::empty(),
+        };
+        dispatch(drain, &mut sink);
     }
 }
 

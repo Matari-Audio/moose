@@ -853,7 +853,10 @@ mod tests {
             SmoothingStyle::Exponential(20.0),
             SmoothingStyle::Logarithmic(20.0),
         ];
+        #[cfg(not(miri))]
         let blocks = [1_usize, 7, 64, 3, 512, 1, 128, 1000, 33, 2048];
+        #[cfg(miri)]
+        let blocks = [1_usize, 7, 16, 3, 32, 1, 16, 24, 9, 64];
         for style in styles {
             let shared = Smoother::new(style);
             shared.set_sample_rate(48_000.0);
@@ -941,7 +944,10 @@ mod tests {
             SmoothingStyle::Exponential(20.0),
             SmoothingStyle::Logarithmic(20.0),
         ];
+        #[cfg(not(miri))]
         let blocks = [1_usize, 7, 64, 3, 512, 1, 128, 1000, 33, 2048];
+        #[cfg(miri)]
+        let blocks = [1_usize, 7, 16, 3, 32, 1, 16, 24, 9, 64];
         for style in styles {
             let mk = || {
                 let s = Smoother::new(style);

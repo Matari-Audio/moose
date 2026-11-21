@@ -1,8 +1,7 @@
-//! Editor callbacks and the shim's view entry points.
+//! Editor callbacks, `HostContext`, and main-thread `HostQueue` drain.
 
-use crate::instance::{AuCtx, AuInstance, StateLoadQueue};
+use crate::instance::{AuCtx, AuInstance, EditorGesture, StateLoadQueue};
 
-#[cfg(target_os = "macos")]
 use moose_core::Float;
 use moose_core::TransportSlot;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -10,7 +9,7 @@ use moose_core::editor::RawWindowHandle;
 use moose_core::editor::{Editor, EditorBridge, HostContext, PluginContext, fit_logical_size};
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
-use moose_core::host_queue::{HostQueue, HostSignal};
+use moose_core::host_queue::{HostQueue, HostSignal, HostSink, dispatch};
 use moose_core::main_thread::HostNotice;
 use moose_core::meters::MeterStore;
 use moose_core::snapshot::SnapshotSlot;
@@ -18,9 +17,104 @@ use moose_core::state;
 use moose_core::thread::MainThread;
 use moose_core::wrapper::{custom_state_view, run_extern_callback_with};
 use moose_params::Params;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError};
+
+thread_local! {
+    /// Target `(ctx, param_id, value bits)` strictly while `drain_host_queue` invokes
+    /// `HostSink::set_param` so only the synchronous re-entrant echo for that
+    /// exact instance + parameter skips bumping `param_edit_seqs`.
+    static IN_AU_FEEDBACK_DRAIN: Cell<Option<(*mut std::ffi::c_void, u32, u64)>> = const { Cell::new(None) };
+    /// Active host registrations and their deferred destruction flags, so
+    /// a synchronous re-entrant `cb_destroy` defers `HostQueue::close` + free
+    /// until `with_open` returns instead of deadlocking on its own registration.
+    static ACTIVE_DRAIN_CTX: RefCell<Vec<(*mut std::ffi::c_void, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+pub(crate) fn take_feedback_echo(ctx: *mut std::ffi::c_void, param_id: u32, value: f64) -> bool {
+    IN_AU_FEEDBACK_DRAIN.with(|cell| {
+        if cell.get() == Some((ctx, param_id, value.to_bits())) {
+            cell.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[inline]
+pub(crate) fn defer_host_destroy(ctx: *mut std::ffi::c_void) -> bool {
+    ACTIVE_DRAIN_CTX.with_borrow_mut(|stack| {
+        if let Some((_, deferred)) = stack.iter_mut().find(|(active, _)| *active == ctx) {
+            *deferred = true;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+struct DrainCtxGuard;
+
+impl Drop for DrainCtxGuard {
+    fn drop(&mut self) {
+        ACTIVE_DRAIN_CTX.with_borrow_mut(Vec::pop);
+    }
+}
+
+/// Run a host callback under the queue lifetime gate. Only the outermost
+/// registration for this instance can take ownership of deferred teardown.
+pub(crate) unsafe fn with_host_open<P: PluginExport, R>(
+    queue: &HostQueue,
+    ctx: *mut std::ffi::c_void,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
+    let mut finalize = false;
+    let result = queue.with_open(|| {
+        ACTIVE_DRAIN_CTX.with_borrow_mut(|stack| stack.push((ctx, false)));
+        let _guard = DrainCtxGuard;
+        let result = f();
+        finalize = ACTIVE_DRAIN_CTX.with_borrow(|stack| stack.last().unwrap().1);
+        result
+    });
+    if finalize {
+        unsafe { crate::callbacks::finalize_destroy::<P>(ctx.cast()) };
+    }
+    result
+}
+
+#[cfg_attr(
+    not(any(target_vendor = "apple", test)),
+    allow(
+        dead_code,
+        reason = "used by drain_host_queue on Apple targets and in tests"
+    )
+)]
+struct FeedbackDrainGuard(Option<(*mut std::ffi::c_void, u32, u64)>);
+
+impl FeedbackDrainGuard {
+    #[cfg_attr(
+        not(any(target_vendor = "apple", test)),
+        allow(
+            dead_code,
+            reason = "used by drain_host_queue on Apple targets and in tests"
+        )
+    )]
+    fn enter(ctx: *mut std::ffi::c_void, param_id: u32, value: f32) -> Self {
+        let prev = IN_AU_FEEDBACK_DRAIN
+            .with(|c| c.replace(Some((ctx, param_id, f64::from(value).to_bits()))));
+        Self(prev)
+    }
+}
+
+impl Drop for FeedbackDrainGuard {
+    fn drop(&mut self) {
+        IN_AU_FEEDBACK_DRAIN.with(|c| c.set(self.0));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HostContext
@@ -39,6 +133,40 @@ pub(crate) struct AuHost<P: PluginExport> {
 }
 
 impl<P: PluginExport> AuHost<P> {
+    fn send_gesture(&self, gesture: EditorGesture) {
+        self.with_open(|| {
+            let inst = unsafe { &*self.ctx.as_ptr().cast::<AuInstance<P>>() };
+            Self::queue_gesture(inst, gesture);
+        });
+    }
+
+    fn queue_gesture(inst: &AuInstance<P>, gesture: EditorGesture) {
+        if let EditorGesture::SetParam(id, _) = gesture
+            && inst.params_arc.parameter_affects_presentation(id)
+        {
+            inst.host_queue.signal(HostSignal::PRESENTATION);
+        }
+        if inst.is_ui_thread() {
+            drain_editor_gestures(inst);
+        }
+        if inst.host_queue.is_closed() {
+            return;
+        }
+        inst.editor_gestures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(gesture);
+        if inst.is_ui_thread() {
+            drain_editor_gestures(inst);
+        } else if let Some(dispatch) = &inst.host_dispatch {
+            dispatch.trigger_now();
+        }
+    }
+
+    fn with_open<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        unsafe { with_host_open::<P, R>(&self.queue, self.ctx.as_ptr(), f) }
+    }
+
     /// # Safety
     /// `ctx` is a live `AuInstance<P>` pointer.
     unsafe fn new(ctx: *mut std::ffi::c_void) -> Self {
@@ -56,70 +184,117 @@ impl<P: PluginExport> AuHost<P> {
     }
 }
 
+fn drain_editor_gestures<P: PluginExport>(inst: &AuInstance<P>) {
+    loop {
+        let Some(gesture) = inst
+            .editor_gestures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .pop_front()
+        else {
+            return;
+        };
+        if inst.host_queue.is_closed() {
+            return;
+        }
+        match gesture {
+            EditorGesture::BeginEdit(id) => unsafe { inst.host_sink.begin_edit(id) },
+            EditorGesture::SetParam(id, plain) => unsafe { inst.host_sink.set_param(id, plain) },
+            EditorGesture::EndEdit(id) => unsafe { inst.host_sink.end_edit(id) },
+        }
+    }
+}
+
+#[cfg_attr(
+    not(any(target_vendor = "apple", test)),
+    allow(
+        dead_code,
+        reason = "used by drain_host_queue on Apple targets and in tests"
+    )
+)]
+fn apply_pending_resize<P: PluginExport>(inst: &AuInstance<P>) {
+    let packed = inst.pending_resize.swap(0, Ordering::AcqRel);
+    if packed == 0 || inst.host_queue.is_closed() {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let (w, h) = ((packed >> 32) as u32, packed as u32);
+    if w == 0 || h == 0 {
+        return;
+    }
+    if let Some(mut gui) = inst.gui.try_enter() {
+        let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
+        if resized && let Some((aw, ah)) = gui.editor.as_ref().map(|e| e.size()) {
+            let handled = unsafe { inst.host_sink.request_resize(aw, ah) };
+            #[cfg(target_os = "macos")]
+            if !handled && gui.view != 0 {
+                unsafe { moose_au_view_fit(gui.view as *mut std::ffi::c_void, aw, ah) };
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = handled;
+        }
+    } else {
+        // Still re-entrantly inside a GUI callback; restore for the next drain.
+        let _ =
+            inst.pending_resize
+                .compare_exchange(0, packed, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
 impl<P: PluginExport> EditorBridge for AuHost<P> {
     fn begin_edit(&self, id: u32) {
-        // Broadcasts kAudioUnitEvent_BeginParameterChangeGesture via
-        // AUEventListenerNotify on macOS AU v2 so hosts (Logic, Live,
-        // Reaper) group subsequent set_param calls into one undo step and
-        // automation gesture. iOS AU v3 notifies via the AUParameterTree.
-        #[cfg(target_os = "macos")]
-        self.queue.with_open(|| unsafe {
-            moose_au_v2_host_begin_param_gesture(self.ctx.as_ptr(), id);
-        });
-        #[cfg(not(target_os = "macos"))]
-        let _ = (self.ctx, id);
+        self.send_gesture(EditorGesture::BeginEdit(id));
     }
 
     fn set_param(&self, id: u32, normalized: f64) {
-        let plain = self.params.set_normalized_returning_plain(id, normalized);
-        #[cfg(target_os = "macos")]
-        self.queue.with_open(|| unsafe {
-            moose_au_v2_host_set_param(self.ctx.as_ptr(), id, f32::from_f64(plain));
+        self.with_open(|| {
+            let inst = unsafe { &*self.ctx.as_ptr().cast::<AuInstance<P>>() };
+            let plain = inst.edit_param(id, || {
+                self.params.set_normalized_returning_plain(id, normalized)
+            });
+            Self::queue_gesture(inst, EditorGesture::SetParam(id, f32::from_f64(plain)));
         });
-        #[cfg(not(target_os = "macos"))]
-        let _ = (self.ctx, plain);
     }
 
     fn end_edit(&self, id: u32) {
-        #[cfg(target_os = "macos")]
-        self.queue.with_open(|| unsafe {
-            moose_au_v2_host_end_param_gesture(self.ctx.as_ptr(), id);
-        });
-        #[cfg(not(target_os = "macos"))]
-        let _ = (self.ctx, id);
+        self.send_gesture(EditorGesture::EndEdit(id));
     }
 
     fn request_resize(&self, w: u32, h: u32) -> bool {
-        // AU v2 has no host-driven resize API: the host observes the
-        // plug-in's NSView frame via AppKit and updates its container in
-        // response. `request_resize` routes back into the editor's own
-        // `set_size` (and fits the container view on macOS).
         if w == 0 || h == 0 {
             return false;
         }
-        self.queue
-            .with_open(|| {
-                // SAFETY: `with_open` keeps the `AuInstance<P>` alive against `cb_destroy`.
-                let inst = unsafe { &*self.ctx.as_ptr().cast::<AuInstance<P>>() };
-                // `try_enter` applies the resize when the cell is free and otherwise
-                // stashes it for `cb_gui_get_size` to apply on the next size query.
-                if let Some(mut gui) = inst.gui.try_enter() {
-                    let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
-                    #[cfg(target_os = "macos")]
-                    if resized
-                        && gui.view != 0
-                        && let Some((w, h)) = gui.editor.as_ref().map(|e| e.size())
-                    {
-                        unsafe { moose_au_view_fit(gui.view as *mut std::ffi::c_void, w, h) };
-                    }
-                    resized
-                } else {
-                    inst.pending_resize
-                        .store((u64::from(w) << 32) | u64::from(h), Ordering::Relaxed);
-                    true
+        self.with_open(|| {
+            // SAFETY: `with_open` keeps the `AuInstance<P>` alive against `cb_destroy`.
+            let inst = unsafe { &*self.ctx.as_ptr().cast::<AuInstance<P>>() };
+            if !inst.is_ui_thread() {
+                inst.pending_resize
+                    .store((u64::from(w) << 32) | u64::from(h), Ordering::Release);
+                if let Some(dispatch) = &inst.host_dispatch {
+                    dispatch.trigger_now();
                 }
-            })
-            .unwrap_or(false)
+                return true;
+            }
+            if let Some(mut gui) = inst.gui.try_enter() {
+                let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
+                if resized && let Some((aw, ah)) = gui.editor.as_ref().map(|e| e.size()) {
+                    let handled = unsafe { inst.host_sink.request_resize(aw, ah) };
+                    #[cfg(target_os = "macos")]
+                    if !handled && gui.view != 0 {
+                        unsafe { moose_au_view_fit(gui.view as *mut std::ffi::c_void, aw, ah) };
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = handled;
+                }
+                resized
+            } else {
+                inst.pending_resize
+                    .store((u64::from(w) << 32) | u64::from(h), Ordering::Release);
+                true
+            }
+        })
+        .unwrap_or(false)
     }
 
     fn get_param(&self, id: u32) -> f64 {
@@ -182,7 +357,116 @@ pub(crate) unsafe fn editor_context<P: PluginExport>(ctx: *mut std::ffi::c_void)
         .with_tasks(inst.task_spawner.clone())
 }
 
-/// Drain the instance's [`HostQueue`] on the main thread.
+#[cfg_attr(
+    not(any(target_vendor = "apple", test)),
+    allow(
+        dead_code,
+        reason = "used by drain_host_queue on Apple targets and in unit tests"
+    )
+)]
+struct AuSink<'a, P: PluginExport> {
+    ctx: *mut std::ffi::c_void,
+    inst: &'a AuInstance<P>,
+    sync_catalog: bool,
+    param_rescan: bool,
+}
+
+impl<P: PluginExport> HostSink for AuSink<'_, P> {
+    fn persist_changed(&mut self) {
+        if self.inst.host_queue.is_closed() {
+            return;
+        }
+        if let Some((id, value)) = self.inst.params_arc.take_persist_change()
+            && value.is_finite()
+            && (0.0..=1.0).contains(&value)
+            && self.inst.params_arc.get_normalized(id).is_some()
+        {
+            // SAFETY: `self.ctx` is a live `AuInstance<P>`.
+            let context = unsafe { editor_context::<P>(self.ctx) };
+            context.automate(id, value);
+        }
+    }
+
+    fn latency_changed(&mut self) {
+        if self.inst.host_queue.is_closed() {
+            return;
+        }
+        // Promote observed latency BEFORE firing AU property / KVO
+        // notifications so synchronous host re-reads immediately see the new
+        // value. Commit only the latency lane so a latency-only drain can
+        // never silently publish a racing tail observation.
+        if self.inst.delay.commit_latency() {
+            // SAFETY: main thread, live instance.
+            unsafe { self.inst.host_sink.latency_changed() };
+        }
+    }
+
+    fn tail_changed(&mut self) {
+        if self.inst.host_queue.is_closed() {
+            return;
+        }
+        if self.inst.delay.commit_tail() {
+            // SAFETY: main thread, live instance.
+            unsafe { self.inst.host_sink.tail_changed() };
+        }
+    }
+
+    fn param_values_changed(&mut self) {
+        self.sync_catalog = true;
+        self.param_rescan = true;
+    }
+
+    fn presentation_changed(&mut self) {
+        self.sync_catalog = true;
+    }
+
+    fn flush_signals(&mut self) {
+        if self.inst.host_queue.is_closed() {
+            return;
+        }
+        if self.sync_catalog {
+            let (catalog_values, presentation_changed, new_catalog) = {
+                let mut exposed = self
+                    .inst
+                    .exposed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                exposed.sync(self.inst.params_arc.as_ref())
+            };
+            if let Some(catalog) = new_catalog {
+                self.inst.param_edit_seqs.extend_catalog(&catalog);
+                let _guard = self
+                    .inst
+                    .lifecycle_lock
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if self.inst.is_known_inactive() {
+                    self.inst.audio.enter().catalog = catalog;
+                    *self
+                        .inst
+                        .pending_audio_catalog
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
+                } else {
+                    *self
+                        .inst
+                        .pending_audio_catalog
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(catalog);
+                }
+            }
+            if presentation_changed && !self.inst.host_queue.is_closed() {
+                unsafe { self.inst.host_sink.param_presentation_changed() };
+            }
+            if (self.param_rescan || catalog_values) && !self.inst.host_queue.is_closed() {
+                unsafe { self.inst.host_sink.param_values_changed() };
+            }
+        }
+    }
+}
+
+/// Drain the instance's [`HostQueue`] and process-emitted parameter feedback
+/// queue on the host main thread.
 ///
 /// # Safety
 /// `ctx` is a live `AuInstance<P>` pointer.
@@ -198,30 +482,38 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
     main: &MainThread,
 ) {
     let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
+
+    // 1. Deliver any off-UI-thread editor gestures and deferred resizes on
+    //    the main/UI thread before host feedback.
+    drain_editor_gestures(inst);
+    apply_pending_resize(inst);
+
+    // 2. Drain process-emitted ParamChange feedback through the host sink,
+    //    skipping any stale entry superseded by a newer host/editor edit.
+    while let Some((id, value, epoch)) = inst.param_out_queue.pop() {
+        if inst.host_queue.is_closed() {
+            return;
+        }
+        if !inst.feedback_is_current(id, epoch) {
+            continue;
+        }
+        let _guard = FeedbackDrainGuard::enter(ctx, id, value);
+        unsafe { inst.host_sink.set_param(id, value) };
+    }
+
+    if inst.host_queue.is_closed() {
+        return;
+    }
+
+    // 3. Drain coalesced HostQueue signals via the shared `HostSink` dispatch.
     let drain = inst.host_queue.drain(main);
-    // Commit only the delay lanes covered by the drained signals so a tail-only
-    // drain can never silently publish a racing latency observation.
-    if drain.has(HostSignal::LATENCY) && inst.delay.commit_latency() {
-        #[cfg(target_os = "macos")]
-        unsafe {
-            moose_au_v2_host_latency_changed(ctx);
-        }
-    }
-    if drain.has(HostSignal::TAIL) && inst.delay.commit_tail() {
-        #[cfg(target_os = "macos")]
-        unsafe {
-            moose_au_v2_host_tail_changed(ctx);
-        }
-    }
-    if drain.has(HostSignal::PERSIST)
-        && let Some((id, value)) = inst.params_arc.take_persist_change()
-        && value.is_finite()
-        && (0.0..=1.0).contains(&value)
-        && inst.params_arc.get_normalized(id).is_some()
-    {
-        let context = unsafe { editor_context::<P>(ctx) };
-        context.automate(id, value);
-    }
+    let mut sink = AuSink {
+        ctx,
+        inst,
+        sync_catalog: false,
+        param_rescan: false,
+    };
+    dispatch(drain, &mut sink);
 }
 
 // ---------------------------------------------------------------------------
@@ -231,8 +523,6 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> i32 {
-    // The editor builder is author code; firewall its lazy construction so
-    // a panic there can't unwind across the C ABI (0 = "no editor").
     run_extern_callback_with::<P, i32>("au", "gui_has_editor", 0, || unsafe {
         if ctx.is_null() {
             return 0;
@@ -240,24 +530,15 @@ pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut gui = inst.gui.enter();
         if gui.editor.is_none() {
-            // Built from the lock-free param store the wrapper already
-            // holds outside the plugin, so opening the GUI never
-            // stalls the audio thread.
             gui.editor = (inst.editor_builder)(inst.params_arc.clone());
         }
         i32::from(gui.editor.is_some())
     })
 }
 
-/// Used by the AU v3 Swift shim in `viewDidLayoutSubviews` to
-/// decide whether to forward host bounds changes to the editor,
-/// and by the AU v2 `uiViewForAudioUnit:withSize:` path to pick
-/// between the host's `preferredSize` and the editor's natural
-/// size. Returns 1 / 0 mapping to "yes / no resizable".
 pub(crate) unsafe extern "C" fn cb_gui_can_resize<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> i32 {
-    // `Editor::can_resize` is author code; firewall it (0 = "not resizable").
     run_extern_callback_with::<P, i32>("au", "gui_can_resize", 0, || unsafe {
         if ctx.is_null() {
             return 0;
@@ -273,29 +554,16 @@ pub(crate) unsafe extern "C" fn cb_gui_can_resize<P: PluginExport>(
     })
 }
 
-/// Host-driven `set_size`. The AU v2 Cocoa view's
-/// `setFrameSize:` / superview-frame observer calls this when the
-/// host resizes its outer container; the AU v3 Swift shim calls
-/// it from `viewDidLayoutSubviews`. Clamps to the editor's
-/// `min_size` / `max_size` / `aspect_ratio` so a host dragging
-/// below the editor's floor doesn't clip widgets (mirrors the
-/// CLAP and VST3 wrappers).
 pub(crate) unsafe extern "C" fn cb_gui_set_size<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     w: u32,
     h: u32,
 ) {
-    // `Editor::set_size` / `can_resize` are author code; firewall them.
     run_extern_callback_with::<P, ()>("au", "gui_set_size", (), || unsafe {
         if ctx.is_null() || w == 0 || h == 0 {
             return;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        // `try_enter`, not `enter`: if `editor.set_size` (driven by a plugin
-        // `request_resize`) ever makes the host re-drive layout synchronously
-        // back into this callback on the same thread, `enter` would
-        // double-enter the still-held cell. Skipping a re-entrant commit is
-        // safe - the host re-asserts the size on its next layout pass.
         let Some(mut gui) = inst.gui.try_enter() else {
             return;
         };
@@ -313,24 +581,11 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
     w: *mut u32,
     h: *mut u32,
 ) {
-    // The editor builder + `Editor::size` are author code; firewall them so
-    // a panic can't unwind across the C ABI.
     run_extern_callback_with::<P, ()>("au", "gui_get_size", (), || unsafe {
         if ctx.is_null() {
             return;
         }
-        // Lazily install the editor here too. Some AU validators
-        // (`auval`, Logic Pro's plugin validator) call `..._get_size`
-        // before `..._has_editor`, which is the canonical install
-        // site. Without the lazy install here those validators see
-        // `inst.editor == None` and silently receive a 0x0 view,
-        // which shows up as "plugin reports invalid size" in their
-        // reports.
         let inst = &*ctx.cast::<AuInstance<P>>();
-        // `try_enter`: same synchronous-relayout re-entry guard as
-        // `cb_gui_set_size`. If busy, report the size the plugin last
-        // requested (still pending), leaving the host's value when there is
-        // none - never re-enter the cell.
         let Some(mut gui) = inst.gui.try_enter() else {
             let packed = inst.pending_resize.load(Ordering::Relaxed);
             if packed != 0 {
@@ -343,16 +598,8 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
             return;
         };
         if gui.editor.is_none() {
-            // Built from the lock-free param store the wrapper already
-            // holds outside the plugin, so opening the GUI never
-            // stalls the audio thread.
             gui.editor = (inst.editor_builder)(inst.params_arc.clone());
         }
-        // Apply a resize the plugin requested re-entrantly through
-        // `request_resize` (deferred there because the `gui` cell was held)
-        // before reporting the size, so the host sees the value the plugin
-        // asked for. A re-request from this `set_size` re-stashes and lands on
-        // the next query.
         let packed = inst.pending_resize.swap(0, Ordering::Relaxed);
         if packed != 0
             && let Some(editor) = gui.editor.as_mut()
@@ -362,10 +609,6 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
             editor.set_size(rw, rh);
         }
         if let Some(ref editor) = gui.editor {
-            // AU is macOS-only; hosts embed our NSView inside a Cocoa
-            // container at logical-point coordinates and AppKit handles
-            // the Retina backing transparently. Report the editor size
-            // as-is - no scaling.
             let (ew, eh) = editor.size();
             *w = ew;
             *h = eh;
@@ -377,15 +620,7 @@ pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     parent: *mut std::ffi::c_void,
 ) -> i32 {
-    // `editor.open` runs author GUI-construction code that can panic;
-    // firewall it so the panic can't unwind across the C ABI.
     run_extern_callback_with::<P, i32>("au", "gui_open", 0, || {
-        // AU is macOS+iOS-only at runtime. Linux/Windows builds compile
-        // the wrapper crate for completeness (it's part of the workspace
-        // build matrix) but the body references AppKit / UIKit /
-        // AUEventListener APIs that don't exist off-Apple. Stubbing the
-        // body keeps the FFI table population in `register_au_inner`
-        // type-checking on every platform.
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = parent;
@@ -404,12 +639,6 @@ pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
                 let handle = RawWindowHandle::AppKit(parent);
                 #[cfg(target_os = "ios")]
                 let handle = RawWindowHandle::UiKit(parent);
-                // Scale policy (same as moose-clap / moose-vst3): the host
-                // scale wins when one is given, else the OS backing scale,
-                // never both multiplied. AU has no host content-scale API,
-                // so nothing is pinned via `set_scale_factor`: sizes stay in
-                // logical AppKit points and the editor follows the parent
-                // view's backing scale.
                 editor.open(handle, context);
                 let opened = editor.is_open();
                 gui.view = if opened { parent as usize } else { 0 };
@@ -425,30 +654,11 @@ pub(crate) unsafe extern "C" fn cb_gui_close<P: PluginExport>(ctx: *mut std::ffi
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut gui = inst.gui.enter();
         if let Some(editor) = gui.editor.as_mut() {
-            // Same boundary-protection as `cb_destroy`: any panic
-            // during `editor.close()` (wgpu surface drop, baseview
-            // window close, NSView removal) would otherwise cross
-            // the FFI line and become an unhandled ObjC exception
-            // in the host.
             let editor_ptr: *mut dyn Editor = editor.as_mut();
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (*editor_ptr).close();
             }));
         }
-        // Keep the editor alive - just closed, not dropped.
-        //
-        // Dropping the editor here would synchronously deallocate its
-        // baseview NSWindow + content NSView. Logic / Pro Tools tend
-        // to call `gui_close` from inside their own NSTimer fire or
-        // a `[CALayer display]` callback, both of which run inside an
-        // implicit autorelease pool that's about to pop. If
-        // `[NSTimer invalidate]` (which baseview's drop chain calls
-        // via `WindowHandle::drop`) re-enters that pool's pop
-        // sequence, the host crashes inside `objc_release` on a
-        // freed `NSAutoreleasePool*`. The editor's `close()` has
-        // already released the NSView contents and Metal resources;
-        // the lightweight Rust struct that survives is reopened
-        // in-place by the next `gui_open` call.
     }
 }
 
@@ -465,18 +675,6 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub(crate) fn malloc(size: usize) -> *mut std::ffi::c_void;
     pub(crate) fn free(ptr: *mut std::ffi::c_void);
-}
-
-// AU v2 host-side automation notifiers: gated to macOS because v2 is
-// macOS-only. iOS uses AU v3 exclusively, where host notification
-// goes through the parameter tree directly.
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    pub(crate) fn moose_au_v2_host_set_param(ctx: *mut std::ffi::c_void, param_id: u32, value: f32);
-    pub(crate) fn moose_au_v2_host_begin_param_gesture(ctx: *mut std::ffi::c_void, param_id: u32);
-    pub(crate) fn moose_au_v2_host_end_param_gesture(ctx: *mut std::ffi::c_void, param_id: u32);
-    pub(crate) fn moose_au_v2_host_latency_changed(ctx: *mut std::ffi::c_void);
-    pub(crate) fn moose_au_v2_host_tail_changed(ctx: *mut std::ffi::c_void);
 }
 
 #[cfg(test)]
@@ -510,11 +708,6 @@ mod tests {
                     HostSignal::MARK_DIRTY | HostSignal::RESTART | HostSignal::NOTE_NAMES
                 )
             );
-
-            let main = MainThread::assume();
-            drain_host_queue::<TestPlugin>(ctx, &main);
-            assert!(inst.host_queue.pending().is_empty());
-
             cb_destroy::<TestPlugin>(ctx);
         }
     }

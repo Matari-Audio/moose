@@ -68,8 +68,13 @@ pub fn apply_queued_state<P: PluginExport>(
     plugin: &mut P,
     queue: &crate::state::StateLoadQueue,
 ) -> Option<Result<(), crate::state::StateLoadError>> {
-    let state = queue.pop()?;
+    let (state, backup) = queue.pop_with_backup()?;
     let result = crate::state::try_apply_state(plugin, &state);
+    if result.is_err()
+        && let Some(backup) = backup
+    {
+        backup.restore(plugin.params());
+    }
     queue.mark_applied(&state, result.is_ok());
     plugin.snapshot_slot().request_fresh();
     Some(result)
@@ -103,24 +108,13 @@ pub fn apply_or_queue_state<P: PluginExport>(
     backup: &crate::state::ParamsBackup,
     can_own: bool,
 ) -> Result<(), crate::state::StateLoadError> {
-    let result = apply_or_queue_inner(plugin, slot, queue, state, can_own);
-    if result.is_err() {
-        backup.restore(params);
-    }
-    result
-}
-
-fn apply_or_queue_inner<P: PluginExport>(
-    plugin: &PluginCell<P>,
-    slot: &crate::snapshot::SnapshotSlot,
-    queue: &crate::state::StateLoadQueue,
-    state: crate::state::DeserializedState,
-    can_own: bool,
-) -> Result<(), crate::state::StateLoadError> {
     // Host thread, before anything is applied or queued: a queued load may
     // answer the host before `load_state` runs, so this is where it can fail.
-    if let Some(extra) = &state.extra {
-        P::validate_state(extra)?;
+    if let Some(extra) = &state.extra
+        && let Err(err) = P::validate_state(extra)
+    {
+        backup.restore(params);
+        return Err(err);
     }
     // `try_enter`: a CLAP `reset` may hold the cell on the audio thread
     // while stopped; then queue instead of panicking on an overlap.
@@ -130,10 +124,13 @@ fn apply_or_queue_inner<P: PluginExport>(
             queue.mark_applied(&stale, true);
         }
         let result = crate::state::try_apply_state(&mut *instance, &state);
+        if result.is_err() {
+            backup.restore(params);
+        }
         instance.republish_snapshot();
         return result;
     }
-    let handle = queue.push_tracked(state);
+    let handle = queue.push_with_backup(state, Some(backup.clone()));
     match queue.wait_applied(&handle, AUDIO_HANDSHAKE_WAIT) {
         Some(false) => Err(crate::state::StateLoadError::Other(
             "plugin load_state rejected the state".into(),

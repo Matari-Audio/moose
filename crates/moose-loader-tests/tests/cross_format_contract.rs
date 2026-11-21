@@ -1488,7 +1488,7 @@ impl Harness for vst3_host_harness::Vst3 {
 
 mod au_host_harness {
     use super::{Contract, HostEvent, MAX_FRAMES};
-    use moose_au::ffi::{AuCallbacks, AuMidiEvent, AuParamEvent};
+    use moose_au::ffi::{AuCallbacks, AuMidiEvent, AuParamEvent, MooseAuHostSink};
     use std::ffi::{CStr, CString, c_char, c_void};
     use std::ptr;
 
@@ -1501,8 +1501,9 @@ mod au_host_harness {
     impl Au {
         pub fn new() -> Self {
             let cb = moose_au::callbacks::<Contract>();
-            let ctx = unsafe { (cb.create)() };
-            assert!(!ctx.is_null(), "AU create");
+            let sink = MooseAuHostSink::default();
+            let ctx = unsafe { (cb.create_with_sink)(&raw const sink) };
+            assert!(!ctx.is_null(), "AU create_with_sink");
             Self { cb, ctx, rate: 0.0 }
         }
 
@@ -1617,12 +1618,13 @@ impl Harness for au_host_harness::Au {
         Self::new()
     }
     fn start(&mut self, rate: f64) {
-        // AudioUnitInitialize -> reset callback (full prepare).
+        // AudioUnitInitialize / allocateRenderResources -> reset + set_active(1).
         self.reset_at(rate);
+        unsafe { (self.cb.set_active)(self.ctx, 1) };
     }
     fn stop(&mut self) {
-        // AudioUnitUninitialize has no Rust callback; the instance just
-        // stops receiving render calls.
+        // AudioUnitUninitialize / deallocateRenderResources -> set_active(0).
+        unsafe { (self.cb.set_active)(self.ctx, 0) };
     }
     fn reset(&mut self) {
         // AudioUnitReset at the same configuration.
@@ -1873,15 +1875,33 @@ fn state_load_state_rejection_rolls_back_when_idle<H: Harness>() {
     );
     assert_eq!(snapshot(&h), before, "{}: rejection rolled back", H::NAME);
 }
-// CLAP + VST3 only; AU diverges, see `divergences::au_idle_load_state_rejection`.
-mod state_load_state_rejection_rolls_back_when_idle {
-    #[test]
-    fn clap() {
-        super::state_load_state_rejection_rolls_back_when_idle::<super::ClapH>();
-    }
-    #[test]
-    fn vst3() {
-        super::state_load_state_rejection_rolls_back_when_idle::<super::Vst3H>();
+for_each_format!(state_load_state_rejection_rolls_back_when_idle);
+
+#[test]
+fn au_state_rejection_after_timeout_restores_params_and_persist() {
+    for on_stop in [false, true] {
+        let mut h = AuH::create();
+        h.suspended_param_flush(&[(MIX, 0.11), (GAIN, 0.22)]);
+        fixture::live().set_label("live");
+        h.start(48000.0);
+        let before = snapshot(&h);
+        let poison = serialize_state_v2(
+            hash(),
+            2,
+            &[("mix", MIX, 0.9), ("gain", GAIN, 0.9)],
+            fixture::POISON_EXTRA,
+            &ContractParams::persist_blob("intruder"),
+        );
+        assert!(h.load(&poison));
+        if on_stop {
+            h.stop();
+        } else {
+            h.process(64, 0.0, &[]);
+        }
+        assert_eq!(snapshot(&h), before);
+        if !on_stop {
+            h.stop();
+        }
     }
 }
 
@@ -2671,22 +2691,5 @@ mod clap_spec {
         let events = Vec::new();
         let status = clap.process_raw(1024, &mut inputs, &mut outputs, &events);
         assert_eq!(status, clap_sys::process::CLAP_PROCESS_ERROR);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Divergences found by this suite. Each is `#[ignore]`d with the wrapper
-// track that owns the fix; run with `--ignored` to reproduce.
-// ---------------------------------------------------------------------------
-
-mod divergences {
-    use super::*;
-
-    /// AU: a custom-state rejection from `load_state` on an instance that is
-    /// not rendering is reported to the host as success.
-    #[test]
-    #[ignore = "moose-au: idle state load queues for a render thread that never runs (see report)"]
-    fn au_idle_load_state_rejection() {
-        state_load_state_rejection_rolls_back_when_idle::<AuH>();
     }
 }

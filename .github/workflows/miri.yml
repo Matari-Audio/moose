@@ -6,13 +6,26 @@ name: Miri
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/**']
+    paths:
+      - 'crates/moose-core/**'
+      - 'crates/moose-params/**'
+      - 'crates/moose-utils/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/miri.yml'
   pull_request:
-    paths-ignore: ['**.md', 'docs/**']
+    paths:
+      - 'crates/moose-core/**'
+      - 'crates/moose-params/**'
+      - 'crates/moose-utils/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/miri.yml'
   # The toolchain's borrow-model evolves independently of the code;
   # a weekly run surfaces new Miri findings against an idle repo.
   schedule:
     - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -52,10 +65,8 @@ jobs:
       # Full leak checking. The task-pool tests are carved into their own
       # step below (they leak worker threads by design), so leak detection
       # stays on for every other crate and test here.
-      - name: miri test (core crates)
-        run: |
-          cargo +nightly miri test -p moose-utils -p moose-params
-          cargo +nightly miri test -p moose-core --lib -- --skip tasks::tests
+      - name: miri test (moose-core)
+        run: cargo +nightly miri test -p moose-core --lib -- --skip tasks::tests
 
       # The managed background-task pool (`moose-core::tasks`) spawns
       # process-global worker threads that never join by design, so Miri's
@@ -77,6 +88,19 @@ jobs:
         run: cargo +nightly miri test -p moose-core --test mediation_repro
         env:
           MIRIFLAGS: -Zmiri-many-seeds=0..8
+
+      # Multi-seed data-race and UB sweep on the unsafe-heavy core handoffs
+      # (PluginCell, SnapshotSlot, transport seqlock, state load queue).
+      - name: miri test (PluginCell, SnapshotSlot, transport seqlock, state queue)
+        run: "cargo +nightly miri test -p moose-core --lib -- wrapper:: snapshot:: transport:: state::"
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..4
+
+      # moose-utils and moose-params both carry #![forbid(unsafe_code)];
+      # run them on the weekly schedule and manual dispatch.
+      - name: miri test (moose-utils, moose-params)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: cargo +nightly miri test -p moose-utils -p moose-params
 
       # Fuzz corpus replay dropped until MOOSE has its own harness repo
       # (truce-audio/truce-fuzz-tests path-depends on truce-* crates).

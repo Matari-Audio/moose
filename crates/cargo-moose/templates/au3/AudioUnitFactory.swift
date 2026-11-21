@@ -166,29 +166,90 @@ func mooseAudioFormat(sampleRate: Double, channels: AVAudioChannelCount) -> AVAu
 
 // MARK: - AUAudioUnit subclass
 
+/// Weak wrapper passed as `MooseAuHostSink.user_data` so Rust holds no strong
+/// reference cycle on `MooseAUAudioUnit` and teardown in `deinit` is race-free.
+private final class MooseAuSinkBox {
+    weak var au: MooseAUAudioUnit?
+    init(_ au: MooseAUAudioUnit) { self.au = au }
+}
+
+private func mooseCString<T>(_ field: T) -> String {
+    withUnsafeBytes(of: field) { raw in
+        guard let base = raw.baseAddress?.assumingMemoryBound(to: CChar.self) else { return "" }
+        return String(cString: base)
+    }
+}
+
+private func au3SinkRelease(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud else { return }
+    Unmanaged<MooseAuSinkBox>.fromOpaque(ud).release()
+}
+
+private func au3SinkBeginEdit(_ ud: UnsafeMutableRawPointer?, _ paramID: UInt32) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkBeginEdit(paramID)
+}
+
+private func au3SinkSetParam(_ ud: UnsafeMutableRawPointer?, _ paramID: UInt32, _ value: Float) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkSetParam(paramID, value: value)
+}
+
+private func au3SinkEndEdit(_ ud: UnsafeMutableRawPointer?, _ paramID: UInt32) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkEndEdit(paramID)
+}
+
+private func au3SinkLatencyChanged(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkLatencyChanged()
+}
+
+private func au3SinkTailChanged(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkTailChanged()
+}
+
+private func au3SinkParamValuesChanged(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkParamValuesChanged()
+}
+
+private func au3SinkParamPresentationChanged(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkParamPresentationChanged()
+}
+
+private func au3SinkRequestResize(_ ud: UnsafeMutableRawPointer?, _ width: UInt32, _ height: UInt32) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkRequestResize(width: width, height: height)
+}
+
 class MooseAUAudioUnit: AUAudioUnit {
     private(set) var rustCtx: UnsafeMutableRawPointer?
-    /// Set to true during GUI→host param sync to prevent observer feedback.
-    var isSyncingToHost = false
+    /// Main-thread guard while pushing Rust-originated parameter changes into
+    /// `_parameterTree` so `implementorValueObserver` does not echo them back.
+    private var _applyingRustSync = false
+    private var _syncOriginatorToken: AUParameterObserverToken?
+    private var _sinkBox: MooseAuSinkBox?
+    private var _hasV13Sink = false
+    private var _isActive = false
+    /// View-controller hook for plugin-initiated editor resizes (`request_resize`).
+    var onResizeRequested: ((UInt32, UInt32) -> Void)?
 
     private var _inputBusArray: AUAudioUnitBusArray!
     private var _outputBusArray: AUAudioUnitBusArray!
     private var _parameterTree: AUParameterTree?
     private var _sampleRate: Double = 44100.0
     private var _maxFrames: UInt32 = 1024
-    /// Last latency (samples) pushed to the host via KVO. The framework
-    /// commits observed delay changes on the main thread; a timer
-    /// compares against this and fires KVO on `latency` when it moves, so
-    /// a plugin that varies its latency reaches the host.
-    private var _lastLatencySamples: UInt32 = 0
-    /// Last tail time (seconds) pushed to the host via KVO.
-    private var _lastTailTime: TimeInterval = 0
-    /// Host-visible value, published between the KVO will/did notifications.
-    private var _publishedTailTime: TimeInterval = 0
-    /// Polls latency and tail while render resources are allocated, so a delay
-    /// change driven by host automation (no editor open) still notifies.
-    /// Slow (a few Hz) - latency moves on mode switches, not per block.
-    private var _latencyTimer: Timer?
 
     override init(componentDescription: AudioComponentDescription,
                   options: AudioComponentInstantiationOptions = []) throws {
@@ -196,23 +257,39 @@ class MooseAUAudioUnit: AUAudioUnit {
 
         guard let callbacks = g_callbacks, let descriptor = g_descriptor else { return }
 
-        // A pre-2.0 framework loads cleanly (the globals above kept
-        // their names) but lays out `AuCallbacks` differently -
-        // calling `create` there would jump through the wrong slot.
-        // Refuse instantiation instead of crashing the extension.
-        guard mooseAbiTailVersion(callbacks) >= 7 else {
-            logger.error("AU init: plugin binary lacks the native event ABI; rebuild the framework and appex with the same moose version")
+        // Require ABI v13 (`create_with_sink` + `process_native_v13`) up front
+        // so an older framework binary fails cleanly at initialization instead
+        // of initializing and returning `kAudio_ParamError` on every render.
+        guard mooseAbiTailVersion(callbacks) >= 13,
+              callbacks.pointee.create_with_sink != nil,
+              callbacks.pointee.process_native_v13 != nil else {
+            logger.error("AU init: plugin binary lacks the ABI v13 render/sink contract; rebuild the framework and appex with the same moose version")
             throw NSError(domain: NSOSStatusErrorDomain,
                           code: Int(kAudioUnitErr_FailedInitialization))
         }
 
-        rustCtx = callbacks.pointee.create()
+        if let createWithSink = callbacks.pointee.create_with_sink {
+            let box = MooseAuSinkBox(self)
+            _sinkBox = box
+            var sink = MooseAuHostSink()
+            sink.size = UInt32(MemoryLayout<MooseAuHostSink>.size)
+            sink.user_data = Unmanaged.passRetained(box).toOpaque()
+            sink.release_user_data = au3SinkRelease
+            sink.begin_edit = au3SinkBeginEdit
+            sink.set_param = au3SinkSetParam
+            sink.end_edit = au3SinkEndEdit
+            sink.latency_changed = au3SinkLatencyChanged
+            sink.tail_changed = au3SinkTailChanged
+            sink.param_values_changed = au3SinkParamValuesChanged
+            sink.param_presentation_changed = au3SinkParamPresentationChanged
+            sink.request_resize = au3SinkRequestResize
+            rustCtx = createWithSink(&sink)
+            _hasV13Sink = (rustCtx != nil)
+        }
         guard rustCtx != nil else {
             throw NSError(domain: NSOSStatusErrorDomain,
                           code: Int(kAudioUnitErr_FailedInitialization))
         }
-        _publishedTailTime = reportedTailTime
-        _lastTailTime = _publishedTailTime
         logger.info("AU init: in=\(descriptor.pointee.num_inputs) out=\(descriptor.pointee.num_outputs)")
         let numIn = descriptor.pointee.num_inputs
         let numOut = descriptor.pointee.num_outputs
@@ -267,9 +344,79 @@ class MooseAUAudioUnit: AUAudioUnit {
     }
 
     deinit {
+        _sinkBox?.au = nil
         if let ctx = rustCtx, let callbacks = g_callbacks {
+            if _isActive, mooseAbiTailVersion(callbacks) >= 13,
+               let setActive = callbacks.pointee.set_active {
+                setActive(ctx, 0)
+                _isActive = false
+            }
             callbacks.pointee.destroy(ctx)
         }
+    }
+
+    override var contextName: String? {
+        didSet {
+            guard let ctx = rustCtx, let cb = g_callbacks,
+                  mooseAbiTailVersion(cb) >= 13,
+                  let setContextName = cb.pointee.set_context_name else { return }
+            if let name = contextName {
+                name.withCString { cstr in
+                    setContextName(ctx, cstr)
+                }
+            } else {
+                setContextName(ctx, nil)
+            }
+        }
+    }
+
+    // MARK: - MooseAuHostSink handlers (main queue)
+
+    fileprivate func handleSinkBeginEdit(_ paramID: UInt32) {
+        guard let param = _parameterTree?.parameter(withAddress: AUParameterAddress(paramID)) else { return }
+        _applyingRustSync = true
+        param.setValue(param.value, originator: _syncOriginatorToken, atHostTime: 0, eventType: .touch)
+        _applyingRustSync = false
+    }
+
+    fileprivate func handleSinkSetParam(_ paramID: UInt32, value: Float) {
+        guard let param = _parameterTree?.parameter(withAddress: AUParameterAddress(paramID)) else { return }
+        _applyingRustSync = true
+        param.setValue(AUValue(value), originator: _syncOriginatorToken, atHostTime: 0, eventType: .value)
+        _applyingRustSync = false
+    }
+
+    fileprivate func handleSinkEndEdit(_ paramID: UInt32) {
+        guard let param = _parameterTree?.parameter(withAddress: AUParameterAddress(paramID)) else { return }
+        _applyingRustSync = true
+        param.setValue(param.value, originator: _syncOriginatorToken, atHostTime: 0, eventType: .release)
+        _applyingRustSync = false
+    }
+
+    fileprivate func handleSinkLatencyChanged() {
+        willChangeValue(forKey: "latency")
+        didChangeValue(forKey: "latency")
+    }
+
+    fileprivate func handleSinkTailChanged() {
+        willChangeValue(forKey: "tailTime")
+        didChangeValue(forKey: "tailTime")
+    }
+
+    fileprivate func handleSinkParamValuesChanged() {
+        syncParameterTreeFromRust()
+        willChangeValue(forKey: "allParameterValues")
+        didChangeValue(forKey: "allParameterValues")
+    }
+
+    fileprivate func handleSinkParamPresentationChanged() {
+        willChangeValue(forKey: "parameterTree")
+        buildParameterTree()
+        didChangeValue(forKey: "parameterTree")
+    }
+
+    fileprivate func handleSinkRequestResize(width: UInt32, height: UInt32) {
+        onResizeRequested?(width, height)
     }
 
     override var inputBusses: AUAudioUnitBusArray { _inputBusArray }
@@ -344,12 +491,6 @@ class MooseAUAudioUnit: AUAudioUnit {
     }
 
     private func buildParameterTree() {
-        // We need `rustCtx` to be non-nil (the body uses `rustCtx!`
-        // below) but the value is only consumed through the closures
-        // that capture it explicitly, so the `let ctx = ...` binding
-        // would be unused. `case .some` matches both the
-        // existence check and silences the unused-binding warning
-        // without forcing a runtime !-unwrap here.
         guard let callbacks = g_callbacks, case .some = rustCtx else { return }
         let rawCtx = rustCtx!
         let cb = callbacks.pointee
@@ -357,61 +498,61 @@ class MooseAUAudioUnit: AUAudioUnit {
         var groups: [String: [AUParameter]] = [:]
         var groupOrder: [String] = []
 
-        for i in 0..<g_num_params {
-            let desc = g_param_descriptors.advanced(by: Int(i)).pointee
-            let name = String(cString: desc.name)
-            let group = String(cString: desc.group)
+        func auUnitFor(_ unitStr: String, stepCount: UInt32) -> AudioUnitParameterUnit {
+            if stepCount == 1 { return .boolean }
+            if stepCount > 1 { return .indexed }
+            switch unitStr {
+            case "Hz": return .hertz
+            case "dB": return .decibels
+            case "s": return .seconds
+            case "ms": return .milliseconds
+            case "%": return .percent
+            case "st": return .relativeSemiTones
+            case "ct": return .cents
+            case "oct": return .octaves
+            case "°": return .degrees
+            case "x": return .rate
+            case ":1": return .ratio
+            default: return .generic
+            }
+        }
 
-            // step_count is values-1: 1 => boolean-like, >=2 => an indexed
-            // list. Reporting the unit (not .generic) makes the host
-            // quantize automation to the steps and offer step navigation;
-            // valueStrings carries the per-index names from the plugin's
-            // own format_value, so an enum shows its variant names.
-            var auUnit: AudioUnitParameterUnit = .generic
-            switch String(cString: desc.unit) {
-            case "Hz": auUnit = .hertz
-            case "dB": auUnit = .decibels
-            case "s": auUnit = .seconds
-            case "ms": auUnit = .milliseconds
-            case "%": auUnit = .percent
-            case "st": auUnit = .relativeSemiTones
-            case "ct": auUnit = .cents
-            case "oct": auUnit = .octaves
-            case "°": auUnit = .degrees
-            case "x": auUnit = .rate
-            case ":1": auUnit = .ratio
-            default: break
-            }
+        func appendParameter(
+            id: UInt32, name: String, group: String, unitStr: String,
+            minVal: Double, maxVal: Double, defaultVal: Double,
+            stepCount: UInt32, readOnly: Bool, hidden: Bool, canRamp: Bool
+        ) {
+            let auUnit = auUnitFor(unitStr, stepCount: stepCount)
             var valueStrings: [String]? = nil
-            if desc.step_count >= 1 {
-                auUnit = desc.step_count == 1 ? .boolean : .indexed
+            if stepCount >= 1 && stepCount <= 1024 {
                 var names: [String] = []
-                // Individual formatting remains available for wide integer
-                // ranges without constructing an unbounded valueStrings list.
-                if desc.step_count <= 1024 {
-                    for step in 0...desc.step_count {
-                        let plain = desc.min + (desc.max - desc.min) * Double(step) / Double(desc.step_count)
-                        var buf = [CChar](repeating: 0, count: 128)
-                        let len = cb.param_format_value(rawCtx, desc.id, plain, &buf, 128)
-                        names.append(len > 0 ? String(cString: buf) : "\(step)")
-                    }
-                    valueStrings = names
+                for step in 0...stepCount {
+                    let plain = minVal + (maxVal - minVal) * Double(step) / Double(stepCount)
+                    var buf = [CChar](repeating: 0, count: 128)
+                    let len = cb.param_format_value(rawCtx, id, plain, &buf, 128)
+                    names.append(len > 0 ? String(cString: buf) : "\(step)")
                 }
+                valueStrings = names
             }
-            var parameterFlags: AudioUnitParameterOptions = [.flag_IsWritable, .flag_IsReadable]
-            if desc.step_count == 0 {
+            var parameterFlags: AudioUnitParameterOptions = [.flag_IsReadable]
+            if !readOnly {
+                parameterFlags.insert(.flag_IsWritable)
+            }
+            if hidden {
+                parameterFlags.insert(.flag_ExpertMode)
+            }
+            if canRamp {
                 parameterFlags.insert(.flag_CanRamp)
                 parameterFlags.insert(.flag_IsHighResolution)
             }
-
             let param = AUParameterTree.createParameter(
-                withIdentifier: "param\(desc.id)", name: name,
-                address: AUParameterAddress(desc.id),
-                min: AUValue(desc.min), max: AUValue(desc.max),
+                withIdentifier: "param\(id)", name: name,
+                address: AUParameterAddress(id),
+                min: AUValue(minVal), max: AUValue(maxVal),
                 unit: auUnit, unitName: nil,
                 flags: parameterFlags,
                 valueStrings: valueStrings, dependentParameters: nil)
-            param.value = AUValue(desc.default_value)
+            param.value = AUValue(cb.param_get_value(rawCtx, id))
             if group.isEmpty { params.append(param) }
             else {
                 if groups[group] == nil { groupOrder.append(group) }
@@ -419,34 +560,82 @@ class MooseAUAudioUnit: AUAudioUnit {
             }
         }
 
+        if mooseAbiTailVersion(callbacks) >= 13,
+           let paramIdsFn = cb.param_ids,
+           let paramInfoFn = cb.param_info_by_id {
+            let count = Int(paramIdsFn(rawCtx, nil, 0))
+            if count > 0 {
+                var ids = [UInt32](repeating: 0, count: count)
+                let actual = Int(paramIdsFn(rawCtx, &ids, UInt32(count)))
+                for id in ids.prefix(min(actual, count)) {
+                    var pi = AuParamInfoOut()
+                    guard paramInfoFn(rawCtx, id, &pi) != 0 else { continue }
+                    appendParameter(
+                        id: pi.id,
+                        name: mooseCString(pi.name),
+                        group: mooseCString(pi.group),
+                        unitStr: mooseCString(pi.unit),
+                        minVal: pi.min,
+                        maxVal: pi.max,
+                        defaultVal: pi.default_value,
+                        stepCount: pi.step_count,
+                        readOnly: (pi.flags & UInt32(AU_PARAM_FLAG_READ_ONLY)) != 0,
+                        hidden: (pi.flags & UInt32(AU_PARAM_FLAG_HIDDEN)) != 0,
+                        canRamp: (pi.flags & UInt32(AU_PARAM_FLAG_CAN_RAMP)) != 0)
+                }
+            }
+        } else {
+            for i in 0..<g_num_params {
+                let desc = g_param_descriptors.advanced(by: Int(i)).pointee
+                appendParameter(
+                    id: desc.id,
+                    name: String(cString: desc.name),
+                    group: String(cString: desc.group),
+                    unitStr: String(cString: desc.unit),
+                    minVal: desc.min,
+                    maxVal: desc.max,
+                    defaultVal: desc.default_value,
+                    stepCount: desc.step_count,
+                    readOnly: false,
+                    hidden: false,
+                    canRamp: desc.step_count == 0)
+            }
+        }
+
         var children: [AUParameterNode] = params
         for gn in groupOrder {
             children.append(AUParameterTree.createGroup(withIdentifier: gn, name: gn, children: groups[gn]!))
         }
-        _parameterTree = AUParameterTree.createTree(withChildren: children)
+        let tree = AUParameterTree.createTree(withChildren: children)
+        _parameterTree = tree
+        _syncOriginatorToken = tree.token(byAddingParameterObserver: { _, _ in })
 
-        _parameterTree?.implementorValueObserver = { [weak self] p, v in
-            guard self?.isSyncingToHost != true else { return }
-            cb.param_set_value(rawCtx, UInt32(p.address), Double(v))
+        tree.implementorValueObserver = { [weak self] p, v in
+            guard let self = self, !self._applyingRustSync, let ctx = self.rustCtx else { return }
+            cb.param_set_value(ctx, UInt32(p.address), Double(v))
         }
-        _parameterTree?.implementorValueProvider = { p in
-            AUValue(cb.param_get_value(rawCtx, UInt32(p.address)))
+        tree.implementorValueProvider = { [weak self] p in
+            guard let self = self, let ctx = self.rustCtx else { return p.value }
+            return AUValue(cb.param_get_value(ctx, UInt32(p.address)))
         }
-        _parameterTree?.implementorStringFromValueCallback = { p, vp in
+        tree.implementorStringFromValueCallback = { [weak self] p, vp in
             let val = vp?.pointee ?? p.value
+            guard let self = self, let ctx = self.rustCtx else {
+                return String(format: "%.2f", val)
+            }
             var buf = [CChar](repeating: 0, count: 128)
-            let len = cb.param_format_value(rawCtx, UInt32(p.address), Double(val), &buf, 128)
+            let len = cb.param_format_value(ctx, UInt32(p.address), Double(val), &buf, 128)
             return len > 0 ? String(cString: buf) : String(format: "%.2f", val)
         }
-        _parameterTree?.implementorValueFromStringCallback = { p, str in
+        tree.implementorValueFromStringCallback = { [weak self] p, str in
             // `param_parse_value` is an ABI v5 tail callback: on an older
             // plugin binary the pointer is past its tail, so gate on the
             // version and fall back to a plain float parse (what AU does
             // by default) rather than calling through it.
-            if mooseAbiTailVersion(callbacks) >= 5 {
+            if let self = self, let ctx = self.rustCtx, mooseAbiTailVersion(callbacks) >= 5 {
                 var plain = 0.0
                 let ok = str.withCString { cstr in
-                    cb.param_parse_value(rawCtx, UInt32(p.address), cstr, &plain)
+                    cb.param_parse_value(ctx, UInt32(p.address), cstr, &plain)
                 }
                 if ok != 0 { return AUValue(plain) }
             }
@@ -461,35 +650,23 @@ class MooseAUAudioUnit: AUAudioUnit {
         if _outputBusArray.count > 0 { _sampleRate = _outputBusArray[0].format.sampleRate }
         _maxFrames = maximumFramesToRender
         if let ctx = rustCtx, let cb = g_callbacks {
-            // Forward the host's offline-render flag before prep so the
-            // plugin's reset / process observe the right ProcessMode
-            // (0 realtime, 2 offline). `set_render_mode` is an ABI v4
-            // tail callback - gate so an older plugin binary is never
-            // called through a pointer past its tail.
             if mooseAbiTailVersion(cb) >= 4 {
                 let mode: UInt32 = isRenderingOffline ? 2 : 0
                 cb.pointee.set_render_mode(ctx, mode)
             }
             cb.pointee.reset(ctx, _sampleRate, _maxFrames)
-        }
-        // Watch for latency and tail changes on the main thread while
-        // rendering (KVO must fire off the audio thread). Scheduled on
-        // the main run loop even if the host allocates on another thread.
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.notifyDelayIfChanged()
-            self._latencyTimer?.invalidate()
-            self._latencyTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) {
-                [weak self] _ in
-                self?.notifyDelayIfChanged()
+            if mooseAbiTailVersion(cb) >= 13, let setActive = cb.pointee.set_active {
+                setActive(ctx, 1)
+                _isActive = true
             }
         }
     }
 
     override func deallocateRenderResources() {
-        DispatchQueue.main.async { [weak self] in
-            self?._latencyTimer?.invalidate()
-            self?._latencyTimer = nil
+        if _isActive, let ctx = rustCtx, let cb = g_callbacks,
+           mooseAbiTailVersion(cb) >= 13, let setActive = cb.pointee.set_active {
+            setActive(ctx, 0)
+            _isActive = false
         }
         super.deallocateRenderResources()
     }
@@ -513,7 +690,8 @@ class MooseAUAudioUnit: AUAudioUnit {
         scMaxFrames: Int,
         mainInScratch: UnsafeMutablePointer<Float>?,
         mainInABL: UnsafeMutableAudioBufferListPointer?,
-        paramBuf: UnsafeMutablePointer<AuParamEvent>,
+        paramBuf: UnsafeMutablePointer<AuParamEventV2>,
+        hasV13Sink: Bool,
         transportBuf: UnsafeMutablePointer<AuTransportSnapshot>,
         sysexOutScratch: UnsafeMutablePointer<UInt8>,
         sysexOutScratchCap: Int,
@@ -636,25 +814,41 @@ class MooseAUAudioUnit: AUAudioUnit {
                     nativeBuf: nativeBuf,
                     nativeCount: &numNative,
                     overflow: &nativeOverflow) else { return kAudio_ParamError }
-            } else if head.eventType == .parameter || head.eventType == .parameterRamp {
-                // Decode .parameter / .parameterRamp into AuParamEvent
-                // with the proper within-block sample offset so the
-                // Rust chunker can split the audio block at each
-                // automation point. Ramp events get treated as a step
-                // at the ramp's start (eventSampleTime); the plugin's
-                // own smoother handles the actual interpolation. This
-                // matches moose-vst3's step-at-point treatment of VST3
-                // parameter queues.
-                //
-                let absTime = event.pointee.parameter.eventSampleTime
-                guard let offset = sampleOffset(absTime, bufStart, frameCount),
-                      let paramID = UInt32(exactly: event.pointee.parameter.parameterAddress)
+            } else if head.eventType == .parameter {
+                let p = event.pointee.parameter
+                guard let offset = sampleOffset(p.eventSampleTime, bufStart, frameCount),
+                      let paramID = UInt32(exactly: p.parameterAddress)
                 else { return kAudio_ParamError }
                 if numParam < 256 {
-                    paramBuf[Int(numParam)] = AuParamEvent(
-                        sample_offset: offset,
+                    paramBuf[Int(numParam)] = AuParamEventV2(
+                        start_offset: Int32(offset),
+                        duration_frames: 0,
                         param_id: paramID,
-                        value: event.pointee.parameter.value)
+                        flags: 0,
+                        start_value: p.value,
+                        end_value: p.value)
+                    numParam += 1
+                } else {
+                    paramOverflow = 1
+                }
+            } else if head.eventType == .parameterRamp {
+                // A ramp can start before `bufStart` (negative relative offset)
+                // when it continues from a previous render slice. Preserve its
+                // exact signed offset and duration for `process_native_v13`.
+                let p = event.pointee.parameter
+                let (rel, overflow) = p.eventSampleTime.subtractingReportingOverflow(bufStart)
+                guard !overflow,
+                      let startOffset = Int32(exactly: rel),
+                      let paramID = UInt32(exactly: p.parameterAddress)
+                else { return kAudio_ParamError }
+                if numParam < 256 {
+                    paramBuf[Int(numParam)] = AuParamEventV2(
+                        start_offset: startOffset,
+                        duration_frames: p.rampDurationSampleFrames,
+                        param_id: paramID,
+                        flags: 0,
+                        start_value: p.value,
+                        end_value: p.value)
                     numParam += 1
                 } else {
                     paramOverflow = 1
@@ -776,8 +970,8 @@ class MooseAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard mooseAbiTailVersion(cb) >= 11,
-              let processNative = cb.pointee.process_native_v11,
+        guard mooseAbiTailVersion(cb) >= 13,
+              let processNative = cb.pointee.process_native_v13,
               let beginOutput = cb.pointee.begin_output_events_v10,
               let nextOutput = cb.pointee.next_output_event,
               let finishOutput = cb.pointee.finish_output_events,
@@ -809,7 +1003,7 @@ class MooseAUAudioUnit: AUAudioUnit {
             carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
         }
         beginOutput(ctx, carrierMask, frameCount, midiOutputProtocol,
-                    maxAbsoluteOffset, 1, 0)
+                    maxAbsoluteOffset, 1, hasV13Sink ? 1 : 0)
         while true {
             var out = AuNativeEvent()
             let result = nextOutput(ctx, &out)
@@ -975,7 +1169,8 @@ class MooseAUAudioUnit: AUAudioUnit {
         // the Rust chunker splits the audio block at each
         // automation point. This capacity is independent of the native
         // event lane, so filling one never truncates the other.
-        let paramBuf = UnsafeMutablePointer<AuParamEvent>.allocate(capacity: 256)
+        let paramBuf = UnsafeMutablePointer<AuParamEventV2>.allocate(capacity: 256)
+        let hasV13Sink = _hasV13Sink
         let transportBuf = UnsafeMutablePointer<AuTransportSnapshot>.allocate(capacity: 1)
         let sysexOutScratchCap = Int(MOOSE_SYSEX_POOL_PREALLOC) + 2
         let sysexOutScratch =
@@ -1046,6 +1241,7 @@ class MooseAUAudioUnit: AUAudioUnit {
                 scScratch: scScratch, scABL: scABL, scMaxFrames: scMaxFrames,
                 mainInScratch: mainInScratch, mainInABL: mainInABL,
                 paramBuf: paramBuf,
+                hasV13Sink: hasV13Sink,
                 transportBuf: transportBuf,
                 sysexOutScratch: sysexOutScratch,
                 sysexOutScratchCap: sysexOutScratchCap,
@@ -1115,9 +1311,12 @@ class MooseAUAudioUnit: AUAudioUnit {
     /// parameter tree so host UIs reflect a state / preset load.
     private func syncParameterTreeFromRust() {
         guard let ctx = rustCtx, let cb = g_callbacks, let tree = _parameterTree else { return }
+        _applyingRustSync = true
         for param in tree.allParameters {
-            param.value = AUValue(cb.pointee.param_get_value(ctx, UInt32(param.address)))
+            let rustVal = AUValue(cb.pointee.param_get_value(ctx, UInt32(param.address)))
+            param.setValue(rustVal, originator: _syncOriginatorToken, atHostTime: 0, eventType: .value)
         }
+        _applyingRustSync = false
     }
 
     // MARK: Factory presets
@@ -1213,41 +1412,12 @@ class MooseAUAudioUnit: AUAudioUnit {
               mooseAbiTailVersion(cb) >= 3, _sampleRate > 0 else { return 0 }
         return TimeInterval(cb.pointee.latency_samples(ctx)) / _sampleRate
     }
-    override var tailTime: TimeInterval { _publishedTailTime }
-
-    private var reportedTailTime: TimeInterval {
+    override var tailTime: TimeInterval {
         guard let ctx = rustCtx, let cb = g_callbacks,
               mooseAbiTailVersion(cb) >= 3, _sampleRate > 0 else { return 0 }
         return TimeInterval(cb.pointee.tail_samples(ctx)) / _sampleRate
     }
     override var shouldBypassEffect: Bool { get { false } set { } }
-
-    // AUAudioUnit latency and tailTime are KVO-observed by hosts for delay
-    // compensation, but the value comes from a callback (a computed
-    // property) so re-assignment can't fire the notification. Called on
-    // the main thread from the param-sync timer: when the framework's
-    // reported latency or tail moves, fire KVO so the host re-reads the
-    // fresh delay values. This is AU v3's push path - the audio thread only
-    // observes delay changes, never touches KVO.
-    func notifyDelayIfChanged() {
-        guard let ctx = rustCtx, let cb = g_callbacks,
-              mooseAbiTailVersion(cb) >= 3 else { return }
-        let now = cb.pointee.latency_samples(ctx)
-        if now != _lastLatencySamples {
-            _lastLatencySamples = now
-            willChangeValue(forKey: "latency")
-            didChangeValue(forKey: "latency")
-        }
-        // Compare the host-visible seconds so reallocation at a different
-        // sample rate notifies even when the tail sample count is unchanged.
-        let tail = reportedTailTime
-        if tail != _lastTailTime {
-            willChangeValue(forKey: "tailTime")
-            _publishedTailTime = tail
-            _lastTailTime = tail
-            didChangeValue(forKey: "tailTime")
-        }
-    }
 }
 
 // MARK: - Factory
@@ -1269,6 +1439,13 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
 
     public func createAudioUnit(with componentDescription: AudioComponentDescription) throws -> AUAudioUnit {
         let au = try MooseAUAudioUnit(componentDescription: componentDescription, options: [])
+        au.onResizeRequested = { [weak self] w, h in
+            guard let self = self, w > 0, h > 0 else { return }
+            let next = NSSize(width: CGFloat(w), height: CGFloat(h))
+            self.guiPtSize = next
+            self.guiContainer?.frame = NSRect(origin: .zero, size: next)
+            self.preferredContentSize = next
+        }
         auInstance = au
         logger.info("factory createAudioUnit")
         // If the view is already loaded (host called loadView before
@@ -1285,7 +1462,6 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
     private var guiSetUp = false
     private var guiContainer: NSView?
     private var guiPtSize: NSSize = .zero
-    private var paramSyncTimer: Timer?
     /// Latch flipped after the host's first `viewDidLayout` pass.
     /// On first layout Logic Pro lays our `view` out at its plug-in
     /// pane size (typically wider than the editor's natural), and
@@ -1395,10 +1571,6 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
         // Center the GUI in the host's view (which may be oversized).
         centerGUI()
         #endif
-
-        // Sync Rust param values → AUParameterTree at ~30fps.
-        // This ensures the host sees GUI-initiated param changes (KVO).
-        startParamSync()
     }
 
     #if os(macOS)
@@ -1525,7 +1697,6 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
         // Close the GUI when the host hides the plugin window.
         // This stops the repaint timer. setupGUIIfReady will
         // re-create the GUI when the window is shown again.
-        stopParamSync()
         if guiSetUp, let ctx = myCtx, let cb = g_callbacks {
             cb.pointee.gui_close(ctx)
         }
@@ -1564,42 +1735,5 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
         #endif
         container.frame = NSRect(x: x, y: y,
                                  width: guiPtSize.width, height: guiPtSize.height)
-    }
-
-    // MARK: - Parameter sync (GUI ↔ host)
-
-    private func startParamSync() {
-        paramSyncTimer = Timer.scheduledTimer(withTimeInterval: 1.0/30.0, repeats: true) { [weak self] _ in
-            self?.syncParamsToHost()
-        }
-    }
-
-    private func stopParamSync() {
-        paramSyncTimer?.invalidate()
-        paramSyncTimer = nil
-    }
-
-    /// Push current Rust param values to the AUParameterTree so the host
-    /// sees changes made via the custom GUI (triggers KVO notification).
-    private var syncCount = 0
-
-    private func syncParamsToHost() {
-        guard let au = auInstance,
-              let ctx = au.rustCtx,
-              let cb = g_callbacks,
-              let tree = au.parameterTree else { return }
-
-        au.isSyncingToHost = true
-        for param in tree.allParameters {
-            let rustVal = AUValue(cb.pointee.param_get_value(ctx, UInt32(param.address)))
-            if abs(param.value - rustVal) > 1e-4 {
-                param.setValue(rustVal, originator: nil)
-            }
-        }
-        au.isSyncingToHost = false
-
-        // Push latency and tail changes (if any) to the host on the same
-        // main-thread tick.
-        au.notifyDelayIfChanged()
     }
 }
