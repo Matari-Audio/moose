@@ -793,3 +793,103 @@ fn context_menu_populates_and_performs_through_the_hooks() {
         );
     });
 }
+
+#[test]
+fn host_log_and_thread_check_integrate_with_host_handle() {
+    use clap_sys::ext::log::{CLAP_EXT_LOG, CLAP_LOG_ERROR, clap_host_log, clap_log_severity};
+    use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
+    use clap_sys::host::clap_host;
+    use std::ffi::CStr;
+    use std::sync::Mutex;
+
+    static LOGGED: Mutex<Vec<(clap_log_severity, String)>> = Mutex::new(Vec::new());
+    static ON_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static ON_AUDIO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    unsafe extern "C" fn log_cb(
+        _host: *const clap_host,
+        severity: clap_log_severity,
+        msg: *const std::ffi::c_char,
+    ) {
+        let text = unsafe { CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned();
+        LOGGED.lock().unwrap().push((severity, text));
+    }
+
+    unsafe extern "C" fn is_main(_host: *const clap_host) -> bool {
+        ON_MAIN.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    unsafe extern "C" fn is_audio(_host: *const clap_host) -> bool {
+        ON_AUDIO.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    unsafe extern "C" fn get_ext(
+        _host: *const clap_host,
+        id: *const std::ffi::c_char,
+    ) -> *const std::ffi::c_void {
+        static LOG_EXT: clap_host_log = clap_host_log { log: Some(log_cb) };
+        static TC_EXT: clap_host_thread_check = clap_host_thread_check {
+            is_main_thread: Some(is_main),
+            is_audio_thread: Some(is_audio),
+        };
+        let id = unsafe { CStr::from_ptr(id) };
+        if id == CLAP_EXT_LOG {
+            (&raw const LOG_EXT).cast()
+        } else if id == CLAP_EXT_THREAD_CHECK {
+            (&raw const TC_EXT).cast()
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    LOGGED.lock().unwrap().clear();
+    ON_MAIN.store(true, std::sync::atomic::Ordering::Release);
+    ON_AUDIO.store(true, std::sync::atomic::Ordering::Release);
+
+    let host = clap_host {
+        clap_version: clap_sys::version::CLAP_VERSION,
+        host_data: std::ptr::null_mut(),
+        name: c"test".as_ptr(),
+        vendor: c"test".as_ptr(),
+        url: c"".as_ptr(),
+        version: c"1".as_ptr(),
+        get_extension: Some(get_ext),
+        request_restart: None,
+        request_process: None,
+        request_callback: None,
+    };
+    let handle = unsafe { crate::host_handle::HostHandle::any(&raw const host) };
+    let log_ext = unsafe { handle.extension::<clap_host_log>(CLAP_EXT_LOG) }.expect("log ext");
+    let tc_ext = unsafe { handle.extension::<clap_host_thread_check>(CLAP_EXT_THREAD_CHECK) }
+        .expect("thread-check ext");
+
+    assert_eq!(unsafe { handle.is_main_thread(tc_ext) }, Some(true));
+    assert_eq!(unsafe { handle.is_audio_thread(tc_ext) }, Some(true));
+    unsafe {
+        handle.debug_assert_main_thread(tc_ext);
+        handle.debug_assert_audio_thread(tc_ext);
+    }
+
+    let latch = moose_core::wrapper::PanicLatch::new();
+    let _ = moose_core::wrapper::run_audio_block_latched::<(), ()>(&latch, "CLAP", || {
+        panic!("boom in dsp")
+    });
+    assert!(latch.is_failed());
+    latch.report_with(|msg| {
+        assert!(unsafe { handle.log(log_ext, CLAP_LOG_ERROR, msg) });
+    });
+
+    let entries = LOGGED.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, CLAP_LOG_ERROR);
+    assert!(
+        entries[0].1.contains("boom in dsp"),
+        "got: {}",
+        entries[0].1
+    );
+
+    ON_MAIN.store(false, std::sync::atomic::Ordering::Release);
+    assert_eq!(unsafe { handle.is_main_thread(tc_ext) }, Some(false));
+}

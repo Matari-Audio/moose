@@ -670,6 +670,11 @@ impl<const N: usize> Params for DynamicParams<N> {
         self.def(self.slot_for_id(id)?)?.function
     }
 
+    fn live_param_range(&self, id: u32) -> Option<ParamRange> {
+        let slot = self.slot_for_id(id)?;
+        Some(self.slots[slot.0].shape.load().param_range())
+    }
+
     fn param_string_ids(&self) -> Vec<(u32, String)> {
         self.slots
             .iter()

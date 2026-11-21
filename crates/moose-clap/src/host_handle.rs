@@ -14,18 +14,20 @@
 //! - **`[audio-thread]`** ([`Audio`]): audio-thread view of the host.
 //!   Not `Send` and not `Sync`.
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 use std::marker::PhantomData;
 
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_host_audio_ports};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
 use clap_sys::ext::latency::clap_host_latency;
+use clap_sys::ext::log::{clap_host_log, clap_log_severity};
 use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_host_note_name};
 use clap_sys::ext::params::clap_host_params;
 use clap_sys::ext::preset_load::{CLAP_EXT_PRESET_LOAD, clap_host_preset_load};
 use clap_sys::ext::remote_controls::{CLAP_EXT_REMOTE_CONTROLS, clap_host_remote_controls};
 use clap_sys::ext::state::clap_host_state;
 use clap_sys::ext::tail::clap_host_tail;
+use clap_sys::ext::thread_check::clap_host_thread_check;
 use clap_sys::ext::track_info::{clap_host_track_info, clap_track_info};
 use clap_sys::ext::voice_info::{CLAP_EXT_VOICE_INFO, clap_host_voice_info};
 use clap_sys::host::clap_host;
@@ -163,6 +165,104 @@ impl HostHandle<Any> {
                 flush(self.raw);
             }
         }
+    }
+
+    /// Log a diagnostic message through the host's `clap.log` extension
+    /// (`[thread-safe]`, non-audio paths only since it builds a C string).
+    /// Returns `true` when the host accepted the message, `false` when the
+    /// host does not expose `clap.log`.
+    ///
+    /// # Safety
+    /// Both `self.raw` and `ext` (if non-null) must still be alive.
+    #[must_use]
+    pub(crate) unsafe fn log(
+        self,
+        ext: *const clap_host_log,
+        severity: clap_log_severity,
+        msg: &str,
+    ) -> bool {
+        if self.raw.is_null() || ext.is_null() {
+            return false;
+        }
+        // SAFETY: caller guarantees host and extension are live; `log` is
+        // `[thread-safe]` per CLAP `ext/log.h`.
+        let Some(log_fn) = (unsafe { (*ext).log }) else {
+            return false;
+        };
+        let sanitized: String = msg.chars().filter(|&c| c != '\0').collect();
+        let Ok(cstr) = CString::new(sanitized) else {
+            return false;
+        };
+        unsafe { log_fn(self.raw, severity, cstr.as_ptr()) };
+        true
+    }
+
+    /// Query `clap_host_thread_check::is_main_thread` (`[thread-safe]`), or
+    /// `None` if the host does not expose `clap.thread-check`.
+    ///
+    /// # Safety
+    /// Both `self.raw` and `ext` (if non-null) must still be alive.
+    #[cfg(any(debug_assertions, test))]
+    #[must_use]
+    pub(crate) unsafe fn is_main_thread(self, ext: *const clap_host_thread_check) -> Option<bool> {
+        if self.raw.is_null() || ext.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees host and extension are live;
+        // `is_main_thread` is `[thread-safe]` per CLAP `ext/thread-check.h`.
+        let check = unsafe { (*ext).is_main_thread }?;
+        Some(unsafe { check(self.raw) })
+    }
+
+    /// Query `clap_host_thread_check::is_audio_thread` (`[thread-safe]`), or
+    /// `None` if the host does not expose `clap.thread-check`.
+    ///
+    /// # Safety
+    /// Both `self.raw` and `ext` (if non-null) must still be alive.
+    #[cfg(any(debug_assertions, test))]
+    #[must_use]
+    pub(crate) unsafe fn is_audio_thread(self, ext: *const clap_host_thread_check) -> Option<bool> {
+        if self.raw.is_null() || ext.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees host and extension are live;
+        // `is_audio_thread` is `[thread-safe]` per CLAP `ext/thread-check.h`.
+        let check = unsafe { (*ext).is_audio_thread }?;
+        Some(unsafe { check(self.raw) })
+    }
+
+    /// Debug-assert that this callback runs on the host's main thread when
+    /// the host exposes `clap.thread-check`. No-op in release builds or when
+    /// the host omits the extension.
+    ///
+    /// # Safety
+    /// Both `self.raw` and `ext` (if non-null) must still be alive.
+    pub(crate) unsafe fn debug_assert_main_thread(self, ext: *const clap_host_thread_check) {
+        #[cfg(debug_assertions)]
+        debug_assert_ne!(
+            unsafe { self.is_main_thread(ext) },
+            Some(false),
+            "CLAP [main-thread] callback invoked off the host main thread"
+        );
+        #[cfg(not(debug_assertions))]
+        let _ = (self, ext);
+    }
+
+    /// Debug-assert that this callback runs on the host's audio thread when
+    /// the host exposes `clap.thread-check`. No-op in release builds or when
+    /// the host omits the extension.
+    ///
+    /// # Safety
+    /// Both `self.raw` and `ext` (if non-null) must still be alive.
+    pub(crate) unsafe fn debug_assert_audio_thread(self, ext: *const clap_host_thread_check) {
+        #[cfg(debug_assertions)]
+        debug_assert_ne!(
+            unsafe { self.is_audio_thread(ext) },
+            Some(false),
+            "CLAP [audio-thread] callback invoked off the host audio thread"
+        );
+        #[cfg(not(debug_assertions))]
+        let _ = (self, ext);
     }
 
     /// Narrow to the main-thread phase using a [`MainThreadToken`] proof.

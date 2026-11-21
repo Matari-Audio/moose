@@ -2,7 +2,7 @@
 
 use crate::instance::{Vst3Instance, Vst3Scratch};
 use crate::midi_proxy::{allocated_midi_proxy_decode, midi_proxy_event};
-use crate::output_events::midi_event_from_map;
+use crate::output_events::midi_event_from_map_with_range;
 
 use crate::ffi::Vst3NativeEvent;
 use moose_core::events::{
@@ -10,7 +10,7 @@ use moose_core::events::{
     ExactEventQualifiers, ExactNoteAddress, ExactNoteKind, PushError, Vst3EventMetadata,
 };
 use moose_core::export::PluginExport;
-use moose_params::ParamRange;
+use moose_params::{ParamRange, Params};
 
 pub(crate) const VST3_EVENT_NOTE_ON: u32 = 0;
 pub(crate) const VST3_EVENT_NOTE_OFF: u32 = 1;
@@ -150,10 +150,12 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
         list.push(point);
     }
     if let Some(idx) = mapped {
+        let map = &inst.midi_maps[idx].1;
+        let range = inst.params_arc.live_param_range(id).unwrap_or(map.range);
         list.push(Event {
             sample_offset,
             port: 0,
-            body: midi_event_from_map(&inst.midi_maps[idx].1, value),
+            body: midi_event_from_map_with_range(map, range, value),
         });
     }
     if !point_first {

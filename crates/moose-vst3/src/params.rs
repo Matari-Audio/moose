@@ -119,6 +119,9 @@ pub(crate) unsafe extern "C" fn cb_param_normalize<P: PluginExport>(
 ) -> f64 {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if let Some(range) = inst.params_arc.live_param_range(id) {
+            return range.normalize(plain);
+        }
         match inst.param_ranges.binary_search_by_key(&id, |(i, _)| *i) {
             Ok(idx) => inst.param_ranges[idx].1.normalize(plain),
             Err(_) => plain,
@@ -133,10 +136,42 @@ pub(crate) unsafe extern "C" fn cb_param_denormalize<P: PluginExport>(
 ) -> f64 {
     unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
+        if let Some(range) = inst.params_arc.live_param_range(id) {
+            return range.denormalize(normalized);
+        }
         match inst.param_ranges.binary_search_by_key(&id, |(i, _)| *i) {
             Ok(idx) => inst.param_ranges[idx].1.denormalize(normalized),
             Err(_) => normalized,
         }
+    }
+}
+
+/// Live VST3 `stepCount` for parameters whose range changes at runtime (such
+/// as [`moose_params::ValueListParam`] after `set_labels` or `DynamicParams`),
+/// or `-1` to keep the static registration descriptor's `step_count`.
+///
+/// When returning `>= 0` and `out_default_norm` is non-null, writes the
+/// parameter's normalized default under the live range so `getParameterInfo`
+/// keeps `defaultNormalizedValue` consistent with the live `stepCount`.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) unsafe extern "C" fn cb_param_step_count<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    id: u32,
+    out_default_norm: *mut f64,
+) -> i32 {
+    unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return -1;
+        };
+        let Some(range) = inst.params_arc.live_param_range(id) else {
+            return -1;
+        };
+        if let Some(out_default) = out_default_norm.as_mut()
+            && let Some(info) = inst.param_infos.by_id(id)
+        {
+            *out_default = range.normalize(info.default_plain);
+        }
+        range.step_count().map_or(0, |n| n.get() as i32)
     }
 }
 
