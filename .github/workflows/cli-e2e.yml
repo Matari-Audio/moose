@@ -72,9 +72,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: cli-e2e-${{ matrix.os }}
+          # Give Windows scaffolds their own writer so the plugin job
+          # cannot fill the key before scaffold build artifacts are saved.
+          shared-key: cli-e2e-${{ matrix.os }}${{ runner.os == 'Windows' && matrix.part == 'scaffolds' && '-scaffolds' || '' }}
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.part != 'scaffolds' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && (matrix.part != 'scaffolds' || runner.os == 'Windows') }}
 
       - name: Linux system deps
         if: runner.os == 'Linux'
