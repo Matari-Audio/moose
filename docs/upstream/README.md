@@ -8,11 +8,16 @@ git remote add upstream https://github.com/truce-audio/truce.git
 git fetch upstream main
 ```
 
-The **Truce upstream review** workflow runs daily and on manual dispatch. It
-paginates all open/closed issues and PRs and checks main's commit. Changes since
-`truce.json` produce a review summary and a failed scheduled run, so workflow
-subscribers can receive GitHub notifications. It never posts comments, executes
-upstream code, merges changes or rewrites the baseline automatically.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:a26dea2fd9664f2f6c9052c9d1ced96548be30077e42978910ff2d8d1abbeb1e -->
+
+The **Truce upstream review** workflow runs weekly on Mondays at 06:00 UTC
+and on manual dispatch. It paginates all open and closed issues and PRs and
+checks main's commit. The report is written to the job log and job summary.
+Pending changes since `truce.json` do not fail the run or trigger a
+failure notification. The workflow never posts comments, executes upstream
+code, merges changes, or rewrites the baseline automatically.
 
 After reviewing the report and updating the disposition below:
 
@@ -21,10 +26,13 @@ GH_TOKEN=$(gh auth token) python3 scripts/truce-upstream.py --accept
 git add docs/upstream/truce.json docs/upstream/README.md
 ```
 
-Commit the reviewed baseline. Normal build CI is independent of this review gate.
-To see a report locally, omit `--accept`; exit 1 means review is needed, while
-network/API errors raise an error rather than recording a partial snapshot.
+Commit the reviewed baseline. Normal build CI is independent of this report.
+To see the report locally, omit `--accept`. A successful report exits with
+status 0 even when changes are pending. Network and API errors still fail
+the command without recording a partial snapshot.
 
+
+<!-- /coderabbit-ai-generated:v1 -->
 ## Reviewed 2026-09-27
 
 33 issues and 194 PRs (all states) were inventoried; historical release rollups

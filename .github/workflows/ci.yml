@@ -59,7 +59,7 @@ jobs:
                 crates/moose-egui/* | \
                 crates/moose-baseview/* | \
                 crates/moose-standalone/* | \
-                examples/gain/* | \
+                examples/moose-example-gain/* | \
                 scripts/gui-window-test.sh | \
                 scripts/macos-cursor-poke.swift | \
                 .github/workflows/ci.yml | \
