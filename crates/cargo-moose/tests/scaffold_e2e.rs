@@ -56,16 +56,31 @@ fn cargo_moose_bin() -> PathBuf {
 
 /// Shared cargo target dir across every e2e test in this run. First
 /// test compiles moose-* from source (~30s cold); subsequent tests
-/// reuse the artifacts (~1–5s each). Lives under the workspace
-/// `target/tmp/` (`CARGO_TARGET_TMPDIR`) rather than the OS temp dir so
-/// CI's target-dir cache keeps the scaffold deps warm between runs.
+/// reuse the artifacts (~1–5s each). Use Cargo's selected target
+/// directory, including selections made via CLI flags or config.
+/// Keep artifacts beside Cargo's integration-test tmp directory,
+/// which `Swatinem/rust-cache@v2` excludes.
 fn shared_target() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let p = Path::new(env!("CARGO_TARGET_TMPDIR")).join("moose-scaffold-e2e-target");
+        let target_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .parent()
+            .expect("Cargo's integration-test tmp directory should have a parent");
+        let p = target_root.join("scaffold-e2e-target");
         std::fs::create_dir_all(&p).unwrap();
         p
     })
+}
+
+#[test]
+fn shared_target_uses_absolute_path() {
+    let cargo_tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    assert!(shared_target().is_absolute());
+    assert_eq!(
+        shared_target().parent(),
+        cargo_tmp.parent(),
+        "scaffold artifacts should be cached beside Cargo's tmp directory",
+    );
 }
 
 /// Global mutex around `cargo check`. Scaffolding + rewriting can

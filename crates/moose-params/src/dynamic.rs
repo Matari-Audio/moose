@@ -1117,6 +1117,7 @@ mod tests {
 
     #[test]
     fn shape_reads_never_tear() {
+        let iters: u32 = if cfg!(miri) { 256 } else { 20_000 };
         let cell = Arc::new(ShapeCell::new(Shape {
             tag: Tag::Linear,
             a: 0.0,
@@ -1125,7 +1126,7 @@ mod tests {
         let writer = {
             let cell = Arc::clone(&cell);
             std::thread::spawn(move || {
-                for i in 0..20_000u32 {
+                for i in 0..iters {
                     let v = f64::from(i);
                     cell.store(Shape {
                         tag: Tag::Linear,
@@ -1135,7 +1136,7 @@ mod tests {
                 }
             })
         };
-        for _ in 0..20_000 {
+        for _ in 0..iters {
             let s = cell.load();
             assert_eq!(s.a.to_bits(), s.b.to_bits(), "torn read {s:?}");
         }
