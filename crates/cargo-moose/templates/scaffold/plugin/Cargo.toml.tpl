@@ -49,6 +49,18 @@ moose-standalone = \{ {dep_args | unescaped}, features = ["gui"], optional = tru
 {{ endif -}}
 clap-sys = \{ version = "0.5", optional = true }
 {{ if is_workspace }}{{ else }}
+# Fast-compile dev loop: line tables keep backtraces crisp while cutting
+# link time and debug-info disk usage. Optimizing dependencies at
+# `opt-level = 1` makes the first (cold) dependency build a little
+# slower, in exchange for DSP and GUI that run smoothly in `--debug`
+# builds; your own crates stay at `opt-level = 0` for fast rebuilds.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = 0
+
 # Custom profile for `cargo moose install --shell`. The shell-mode
 # build (`cargo build --profile shell --features ...,shell`) lands the
 # shell binary at `target/shell/lib<crate>.dylib`, independent of

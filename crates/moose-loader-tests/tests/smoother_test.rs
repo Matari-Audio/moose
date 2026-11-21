@@ -9,13 +9,16 @@
     reason = "tests the deprecated shared-atomic smoothing path until it is removed"
 )]
 
+use moose::{Lifecycle, Plugin};
 use moose_core::AudioConfig;
 use moose_core::buffer::AudioBuffer;
 use moose_core::events::{Event, EventBody, EventList, TransportInfo};
-use moose_core::plugin::PluginRuntime;
+use moose_core::plugin::{
+    PluginRuntime, PreparationConfig, PreparationError, PreparationFrameBound,
+};
 use moose_core::process::{ProcessContext, ProcessStatus};
+use moose_core::tasks::InitContext;
 use moose_derive::Params;
-use moose_gui::PluginLogic;
 use moose_params::{FloatParamReadF32, Params};
 use std::sync::Arc;
 
@@ -32,9 +35,20 @@ struct SmootherDspState {
     samples: Vec<f32>,
 }
 
-impl PluginLogic for SmootherPlugin {
-    type Params = SmootherParams;
-    type DspState = SmootherDspState;
+impl Plugin for SmootherPlugin {
+    type Shared = SmootherParams;
+    type MainThread = ();
+    type Processor = SmootherDspState;
+
+    fn main_thread(_shared: &Arc<SmootherParams>) {}
+
+    fn activate(
+        _shared: &SmootherParams,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<SmootherDspState, PreparationError> {
+        Ok(SmootherDspState::default())
+    }
 
     fn process(
         state: &mut SmootherDspState,
@@ -72,11 +86,16 @@ impl moose::prelude::Editor for NoEditor {
 #[test]
 fn smoother_ramps_gradually() {
     let params = Arc::new(SmootherParams::new());
-    let mut shell =
-        moose_loader::static_shell::StaticShell::<SmootherParams, SmootherPlugin>::from_parts(
-            params, None,
-        );
-    shell.reset(&AudioConfig::new(44100.0, 64));
+    let mut shell = moose_loader::static_shell::StaticShell::<
+        SmootherParams,
+        Lifecycle<SmootherPlugin>,
+    >::from_parts(params, None);
+    shell
+        .prepare(&PreparationConfig::new(
+            AudioConfig::new(44100.0, 64),
+            PreparationFrameBound::ExplicitDriver,
+        ))
+        .unwrap();
 
     // Set gain to 0.0 initially.
     let mut events = EventList::default();
@@ -103,7 +122,12 @@ fn smoother_ramps_gradually() {
     events.clear();
     events.push(Event::new(0, EventBody::ParamChange { id: 0, value: 1.0 }));
 
-    shell.state_ref_mut().samples.clear();
+    shell
+        .state_ref_mut()
+        .processor_mut()
+        .unwrap()
+        .samples
+        .clear();
 
     let mut second_output = vec![0.0f32; 64];
     let mut outputs2: Vec<&mut [f32]> = vec![&mut second_output];
@@ -115,7 +139,7 @@ fn smoother_ramps_gradually() {
 
     shell.process(&mut buffer2, &events, &mut ctx2);
 
-    let samples = &shell.state_ref().samples;
+    let samples = &shell.state_ref().processor().unwrap().samples;
     assert!(!samples.is_empty(), "should have recorded samples");
 
     // The first sample should NOT be 1.0 - it should be somewhere
@@ -139,11 +163,10 @@ fn smoother_ramps_gradually() {
 #[test]
 fn static_shell_reset_snaps_smoothers() {
     let params = Arc::new(SmootherParams::new());
-    let mut shell =
-        moose_loader::static_shell::StaticShell::<SmootherParams, SmootherPlugin>::from_parts(
-            Arc::clone(&params),
-            None,
-        );
+    let mut shell = moose_loader::static_shell::StaticShell::<
+        SmootherParams,
+        Lifecycle<SmootherPlugin>,
+    >::from_parts(Arc::clone(&params), None);
 
     // Target away from both the default and the smoother's current
     // value, then reset.
@@ -270,7 +293,6 @@ mod hot_shell {
 mod extension_export {
     use super::*;
     use moose_core::export::{CustomClapExtension, PluginExport};
-    use moose_gui::PluginLogic;
     type Sample = f32;
 
     struct ExtensionLogic;
@@ -278,9 +300,21 @@ mod extension_export {
     struct ExtensionState(u32);
     static TABLE: u32 = 42;
 
-    impl PluginLogic for ExtensionLogic {
-        type Params = SmootherParams;
-        type DspState = ExtensionState;
+    impl Plugin for ExtensionLogic {
+        type Shared = SmootherParams;
+        type MainThread = ();
+        type Processor = ExtensionState;
+
+        fn main_thread(_: &Arc<SmootherParams>) {}
+
+        fn activate(
+            _: &SmootherParams,
+            _: &AudioConfig,
+            _: &InitContext,
+        ) -> Result<ExtensionState, PreparationError> {
+            Ok(ExtensionState::default())
+        }
+
         fn clap_extension(id: &std::ffi::CStr) -> Option<CustomClapExtension> {
             (id == c"test.extension").then(|| {
                 // SAFETY: the test uses the static table's u32 ABI.
@@ -303,12 +337,18 @@ mod extension_export {
     moose_loader::export_static! {
         params: SmootherParams,
         info: unreachable!(),
-        logic: ExtensionLogic,
+        logic: Lifecycle<ExtensionLogic>,
     }
 
     #[test]
     fn generated_export_forwards_extension_and_state() {
         let mut instance = __HotShellWrapper::create();
+        instance
+            .prepare(&PreparationConfig::new(
+                AudioConfig::new(44100.0, 64),
+                PreparationFrameBound::ExplicitDriver,
+            ))
+            .unwrap();
         assert_eq!(
             __HotShellWrapper::clap_extension(c"test.extension")
                 .unwrap()
@@ -316,12 +356,21 @@ mod extension_export {
             (&raw const TABLE).cast()
         );
         assert!(__HotShellWrapper::clap_extension(c"unknown").is_none());
-        assert!(
-            instance
-                .with_dsp_state(&mut |state| state.downcast_mut::<ExtensionState>().unwrap().0 = 7)
-        );
+        assert!(instance.with_dsp_state(&mut |state| {
+            state
+                .downcast_mut::<moose::ProcessorSlot<ExtensionState>>()
+                .unwrap()
+                .processor_mut()
+                .unwrap()
+                .0 = 7;
+        }));
         assert!(instance.with_dsp_state(&mut |state| assert_eq!(
-            state.downcast_ref::<ExtensionState>().unwrap().0,
+            state
+                .downcast_ref::<moose::ProcessorSlot<ExtensionState>>()
+                .unwrap()
+                .processor()
+                .unwrap()
+                .0,
             7
         )));
     }

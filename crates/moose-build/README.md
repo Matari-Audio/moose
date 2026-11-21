@@ -16,4 +16,4 @@ Plugin crates do not need a `build.rs` - `moose::plugin_info!()` reads
   `[build].target-dir` in `.cargo/config.toml`. Used by runtime callers
   (cargo-moose, moose-test) that need to anchor artifact paths.
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

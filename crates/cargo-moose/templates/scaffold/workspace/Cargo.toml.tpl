@@ -33,6 +33,18 @@ moose-standalone = \{ git = "https://github.com/Matari-Audio/moose", tag = "{tag
 {{ endif -}}
 {{- endif }}
 
+# Fast-compile dev loop: line tables keep backtraces crisp while cutting
+# link time and debug-info disk usage. Optimizing dependencies at
+# `opt-level = 1` makes the first (cold) dependency build a little
+# slower, in exchange for DSP and GUI that run smoothly in `--debug`
+# builds; your own crates stay at `opt-level = 0` for fast rebuilds.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = 0
+
 # Custom profile for `cargo moose install --shell`. The shell-mode
 # build lands at `target/shell/lib<crate>.dylib`, independent of
 # `target/release/` and `target/debug/`. Cargo profiles are workspace-

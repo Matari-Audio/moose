@@ -18,7 +18,7 @@ use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::tasks::InitContext;
 use moose_core::thread::MainThread;
 use moose_derive::Params;
-use moose_gui::PluginLogicCore;
+use moose_loader::PluginLogicCore;
 use moose_loader::static_shell::StaticShell;
 use moose_params::{FloatParam, FloatParamReadF32 as _, Params as _};
 

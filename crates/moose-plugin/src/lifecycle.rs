@@ -12,11 +12,12 @@
 //! a spawner or the snapshot publisher in the processor) and through
 //! `ProcessContext::tasks` in [`Plugin::process`].
 //!
-//! [`Lifecycle`] adapts a [`Plugin`] to the existing leaf traits, so every
-//! wrapper runs it unchanged:
+//! [`Lifecycle`] adapts a [`Plugin`] to [`PluginLogicCore`] and
+//! [`PluginEditor`], so every format wrapper runs it unchanged through
+//! `moose::plugin!`:
 //!
 //! ```ignore
-//! moose::plugin! { logic: moose::Lifecycle<MySynth>, params: MySynthParams }
+//! moose::plugin! { plugin: MySynth, params: MySynthParams }
 //! ```
 
 use std::marker::PhantomData;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use moose_core::buffer::AudioBuffer;
 use moose_core::bus::BusLayout;
 use moose_core::config::AudioConfig;
+use moose_core::denormal::DenormalGuard;
 use moose_core::editor::Editor;
 use moose_core::events::EventList;
 use moose_core::export::CustomClapExtension;
@@ -36,11 +38,7 @@ use moose_core::tasks::InitContext;
 use moose_params::Params;
 use moose_params::sample::Sample;
 
-#[allow(
-    deprecated,
-    reason = "`Lifecycle` implements the leaf traits for the wrappers"
-)]
-use crate::{PluginLogic, PluginLogic64};
+use crate::{PluginEditor, PluginLogicCore};
 
 /// A plugin split by thread: `Shared` params, a `MainThread` part and a `Processor`.
 ///
@@ -174,15 +172,12 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// caches the next `process` reads (snap smoothers, for instance).
     /// Default: no-op.
     ///
-    /// Custom state lives in `#[persist]` fields on [`Self::Shared`]; the
-    /// processor-side `save_state` / `load_state` / snapshot hooks remain
-    /// only on the deprecated [`PluginLogic`] adapter.
+    /// Custom state lives in `#[persist]` fields on [`Self::Shared`].
     fn state_changed(processor: &mut Self::Processor, shared: &Self::Shared) {
         let _ = (processor, shared);
     }
 
-    /// Check custom state on the host thread. Same contract as
-    /// [`PluginLogic::validate_state`].
+    /// Check custom state bytes on the host thread before they are applied.
     ///
     /// # Errors
     ///
@@ -192,8 +187,8 @@ pub trait Plugin<S: Sample = f32>: 'static {
         Ok(())
     }
 
-    /// Translate foreign state. Same contract as
-    /// [`PluginLogic::migrate_state`].
+    /// Translate foreign state (a previous framework's blob or a renamed
+    /// plugin's envelope) into moose params, extra, and persist bytes.
     #[must_use]
     fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
         let _ = foreign;
@@ -218,11 +213,11 @@ pub trait Plugin<S: Sample = f32>: 'static {
     fn editor(shared: Arc<Self::Shared>) -> Box<dyn Editor>;
 }
 
-/// Runs a [`Plugin`] through the existing wrappers (`moose::plugin!`).
+/// Runs a [`Plugin`] through the format wrappers (`moose::plugin!`).
 ///
-/// A type-level marker, never constructed: it implements [`PluginLogic`] for
-/// `P: Plugin<f32>` and [`PluginLogic64`] for `P: Plugin<f64>`, with
-/// [`ProcessorSlot`] as the DSP state.
+/// A type-level marker, never constructed: it implements [`PluginLogicCore`]
+/// and [`PluginEditor`] for any `P: Plugin<S>`, with [`ProcessorSlot`] as
+/// the shell-owned DSP state.
 pub struct Lifecycle<P>(PhantomData<fn() -> P>);
 
 impl<P> std::fmt::Debug for Lifecycle<P> {
@@ -334,105 +329,103 @@ fn process<S: Sample, P: Plugin<S>>(
     ProcessStatus::Normal
 }
 
-/// `impl $leaf for Lifecycle<P>` where `P: Plugin<$sample>`.
-macro_rules! lifecycle_leaf {
-    ($leaf:ident, $sample:ty) => {
-        #[allow(deprecated, reason = "the leaf traits are how the wrappers run a `Plugin` until they bind it directly")]
-        impl<P: Plugin<$sample>> $leaf for Lifecycle<P> {
-            type Params = P::Shared;
-            type DspState = ProcessorSlot<P::Processor>;
+impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
+    type Params = P::Shared;
+    type DspState = ProcessorSlot<P::Processor>;
 
-            fn clap_extension(id: &std::ffi::CStr) -> Option<CustomClapExtension> {
-                P::clap_extension(id)
-            }
+    fn clap_extension(id: &std::ffi::CStr) -> Option<CustomClapExtension> {
+        P::clap_extension(id)
+    }
 
-            fn supports_in_place() -> bool {
-                P::supports_in_place()
-            }
+    fn supports_in_place() -> bool {
+        P::supports_in_place()
+    }
 
-            fn max_host_state_bytes() -> usize {
-                P::max_host_state_bytes()
-            }
+    fn max_host_state_bytes() -> usize {
+        P::max_host_state_bytes()
+    }
 
-            fn bus_layouts() -> Vec<BusLayout> {
-                P::bus_layouts()
-            }
+    fn bus_layouts() -> Vec<BusLayout> {
+        P::bus_layouts()
+    }
 
-            fn requires_fallible_preparation() -> bool {
-                P::requires_fallible_preparation()
-            }
+    fn requires_fallible_preparation() -> bool {
+        P::requires_fallible_preparation()
+    }
 
-            fn init(_params: &P::Shared, cx: &InitContext) -> Self::DspState {
-                ProcessorSlot {
-                    slot: Slot::default(),
-                    cx: cx.clone(),
-                }
-            }
-
-            fn main_thread(params: &Arc<P::Shared>) -> Box<dyn MainThreadHooks> {
-                Box::new(P::main_thread(params))
-            }
-
-            fn reset(state: &mut Self::DspState, params: &P::Shared, _config: &AudioConfig) {
-                if let Some(processor) = state.processor_mut() {
-                    P::reset(processor, params);
-                }
-            }
-
-            fn prepare(
-                state: &mut Self::DspState,
-                params: &P::Shared,
-                config: &PreparationConfig,
-            ) -> Result<(), PreparationError> {
-                activate::<$sample, P>(state, params, config)
-            }
-
-            fn process(
-                state: &mut Self::DspState,
-                params: &P::Shared,
-                buffer: &mut AudioBuffer<$sample>,
-                events: &EventList,
-                context: &mut ProcessContext,
-            ) -> ProcessStatus {
-                process::<$sample, P>(state, params, buffer, events, context)
-            }
-
-            fn state_changed(state: &mut Self::DspState, params: &P::Shared) {
-                if let Some(processor) = state.processor_mut() {
-                    P::state_changed(processor, params);
-                }
-            }
-
-            fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
-                P::validate_state(data)
-            }
-
-            fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
-                P::migrate_state(foreign)
-            }
-
-            fn state_schema_version() -> u32 {
-                P::state_schema_version()
-            }
-
-            fn state_migrations() -> moose_core::state::StateMigrationChain {
-                P::state_migrations()
-            }
-
-            fn latency(state: &Self::DspState) -> u32 {
-                state.processor().map_or(0, P::latency)
-            }
-
-            fn tail(state: &Self::DspState) -> u32 {
-                state.processor().map_or(0, P::tail)
-            }
-
-            fn editor(params: Arc<P::Shared>) -> Box<dyn Editor> {
-                P::editor(params)
-            }
+    fn init(_params: &P::Shared, cx: &InitContext) -> Self::DspState {
+        ProcessorSlot {
+            slot: Slot::default(),
+            cx: cx.clone(),
         }
-    };
+    }
+
+    fn main_thread(params: &Arc<P::Shared>) -> Box<dyn MainThreadHooks> {
+        Box::new(P::main_thread(params))
+    }
+
+    fn reset(state: &mut Self::DspState, params: &P::Shared, _config: &AudioConfig) {
+        if let Some(processor) = state.processor_mut() {
+            P::reset(processor, params);
+        }
+    }
+
+    fn prepare(
+        state: &mut Self::DspState,
+        params: &P::Shared,
+        config: &PreparationConfig,
+    ) -> Result<(), PreparationError> {
+        activate::<S, P>(state, params, config)
+    }
+
+    fn process(
+        state: &mut Self::DspState,
+        params: &P::Shared,
+        buffer: &mut AudioBuffer<S>,
+        events: &EventList,
+        context: &mut ProcessContext,
+    ) -> ProcessStatus {
+        // FTZ/DAZ (or FZ on AArch64) for the duration of the plugin's
+        // process body so denormals on feedback paths never stall the core.
+        let _denormal_guard = DenormalGuard::new();
+        process::<S, P>(state, params, buffer, events, context)
+    }
+
+    fn state_changed(state: &mut Self::DspState, params: &P::Shared) {
+        if let Some(processor) = state.processor_mut() {
+            P::state_changed(processor, params);
+        }
+    }
+
+    fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
+        P::validate_state(data)
+    }
+
+    fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
+        P::migrate_state(foreign)
+    }
+
+    fn state_schema_version() -> u32 {
+        P::state_schema_version()
+    }
+
+    fn state_migrations() -> moose_core::state::StateMigrationChain {
+        P::state_migrations()
+    }
+
+    fn latency(state: &Self::DspState) -> u32 {
+        state.processor().map_or(0, P::latency)
+    }
+
+    fn tail(state: &Self::DspState) -> u32 {
+        state.processor().map_or(0, P::tail)
+    }
 }
 
-lifecycle_leaf!(PluginLogic, f32);
-lifecycle_leaf!(PluginLogic64, f64);
+impl<S: Sample, P: Plugin<S>> PluginEditor<S> for Lifecycle<P> {
+    type Params = P::Shared;
+
+    fn editor(params: Arc<P::Shared>) -> Box<dyn Editor> {
+        P::editor(params)
+    }
+}

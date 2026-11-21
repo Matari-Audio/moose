@@ -1,53 +1,26 @@
 # moose-plugin
 
-User-facing plugin traits for the moose audio plugin framework.
+User-facing plugin trait for the moose audio plugin framework.
 
 ## Overview
 
-`moose-plugin` is the home of `PluginLogic` - the one trait plugin
-authors implement, covering both audio-thread DSP and main-thread
-GUI. The crate is intentionally light: it depends on `moose-core`,
-`moose-gui-types` (data + render-trait surface only), and
-`moose-params`. No tiny-skia, no baseview, no fonts. Plugin
-authors using a custom editor (egui, raw window
-handle) end up with this crate in their dep tree but never pull in
-the built-in editor's heavy stack.
+`moose-plugin` defines [`Plugin`], the single trait plugin authors implement.
+It splits a plugin into three ownership-clean types:
 
-## Three traits, one source of truth
+- `Shared`: lock-free parameters and atomics (`Arc<Self::Shared>`)
+- `MainThread`: host-main-thread hooks (track info, context menus, MIDI learn)
+- `Processor`: audio-thread DSP state created in `activate` and dropped in `deactivate`
 
-| Trait | Sample type | Where it lives |
-|---|---|---|
-| `PluginLogic` | `f32` | What `f32` plugins implement |
-| `PluginLogic64` | `f64` | What `f64` plugins implement |
-| `PluginLogicCore<S>` | generic | What format wrappers consume |
+The crate is intentionally light: it depends on `moose-core`, `moose-gui-types`
+(data + render-trait surface only), and `moose-params`. No tiny-skia, no
+baseview, no fonts. Custom editors (egui, MUI, raw window handles) never pull
+in the built-in editor's rendering stack.
 
-Both leaf traits are stamped from one `plugin_logic_leaf_trait!`
-`macro_rules!` definition so the method shapes stay in lock-step.
-Each leaf gets a blanket impl that forwards every method to
-`PluginLogicCore<S>` with the matching `S`. Wrappers
-(`StaticShell`, `HotShell`, the format crates) bind on
-`PluginLogicCore<S>`; the leaf-vs-leaf distinction is purely
-user-facing.
+## Wrapper Bridge
 
-One layer of sugar sits on top: `PurePluginLogic` /
-`PurePluginLogic64` for plugins with no DSP state. They drop the
-`type DspState` / `init` / `state` plumbing from the surface and
-blanket-implement the matching leaf with `DspState = ()`, so
-everything downstream consumes them unchanged.
+`Lifecycle<P>` adapts any `P: Plugin<S>` (`S = f32` default, or `f64`) into
+`PluginLogicCore<S>` and `PluginEditor<S>` so `StaticShell`, `HotShell`, and
+every format wrapper (`moose-clap`, `moose-vst3`, `moose-au`) drive it through
+one unified path via `moose::plugin!`.
 
-## What this buys
-
-The `moose::prelude64` re-export aliases `PluginLogic64` as
-`PluginLogic` in the user's scope, so the same impl header reads
-the same regardless of which precision the prelude chose:
-
-```rust
-use moose::prelude::*;          // or prelude64::*
-impl PluginLogic for MyPlugin {
-    fn process(state: &mut Self::DspState, params: &Self::Params, buffer: &mut AudioBuffer, ...) -> ProcessStatus { ... }
-}
-```
-
-Zero `<Sample>` mentions in user code.
-
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

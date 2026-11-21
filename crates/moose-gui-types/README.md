@@ -21,7 +21,7 @@ moose-core          <- AudioBuffer, Editor trait, EventList, ...
    |
 moose-gui-types     <- this crate - light data + traits
    |
-moose-plugin        <- PluginLogic / PluginLogic64 / PluginLogicCore
+moose-plugin        <- Plugin / Lifecycle / PluginLogicCore
    |       \
 moose-gui   moose-egui  <- alt GUI backend
 (BuiltinEditor,   depends on moose-gui-types but not moose-gui
@@ -57,4 +57,4 @@ depends on `moose-gui`.
 - **`layout!`** - declarative DSL for `PluginLayout`
 - **`grid!`** - declarative DSL for `GridLayout`
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

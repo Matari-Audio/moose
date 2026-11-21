@@ -1,13 +1,11 @@
 //! Shell-side integration: the hot-reloadable `HotShell<P, S>`.
 //!
-//! `HotShell<P, S = f32>` implements moose-core's `Plugin` +
+//! `HotShell<P, S = f32>` implements moose-core's `PluginRuntime` +
 //! `PluginExport` traits, delegating all logic to the flat Rust-ABI
 //! symbols the hot-reloadable dylib exports (`export_plugin!`), which
 //! it drives over an opaque `state: *mut ()` it owns across reloads.
-//! The user's plugin impls one of the leaf traits (`PluginLogic` for
-//! `f32` or `PluginLogic64` for `f64`); the blanket bridges in
-//! `moose-plugin` lift that into the `PluginLogicCore<S>` the dylib's
-//! exported functions call through.
+//! The user implements `Plugin<S>` for `f32` or `f64`; `Lifecycle` adapts
+//! it to the `PluginLogicCore<S>` the dylib's exported functions call.
 //!
 //! `HotShell` is parameterised over `S` so a `prelude64` plugin
 //! and its `S = f64` logic dylib can hot-reload too. The chosen

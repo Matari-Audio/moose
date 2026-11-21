@@ -120,7 +120,7 @@ pub trait State: Sized + Default {
     /// Serialize into `buf`. Clears `buf` first, then reuses its
     /// capacity - calling this repeatedly with the same buffer is
     /// allocation-free once warmed, so it is the form to use on the
-    /// audio thread (e.g. `PluginLogic::snapshot_into`).
+    /// audio thread (e.g. `PluginLogicCore::snapshot_into`).
     fn serialize_into(&self, buf: &mut Vec<u8>);
 
     /// Serialize to a fresh `Vec`. Convenience wrapper over

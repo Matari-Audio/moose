@@ -77,10 +77,11 @@ cargo-moose - build tool for moose audio plugins
 Usage: cargo moose <command> [options]
 
 Scaffold:
-  new <name> [--instrument] [--midi] [--pure|--stateful] [--no-standalone] [--vendor <n>] [--vendor-id <id>]
+  new <name> [--instrument] [--midi] [--pure|--stateful] [--no-standalone] [--no-ci] [--vendor <n>] [--vendor-id <id>]
       Scaffold a new single-plugin project. Defaults include the
-      `standalone` feature + `src/main.rs` host; pass --no-standalone
-      to skip those (saves the bin entry, the dep, and the file).
+      `standalone` feature + `src/main.rs` host and a ready-to-run
+      `.github/workflows/ci.yml`; pass --no-standalone or --no-ci to
+      skip them.
       `--stateful` (default) implements `moose::Plugin` with a
       `<Name>Processor` struct for the DSP state, built in `activate`;
       `--pure` implements it with `type Processor = ()`.
@@ -100,6 +101,7 @@ Scaffold:
         --midi                      Default all plugins to midi type
         --pure | --stateful         Processor = () vs a <Name>Processor struct (default)
         --no-standalone             Skip the standalone feature + host bin in every plugin
+        --no-ci                     Skip generating .github/workflows/ci.yml
         --type:<plugin>=<kind>      Per-plugin type override (effect, instrument, midi)
 
 Build / Install / Package:
@@ -283,10 +285,10 @@ fn print_new_help() {
         "\
 Usage:
   cargo moose new <name> [--instrument] [--midi] [--pure|--stateful]
-                        [--no-standalone] [--vendor <name>] [--vendor-id <id>]
+                        [--no-standalone] [--no-ci] [--vendor <name>] [--vendor-id <id>]
   cargo moose new <workspace-name> --workspace <plugin1> [plugin2 ...]
                                    [--instrument] [--midi] [--pure|--stateful]
-                                   [--no-standalone] [--vendor <name>] [--vendor-id <id>]
+                                   [--no-standalone] [--no-ci] [--vendor <name>] [--vendor-id <id>]
                                    [--type:<plugin>=<kind> ...]
 
 Scaffold a new moose plugin project.
@@ -309,6 +311,7 @@ Options:
                           and passed to `process`, pre-wired.
                           This is the default.
   --no-standalone         Skip generating a standalone runner crate.
+  --no-ci                 Skip generating .github/workflows/ci.yml.
   --workspace             Multi-plugin workspace mode (positional args
                           after the name are plugin names).
   --vendor <name>         Vendor display name (default: placeholder).
@@ -334,9 +337,7 @@ fn cmd_new(args: &[String]) -> Res {
     }
 
     let scaffolder = Scaffolder::new(parsed.use_registry);
-    let features = FeatureSet {
-        standalone: parsed.with_standalone,
-    };
+    let features = parsed.features;
 
     if parsed.workspace_mode {
         scaffold_workspace(&scaffolder, parsed, features)
@@ -359,7 +360,7 @@ struct NewArgs {
     vendor_name: Option<String>,
     vendor_id: Option<String>,
     type_overrides: Vec<(String, PluginKind)>,
-    with_standalone: bool,
+    features: FeatureSet,
     workspace_mode: bool,
     /// Default `true` — scaffolds pin moose-* deps to crates.io
     /// (`version = "X.Y"`). Setting `--github` flips this to
@@ -380,6 +381,7 @@ fn parse_new_args(args: &[String]) -> Result<NewArgs, CargoMooseError> {
     let mut vendor_id: Option<String> = None;
     let mut type_overrides: Vec<(String, PluginKind)> = Vec::new();
     let mut with_standalone = true;
+    let mut with_ci = true;
     let mut workspace_mode = false;
     let mut use_registry = true;
 
@@ -392,6 +394,7 @@ fn parse_new_args(args: &[String]) -> Result<NewArgs, CargoMooseError> {
             "--pure" => default_statefulness = Statefulness::Pure,
             "--stateful" => default_statefulness = Statefulness::Stateful,
             "--no-standalone" => with_standalone = false,
+            "--no-ci" => with_ci = false,
             "--github" => use_registry = false,
             "--vendor" => {
                 vendor_name = Some(iter.next().ok_or("--vendor requires a value")?.clone());
@@ -438,7 +441,10 @@ fn parse_new_args(args: &[String]) -> Result<NewArgs, CargoMooseError> {
         vendor_name,
         vendor_id,
         type_overrides,
-        with_standalone,
+        features: FeatureSet {
+            standalone: with_standalone,
+            ci: with_ci,
+        },
         workspace_mode,
         use_registry,
     })

@@ -24,7 +24,7 @@ use moose_plugin::PluginLogicCore;
 // StaticShell
 // ---------------------------------------------------------------------------
 
-/// A static plugin shell that embeds the user's `PluginLogic` impl
+/// A static plugin shell that embeds the user's plugin logic
 /// directly into the format-wrapper binary.
 ///
 /// Same bridging as `HotShell` but without `NativeLoader`, `Mutex`,
@@ -421,13 +421,13 @@ pub(crate) fn publish_snapshot_with(
 // export_static! macro
 // ---------------------------------------------------------------------------
 
-/// Compile-time static embedding of a `PluginLogic` impl into the binary.
+/// Compile-time static embedding of a `PluginLogicCore` adapter into the binary.
 ///
-/// Produces a `__HotShellWrapper` struct that implements `Plugin + PluginExport`,
+/// Produces a `__HotShellWrapper` struct that implements `PluginRuntime + PluginExport`,
 /// so format export macros (`export_clap!`, `export_vst3!`, etc.) work unchanged.
 /// No dlopen, no file watcher, zero runtime overhead. Bus layouts come from
-/// `<$logic as PluginLogic>::bus_layouts()` - override the trait method to
-/// pick something other than the stereo default.
+/// `<$logic as PluginLogicCore<Sample>>::bus_layouts()`. Override the
+/// corresponding `Plugin` method to pick a layout other than stereo.
 ///
 /// ```ignore
 /// export_static! {

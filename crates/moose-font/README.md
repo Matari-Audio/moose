@@ -23,4 +23,4 @@ Open Font License, Version 1.1**. The full license text is at
 the font and preserve its embedded copyright notice
 ("Copyright 2020 The JetBrains Mono Project Authors").
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).

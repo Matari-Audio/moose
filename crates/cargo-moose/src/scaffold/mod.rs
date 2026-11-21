@@ -29,7 +29,10 @@ use std::path::Path;
 
 use crate::{CargoMooseError, Res};
 
-use context::{MooseTomlContext, Pins, PluginScaffoldingContext, WorkspaceContext};
+use context::{
+    CiContext, MooseTomlContext, Pins, PluginScaffoldingContext, ProjectReadmeContext,
+    WorkspaceContext,
+};
 use layout::{ProjectLayout, WorkspaceLayout};
 use render::{Renderer, tpl};
 
@@ -136,6 +139,19 @@ impl Scaffolder {
             self.renderer.render(tpl::MOOSE_TOML, &moose_ctx),
         )?;
 
+        let crate_names = vec![plugin.name.clone()];
+        let readme_ctx =
+            ProjectReadmeContext::new(&plugin.name, false, features, crate_names.clone());
+        write(
+            &layout.readme_md(),
+            self.renderer.render(tpl::PROJECT_README, &readme_ctx),
+        )?;
+        if features.ci {
+            fs::create_dir_all(layout.github_workflows_dir())?;
+            let ci_ctx = CiContext::new(crate_names);
+            write(&layout.ci_yml(), self.renderer.render(tpl::CI_YML, &ci_ctx))?;
+        }
+
         Ok(())
     }
 
@@ -189,6 +205,7 @@ impl Scaffolder {
         )?;
 
         // Per-plugin crates.
+        let mut crate_names = Vec::with_capacity(plugins.len());
         for p in plugins {
             let layout = ProjectLayout::workspace_plugin(root, &p.name);
             let crate_name = format!("{workspace_name}-{}", p.name);
@@ -199,6 +216,22 @@ impl Scaffolder {
                 p.statefulness,
                 DepForm::Workspace,
                 features,
+            )?;
+            crate_names.push(crate_name);
+        }
+
+        let readme_ctx =
+            ProjectReadmeContext::new(workspace_name, true, features, crate_names.clone());
+        write(
+            &ws_layout.readme_md(),
+            self.renderer.render(tpl::PROJECT_README, &readme_ctx),
+        )?;
+        if features.ci {
+            fs::create_dir_all(ws_layout.github_workflows_dir())?;
+            let ci_ctx = CiContext::new(crate_names);
+            write(
+                &ws_layout.ci_yml(),
+                self.renderer.render(tpl::CI_YML, &ci_ctx),
             )?;
         }
 

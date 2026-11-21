@@ -1,18 +1,18 @@
 //! Hot-reload mechanics for moose: dylib loading, ABI canary, and the
 //! shells (`HotShell<P, S>`, `StaticShell<P, L, S>`) that bridge the
-//! user-facing `moose_plugin::PluginLogic` / `moose_plugin::PluginLogic64`
-//! leaf traits onto [`moose_core::PluginRuntime`] for format wrappers.
+//! user-facing `moose_plugin::Plugin<S>` through `Lifecycle` onto
+//! [`moose_core::PluginRuntime`] for format wrappers.
 //!
 //! Plugin authors don't reach into this crate directly. They write
-//! `impl PluginLogic for MyPlugin` (the leaf trait is sample-pinned
-//! via the prelude re-export) and the `moose::plugin!` macro picks
-//! the static or hot shell based on the `shell` Cargo feature.
+//! `impl Plugin for MyPlugin` (or `impl Plugin<f64> for MyPlugin`) and the
+//! `moose::plugin!` macro picks the static or hot shell based on the
+//! `shell` Cargo feature.
 //!
 //! # ABI boundary
 //!
-//! `PluginLogic` is a stateless descriptor with a separate `type DspState`,
-//! so the DSP state can live in the *shell* rather than the reloadable
-//! dylib. The dylib exports a flat set of Rust-ABI functions
+//! The `Plugin::Processor` owns the DSP state, which lives in the *shell*
+//! rather than the reloadable dylib. The dylib exports a flat set of
+//! Rust-ABI functions
 //! (`export_plugin!`) over an opaque `*mut ()` state pointer (an erased
 //! `Box<State>`) plus the shell's `Arc<Params>` pointer. `HotShell` owns
 //! the state and, on a reload, carries it into the new code by a save /
@@ -22,10 +22,7 @@
 //! `StaticShell` holds a typed `L::DspState` directly.
 //!
 //! ```ignore
-//! use moose_loader::{AbiCanary, PluginLogic, PluginLogicCore};
-//!
-//! struct MyPlugin;                 // stateless descriptor
-//! impl PluginLogic for MyPlugin { type DspState = MyState; /* ... */ }
+//! use moose_loader::AbiCanary;
 //!
 //! // Emitted by `moose::plugin!` (plugin authors don't write these).
 //! // `Sample` resolves through the prelude alias (`f32` for `prelude` /
@@ -65,14 +62,10 @@ pub mod static_shell;
 
 pub use canary::{ABI_EPOCH, AbiCanary};
 pub use safe_types::*;
-// Source the leaf + core traits directly from `moose-plugin` rather
-// than via the optional `moose-gui` re-export, so these names are
-// reachable regardless of whether the `builtin-gui` feature is on.
-#[allow(
-    deprecated,
-    reason = "re-exported for code still on the deprecated leaf traits"
-)]
-pub use moose_plugin::{PluginLogic, PluginLogic64, PluginLogicCore};
+// Source the core trait directly from `moose-plugin` rather than via the
+// optional `moose-gui` re-export, so it stays reachable regardless of
+// whether the `builtin-gui` feature is on.
+pub use moose_plugin::PluginLogicCore;
 
 #[cfg(feature = "shell")]
 pub use loader::NativeLoader;

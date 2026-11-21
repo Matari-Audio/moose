@@ -3,8 +3,8 @@
 #
 # Cargo injects everything in `[env]` into the environment of any
 # subcommand it spawns, so values here are visible to `cargo moose`
-# without further plumbing. See https://truce.audio/ for the full
-# list of env vars moose understands.
+# without further plumbing. See https://github.com/Matari-Audio/moose
+# for the full list of env vars moose understands.
 
 [env]
 # --- macOS code signing ---
@@ -37,3 +37,20 @@
 
 # Optional override for the RFC 3161 timestamp server:
 # MOOSE_TIMESTAMP_URL = "http://timestamp.digicert.com"
+
+# --- Fast local linking (optional) ---
+# x86_64 Linux: nothing to do - Rust 1.90+ already links with the
+# bundled `rust-lld` by default.
+#
+# Windows (requires `lld-link` from LLVM or rustup `llvm-tools`):
+# [target.x86_64-pc-windows-msvc]
+# linker = "lld-link.exe"
+
+# --- Windows MSVC: static C runtime ---
+# `cargo moose` always links the CRT statically on windows-msvc (hosts
+# such as FL Studio's scanner can't find VCRUNTIME140 next to a plugin).
+# Mirroring it here keeps plain `cargo build` / `test` / `clippy` and
+# rust-analyzer on the same rustflags, so switching between them and
+# `cargo moose --debug` doesn't rebuild every dependency.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

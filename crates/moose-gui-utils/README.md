@@ -30,4 +30,4 @@ raw parent pointer) and are no-ops off macOS, so callers can invoke them
 unconditionally; `should_skip_frame` returns a real answer on macOS and
 Windows and `false` elsewhere.
 
-Part of [moose](https://github.com/Matari-Audio/moose). [Docs](https://truce.audio/docs/).
+Part of [moose](https://github.com/Matari-Audio/moose).
