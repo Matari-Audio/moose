@@ -182,6 +182,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
 
         let proc = &*process;
         let data = data_from_plugin::<P>(plugin);
+        data.host.debug_assert_audio_thread(data.host_thread_check);
         let num_frames = proc.frames_count as usize;
 
         if num_frames == 0 {

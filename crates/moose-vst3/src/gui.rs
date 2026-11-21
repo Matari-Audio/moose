@@ -305,6 +305,49 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
     });
 }
 
+/// `IParameterFinder::findParameter`: hit-test the editor at host view
+/// coordinates `(x, y)` (physical pixels on Windows/Linux, logical points on
+/// macOS) and write the matching parameter ID into `out_id`.
+pub(crate) unsafe extern "C" fn cb_gui_param_at<P: PluginExport>(
+    ctx: *mut std::ffi::c_void,
+    x: i32,
+    y: i32,
+    out_id: *mut u32,
+) -> i32 {
+    run_extern_callback_with::<P, i32>("vst3", "gui_param_at", 0, || unsafe {
+        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
+            return 0;
+        };
+        let Some(out) = out_id.as_mut() else {
+            return 0;
+        };
+        let Some(gui) = inst.gui.try_enter() else {
+            return 0;
+        };
+        let Some(editor) = gui.editor.as_deref() else {
+            return 0;
+        };
+        #[cfg(target_os = "macos")]
+        let (lx, ly) = (x, y);
+        #[cfg(not(target_os = "macos"))]
+        let (lx, ly) = {
+            inst.note_window_scale(editor);
+            let scale = inst.host_scale();
+            #[allow(clippy::cast_possible_truncation)]
+            (
+                (f64::from(x) / scale).round() as i32,
+                (f64::from(y) / scale).round() as i32,
+            )
+        };
+        if let Some(id) = editor.param_at(lx, ly) {
+            *out = id;
+            1
+        } else {
+            0
+        }
+    })
+}
+
 pub(crate) unsafe extern "C" fn cb_gui_set_content_scale<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     scale: f64,

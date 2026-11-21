@@ -1440,6 +1440,29 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             }
         }
     };
+    let live_param_range_arms: Vec<_> = value_list_idents
+        .iter()
+        .map(|ident| {
+            quote! {
+                x if x == self.#ident.id() => Some(self.#ident.current_range()),
+            }
+        })
+        .collect();
+    let live_param_range_impl = if live_param_range_arms.is_empty() && nested_idents.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn live_param_range(&self, id: u32) -> Option<::moose::params::ParamRange> {
+                match id {
+                    #(#live_param_range_arms)*
+                    _ => {
+                        #(if let Some(range) = ::moose::params::Params::live_param_range(&self.#nested_idents, id) { return Some(range); })*
+                        None
+                    }
+                }
+            }
+        }
+    };
     let own_string_id_pushes: Vec<_> = param_fields
         .iter()
         .map(|f| {
@@ -1704,6 +1727,7 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             #function_impl
             #param_string_ids_impl
             #value_list_labels_impl
+            #live_param_range_impl
             #catalog_impl
             #validate_impl
             #restore_impl

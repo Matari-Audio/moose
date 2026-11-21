@@ -4,8 +4,8 @@ use crate::ffi;
 use crate::gui::{
     cb_gui_can_resize, cb_gui_check_size_constraint, cb_gui_close, cb_gui_event_fd,
     cb_gui_get_size, cb_gui_has_editor, cb_gui_on_fd, cb_gui_on_timer, cb_gui_open,
-    cb_gui_open_wayland, cb_gui_set_content_scale, cb_gui_set_size, cb_gui_supports_wayland,
-    cb_midi_mapping_get_param_id,
+    cb_gui_open_wayland, cb_gui_param_at, cb_gui_set_content_scale, cb_gui_set_size,
+    cb_gui_supports_wayland, cb_midi_mapping_get_param_id,
 };
 use crate::host_state::{
     cb_state_free, cb_state_load, cb_state_load_stream, cb_state_save, cb_state_save_stream,
@@ -15,8 +15,8 @@ use crate::lifecycle::{
     cb_bind_host_queue, cb_create, cb_destroy, cb_drain_host_queue, cb_layout_bus_channels,
     cb_match_bus_layout, cb_match_bus_layout_perbus, cb_midi_learn, cb_param_affects_presentation,
     cb_param_function_name, cb_perform_menu, cb_prepare, cb_remap_param_id, cb_reset,
-    cb_set_active, cb_set_catalog_waker, cb_set_persist_waker, cb_set_processing,
-    cb_take_catalog_changes, cb_take_persist_change, cb_track_info_changed,
+    cb_set_active, cb_set_audio_presentation_latency, cb_set_catalog_waker, cb_set_persist_waker,
+    cb_set_processing, cb_take_catalog_changes, cb_take_persist_change, cb_track_info_changed,
     cb_wants_persist_notifications, descriptor_buses, vst3_topology_consistent,
 };
 use crate::midi_proxy::{
@@ -30,7 +30,7 @@ use crate::output_events::{
 use crate::params::{
     cb_param_count, cb_param_denormalize, cb_param_format, cb_param_get_value, cb_param_is_chunked,
     cb_param_normalize, cb_param_parse, cb_param_presentation, cb_param_presentation_revision,
-    cb_param_set_value,
+    cb_param_set_value, cb_param_step_count,
 };
 use crate::process::{cb_get_latency, cb_get_tail, cb_process, cb_process_f64};
 
@@ -386,6 +386,9 @@ pub(crate) fn register_vst3_inner<P: PluginExport>(num_inputs: u32, num_outputs:
         bind_host_queue: cb_bind_host_queue::<P>,
         drain_host_queue: cb_drain_host_queue::<P>,
         perform_menu: cb_perform_menu::<P>,
+        gui_param_at: cb_gui_param_at::<P>,
+        set_audio_presentation_latency: cb_set_audio_presentation_latency::<P>,
+        param_step_count: cb_param_step_count::<P>,
     }));
 
     // Unify with the `Box::leak(Box::new(...))` shape above so every

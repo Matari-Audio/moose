@@ -12,9 +12,11 @@ use crate::track_info;
 use crate::voice_info;
 
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency};
+use clap_sys::ext::log::{CLAP_EXT_LOG, CLAP_LOG_ERROR, clap_host_log};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_host_params};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail};
+use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
 use clap_sys::ext::track_info::{
     CLAP_EXT_TRACK_INFO, CLAP_EXT_TRACK_INFO_COMPAT, clap_host_track_info,
 };
@@ -97,6 +99,16 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
         {
             data.host_track_info = ext;
         }
+        if let Some(ext) = data.host.extension::<clap_host_log>(CLAP_EXT_LOG) {
+            data.host_log = ext;
+        }
+        if let Some(ext) = data
+            .host
+            .extension::<clap_host_thread_check>(CLAP_EXT_THREAD_CHECK)
+        {
+            data.host_thread_check = ext;
+        }
+        data.host.debug_assert_main_thread(data.host_thread_check);
         if data.params_arc.wants_persist_notifications() {
             let queue = Arc::clone(&data.host_queue);
             let signal = Arc::new(moose_params::PersistChangeSignal::new(move || {
@@ -144,6 +156,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *co
                 signal.close();
             }
             (*data_ptr).host_queue.close();
+            report_latched_panic(&*data_ptr);
             drop(Box::from_raw(data_ptr));
             drop(Box::from_raw(plugin_ptr));
         }));
@@ -159,6 +172,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
     // Author `reset` runs here; firewall it (false = "activate failed").
     run_extern_callback_with::<P, bool>("CLAP", "activate", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
+        data.host.debug_assert_main_thread(data.host_thread_check);
         let mut audio = data.audio.enter();
         audio.sample_rate = sample_rate;
         let max_block = max_frames_count as usize;
@@ -204,7 +218,11 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             if instance.prepare(&config).is_err() {
                 return false;
             }
-            data.panic_latch.clear();
+            data.panic_latch.clear_with(|msg| {
+                if !data.host.log(data.host_log, CLAP_LOG_ERROR, msg) {
+                    eprintln!("{msg}");
+                }
+            });
             // Publish what the freshly prepared processor reports, so the
             // host reads the real latency/tail before the first block - not
             // the placeholder-rate value from create. CLAP 1.2 permits
@@ -275,6 +293,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
     // firewall it so a panic can't unwind across the C ABI.
     run_extern_callback_with::<P, ()>("CLAP", "deactivate", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
+        data.host.debug_assert_main_thread(data.host_thread_check);
         data.active.store(false, Ordering::Relaxed);
         // A `state_load` while active queues its blob for the audio thread
         // to drain at the top of the next block. If the host deactivates
@@ -352,7 +371,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
 ) {
     unsafe {
         let data = data_from_plugin::<P>(plugin);
-        data.panic_latch.report();
+        data.host.debug_assert_main_thread(data.host_thread_check);
+        report_latched_panic(data);
         // SAFETY: `clap_plugin.on_main_thread` is [main-thread] (plugin.h).
         let main = MainThread::assume();
         let host = data.host.on_main_thread(&main);
@@ -416,4 +436,18 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
             }
         }
     }
+}
+
+/// Forward any latched audio-thread panic message to the host's `clap.log`
+/// extension, falling back to stderr when the host does not expose `clap.log`.
+///
+/// # Safety
+/// `data` belongs to a live instance on a non-audio thread.
+unsafe fn report_latched_panic<P: PluginExport>(data: &ClapPluginData<P>) {
+    data.panic_latch.report_with(|msg| {
+        // SAFETY: caller guarantees `data.host` and `data.host_log` are live.
+        if !unsafe { data.host.log(data.host_log, CLAP_LOG_ERROR, msg) } {
+            eprintln!("{msg}");
+        }
+    });
 }

@@ -372,6 +372,15 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
         None
     }
 
+    /// Live [`ParamRange`] for `id` when its bounds can change at runtime
+    /// (such as [`ValueListParam`] after [`ValueListParam::set_labels`] or
+    /// [`DynamicParams`] slots). Must be lock-free so format wrappers can call
+    /// it from audio-thread automation normalization/denormalization.
+    /// Returns `None` for parameters whose range is fixed at registration.
+    fn live_param_range(&self, _id: u32) -> Option<ParamRange> {
+        None
+    }
+
     /// Cached immutable metadata for format adapters. The default builds the
     /// instance's current table with its stable string IDs attached. Root
     /// projection stores use one process-shared catalog because their complete

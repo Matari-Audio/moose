@@ -543,24 +543,49 @@ impl PanicLatch {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Host thread: take any recorded panic message once and pass it to `f`.
+    ///
+    /// Wrappers that expose a host logging API (such as CLAP `clap.log`) use
+    /// this to forward the message to the host instead of printing to stderr.
+    pub fn report_with(&self, f: impl FnOnce(&str)) {
+        let msg = {
+            let mut slot = self
+                .message
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_empty() {
+                String::new()
+            } else {
+                // Clone out and clear rather than `mem::take` so the slot
+                // keeps its preallocated `PANIC_MESSAGE_CAP` capacity for
+                // future audio-thread `record` calls (which never allocate).
+                let out = slot.clone();
+                slot.clear();
+                out
+            }
+        };
+        if !msg.is_empty() {
+            f(&msg);
+        }
+    }
+
     /// Host thread: print a recorded message, once.
     pub fn report(&self) {
-        let mut slot = self
-            .message
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !slot.is_empty() {
-            eprintln!("{slot}");
-            slot.clear();
-        }
+        self.report_with(|msg| eprintln!("{msg}"));
+    }
+
+    /// Host thread, after a successful prepare / activate: report any
+    /// pending message through `f` and let `process` call the plugin again.
+    pub fn clear_with(&self, f: impl FnOnce(&str)) {
+        self.report_with(f);
+        self.failed
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Host thread, after a successful prepare / activate: report any
     /// pending message and let `process` call the plugin again.
     pub fn clear(&self) {
-        self.report();
-        self.failed
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.clear_with(|msg| eprintln!("{msg}"));
     }
 }
 
@@ -966,7 +991,24 @@ mod panic_latch_tests {
             assert_eq!(slot.capacity(), PANIC_MESSAGE_CAP, "the slot never grows");
         }
         latch.clear();
-        assert!(!latch.is_failed() && latch.message.lock().unwrap().is_empty());
+        {
+            let slot = latch.message.lock().unwrap();
+            assert!(!latch.is_failed() && slot.is_empty());
+            assert_eq!(
+                slot.capacity(),
+                PANIC_MESSAGE_CAP,
+                "clear/report must preserve preallocated capacity for future audio panics"
+            );
+        }
+        // A second panic after clear still captures its message without allocating.
+        let out2 = run_audio_block_latched::<(), ()>(&latch, "TEST", || {
+            std::panic::panic_any("second panic")
+        });
+        assert!(out2.is_none() && latch.is_failed());
+        let mut reported = String::new();
+        latch.clear_with(|msg| reported.push_str(msg));
+        assert!(reported.contains("second panic"), "{reported}");
+        assert_eq!(latch.message.lock().unwrap().capacity(), PANIC_MESSAGE_CAP);
     }
 }
 
