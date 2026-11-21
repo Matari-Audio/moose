@@ -283,8 +283,10 @@ pub(crate) fn cmd_validate(args: &[String]) -> Res {
                     p.resolved_fourcc(),
                     config.vendor.au_manufacturer
                 );
+                // `-strict` fails on warnings as well as errors.
                 let output = validator_command("auval")
                     .args([
+                        "-strict",
                         "-v",
                         p.resolved_au_type(),
                         p.resolved_fourcc(),

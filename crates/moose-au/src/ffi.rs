@@ -642,6 +642,8 @@ pub struct MooseAuHostSink {
     pub param_presentation_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
     pub request_resize:
         Option<unsafe extern "C" fn(user_data: *mut c_void, width: u32, height: u32)>,
+    pub state_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    pub audio_ports_changed: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 }
 
 impl Default for MooseAuHostSink {
@@ -661,6 +663,8 @@ impl Default for MooseAuHostSink {
             param_values_changed: None,
             param_presentation_changed: None,
             request_resize: None,
+            state_changed: None,
+            audio_ports_changed: None,
         }
     }
 }

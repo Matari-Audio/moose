@@ -1625,6 +1625,69 @@ mod tests {
     }
 
     #[test]
+    fn mark_dirty_and_audio_ports_reach_the_host_sink() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::ffi::MooseAuHostSink;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+        use moose_core::host_queue::HostSignal;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        type P = LargePlugin<16>;
+
+        #[derive(Default)]
+        struct Counts {
+            state: AtomicUsize,
+            ports: AtomicUsize,
+        }
+        unsafe extern "C" fn on_state(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<Counts>() }
+                .state
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn on_ports(ud: *mut std::ffi::c_void) {
+            unsafe { &*ud.cast::<Counts>() }
+                .ports
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let counts = Box::new(Counts::default());
+        let sink = MooseAuHostSink {
+            user_data: std::ptr::from_ref(&*counts)
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            state_changed: Some(on_state),
+            audio_ports_changed: Some(on_ports),
+            ..MooseAuHostSink::default()
+        };
+
+        // A v13 shim's sink ends at `request_resize`: the new fields stay unset.
+        let v13_size = std::mem::offset_of!(MooseAuHostSink, state_changed);
+        #[allow(clippy::cast_possible_truncation)]
+        let v13 = MooseAuHostSink {
+            size: v13_size as u32,
+            ..sink
+        };
+        let v13_sink = unsafe { crate::host_drain::HostSink::from_raw(&raw const v13) };
+        unsafe { v13_sink.state_changed() };
+        unsafe { v13_sink.audio_ports_changed() };
+        assert_eq!(counts.state.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.ports.load(Ordering::Relaxed), 0);
+
+        unsafe {
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let main = moose_core::thread::MainThread::assume();
+            inst.host_queue
+                .signal(HostSignal::MARK_DIRTY | HostSignal::AUDIO_PORTS);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(counts.state.load(Ordering::Relaxed), 1);
+            assert_eq!(counts.ports.load(Ordering::Relaxed), 1);
+            cb_destroy::<P>(ctx);
+        }
+    }
+
+    #[test]
     fn v13_combined_presentation_and_rescan_fires_both_and_defers_active_catalog() {
         use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_set_active};
         use crate::ffi::MooseAuHostSink;
