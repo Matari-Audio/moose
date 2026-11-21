@@ -328,6 +328,9 @@ pub trait PluginRuntime: Send + 'static {
     }
 
     /// Tail time in samples. Return `u32::MAX` for infinite tail.
+    /// AU v2 and AU v3 report this sentinel as 10 seconds. For a longer
+    /// AU tail, return a finite sample count; AU converts it to seconds
+    /// using the current sample rate.
     /// Return 0 for no tail (default).
     fn tail(&self) -> u32 {
         0
