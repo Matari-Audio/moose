@@ -13,7 +13,7 @@
 //! through [`DynamicParams::edit`] off the audio thread; the commit wakes the
 //! wrapper through its [`CatalogSignal`] instead of being polled.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::catalog::{CatalogChange, CatalogChanges, CatalogSignal};
@@ -218,20 +218,15 @@ impl Shape {
     }
 }
 
-/// A slot's shape, readable from the audio thread without a lock: a
-/// sequence lock over plain atomics. The single writer is [`DynamicParams`]
-/// under its layout mutex.
-struct ShapeCell {
-    seq: AtomicU32,
+struct ShapeFields {
     tag: AtomicU8,
     a: AtomicU64,
     b: AtomicU64,
 }
 
-impl ShapeCell {
+impl ShapeFields {
     fn new(shape: Shape) -> Self {
         Self {
-            seq: AtomicU32::new(0),
             tag: AtomicU8::new(shape.tag as u8),
             a: AtomicU64::new(shape.a.to_bits()),
             b: AtomicU64::new(shape.b.to_bits()),
@@ -239,20 +234,50 @@ impl ShapeCell {
     }
 
     fn load(&self) -> Shape {
+        Shape {
+            tag: Tag::from_u8(self.tag.load(Ordering::Relaxed)).unwrap_or(Tag::Linear),
+            a: f64::from_bits(self.a.load(Ordering::Relaxed)),
+            b: f64::from_bits(self.b.load(Ordering::Relaxed)),
+        }
+    }
+
+    fn store(&self, shape: Shape) {
+        self.tag.store(shape.tag as u8, Ordering::Relaxed);
+        self.a.store(shape.a.to_bits(), Ordering::Relaxed);
+        self.b.store(shape.b.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// The layout writer fills the inactive copy before publishing it. Readers
+/// can keep using the last published copy if the writer is paused; they only
+/// retry if a publication raced their read.
+struct ShapeCell {
+    published: AtomicU64,
+    fields: [ShapeFields; 2],
+}
+
+impl ShapeCell {
+    fn new(shape: Shape) -> Self {
+        Self {
+            published: AtomicU64::new(0),
+            fields: [ShapeFields::new(shape), ShapeFields::new(shape)],
+        }
+    }
+
+    fn fields_at(&self, generation: u64) -> &ShapeFields {
+        &self.fields[usize::from(generation & 1 != 0)]
+    }
+
+    fn load(&self) -> Shape {
         loop {
-            let before = self.seq.load(Ordering::Acquire);
-            if before & 1 == 0 {
-                let tag = self.tag.load(Ordering::Relaxed);
-                let a = f64::from_bits(self.a.load(Ordering::Relaxed));
-                let b = f64::from_bits(self.b.load(Ordering::Relaxed));
-                fence(Ordering::Acquire);
-                if self.seq.load(Ordering::Relaxed) == before {
-                    return Shape {
-                        tag: Tag::from_u8(tag).unwrap_or(Tag::Linear),
-                        a,
-                        b,
-                    };
-                }
+            let before = self.published.load(Ordering::Acquire);
+            let shape = self.fields_at(before).load();
+            // If any field load sees the writer reusing this copy, this
+            // fence pairs with the pre-write fence in store. The validation
+            // below must then see at least the intervening publication.
+            fence(Ordering::Acquire);
+            if self.published.load(Ordering::Relaxed) == before {
+                return shape;
             }
             std::hint::spin_loop();
         }
@@ -260,13 +285,10 @@ impl ShapeCell {
 
     /// Caller holds the layout lock (one writer).
     fn store(&self, shape: Shape) {
-        let seq = self.seq.load(Ordering::Relaxed);
-        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        let next = self.published.load(Ordering::Relaxed).wrapping_add(1);
         fence(Ordering::Release);
-        self.tag.store(shape.tag as u8, Ordering::Relaxed);
-        self.a.store(shape.a.to_bits(), Ordering::Relaxed);
-        self.b.store(shape.b.to_bits(), Ordering::Relaxed);
-        self.seq.store(seq.wrapping_add(2), Ordering::Release);
+        self.fields_at(next).store(shape);
+        self.published.store(next, Ordering::Release);
     }
 }
 
@@ -1116,6 +1138,36 @@ mod tests {
     }
 
     #[test]
+    fn live_range_uses_published_copy_during_a_layout_write() {
+        let params = DynamicParams::<1>::new();
+        let cell = &params.slots[0];
+        let new = Shape {
+            tag: Tag::Log,
+            a: 10.0,
+            b: 100.0,
+        };
+
+        // Pause the writer after touching the inactive copy but before publishing.
+        cell.shape
+            .fields_at(1)
+            .tag
+            .store(Tag::Log as u8, Ordering::Relaxed);
+        assert!(matches!(
+            params.live_param_range(cell.id),
+            Some(ParamRange::Linear { min: 0.0, max: 1.0 })
+        ));
+
+        cell.shape.store(new);
+        assert!(matches!(
+            params.live_param_range(cell.id),
+            Some(ParamRange::Logarithmic {
+                min: 10.0,
+                max: 100.0
+            })
+        ));
+    }
+
+    #[test]
     fn shape_reads_never_tear() {
         let cell = Arc::new(ShapeCell::new(Shape {
             tag: Tag::Linear,
@@ -1128,7 +1180,7 @@ mod tests {
                 for i in 0..20_000u32 {
                     let v = f64::from(i);
                     cell.store(Shape {
-                        tag: Tag::Linear,
+                        tag: if i % 2 == 0 { Tag::Linear } else { Tag::Log },
                         a: v,
                         b: v,
                     });
@@ -1137,7 +1189,16 @@ mod tests {
         };
         for _ in 0..20_000 {
             let s = cell.load();
-            assert_eq!(s.a.to_bits(), s.b.to_bits(), "torn read {s:?}");
+            assert_eq!(s.a.to_bits(), s.b.to_bits(), "torn bounds {s:?}");
+            assert_eq!(
+                s.tag,
+                if s.a % 2.0 == 0.0 {
+                    Tag::Linear
+                } else {
+                    Tag::Log
+                },
+                "torn tag {s:?}"
+            );
         }
         writer.join().expect("writer");
     }

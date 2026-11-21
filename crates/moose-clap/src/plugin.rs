@@ -369,7 +369,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *cons
 pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
     plugin: *const clap_plugin,
 ) {
-    unsafe {
+    run_extern_callback_with::<P, ()>("CLAP", "on_main_thread", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.host.debug_assert_main_thread(data.host_thread_check);
         report_latched_panic(data);
@@ -435,7 +435,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
                 context_menu::popup(data, &main, target, x, y);
             }
         }
-    }
+    });
 }
 
 /// Forward any latched audio-thread panic message to the host's `clap.log`

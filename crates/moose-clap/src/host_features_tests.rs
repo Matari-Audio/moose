@@ -800,7 +800,7 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
     use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
     use clap_sys::host::clap_host;
     use std::ffi::CStr;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::Ordering};
 
     static LOGGED: Mutex<Vec<(clap_log_severity, String)>> = Mutex::new(Vec::new());
     static ON_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -818,11 +818,11 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
     }
 
     unsafe extern "C" fn is_main(_host: *const clap_host) -> bool {
-        ON_MAIN.load(std::sync::atomic::Ordering::Acquire)
+        ON_MAIN.load(Ordering::Acquire)
     }
 
     unsafe extern "C" fn is_audio(_host: *const clap_host) -> bool {
-        ON_AUDIO.load(std::sync::atomic::Ordering::Acquire)
+        ON_AUDIO.load(Ordering::Acquire)
     }
 
     unsafe extern "C" fn get_ext(
@@ -845,8 +845,8 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
     }
 
     LOGGED.lock().unwrap().clear();
-    ON_MAIN.store(true, std::sync::atomic::Ordering::Release);
-    ON_AUDIO.store(true, std::sync::atomic::Ordering::Release);
+    ON_MAIN.store(true, Ordering::Release);
+    ON_AUDIO.store(true, Ordering::Release);
 
     let host = clap_host {
         clap_version: clap_sys::version::CLAP_VERSION,
@@ -890,6 +890,23 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
         entries[0].1
     );
 
-    ON_MAIN.store(false, std::sync::atomic::Ordering::Release);
+    ON_MAIN.store(false, Ordering::Release);
     assert_eq!(unsafe { handle.is_main_thread(tc_ext) }, Some(false));
+    drop(entries);
+
+    // A host reporting the wrong thread must not abort across the C ABI.
+    #[cfg(debug_assertions)]
+    unsafe {
+        ON_MAIN.store(true, Ordering::Release);
+        let descriptor = DescriptorHolder::new(&Plugin::info());
+        let plugin =
+            create_plugin_instance::<Plugin>(&raw const descriptor.descriptor, &raw const host);
+        assert!(!plugin.is_null());
+        assert!((*plugin).init.unwrap()(plugin));
+        ON_MAIN.store(false, Ordering::Release);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        ON_MAIN.store(true, Ordering::Release);
+        (*plugin).on_main_thread.unwrap()(plugin);
+        (*plugin).destroy.unwrap()(plugin);
+    }
 }
