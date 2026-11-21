@@ -227,6 +227,18 @@ private func au3SinkParamPresentationChanged(_ ud: UnsafeMutableRawPointer?) {
     au.handleSinkParamPresentationChanged()
 }
 
+private func au3SinkStateChanged(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkStateChanged()
+}
+
+private func au3SinkAudioPortsChanged(_ ud: UnsafeMutableRawPointer?) {
+    guard let ud = ud,
+          let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
+    au.handleSinkAudioPortsChanged()
+}
+
 private func au3SinkRequestResize(_ ud: UnsafeMutableRawPointer?, _ width: UInt32, _ height: UInt32) {
     guard let ud = ud,
           let au = Unmanaged<MooseAuSinkBox>.fromOpaque(ud).takeUnretainedValue().au else { return }
@@ -283,6 +295,8 @@ class MooseAUAudioUnit: AUAudioUnit {
             sink.param_values_changed = au3SinkParamValuesChanged
             sink.param_presentation_changed = au3SinkParamPresentationChanged
             sink.request_resize = au3SinkRequestResize
+            sink.state_changed = au3SinkStateChanged
+            sink.audio_ports_changed = au3SinkAudioPortsChanged
             rustCtx = createWithSink(&sink)
             _hasV13Sink = (rustCtx != nil)
         }
@@ -413,6 +427,17 @@ class MooseAUAudioUnit: AUAudioUnit {
         willChangeValue(forKey: "parameterTree")
         buildParameterTree()
         didChangeValue(forKey: "parameterTree")
+    }
+
+    fileprivate func handleSinkStateChanged() {
+        // Hosts that observe `fullState` re-save it and mark the project dirty.
+        willChangeValue(forKey: "fullState")
+        didChangeValue(forKey: "fullState")
+    }
+
+    fileprivate func handleSinkAudioPortsChanged() {
+        willChangeValue(forKey: "channelCapabilities")
+        didChangeValue(forKey: "channelCapabilities")
     }
 
     fileprivate func handleSinkRequestResize(width: UInt32, height: UInt32) {
@@ -1415,7 +1440,10 @@ class MooseAUAudioUnit: AUAudioUnit {
     override var tailTime: TimeInterval {
         guard let ctx = rustCtx, let cb = g_callbacks,
               mooseAbiTailVersion(cb) >= 3, _sampleRate > 0 else { return 0 }
-        return TimeInterval(cb.pointee.tail_samples(ctx)) / _sampleRate
+        let tail = cb.pointee.tail_samples(ctx)
+        // AU has no infinite-tail marker: UInt32.max samples would make hosts
+        // (Logic) render ~25 h of tail on bounce. Same 10 s bound as the v2 shim.
+        return tail == UInt32.max ? 10 : TimeInterval(tail) / _sampleRate
     }
     override var shouldBypassEffect: Bool { get { false } set { } }
 }
