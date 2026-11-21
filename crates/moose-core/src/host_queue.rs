@@ -308,6 +308,16 @@ impl HostQueue {
         HostSignal::from_bits_truncate(self.signals.load(Ordering::Acquire))
     }
 
+    /// Prevent any future [`Self::with_open`] or wake calls from starting,
+    /// without waiting for in-flight registrations yet.
+    ///
+    /// Pair with [`Self::close`] once the current registration returns (used
+    /// when a host destroys an instance re-entrantly from inside a
+    /// [`Self::with_open`] drain).
+    pub fn begin_close(&self) {
+        self.waking.fetch_or(CLOSED_BIT, Ordering::AcqRel);
+    }
+
     /// Stop waking the host, after any wake in flight returns. Wrappers
     /// call this before the instance is freed. Later raises and posts stay
     /// pending but call no wake.
@@ -315,7 +325,7 @@ impl HostQueue {
     /// Must not be called from inside the wake itself (it would wait for
     /// its own return).
     pub fn close(&self) {
-        self.waking.fetch_or(CLOSED_BIT, Ordering::AcqRel);
+        self.begin_close();
         while self.waking.load(Ordering::Acquire) & !CLOSED_BIT != 0 {
             #[cfg(not(all(test, feature = "loom")))]
             std::thread::yield_now();

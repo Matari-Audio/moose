@@ -51,9 +51,14 @@
 // feedback publication.
 // v10: appended explicit parameter-feedback carrier negotiation.
 // v11: appended process-time audio-bus activation metadata.
+// v12: state_load returns acceptance.
+// v13: appended MooseAuHostSink vtable (create_with_sink), active lifecycle
+//      (set_active), host context name (set_context_name), per-instance live
+//      parameter catalog queries (param_ids, param_info_by_id,
+//      param_clump_name), and unified ramp-aware process_native_v13.
 #define MOOSE_AU_ABI_MAGIC_MASK 0xFFFFFF00u
 #define MOOSE_AU_ABI_MAGIC 0x54417500u
-#define MOOSE_AU_ABI_VERSION 0x5441750Cu
+#define MOOSE_AU_ABI_VERSION 0x5441750Du
 
 typedef struct {
     uint8_t component_type[4];
@@ -226,6 +231,75 @@ typedef struct {
     uint32_t param_id;
     float value;
 } AuParamEvent;
+
+/* Unified host-side parameter automation event (v13): covers both immediate
+ * steps (`duration_frames == 0`) and linear ramps (`duration_frames > 0`,
+ * with signed `start_offset` that may be negative when a ramp began in a
+ * previous block or >= num_frames when starting later).
+ *
+ * AUv2 sets `AU_PARAM_EVENT_HAS_START_VALUE` (`kParameterEvent_Ramped` carries
+ * both `startValue` and `endValue`). AUv3 leaves it clear (`AUParameterEvent`
+ * carries only the target `value` and `rampDurationSampleFrames`; Rust derives
+ * the starting value from the parameter's current value). */
+#define AU_PARAM_EVENT_HAS_START_VALUE (1u << 0)
+
+typedef struct {
+    int32_t start_offset;
+    uint32_t duration_frames;
+    uint32_t param_id;
+    uint32_t flags;
+    float start_value;
+    float end_value;
+} AuParamEventV2;
+
+/* Per-instance live parameter metadata copied by value (v13). Avoids
+ * borrowed `const char *` lifetime hazards across dynamic presentation
+ * rebuilds and replaces the legacy process-global C parameter catalog. */
+#define AU_PARAM_FLAG_READ_ONLY (1u << 0)
+#define AU_PARAM_FLAG_HIDDEN    (1u << 1)
+#define AU_PARAM_FLAG_IS_BYPASS (1u << 2)
+#define AU_PARAM_FLAG_CAN_RAMP  (1u << 3)
+
+typedef struct {
+    uint32_t id;
+    uint32_t step_count;
+    uint32_t clump_id;
+    uint32_t flags;
+    double min;
+    double max;
+    double default_value;
+    uint8_t midi_status;
+    uint8_t midi_data1;
+    int16_t midi_channel;
+    uint32_t _reserved;
+    char name[128];
+    char unit[32];
+    char group[128];
+} AuParamInfoOut;
+
+/* Host notification vtable passed by AUv2 (C), AUv3 (Swift), and tests into
+ * `AuCallbacks::create_with_sink` (v13). Copied by value on the Rust side.
+ * Every callback except `release_user_data` runs on the host main/UI thread
+ * while `HostQueue::with_open` holds the instance open. Passing a valid
+ * non-NULL `sink` transfers ownership of `user_data` at call time — including
+ * when `create_with_sink` fails and returns NULL: `release_user_data` (when
+ * non-NULL) runs exactly once either before a NULL return on failure or in
+ * `destroy` AFTER `HostQueue::close()` and editor teardown complete, so
+ * callers must not release `user_data` again after calling `create_with_sink`. */
+typedef struct {
+    uint32_t size;
+    uint32_t _reserved;
+    void *user_data;
+    void (*release_user_data)(void *user_data);
+    void (*begin_edit)(void *user_data, uint32_t param_id);
+    void (*set_param)(void *user_data, uint32_t param_id, float plain_value);
+    void (*end_edit)(void *user_data, uint32_t param_id);
+    void (*latency_changed)(void *user_data);
+    void (*tail_changed)(void *user_data);
+    void (*param_values_changed)(void *user_data);
+    void (*param_presentation_changed)(void *user_data);
+    void (*request_resize)(void *user_data, uint32_t width, uint32_t height);
+} MooseAuHostSink;
 
 /* Transport snapshot filled by the AU v2 / v3 shim from
  * HostCallbackInfo (v2) or AUAudioUnit.musicalContextBlock +
@@ -439,6 +513,43 @@ typedef struct {
                                    uint32_t num_events,
                                    uint32_t input_overflow,
                                    const AuParamEvent *param_events,
+                                   uint32_t num_param_events,
+                                   uint32_t param_overflow,
+                                   const AuTransportSnapshot *transport);
+    /* v13 append-only tail. Offset 1 (`create(void)`) stays untouched for
+     * older AUv3 appex binaries. Passing a valid non-NULL `sink` transfers
+     * ownership of `sink->user_data` immediately, even if initialization fails
+     * and this callback returns NULL (`release_user_data` may run before
+     * returning NULL, so callers must not release `user_data` again). */
+    void *(*create_with_sink)(const MooseAuHostSink *sink);
+    /* 1 on AUv2 Initialize / AUv3 allocateRenderResources;
+     * 0 on AUv2 Uninitialize / AUv3 deallocateRenderResources. */
+    void (*set_active)(void *ctx, uint32_t active);
+    /* Host track / channel name from kAudioUnitProperty_ContextName (v2) or
+     * AUAudioUnit.contextName (v3). NULL clears the name. */
+    void (*set_context_name)(void *ctx, const char *name_utf8);
+    /* Live per-instance parameter enumeration. Returns the total count of
+     * exposed parameters; writes up to `cap` IDs when `out_ids != NULL`. */
+    uint32_t (*param_ids)(void *ctx, uint32_t *out_ids, uint32_t cap);
+    /* Live per-instance parameter info by ID. Returns 1 and fills `*out` if
+     * exposed, 0 otherwise. */
+    int32_t (*param_info_by_id)(void *ctx, uint32_t id, AuParamInfoOut *out);
+    /* Live per-instance clump display name by 1-based `clump_id`. Copies
+     * NUL-terminated UTF-8 into `out` and returns byte length (0 if none). */
+    uint32_t (*param_clump_name)(void *ctx, uint32_t clump_id,
+                                 char *out, uint32_t out_len);
+    /* v13 ramp-aware native process boundary. */
+    uint32_t (*process_native_v13)(void *ctx,
+                                   const float **inputs, float **outputs,
+                                   uint32_t num_input_channels,
+                                   uint32_t num_output_channels,
+                                   uint32_t input_bus_active,
+                                   uint32_t output_bus_active,
+                                   uint32_t num_frames,
+                                   const AuNativeEvent *events,
+                                   uint32_t num_events,
+                                   uint32_t input_overflow,
+                                   const AuParamEventV2 *param_events,
                                    uint32_t num_param_events,
                                    uint32_t param_overflow,
                                    const AuTransportSnapshot *transport);

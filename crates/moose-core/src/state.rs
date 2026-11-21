@@ -329,6 +329,7 @@ pub fn try_apply_state<P: crate::export::PluginExport>(
 ///
 /// ponytail: copies the whole `#[persist]` blob per load; a store with
 /// large persist fields pays that copy. Snapshot by `Arc` if it shows up.
+#[derive(Clone)]
 pub struct ParamsBackup {
     values: Vec<(u32, f64)>,
     persist: Vec<u8>,
@@ -962,14 +963,19 @@ mod tests {
     }
 }
 
+type QueuedLoad = (
+    std::sync::Arc<DeserializedState>,
+    Option<std::sync::Arc<ParamsBackup>>,
+);
+
 /// Host-produced, single audio-consumer state handoff. The host retains an Arc
 /// until it observes that neither the ready slot nor audio owns it. Audio only
 /// decrements an Arc; it can never perform the final free of a recalled state.
 /// At most one consumed state and one queued state survive a producer call.
 /// Persist lanes have already been applied on the host and are released there.
 pub struct StateLoadQueue {
-    ready: crossbeam_queue::ArrayQueue<std::sync::Arc<DeserializedState>>,
-    owners: std::sync::Mutex<Vec<std::sync::Arc<DeserializedState>>>,
+    ready: crossbeam_queue::ArrayQueue<QueuedLoad>,
+    owners: std::sync::Mutex<Vec<QueuedLoad>>,
     /// Address of the last state whose apply finished (0 = none), so the
     /// host can tell whether its own push has landed. The host keeps an
     /// `Arc` clone while it compares, so the address can't be reused.
@@ -997,23 +1003,37 @@ impl StateLoadQueue {
         drop(self.push_tracked(state));
     }
     /// [`Self::force_push`], returning a handle for [`Self::wait_applied`].
-    pub fn push_tracked(&self, mut state: DeserializedState) -> std::sync::Arc<DeserializedState> {
+    pub fn push_tracked(&self, state: DeserializedState) -> std::sync::Arc<DeserializedState> {
+        self.push_with_backup(state, None)
+    }
+    pub(crate) fn push_with_backup(
+        &self,
+        mut state: DeserializedState,
+        backup: Option<ParamsBackup>,
+    ) -> std::sync::Arc<DeserializedState> {
+        let backup = backup.map(std::sync::Arc::new);
         state.persist = Vec::new();
         let state = std::sync::Arc::new(state);
         let mut owners = self
             .owners
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        owners.push(std::sync::Arc::clone(&state));
-        drop(self.ready.force_push(std::sync::Arc::clone(&state)));
+        owners.push((std::sync::Arc::clone(&state), backup.clone()));
+        drop(
+            self.ready
+                .force_push((std::sync::Arc::clone(&state), backup)),
+        );
         // `> 2`: the ready slot or audio, plus the handle returned below.
-        owners.retain(|s| {
+        owners.retain(|(s, _)| {
             std::sync::Arc::strong_count(s) > 1 + usize::from(std::sync::Arc::ptr_eq(s, &state))
         });
         debug_assert!(owners.len() <= 2, "single audio consumer contract");
         state
     }
     pub fn pop(&self) -> Option<std::sync::Arc<DeserializedState>> {
+        self.pop_with_backup().map(|(state, _)| state)
+    }
+    pub(crate) fn pop_with_backup(&self) -> Option<QueuedLoad> {
         self.ready.pop()
     }
     /// Record that `state` (from [`Self::pop`]) has been applied. Two
@@ -1059,6 +1079,7 @@ impl StateLoadQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         owners
             .last()
+            .map(|(state, _)| state)
             .filter(|state| !self.is_applied(state))
             .cloned()
     }
