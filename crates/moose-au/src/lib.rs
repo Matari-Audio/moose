@@ -214,12 +214,19 @@ pub fn register_au<P: PluginExport>() {
                 std::any::type_name::<P>(),
             );
         }
+        let aux_outputs = au_max_aux_output_buses(&layouts);
+        if aux_outputs > 0 {
+            eprintln!(
+                "[moose AU] {}: declares {aux_outputs} auxiliary output bus(es); AU exposes only \
+                 the main output bus and preserves later declared output bus indices as unavailable",
+                std::any::type_name::<P>(),
+            );
+        }
         if layouts.iter().any(|layout| !au_layout_supported(layout)) {
             eprintln!(
-                "[moose AU] {} declares a layout beyond AU's exact process topology: at most one \
-                 main output bus, 32 structurally declared channels per direction, and 32 \
-                 channels of v2 main/output plus first-sidechain staging - plugin will not \
-                 register.",
+                "[moose AU] {} declares a layout beyond AU's exact process topology: 32 \
+                 structurally declared channels per direction, and 32 channels of v2 main/output \
+                 plus first-sidechain staging - plugin will not register.",
                 std::any::type_name::<P>(),
             );
             return;
@@ -253,6 +260,9 @@ fn au_negotiable_layouts(layouts: &[BusLayout]) -> (Vec<i16>, Vec<i16>, u32, usi
     fn main_in(l: &BusLayout) -> u32 {
         l.inputs.first().map_or(0, |b| b.channels.channel_count())
     }
+    fn main_out(l: &BusLayout) -> u32 {
+        l.outputs.first().map_or(0, |b| b.channels.channel_count())
+    }
     fn sidechain(l: &BusLayout) -> u32 {
         l.inputs
             .get(1)
@@ -271,7 +281,7 @@ fn au_negotiable_layouts(layouts: &[BusLayout]) -> (Vec<i16>, Vec<i16>, u32, usi
         .collect();
     let dropped = layouts.len() - kept.len();
     let ins = kept.iter().map(|l| ch(main_in(l))).collect();
-    let outs = kept.iter().map(|l| ch(l.total_output_channels())).collect();
+    let outs = kept.iter().map(|l| ch(main_out(l))).collect();
     (ins, outs, sc0, dropped)
 }
 
@@ -288,13 +298,14 @@ fn au_layout_matches_topology(default: &BusLayout, layout: &BusLayout) -> bool {
                     && (bus.kind == BusKind::Main
                         || bus.channels.channel_count() == default_bus.channels.channel_count())
             })
-        && layout
-            .outputs
-            .iter()
-            .zip(&default.outputs)
-            .all(|(bus, default_bus)| {
-                bus.kind == default_bus.kind && bus.enabled == default_bus.enabled
-            })
+        && layout.outputs.iter().zip(&default.outputs).enumerate().all(
+            |(index, (bus, default_bus))| {
+                bus.kind == default_bus.kind
+                    && bus.enabled == default_bus.enabled
+                    && (index == 0
+                        || bus.channels.channel_count() == default_bus.channels.channel_count())
+            },
+        )
 }
 
 fn au_process_capacity(layouts: &[BusLayout]) -> (u32, u32) {
@@ -348,11 +359,10 @@ fn au_layout_supported(layout: &BusLayout) -> bool {
         .first()
         .map_or(0, |bus| bus.channels.channel_count());
 
-    layout.outputs.len() <= 1
-        && layout
-            .inputs
-            .first()
-            .is_none_or(|bus| bus.kind == BusKind::Main && bus.enabled)
+    layout
+        .inputs
+        .first()
+        .is_none_or(|bus| bus.kind == BusKind::Main && bus.enabled)
         && layout
             .inputs
             .iter()
@@ -374,6 +384,19 @@ fn au_max_aux_input_buses(layouts: &[BusLayout]) -> usize {
     layouts
         .iter()
         .map(|l| l.inputs.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Largest number of auxiliary (non-main) output buses across all declared
+/// layouts. AU exposes only the main output element (index 0); additional
+/// declared output bus indices remain present in `BusRouting` as zero-width
+/// unavailable buses so multi-output instruments (like KONTRA) still register
+/// and render their main stereo bus in AU hosts.
+fn au_max_aux_output_buses(layouts: &[BusLayout]) -> usize {
+    layouts
+        .iter()
+        .map(|l| l.outputs.len().saturating_sub(1))
         .max()
         .unwrap_or(0)
 }
@@ -428,8 +451,9 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
     let layouts = P::bus_layouts();
     // The channel capability describes the *main* bus; a sidechain is a
     // separate input element, not summed into the main width. The main
-    // input bus is the first input bus of a layout.
+    // input/output bus is index 0 of a layout.
     let main_in_of = |l: &BusLayout| l.inputs.first().map_or(0, |b| b.channels.channel_count());
+    let main_out_of = |l: &BusLayout| l.outputs.first().map_or(0, |b| b.channels.channel_count());
     // Only layouts sharing the first layout's sidechain width are
     // negotiable on AU (element 1's width is fixed for the instance).
     let (ins, outs, sidechain_in, dropped) = au_negotiable_layouts(&layouts);
@@ -451,10 +475,11 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
         (std::ptr::null(), std::ptr::null(), 0)
     };
 
-    // Main input bus width (element 0); `num_inputs` is the main width of
-    // the default layout. A plain effect (one input bus) leaves
-    // `sidechain_in` at 0.
+    // Main input/output bus widths (element 0). Multi-output instruments
+    // expose their main output bus (e.g. stereo) on AU while auxiliary output
+    // buses remain inactive in `BusRouting`.
     let num_inputs = layouts.first().map_or(num_inputs, main_in_of);
+    let num_outputs = layouts.first().map_or(num_outputs, main_out_of);
 
     let descriptor = Box::leak(Box::new(AuPluginDescriptor {
         component_type: info.au_type,
@@ -557,7 +582,8 @@ mod tests {
 
     use super::{
         SYSEX_INPUT_SLOTS, SysExInput, SysExQueue, UmpDrainCursor, UmpProtocol,
-        au_max_aux_input_buses, au_negotiable_layouts, au_ump_packet_at, au_ump_packet_count,
+        au_layout_supported, au_max_aux_input_buses, au_max_aux_output_buses,
+        au_negotiable_layouts, au_process_capacity, au_ump_packet_at, au_ump_packet_count,
         au_version_u32, drain_sysex_input, queue_sysex_input,
     };
     use moose_core::bus::{BusLayout, ChannelConfig};
@@ -636,6 +662,40 @@ mod tests {
         assert_eq!(sidechain, 0);
         assert_eq!(dropped, 0);
         assert_eq!(ins, vec![2, 1]);
+    }
+
+    /// Multi-output instruments (like KONTRA's 16 stereo output buses, 32
+    /// channels total) must register on AU and advertise their main stereo
+    /// output bus (2 channels) while auxiliary output buses degrade to
+    /// zero-width inactive routes in `BusRouting`.
+    #[test]
+    fn au_supports_multi_output_instrument_up_to_32_channels() {
+        const NAMES: [&str; 16] = [
+            "st.1", "st.2", "st.3", "st.4", "st.5", "st.6", "st.7", "st.8", "st.9", "st.10",
+            "st.11", "st.12", "st.13", "st.14", "st.15", "st.16",
+        ];
+        let sixteen_stereo = NAMES.into_iter().fold(BusLayout::new(), |layout, name| {
+            layout.with_output(name, ChannelConfig::Stereo)
+        });
+        assert!(au_layout_supported(&sixteen_stereo));
+        assert_eq!(
+            au_max_aux_output_buses(std::slice::from_ref(&sixteen_stereo)),
+            15
+        );
+        let (ins, outs, sidechain, dropped) =
+            au_negotiable_layouts(std::slice::from_ref(&sixteen_stereo));
+        assert_eq!(ins, vec![0]);
+        assert_eq!(outs, vec![2]);
+        assert_eq!(sidechain, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            au_process_capacity(std::slice::from_ref(&sixteen_stereo)),
+            (0, 2)
+        );
+
+        // 17 stereo outputs = 34 structural channels > AU_MAX_FLAT_CHANNELS (32).
+        let seventeen_stereo = sixteen_stereo.with_output("st.17", ChannelConfig::Stereo);
+        assert!(!au_layout_supported(&seventeen_stereo));
     }
 
     #[test]

@@ -35,8 +35,6 @@ pub(crate) struct Session<P: Params> {
     /// The size `build` was designed at, fitted to the window; `None` is
     /// [`MuiEditor::fixed_zoom`].
     design: Option<Size>,
-    #[cfg(target_os = "linux")]
-    native_requests: std::sync::Weak<Requests>,
 }
 
 impl<P: Params> View for Session<P> {
@@ -84,16 +82,7 @@ impl<P: Params> View for Session<P> {
         }
     }
     fn request_resize(&mut self, width: u32, height: u32) -> bool {
-        #[cfg(target_os = "linux")]
-        if let Some(requests) = self.native_requests.upgrade()
-            && requests.wayland_open()
-        {
-            requests.resize(width, height);
-            return true;
-        }
-        self.bridge
-            .context()
-            .is_some_and(|c| c.request_resize(width, height))
+        self.bridge.request_resize(width, height)
     }
     fn rescaled(&mut self, scale: f64, (width, height): (u32, u32)) {
         if let Some(context) = self.bridge.context() {
@@ -208,8 +197,6 @@ impl<P: Params> MuiEditor<P> {
             closed: None,
             user_zoom: None,
             design: Some(size),
-            #[cfg(target_os = "linux")]
-            native_requests: std::sync::Weak::new(),
         };
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
@@ -410,7 +397,10 @@ impl<P: Params> MuiEditor<P> {
                 .log("Wayland: the host gave a null display or surface");
             return;
         };
-        lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
+        lock(&self.shared)
+            .view
+            .bridge
+            .set_native_requests(Arc::downgrade(&self.requests));
         // SAFETY: `RawWindowHandle::WaylandSurface`'s contract: both stay live
         // on this, the host's UI thread, until `close`, which drops the window.
         #[expect(unsafe_code, reason = "the host vouches for its Wayland objects")]
@@ -446,7 +436,10 @@ impl<P: Params> MuiEditor<P> {
                 .log("Wayland: the host gave no socket or token");
             return;
         };
-        lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
+        lock(&self.shared)
+            .view
+            .bridge
+            .set_native_requests(Arc::downgrade(&self.requests));
         let opened = window::wayland::embed_nested(
             socket,
             &token,
@@ -640,7 +633,10 @@ impl<P: Params> Editor for MuiEditor<P> {
         let unhandled = context.clone();
         self.requests
             .on_unhandled_key(Arc::new(move |key| unhandled.unhandled_key(key)));
-        lock(&self.shared).view.native_requests = Arc::downgrade(&self.requests);
+        lock(&self.shared)
+            .view
+            .bridge
+            .set_native_requests(Arc::downgrade(&self.requests));
         match window::wayland::open(
             title,
             self.size,
