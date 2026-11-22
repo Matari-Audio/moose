@@ -61,11 +61,12 @@ fn cargo_moose_bin() -> PathBuf {
 /// Keep artifacts beside Cargo's integration-test tmp directory,
 /// which `Swatinem/rust-cache@v2` excludes.
 ///
-/// Writes a standard `CACHEDIR.TAG` marker because pre-creating the
+/// Ensures a standard `CACHEDIR.TAG` marker because pre-creating the
 /// directory before Cargo runs causes Cargo to skip writing one, which
 /// otherwise hides gigabytes of e2e artifacts from `build-reap` and
 /// cache-aware backup tools.
 fn shared_target() -> &'static Path {
+    const SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let target_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -74,11 +75,13 @@ fn shared_target() -> &'static Path {
         let p = target_root.join("scaffold-e2e-target");
         std::fs::create_dir_all(&p).unwrap();
         let tag = p.join("CACHEDIR.TAG");
-        if !tag.exists() {
+        // A failed write can leave a file without the full signature.
+        if !std::fs::read(&tag).is_ok_and(|contents| contents.starts_with(SIGNATURE.as_bytes())) {
             let _ = std::fs::write(
                 &tag,
-                "Signature: 8a477f597d28d172789f06886806bc55\n\
-                 # This file is a cache directory tag created by cargo-moose scaffold_e2e.\n",
+                format!(
+                    "{SIGNATURE}\n# This file is a cache directory tag created by cargo-moose scaffold_e2e.\n"
+                ),
             );
         }
         p
