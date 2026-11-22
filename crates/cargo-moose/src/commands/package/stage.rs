@@ -469,6 +469,20 @@ pub(crate) fn stage_au3(root: &Path, p: &PluginDef, _config: &Config, staging: &
     Ok(())
 }
 
+/// Stage an AAX `.aaxplugin` bundle into the packaging staging tree by
+/// statically linking the universal Rust `staticlib` (`lib{stem}_aax.a`)
+/// against the Avid AAX SDK (`AAX_SDK_PATH`).
+#[cfg(target_os = "macos")]
+pub(crate) fn stage_aax(root: &Path, p: &PluginDef, config: &Config, staging: &Path) -> Res {
+    if !crate::commands::install::aax::emit_aax_bundle(root, p, config, staging, None)? {
+        return Err(
+            "AAX packaging requested, but AAX_SDK_PATH is not set to a valid Avid AAX SDK directory."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Stage the standalone host as a `.app` bundle inside the packaging
 /// staging tree. Reads the per-arch standalone binaries built by
 /// `build_and_lipo_standalone`, lipo-merges (or copies, single-arch)

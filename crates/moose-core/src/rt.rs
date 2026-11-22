@@ -259,8 +259,9 @@ mod imp {
 
     /// Flag a lock acquisition on the audio thread inside a section. Called
     /// by the instrumented [`Mutex`](super::Mutex) / [`RwLock`](super::RwLock)
-    /// wrappers; a no-op outside a section.
-    pub(super) fn note_lock() {
+    /// wrappers and by blocking [`crate::wrapper::PluginCell::enter`]; a no-op
+    /// outside a section.
+    pub(crate) fn note_lock() {
         note_violation(Kind::Lock);
     }
 
@@ -436,9 +437,10 @@ mod imp {
     /// No-op with `rt-paranoid` off: the instrumented lock types just
     /// delegate to std.
     #[inline]
-    pub(super) fn note_lock() {}
+    pub(crate) fn note_lock() {}
 }
 
+pub(crate) use imp::note_lock;
 pub use imp::{
     Mode, RtSection, allow_alloc, audit, check_dealloc, is_active, set_check_dealloc, set_mode,
 };
@@ -673,16 +675,35 @@ mod tests {
     #[test]
     fn plugin_cell_ownership_is_allocation_free() {
         use super::imp::count_allocs;
+        use crate::wrapper::PluginCell;
+
+        // The audio thread takes plugin ownership every block via wait-free
+        // `try_enter()`, which must never allocate or block.
+        let plugin = PluginCell::new(vec![0u8; 16]);
+        let n = count_allocs(|| {
+            drop(plugin.try_enter().expect("uncontended cell"));
+        });
+        assert_eq!(
+            n, 0,
+            "wait-free try_enter must be allocation- and lock-free"
+        );
+    }
+
+    #[test]
+    fn blocking_plugin_cell_enter_in_section_is_flagged() {
+        use super::imp::count_allocs;
         use crate::wrapper::{PluginCell, enter_plugin};
 
-        // The audio thread takes plugin ownership every block, so that
-        // must never allocate. The ownership cell holds no OS mutex - a
-        // lock is a bare atomic load with nothing to lazily initialize.
-        let plugin = PluginCell::new(vec![0u8; 16]);
+        // Blocking `enter()` may park on an overlapping host and must never be
+        // called inside a real-time section; rt-paranoid flags it as a lock.
+        let plugin = PluginCell::new(0u32);
         let n = count_allocs(|| {
             drop(enter_plugin(&plugin));
         });
-        assert_eq!(n, 0, "taking plugin ownership must be allocation-free");
+        assert!(
+            n >= 1,
+            "blocking PluginCell::enter() inside an RtSection must be flagged"
+        );
     }
 
     #[test]

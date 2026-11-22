@@ -6,15 +6,20 @@
  * to Rust via the shared AuCallbacks table.
  */
 
+#ifdef MOOSE_AU_FAKE_AUDIOTOOLBOX
+#define _GNU_SOURCE
+#include "fake_audiotoolbox.h"
+#else
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <os/lock.h>
+#include <Block.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <pthread.h>
-#include <Block.h>
 #include <math.h>
 
 #include "au_shim_types.h"
@@ -36,7 +41,6 @@ typedef struct {
     AudioComponentPlugInInterface interface; // MUST be first
     AudioComponentInstance componentInstance;
     void *rustCtx;
-    Boolean paramFeedbackAvailable;
 
     AudioStreamBasicDescription inputFormat;
     AudioStreamBasicDescription outputFormat;
@@ -497,16 +501,13 @@ static OSStatus au_v2_open(void *self_, AudioComponentInstance instance) {
     sink.state_changed = au_v2_sink_state_changed;
     sink.audio_ports_changed = au_v2_sink_audio_ports_changed;
 
-    if (g_callbacks->create_with_sink) {
-        // Ownership transfers at the call, even if creation fails. Rust
-        // releases this reference after its last in-flight callback returns.
-        retain_instance(inst);
-        inst->rustCtx = g_callbacks->create_with_sink(&sink);
-        inst->paramFeedbackAvailable = (inst->rustCtx != NULL);
-    } else {
-        inst->rustCtx = g_callbacks->create();
-        inst->paramFeedbackAvailable = false;
+    if (!g_callbacks->create_with_sink) {
+        return kAudioUnitErr_FailedInitialization;
     }
+    // Ownership transfers at the call, even if creation fails. Rust
+    // releases this reference after its last in-flight callback returns.
+    retain_instance(inst);
+    inst->rustCtx = g_callbacks->create_with_sink(&sink);
     if (!inst->rustCtx) return kAudioUnitErr_FailedInitialization;
 
     inst->sampleRate = 44100.0;
@@ -547,7 +548,6 @@ static OSStatus au_v2_close(void *self_) {
         // teardown, including release_user_data, until the drain unwinds.
         g_callbacks->destroy(inst->rustCtx);
         inst->rustCtx = NULL;
-        inst->paramFeedbackAvailable = false;
     }
     release_instance(inst);
     return noErr;
@@ -676,7 +676,7 @@ static OSStatus au_v2_get_property_info(void *self_, AudioUnitPropertyID prop,
             if (scope == kAudioUnitScope_Global) {
                 uint32_t count = (g_callbacks && inst->rustCtx && g_callbacks->param_ids)
                     ? g_callbacks->param_ids(inst->rustCtx, NULL, 0)
-                    : g_num_params;
+                    : 0;
                 size = count * sizeof(AudioUnitParameterID);
             } else {
                 size = 0; // params only on Global scope
@@ -2142,11 +2142,10 @@ static OSStatus au_v2_render(void *self_,
         uint32_t carriers = 0;
         if (inst->midiOutputCallback) carriers |= AU_NATIVE_CARRIER_BYTES;
         if (inst->midiOutputEventListBlock) carriers |= AU_NATIVE_CARRIER_UMP;
-        g_callbacks->begin_output_events_v10(
+        g_callbacks->begin_output_events_v14(
             inst->rustCtx, carriers, inFrameCount,
             (uint32_t)inst->hostMIDIProtocol, UINT32_MAX,
-            umpTimeValid ? 1u : 0u,
-            inst->paramFeedbackAvailable ? 1u : 0u);
+            umpTimeValid ? 1u : 0u);
         for (;;) {
             AuNativeEvent ev = {0};
             uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
@@ -2239,11 +2238,10 @@ static OSStatus au_v2_render(void *self_,
     } else {
         /* Probe the Rust lane so a plugin that emitted events without a host
          * receiver observes queue unavailability on its next block. */
-        g_callbacks->begin_output_events_v10(
+        g_callbacks->begin_output_events_v14(
             inst->rustCtx, 0, inFrameCount,
             (uint32_t)inst->hostMIDIProtocol, UINT32_MAX,
-            umpTimeValid ? 1u : 0u,
-            inst->paramFeedbackAvailable ? 1u : 0u);
+            umpTimeValid ? 1u : 0u);
         AuNativeEvent ev = {0};
         uint32_t status = g_callbacks->next_output_event(inst->rustCtx, &ev);
         if (status == AU_OUTPUT_INVALID)

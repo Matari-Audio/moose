@@ -34,13 +34,6 @@ pub(crate) struct AuExposedParams {
     by_id: HashMap<u32, usize>,
     clump_names: Vec<String>,
     automation: Automation,
-    #[cfg_attr(
-        not(any(target_vendor = "apple", test)),
-        allow(
-            dead_code,
-            reason = "read by AuExposedParams::sync on Apple targets and in tests"
-        )
-    )]
     presentation_revision: u64,
 }
 
@@ -113,13 +106,6 @@ impl AuExposedParams {
     /// Synchronize against `params` on the main thread. Returns
     /// `(values_changed, presentation_changed)` plus the fresh `Arc<ParamCatalog>`
     /// whenever the underlying catalog structure changed.
-    #[cfg_attr(
-        not(any(target_vendor = "apple", test)),
-        allow(
-            dead_code,
-            reason = "called by drain_host_queue on Apple targets and in tests"
-        )
-    )]
     pub(crate) fn sync(&mut self, params: &dyn Params) -> (bool, bool, Option<Arc<ParamCatalog>>) {
         let changes = params.take_catalog_changes();
         let revision = params.parameter_presentation_revision();

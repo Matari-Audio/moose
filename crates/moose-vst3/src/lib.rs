@@ -955,6 +955,55 @@ mod main_thread_tests {
             assert_eq!(unsafe { CStr::from_ptr(function_name(function)) }, name);
         }
     }
+
+    #[test]
+    fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
+        unsafe {
+            let ctx = cb_create::<TestPlugin>();
+            assert!(!ctx.is_null());
+            assert_eq!(cb_prepare::<TestPlugin>(ctx, 48_000.0, 64, 0), 1);
+
+            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
+            let ctx_addr = ctx as usize;
+            let held = inst.plugin.enter();
+
+            let (out_l, out_r) = std::thread::spawn(move || {
+                let ctx = ctx_addr as *mut std::ffi::c_void;
+                let in_l = [0.5f32; 16];
+                let in_r = [0.5f32; 16];
+                let mut out_l = [1.0f32; 16];
+                let mut out_r = [1.0f32; 16];
+                let in_ptrs = [in_l.as_ptr(), in_r.as_ptr()];
+                let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+                let bus_channels = [2u32];
+                crate::process::process_block::<TestPlugin, f32>(
+                    ctx,
+                    in_ptrs.as_ptr(),
+                    out_ptrs.as_mut_ptr(),
+                    2,
+                    2,
+                    bus_channels.as_ptr(),
+                    1,
+                    1,
+                    bus_channels.as_ptr(),
+                    1,
+                    1,
+                    16,
+                    std::ptr::null(),
+                    0,
+                );
+                (out_l, out_r)
+            })
+            .join()
+            .expect("VST3 audio thread must not park on overlap");
+
+            assert!(out_l.iter().all(|&s| s == 0.0));
+            assert!(out_r.iter().all(|&s| s == 0.0));
+
+            drop(held);
+            cb_destroy::<TestPlugin>(ctx);
+        }
+    }
 }
 
 #[cfg(test)]

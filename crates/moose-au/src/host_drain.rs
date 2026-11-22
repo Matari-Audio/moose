@@ -385,13 +385,6 @@ mod non_apple {
 ///
 /// # Safety
 /// `ctx` must point to a live `AuInstance<P>` associated with `queue`.
-#[cfg_attr(
-    not(any(target_vendor = "apple", test)),
-    allow(
-        dead_code,
-        reason = "called by the Apple main-queue dispatch source and unit tests"
-    )
-)]
 pub(crate) unsafe fn run_host_drain<P: moose_core::export::PluginExport>(
     queue: &moose_core::host_queue::HostQueue,
     ctx: *mut std::ffi::c_void,

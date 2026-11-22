@@ -68,55 +68,22 @@ pub struct AuPluginDescriptor {
     pub sidechain_in_channels: u32,
 }
 
-/// Parameter descriptor for the `ObjC` shim.
-#[repr(C)]
-pub struct AuParamDescriptor {
-    pub id: u32,
-    pub name: *const c_char,
-    pub min: f64,
-    pub max: f64,
-    pub default_value: f64,
-    /// 0 = continuous, >0 = number of discrete steps
-    pub step_count: u32,
-    /// Unit string (e.g., "dB", "Hz", "")
-    pub unit: *const c_char,
-    /// Group name (empty string for top-level)
-    pub group: *const c_char,
-    /// MIDI status high-nibble of the default host-learn binding
-    /// (`0xB0` CC, `0xE0` pitch bend, `0xD0` channel pressure, `0xC0`
-    /// program change), or `0` for no binding.
-    pub midi_status: u8,
-    /// CC number when `midi_status` is `0xB0`; `0` otherwise.
-    pub midi_data1: u8,
-    /// Wire channel `0..=15`, or `-1` for any channel.
-    pub midi_channel: i16,
-}
-
 /// AU shim ABI version, mirroring `#define MOOSE_AU_ABI_VERSION` in
 /// `au_shim_types.h`. Stamped into [`AuCallbacks::abi_version`] at
 /// registration so a v3 appex built by a newer `cargo-moose` can tell
 /// how far the append-only callback tail extends on an older plugin
 /// binary before calling into it. The high three bytes are the
-/// `'TAu\0'` magic tag, the low byte the version - readers check the
-/// magic so a non-versioned binary's leading function pointer can't
-/// masquerade as a version. Bump the low byte and the header
-/// `#define` together when appending a callback (or changing an
-/// unreleased tail callback's signature); a test asserts they match.
-/// v2: `output_ump_count` / `output_ump_at` gained the `protocol`
-/// argument. v3: appended `latency_samples` / `tail_samples`. v4:
-/// appended `set_render_mode`. v5: appended `param_parse_value`. v6:
-/// appended the strict native event process and sequential output lane. v7:
-/// native process returns status and output negotiation carries the host's
-/// UMP protocol. v8 appends final output-delivery status publication. v9
-/// appends wrapper-time preflight and transactional parameter feedback. v10
-/// appends explicit parameter-feedback carrier negotiation. v11 appends
-/// process-time audio-bus activation metadata. v12 makes `state_load` return
-/// acceptance so the `AUv2` property setter can report malformed state. v13
-/// appends `create_with_sink` (`MooseAuHostSink`), `set_active`,
-/// `set_context_name`, live per-instance parameter catalog callbacks
-/// (`param_ids`, `param_info_by_id`, `param_clump_name`), and ramp-aware
-/// `process_native_v13`.
-pub const MOOSE_AU_ABI_VERSION: u32 = 0x5441_750D;
+/// `'MAu\0'` magic tag (switched from `'TAu\0'` at v14 when dead pre-v14
+/// slots were removed), the low byte the version - readers check the
+/// magic so a non-versioned or incompatible binary can't masquerade as
+/// a valid version. Bump the low byte and the header `#define` together
+/// when appending a callback; a test asserts they match.
+/// v2..v13: historical append-only evolution.
+/// v14: `'MAu\0'` magic, `moose_au_register_v3` (no static
+/// `g_param_descriptors`/`g_num_params`/`AuParamDescriptor`), removed
+/// legacy `create()`, and `begin_output_events_v14` (param feedback
+/// availability comes solely from `MooseAuHostSink::set_param`).
+pub const MOOSE_AU_ABI_VERSION: u32 = 0x4D41_750E;
 
 /// Callbacks from the `ObjC` shim into Rust.
 #[repr(C)]
@@ -127,8 +94,6 @@ pub struct AuCallbacks {
     /// the rest; consumers gate the append-only tail callbacks on it.
     /// Matches `AuCallbacks::abi_version` in `au_shim_types.h`.
     pub abi_version: u32,
-    /// Create a new plugin instance. Returns an opaque context pointer.
-    pub create: unsafe extern "C" fn() -> *mut c_void,
 
     /// Destroy the plugin instance.
     pub destroy: unsafe extern "C" fn(ctx: *mut c_void),
@@ -350,14 +315,15 @@ pub struct AuCallbacks {
         ump_time_valid: u32,
     ),
     pub commit_output_params: unsafe extern "C" fn(ctx: *mut c_void) -> u32,
-    pub begin_output_events_v10: unsafe extern "C" fn(
+    /// v14 output-event preflight: parameter feedback availability comes
+    /// solely from `MooseAuHostSink::set_param`.
+    pub begin_output_events_v14: unsafe extern "C" fn(
         ctx: *mut c_void,
         carrier_mask: u32,
         num_frames: u32,
         ump_protocol: u32,
         max_absolute_offset: u32,
         ump_time_valid: u32,
-        param_feedback_available: u32,
     ),
     /// v11 process entry with host bus activation metadata. The v7 entry
     /// remains above at its original ABI offset.
@@ -545,7 +511,7 @@ pub struct AuParamEvent {
     /// Sample offset within the current block.
     pub sample_offset: u32,
     /// Plugin parameter ID (matches the `id` from `#[derive(Params)]`'s
-    /// generated `*ParamId` enum and `AuParamDescriptor::id`).
+    /// generated `*ParamId` enum and live `AuParamInfoOut::id`).
     pub param_id: u32,
     /// Plain value. AU represents parameter values as `AUValue`
     /// (a `float`); the Rust side widens to `f64` when building
@@ -701,11 +667,9 @@ pub struct AuTransportSnapshot {
 unsafe extern "C" {
     /// Register the plugin with the AU system. Called once at load time.
     /// The descriptor and callbacks must remain valid for the lifetime of the process.
-    pub fn moose_au_register_v2(
+    pub fn moose_au_register_v3(
         descriptor: *const AuPluginDescriptor,
         callbacks: *const AuCallbacks,
-        param_descriptors: *const AuParamDescriptor,
-        num_params: u32,
     );
 
 }

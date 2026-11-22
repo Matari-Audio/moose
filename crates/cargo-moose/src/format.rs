@@ -19,10 +19,12 @@ pub(crate) enum Format {
     Au2,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Au3,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    Aax,
 }
 
 impl Format {
-    /// Human-readable display name (`"CLAP"`, `"VST3"`, `"AU v2"`,
+    /// Human-readable display name (`"CLAP"`, `"VST3"`, `"AU v2"`, `"AAX"`,
     /// …). Used for log/UI labels in `doctor`, `validate`, and
     /// install/uninstall messaging.
     pub(crate) fn label(self) -> &'static str {
@@ -31,12 +33,14 @@ impl Format {
             Self::Vst3 => "VST3",
             Self::Au2 => "AU v2",
             Self::Au3 => "AU v3",
+            Self::Aax => "AAX",
         }
     }
 
     /// Per-format install directory for the requested scope. Returns
     /// `None` for combinations not addressable by [`InstallScope`]
-    /// alone (AU v3 ships as a host app; AU v2 is macOS-only).
+    /// alone (AU v3 ships as a host app; AU v2 is macOS-only; AAX installs
+    /// strictly into the Avid system directory).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn dir(self, scope: InstallScope) -> Option<PathBuf> {
         match self {
@@ -46,7 +50,7 @@ impl Format {
             Self::Au2 => Some(scope.au_v2_dir()),
             #[cfg(not(target_os = "macos"))]
             Self::Au2 => None,
-            Self::Au3 => None,
+            Self::Au3 | Self::Aax => None,
         }
     }
 }

@@ -5,12 +5,11 @@ use crate::host_drain::{self, HostSink};
 use crate::output_events::NthCursor;
 use crate::output_events::UmpDrainCursor;
 
-use moose_core::SYSEX_POOL_PREALLOC;
 use moose_core::TransportSlot;
 use moose_core::buffer::RawBufferScratch;
 use moose_core::editor::Editor;
 use moose_core::editor::EditorBuilder;
-use moose_core::events::{EventList, ExactEvent, ExactEventBody, LosslessEventCursor};
+use moose_core::events::{EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
 use moose_core::main_thread::MainThreadHooks;
@@ -63,76 +62,12 @@ impl AuCtx {
 /// after the host already moved on.
 pub(crate) type StateLoadQueue = state::StateLoadQueue;
 
-/// One `SysEx` message handed from the host thread to the audio thread.
-/// Recycled through a free-list (see [`SysExQueue`]) so the audio thread
-/// never allocates or frees: it copies the bytes into the event pool and
-/// returns the buffer.
-pub(crate) struct SysExInput {
-    pub(crate) sample_offset: u32,
-    pub(crate) bytes: Vec<u8>,
-}
-
-impl Default for SysExInput {
-    fn default() -> Self {
-        Self {
-            sample_offset: 0,
-            bytes: Vec::with_capacity(SYSEX_POOL_PREALLOC),
-        }
-    }
-}
-
-/// Lock-free `SysEx` input handoff. `SYSEX_INPUT_SLOTS` buffers cycle
-/// between the *free* queue (empty, ready to fill) and the *ready* queue
-/// (filled, awaiting render).
-pub(crate) type SysExQueue = crossbeam_queue::ArrayQueue<SysExInput>;
-
-/// `SysEx` input buffers cycling through [`SysExQueue`].
-pub(crate) const SYSEX_INPUT_SLOTS: usize = 64;
-
-/// Host-thread side of the `SysEx` input handoff: copy one message into a
-/// recycled buffer and queue it. Drops the message if no buffer is free.
-pub(crate) fn try_queue_sysex_input(
-    free: &SysExQueue,
-    ready: &SysExQueue,
-    sample_offset: u32,
-    bytes: &[u8],
-) -> bool {
-    let Some(mut slot) = free.pop() else {
-        return false;
-    };
-    if bytes.len() > slot.bytes.capacity() {
-        let _ = free.push(slot);
-        return false;
-    }
-    slot.sample_offset = sample_offset;
-    slot.bytes.clear();
-    slot.bytes.extend_from_slice(bytes);
-    if let Err(slot) = ready.push(slot) {
-        let _ = free.push(slot);
-        return false;
-    }
-    true
-}
-
-pub(crate) fn queue_sysex_input(
-    free: &SysExQueue,
-    ready: &SysExQueue,
-    sample_offset: u32,
-    bytes: &[u8],
-) {
-    let _ = try_queue_sysex_input(free, ready, sample_offset, bytes);
-}
-
-/// Audio-thread side: drain every queued `SysEx` into `event_list`,
-/// returning each buffer to `free`.
-pub(crate) fn drain_sysex_input(ready: &SysExQueue, free: &SysExQueue, event_list: &mut EventList) {
-    while let Some(slot) = ready.pop() {
-        let exact = ExactEvent::new(slot.sample_offset, ExactEventBody::SysEx { port: 0 });
-        let _ =
-            event_list.try_push_sysex_with_exact_on_port(slot.sample_offset, 0, &slot.bytes, exact);
-        let _ = free.push(slot);
-    }
-}
+pub(crate) use moose_core::c_abi_driver::{
+    EditorGesture, GestureQueue, SysExQueue, drain_sysex_input, new_sysex_queues,
+    queue_sysex_input, try_queue_sysex_input,
+};
+#[cfg(test)]
+pub(crate) use moose_core::c_abi_driver::{SYSEX_INPUT_SLOTS, SysExInput};
 
 /// Cutoffs for asynchronous edits and accepted render automation respectively.
 #[derive(Clone, Copy, Default)]
@@ -145,50 +80,8 @@ pub(crate) struct FeedbackEpoch {
 pub(crate) type ParamNotifyQueue = crossbeam_queue::ArrayQueue<(u32, f32, FeedbackEpoch)>;
 
 /// Explicit host lifecycle state for `AuInstance::lifecycle_state`.
-pub(crate) const LIFECYCLE_UNKNOWN: u8 = 0;
 pub(crate) const LIFECYCLE_INACTIVE: u8 = 1;
 pub(crate) const LIFECYCLE_ACTIVE: u8 = 2;
-
-/// Queued off-UI-thread editor gesture delivered on the host main/UI thread.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum EditorGesture {
-    BeginEdit(u32),
-    SetParam(u32, f32),
-    EndEdit(u32),
-}
-
-/// Editor producers reserve one queue slot for each admitted gesture's end.
-#[derive(Default)]
-pub(crate) struct GestureQueue {
-    pub(crate) pending: std::collections::VecDeque<EditorGesture>,
-    reserved: Vec<u32>,
-}
-
-impl GestureQueue {
-    pub(crate) fn push(&mut self, gesture: EditorGesture) {
-        let used = self.pending.len() + self.reserved.len();
-        match gesture {
-            EditorGesture::BeginEdit(id) if used + 2 <= 256 => self.reserved.push(id),
-            EditorGesture::EndEdit(id) => {
-                let Some(i) = self.reserved.iter().position(|&open| open == id) else {
-                    return;
-                };
-                self.reserved.swap_remove(i);
-            }
-            EditorGesture::SetParam(_, _) if used < 256 => {}
-            EditorGesture::SetParam(id, value) => {
-                if let Some(EditorGesture::SetParam(last_id, last_value)) = self.pending.back_mut()
-                    && *last_id == id
-                {
-                    *last_value = value;
-                }
-                return;
-            }
-            EditorGesture::BeginEdit(_) => return,
-        }
-        self.pending.push_back(gesture);
-    }
-}
 
 /// Retained `AUv3` ramp state spanning multiple render slices (Apple delivers an
 /// `AUParameterEvent` ramp only in the slice where it begins).
@@ -245,6 +138,13 @@ pub(crate) struct AuInstance<P: PluginExport> {
     pub(crate) delay: moose_core::delay::ReportedDelay,
     /// Current render mode as a [`ProcessMode`] discriminant.
     pub(crate) render_mode: AtomicU8,
+    /// Atomic mirrors of the last prepared `(prepared, sample_rate, max_frames, mode)`
+    /// so render-thread `AudioUnitReset` can detect `same_config` without taking a
+    /// blocking `audio.enter()`.
+    pub(crate) prepared_flag: std::sync::atomic::AtomicBool,
+    pub(crate) prepared_rate_bits: AtomicU64,
+    pub(crate) prepared_max_frames: std::sync::atomic::AtomicUsize,
+    pub(crate) prepared_mode: AtomicU8,
     /// Explicit host lifecycle state (`LIFECYCLE_UNKNOWN` for legacy `cb_create`,
     /// `LIFECYCLE_INACTIVE` for stopped v13 instances, `LIFECYCLE_ACTIVE` while
     /// rendering).
@@ -555,7 +455,6 @@ pub(crate) struct AuAudio<P: PluginExport> {
     pub(crate) native_output_ump_protocol: u8,
     pub(crate) native_output_max_absolute_offset: u32,
     pub(crate) native_output_ump_time_valid: bool,
-    pub(crate) native_output_param_feedback_available: bool,
     pub(crate) native_output_status: u32,
     /// Per-sub-block scratch for `chunked_process::process_chunked`.
     pub(crate) sub_event_scratch: EventList,

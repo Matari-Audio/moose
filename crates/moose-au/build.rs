@@ -35,10 +35,9 @@ fn main() {
     // - AU v3 (.appex): the AUAudioUnit subclass + factory are
     //   compiled in Swift (templates/au3/AudioUnitFactory.swift) into
     //   the appex binary by xcodebuild during install. They read the
-    //   exported `g_callbacks` / `g_descriptor` / `g_param_descriptors`
-    //   / `g_num_params` symbols out of the framework dylib, so this
-    //   shim's only job for v3 is to populate those globals at load
-    //   time.
+    //   exported `g_callbacks` and `g_descriptor` symbols out of the
+    //   framework dylib, so this shim's only job for v3 is to populate
+    //   those globals at load time.
 
     let plugin_id = std::env::var("MOOSE_AU_PLUGIN_ID").unwrap_or_default();
     let sanitized: String = if plugin_id.is_empty() {
@@ -107,8 +106,6 @@ fn main() {
     // runtime via dynamic symbol lookup.
     println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_g_descriptor");
     println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_g_callbacks");
-    println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_g_param_descriptors");
-    println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_g_num_params");
 
     if is_macos {
         // AU v2 factory + v2 cocoa-view class-name lookup. Both

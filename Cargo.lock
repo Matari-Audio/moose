@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.26.3"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "accesskit_unix"
 version = "0.22.1"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "accesskit",
  "accesskit_atspi_common",
@@ -1445,7 +1445,7 @@ dependencies = [
 [[package]]
 name = "glifo"
 version = "0.4.0"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "bytemuck",
  "foldhash 0.2.0",
@@ -2048,6 +2048,7 @@ dependencies = [
 name = "moose"
 version = "7.0.0"
 dependencies = [
+ "moose-aax",
  "moose-au",
  "moose-clap",
  "moose-core",
@@ -2058,6 +2059,17 @@ dependencies = [
  "moose-params",
  "moose-plugin",
  "moose-vst3",
+]
+
+[[package]]
+name = "moose-aax"
+version = "7.0.0"
+dependencies = [
+ "moose-core",
+ "moose-derive",
+ "moose-params",
+ "moose-shim-types",
+ "moose-test-fixtures",
 ]
 
 [[package]]
@@ -2076,7 +2088,7 @@ dependencies = [
 [[package]]
 name = "moose-baseview"
 version = "0.4.1-moose.1"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "block2 0.6.2",
  "bytemuck",
@@ -2870,13 +2882,16 @@ dependencies = [
 name = "moose-loader-tests"
 version = "7.0.0"
 dependencies = [
+ "cc",
  "clap-sys",
  "moose",
+ "moose-aax",
  "moose-au",
  "moose-clap",
  "moose-core",
  "moose-derive",
  "moose-gui",
+ "moose-gui-types",
  "moose-loader",
  "moose-params",
  "moose-vst3",
@@ -2994,7 +3009,7 @@ dependencies = [
 [[package]]
 name = "mui"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "color",
  "mui-geometry",
@@ -3012,7 +3027,7 @@ dependencies = [
 [[package]]
 name = "mui-access"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "accesskit",
  "mui-geometry",
@@ -3023,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "mui-baseview"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "accesskit_macos",
  "accesskit_unix",
@@ -3049,7 +3064,7 @@ dependencies = [
 [[package]]
 name = "mui-geometry"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "i_overlay",
  "kurbo",
@@ -3059,7 +3074,7 @@ dependencies = [
 [[package]]
 name = "mui-input"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "mui-geometry",
  "mui-layout",
@@ -3069,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "mui-layout"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "arrayvec",
  "rustc-hash 2.1.3",
@@ -3079,7 +3094,7 @@ dependencies = [
 [[package]]
 name = "mui-material"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "mui-scene",
 ]
@@ -3087,12 +3102,12 @@ dependencies = [
 [[package]]
 name = "mui-motion"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 
 [[package]]
 name = "mui-scene"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "mui-geometry",
  "mui-layout",
@@ -3108,7 +3123,7 @@ dependencies = [
 [[package]]
 name = "mui-style"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "color",
  "kurbo",
@@ -3121,12 +3136,12 @@ dependencies = [
 [[package]]
 name = "mui-symbols"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 
 [[package]]
 name = "mui-text"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "harfrust 0.13.3",
  "mui-geometry",
@@ -3140,7 +3155,7 @@ dependencies = [
 [[package]]
 name = "mui-vello"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "glifo 0.4.0",
  "mach-dxcompiler-rs",
@@ -3160,7 +3175,7 @@ dependencies = [
 [[package]]
 name = "mui-weld"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "color",
  "kurbo",
@@ -5329,7 +5344,7 @@ dependencies = [
 [[package]]
 name = "vello_cpu"
 version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "bytemuck",
  "glifo 0.4.0",
@@ -6327,7 +6342,7 @@ checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 [[package]]
 name = "xim-ctext"
 version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "encoding_rs",
 ]
@@ -6335,7 +6350,7 @@ dependencies = [
 [[package]]
 name = "xim-parser"
 version = "0.2.1"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -6488,7 +6503,7 @@ dependencies = [
 [[package]]
 name = "zed-xim"
 version = "0.4.0-zed"
-source = "git+https://github.com/Matari-Audio/MUI#3cfbbb0ba44aa1fab626a97a7fc143bfc13b6952"
+source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
 dependencies = [
  "ahash",
  "hashbrown 0.14.5",

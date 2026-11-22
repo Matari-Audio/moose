@@ -37,17 +37,8 @@ pub struct StaticShell<P: Params, L: PluginLogicCore<S, Params = P>, S: Sample =
     /// every time the shell itself is moved into the wrapper.
     state: Box<L::DspState>,
     meters: Arc<MeterStore>,
-    /// Lock-free publish slot for `snapshot_into`-based state save.
+    /// Lock-free publish slot for off-thread `SnapshotPublisher` and on-demand saves.
     snapshots: Arc<SnapshotSlot>,
-    /// Whether the plugin opted into the per-block publish (it overrides
-    /// `snapshot_into` or `snapshot_version`), probed once in `from_parts`
-    /// off the audio thread. `false`: nothing serializes per block; a host
-    /// save asks for a snapshot on demand instead (`serve_snapshot_request`).
-    try_snapshot: bool,
-    /// Last `snapshot_version` the shell published. A block whose version
-    /// matches this skips re-serialization entirely (see
-    /// `publish_snapshot_with`). `None` until the first landed publish.
-    last_snapshot_version: Option<u64>,
     sample_rate: f64,
     /// Background-task spawner bundle (one lane per declared task type),
     /// when the plugin wired `tasks:` on `plugin!`. Type-erased; stamped
@@ -86,24 +77,16 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
             warm_pool();
         }
         // Build the snapshot slot before `init` so the plugin can capture
-        // a publisher for the off-thread (large-state) lane. Pre-warm the
-        // inline buffer to the plugin's hint so a first small publish
-        // doesn't allocate on the audio thread.
-        let snapshots = SnapshotSlot::with_capacity(L::snapshot_prealloc_hint());
+        // a publisher for the off-thread (large-state) lane.
+        let snapshots = SnapshotSlot::new();
         let init_ctx =
             InitContext::new(tasks.clone()).with_snapshot(SnapshotPublisher::new(&snapshots));
         let state = Box::new(L::init(&params, &init_ctx));
-        // Static capability probe, here on the creating thread so it never
-        // allocates on the audio thread.
-        let try_snapshot =
-            L::snapshot_version(&state).is_some() || L::snapshot_into(&state, &mut Vec::new());
         let mut shell = Self {
             params,
             state,
             meters: MeterStore::new(),
             snapshots,
-            try_snapshot,
-            last_snapshot_version: None,
             sample_rate: 44100.0,
             tasks,
             _sample: std::marker::PhantomData,
@@ -239,12 +222,6 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         };
 
         let status = L::process(&mut self.state, &self.params, buffer, events, &mut ctx);
-        publish_snapshot::<S, L>(
-            &self.state,
-            &self.snapshots,
-            &mut self.try_snapshot,
-            &mut self.last_snapshot_version,
-        );
         if let Some(ticket) = self.snapshots.pending_request() {
             // A host save (or a just-applied load) asked for live state.
             // Runs once per request, not per block; `save_state` may
@@ -261,13 +238,8 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         L::save_state(&self.state)
     }
 
-    fn snapshot_into(&self, buf: &mut Vec<u8>) -> bool {
-        L::snapshot_into(&self.state, buf)
-    }
-
     fn republish_snapshot(&mut self) {
-        // Host thread, plugin owned: serialize live, whatever the opt-in.
-        self.last_snapshot_version = None;
+        // Host thread, plugin owned: serialize live.
         self.snapshots
             .store_inline(|buf| live_snapshot::<S, L>(&self.state, buf));
     }
@@ -279,13 +251,6 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         // refreshed caches - fire it whether or not load_state
         // succeeded so partial state still triggers a refresh.
         L::state_changed(&mut self.state, &self.params);
-        // Invalidate the snapshot-version gate: the load replaced state
-        // without necessarily bumping `snapshot_version` (a counter that
-        // round-trips through the blob, or an author who forgets), so the
-        // next publish - the `republish_snapshot` the wrapper calls right
-        // after this - must re-serialize rather than skip on a stale
-        // version and leave pre-load bytes in the slot.
-        self.last_snapshot_version = None;
         result
     }
 
@@ -329,92 +294,10 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
     }
 }
 
-/// Live custom state: `snapshot_into`, else the legacy `save_state`.
+/// Live custom state serialization via `PluginLogicCore::save_state`.
 fn live_snapshot<S: Sample, L: PluginLogicCore<S>>(state: &L::DspState, buf: &mut Vec<u8>) {
-    if !L::snapshot_into(state, buf) {
-        buf.clear();
-        buf.extend_from_slice(&L::save_state(state));
-    }
-}
-
-/// Publish the plugin's `snapshot_into` bytes into `slot` on the audio
-/// thread. Shared by both shells.
-///
-/// Opting into snapshots is a static capability: `try_snapshot` latches
-/// off only when the logic reports "no snapshot" *before it has ever
-/// published one* (the default `snapshot_into` returning false), so a
-/// non-opt-in plugin stops paying after one block. Once a plugin has
-/// published, it stays subscribed for its lifetime - a plugin that
-/// returns true then later false is violating the contract, and we keep
-/// calling it rather than silently latching off and serving stale bytes.
-/// Never blocks: `SnapshotSlot::publish` skips on reader contention, in
-/// which case the closure doesn't run and the latch is left alone.
-pub(crate) fn publish_snapshot<S, L>(
-    state: &L::DspState,
-    slot: &SnapshotSlot,
-    try_snapshot: &mut bool,
-    last_version: &mut Option<u64>,
-) where
-    S: Sample,
-    L: PluginLogicCore<S>,
-{
-    let version = L::snapshot_version(state);
-    publish_snapshot_with(slot, try_snapshot, last_version, version, |buf| {
-        // A versioned plugin that only overrides `save_state` opted in
-        // through `snapshot_version`; serialize it when the token moves.
-        L::snapshot_into(state, buf)
-            || (version.is_some() && {
-                buf.extend_from_slice(&L::save_state(state));
-                true
-            })
-    });
-}
-
-/// Latch logic behind [`publish_snapshot`], parameterized over the raw
-/// `snapshot_into` closure so it can be unit-tested without a full
-/// `PluginLogicCore` mock. `pub(crate)` so `HotShell` can drive it with
-/// a closure over the reloadable dylib's `moose_snapshot_into` symbol.
-///
-/// `version` is the plugin's [`PluginLogicCore::snapshot_version`] this
-/// block. When it's `Some(v)` and equals `*last_version`, the state is
-/// unchanged since the last landed publish, so the whole publish is
-/// skipped - no lock, no copy, O(1). `None` re-serializes every block
-/// (the historical behavior). `last_version` advances only on a landed
-/// write, so a block skipped on reader contention retries next time.
-pub(crate) fn publish_snapshot_with(
-    slot: &SnapshotSlot,
-    try_snapshot: &mut bool,
-    last_version: &mut Option<u64>,
-    version: Option<u64>,
-    snapshot_into: impl FnOnce(&mut Vec<u8>) -> bool,
-) {
-    if !*try_snapshot {
-        return;
-    }
-    // Version gate: a versioned plugin whose token is unchanged since the
-    // last landed publish keeps the previous snapshot - the common path.
-    if let Some(v) = version
-        && *last_version == Some(v)
-    {
-        return;
-    }
-    let ran_unsupported = std::cell::Cell::new(false);
-    let landed = slot.publish(|buf| {
-        let wrote = snapshot_into(buf);
-        ran_unsupported.set(!wrote);
-        wrote
-    });
-    // Record the version only on a landed real write, so a block skipped
-    // on reader contention retries next time instead of latching a
-    // version whose bytes never reached the slot.
-    if landed && !ran_unsupported.get() {
-        *last_version = version;
-    }
-    // First-block opt-out only: a plugin that has already published is
-    // committed for its lifetime, so a later false never latches us off.
-    if ran_unsupported.get() && !slot.is_supported() {
-        *try_snapshot = false;
-    }
+    buf.clear();
+    buf.extend_from_slice(&L::save_state(state));
 }
 
 // ---------------------------------------------------------------------------
@@ -694,145 +577,4 @@ macro_rules! export_static {
             }
         }
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::publish_snapshot_with;
-    use moose_core::snapshot::SnapshotSlot;
-    use std::cell::Cell;
-
-    #[test]
-    fn non_opt_in_latches_off_on_first_block() {
-        let slot = SnapshotSlot::new();
-        let mut try_snapshot = true;
-        let mut last = None;
-
-        // Default `snapshot_into` (returns false) before any publish:
-        // latch off so we stop paying every block.
-        publish_snapshot_with(&slot, &mut try_snapshot, &mut last, None, |_| false);
-        assert!(!try_snapshot, "first false must latch off");
-        assert!(!slot.is_supported());
-
-        // Subsequent blocks short-circuit and never call the closure.
-        let mut called = false;
-        publish_snapshot_with(&slot, &mut try_snapshot, &mut last, None, |_| {
-            called = true;
-            false
-        });
-        assert!(!called, "latched-off slot must not call snapshot_into");
-    }
-
-    #[test]
-    fn opt_in_then_contract_violation_stays_subscribed() {
-        let slot = SnapshotSlot::new();
-        let mut try_snapshot = true;
-        let mut last = None;
-
-        // Block 1: plugin publishes - it has opted in for its lifetime.
-        publish_snapshot_with(&slot, &mut try_snapshot, &mut last, None, |buf| {
-            buf.clear();
-            buf.extend_from_slice(&[1, 2, 3]);
-            true
-        });
-        assert!(try_snapshot);
-        assert!(slot.is_supported());
-        assert_eq!(slot.read(), Some(vec![1, 2, 3]));
-
-        // Block 2: a contract-violating false must NOT latch us off - we
-        // keep calling the plugin rather than silently going dark.
-        publish_snapshot_with(&slot, &mut try_snapshot, &mut last, None, |_| false);
-        assert!(try_snapshot, "a post-opt-in false must not latch off");
-
-        // Block 3: still subscribed, so a fresh publish still lands.
-        publish_snapshot_with(&slot, &mut try_snapshot, &mut last, None, |buf| {
-            buf.clear();
-            buf.extend_from_slice(&[4]);
-            true
-        });
-        assert_eq!(slot.read(), Some(vec![4]));
-    }
-
-    #[test]
-    fn unchanged_version_skips_the_copy() {
-        let slot = SnapshotSlot::new();
-        let mut try_snapshot = true;
-        let mut last = None;
-        let calls = Cell::new(0);
-        let publish = |ver, try_s: &mut bool, last: &mut Option<u64>| {
-            publish_snapshot_with(&slot, try_s, last, Some(ver), |buf| {
-                calls.set(calls.get() + 1);
-                buf.extend_from_slice(&[u8::try_from(ver).unwrap_or(0)]);
-                true
-            });
-        };
-
-        // Version 7 lands and is recorded.
-        publish(7, &mut try_snapshot, &mut last);
-        assert_eq!(calls.get(), 1);
-        assert_eq!(last, Some(7));
-        assert_eq!(slot.read(), Some(vec![7]));
-
-        // Same version twice more: the writer never runs again.
-        publish(7, &mut try_snapshot, &mut last);
-        publish(7, &mut try_snapshot, &mut last);
-        assert_eq!(calls.get(), 1, "unchanged version must skip the copy");
-
-        // A new version re-serializes.
-        publish(9, &mut try_snapshot, &mut last);
-        assert_eq!(calls.get(), 2);
-        assert_eq!(slot.read(), Some(vec![9]));
-    }
-
-    #[test]
-    fn unversioned_none_publishes_every_block() {
-        // The default (no `snapshot_version`) must keep re-serializing
-        // every block - the historical behavior, unchanged.
-        let slot = SnapshotSlot::new();
-        let mut try_snapshot = true;
-        let mut last = None;
-        let calls = Cell::new(0);
-        for _ in 0..3 {
-            publish_snapshot_with(&slot, &mut try_snapshot, &mut last, None, |buf| {
-                calls.set(calls.get() + 1);
-                buf.push(1);
-                true
-            });
-        }
-        assert_eq!(calls.get(), 3, "None version re-serializes every block");
-    }
-
-    #[test]
-    fn load_reset_forces_republish_at_unchanged_version() {
-        // A load clears `last_snapshot_version` in both shells' `load_state`,
-        // so the `republish_snapshot` the wrapper fires right after a load
-        // re-serializes even though the plugin's version token didn't change
-        // (a counter that round-trips through the blob, or an author who
-        // forgot to bump). Without the reset the gate stays closed and the
-        // slot keeps pre-load bytes - the host's next save reverts the load.
-        let slot = SnapshotSlot::new();
-        let mut try_snapshot = true;
-        let mut last = None;
-        let calls = Cell::new(0);
-        let publish = |ver, try_s: &mut bool, last: &mut Option<u64>| {
-            publish_snapshot_with(&slot, try_s, last, Some(ver), |buf| {
-                calls.set(calls.get() + 1);
-                buf.push(u8::try_from(ver).unwrap_or(0));
-                true
-            });
-        };
-
-        publish(5, &mut try_snapshot, &mut last);
-        publish(5, &mut try_snapshot, &mut last);
-        assert_eq!(calls.get(), 1, "unchanged version skips");
-
-        // `load_state` clears the gate.
-        last = None;
-        publish(5, &mut try_snapshot, &mut last);
-        assert_eq!(
-            calls.get(),
-            2,
-            "a republish after a load must re-serialize even at the same version"
-        );
-    }
 }

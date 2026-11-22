@@ -272,6 +272,17 @@ jobs:
           echo "auval PASS count: $(grep -c ' PASS$' auval.log)"
           sudo "$CARGO_MOOSE" uninstall --system --au2 --yes
 
+      - name: typecheck AUv3 Swift template against au_shim_types.h (macOS)
+        if: runner.os == 'macOS' && matrix.part != 'scaffolds'
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --show-sdk-path)
+          xcrun swiftc -typecheck \
+            -sdk "$SDK" \
+            -import-objc-header crates/cargo-moose/templates/au3/BridgingHeader.h \
+            -I crates/moose-shim-types/include \
+            crates/cargo-moose/templates/au3/AudioUnitFactory.swift
+
       # ── scaffold shapes ───────────────────────────────────────────────
       # Catches templates that build but trip a downstream packager
       # (workspace bundle-id derivation, instrument vs effect routing), and

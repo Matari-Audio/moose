@@ -170,7 +170,7 @@ pub(crate) fn cmd_package_windows(args: &[String], selection: &super::SuiteSelec
 
         let mut all_signable: Vec<PathBuf> = Vec::new();
         for &arch in &archs {
-            let staged = stage_plugin(&root, p, &formats, &staging, arch)?;
+            let staged = stage_plugin(&root, &config, p, &formats, &staging, arch)?;
             all_signable.extend(staged.signable);
         }
         // Factory presets (arch-independent, not signed). Staged here
@@ -374,6 +374,11 @@ fn resolve_formats(
         if available.contains("vst3") {
             fmts.push(PkgFormat::Vst3);
         }
+        if available.contains("aax")
+            && crate::commands::install::aax::resolve_aax_sdk_path().is_some()
+        {
+            fmts.push(PkgFormat::Aax);
+        }
         if available.contains("standalone") {
             fmts.push(PkgFormat::Standalone);
         }
@@ -425,6 +430,7 @@ fn build_all_formats(
 
     let has_clap = formats.iter().any(|f| matches!(f, PkgFormat::Clap));
     let has_vst3 = formats.iter().any(|f| matches!(f, PkgFormat::Vst3));
+    let has_aax = formats.iter().any(|f| matches!(f, PkgFormat::Aax));
     let has_standalone = formats.iter().any(|f| matches!(f, PkgFormat::Standalone));
 
     for &arch in archs {
@@ -473,6 +479,33 @@ fn build_all_formats(
                 let src = release_lib_for_target(root, &p.dylib_stem(), Some(triple));
                 let saved =
                     release_lib_for_target(root, &format!("{}_vst3", p.dylib_stem()), Some(triple));
+                if src.exists() {
+                    fs::copy(&src, &saved)?;
+                }
+            }
+        }
+
+        if has_aax {
+            eprintln!("Building AAX ({})...", arch.tag());
+            let mut build_args: Vec<String> = vec!["--target".into(), triple.into()];
+            for p in plugins {
+                build_args.push("-p".into());
+                build_args.push(p.crate_name.clone());
+            }
+            build_args.extend_from_slice(&[
+                "--no-default-features".into(),
+                "--features".into(),
+                "aax".into(),
+            ]);
+            let arg_refs: Vec<&str> = build_args.iter().map(std::string::String::as_str).collect();
+            cargo_build(&[], &arg_refs, dt)?;
+            for p in plugins {
+                let src = crate::release_static_for_target(root, &p.dylib_stem(), Some(triple));
+                let saved = crate::release_static_for_target(
+                    root,
+                    &format!("{}_aax", p.dylib_stem()),
+                    Some(triple),
+                );
                 if src.exists() {
                     fs::copy(&src, &saved)?;
                 }
@@ -557,6 +590,7 @@ struct StagedPlugin {
 /// subdirectories in the same bundle root across calls.
 fn stage_plugin(
     root: &Path,
+    config: &Config,
     p: &PluginDef,
     formats: &[PkgFormat],
     staging: &Path,
@@ -572,6 +606,9 @@ fn stage_plugin(
             PkgFormat::Vst3 => {
                 signable.push(stage_vst3(root, p, staging, arch)?);
             }
+            PkgFormat::Aax => {
+                signable.push(stage_aax(root, config, p, staging, arch)?);
+            }
             PkgFormat::Au2 | PkgFormat::Au3 => {
                 return Err("AU is macOS-only; should have been filtered".into());
             }
@@ -582,6 +619,34 @@ fn stage_plugin(
         eprintln!("ok");
     }
     Ok(StagedPlugin { signable })
+}
+
+fn stage_aax(
+    root: &Path,
+    config: &Config,
+    p: &PluginDef,
+    staging: &Path,
+    arch: TargetArch,
+) -> std::result::Result<PathBuf, crate::CargoMooseError> {
+    let aax_dir = staging.join("aax").join(arch.tag());
+    fs::create_dir_all(&aax_dir)?;
+    if !crate::commands::install::aax::emit_aax_bundle(
+        root,
+        p,
+        config,
+        &aax_dir,
+        Some(arch.triple()),
+    )? {
+        return Err(
+            "AAX packaging requested, but AAX_SDK_PATH is not set to a valid Avid AAX SDK directory."
+                .into(),
+        );
+    }
+    Ok(aax_dir
+        .join(format!("{}.aaxplugin", p.file_stem()))
+        .join("Contents")
+        .join("x64")
+        .join(format!("{}.aaxplugin", p.file_stem())))
 }
 
 fn stage_clap(
@@ -1703,6 +1768,18 @@ fn component_install_size(
                 .max()
                 .unwrap_or(0)
         }
+        PkgFormat::Aax => archs
+            .iter()
+            .map(|a| {
+                dir_size_recursive(
+                    &staging
+                        .join("aax")
+                        .join(a.tag())
+                        .join(format!("{}.aaxplugin", p.file_stem())),
+                )
+            })
+            .max()
+            .unwrap_or(0),
         PkgFormat::Standalone => {
             let bin_stem = crate::read_standalone_bin_name(&p.crate_name)
                 .unwrap_or_else(|| format!("{}-standalone", p.crate_name));
@@ -1740,6 +1817,8 @@ fn files_all_check_gated(fmt: &PkgFormat, universal: bool) -> bool {
         // Bundle, but only the matching arch's sub-dir installs - same arch
         // gating as CLAP when universal.
         PkgFormat::Vst3 => universal,
+        // AAX bundle: arch-gated when universal.
+        PkgFormat::Aax => universal,
         // Standalone is single-file like CLAP - universal mode arch-gates.
         PkgFormat::Standalone => universal,
         PkgFormat::Au2 | PkgFormat::Au3 => false,
@@ -1769,6 +1848,7 @@ fn iss_component_spec(fmt: &PkgFormat) -> (&'static str, &'static str, &'static 
     match fmt {
         PkgFormat::Clap => ("clap", "CLAP", "full"),
         PkgFormat::Vst3 => ("vst3", "VST3", "full"),
+        PkgFormat::Aax => ("aax", "AAX", "full"),
         PkgFormat::Standalone => ("standalone", "Standalone app", "full"),
         PkgFormat::Au2 | PkgFormat::Au3 => unreachable!("AU is filtered out on Windows"),
     }
@@ -1850,6 +1930,24 @@ fn iss_files_block(
                 &src_quoted,
                 &dest,
                 &comp("vst3"),
+                arch_check,
+                /* is_dir = */ true,
+            )
+        }
+        PkgFormat::Aax => {
+            let src_dir = staging
+                .join("aax")
+                .join(arch.tag())
+                .join(format!("{}.aaxplugin", p.file_stem()));
+            let src_glob = src_dir.join("*");
+            let src_quoted = iss_escape_path(&src_glob);
+            let name = iss_escape_quoted(&p.file_stem());
+            // Pro Tools always loads AAX from the system-wide Common Files path.
+            let dest = format!("{{commoncf}}\\Avid\\Audio\\Plug-Ins\\{name}.aaxplugin");
+            iss_dual_dest(
+                &src_quoted,
+                &dest,
+                &comp("aax"),
                 arch_check,
                 /* is_dir = */ true,
             )
@@ -1965,6 +2063,13 @@ fn iss_uninstall_lines(
             // the uninstall hits the same path the bundle was written to.
             let path = format!("{}\\VST3\\{safe_stem}.vst3", scoped_cf(scope));
             let component = comp("vst3");
+            vec![format!(
+                "Type: filesandordirs; Name: \"{path}\"; Components: {component}"
+            )]
+        }
+        PkgFormat::Aax => {
+            let path = format!("{{commoncf}}\\Avid\\Audio\\Plug-Ins\\{safe_stem}.aaxplugin");
+            let component = comp("aax");
             vec![format!(
                 "Type: filesandordirs; Name: \"{path}\"; Components: {component}"
             )]

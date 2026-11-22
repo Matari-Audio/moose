@@ -82,6 +82,7 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
     let mut vst3 = false;
     let mut au2 = false;
     let mut au3 = false;
+    let mut aax = false;
     let mut standalone = false;
     let mut dry_run = false;
     let mut yes = false;
@@ -97,6 +98,7 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
             "--vst3" => vst3 = true,
             "--au2" => au2 = true,
             "--au3" => au3 = true,
+            "--aax" => aax = true,
             "--standalone" => standalone = true,
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
@@ -143,21 +145,22 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
     // cleanup can tell "user passed no format flag → uninstall
     // everything for these plugins" apart from "user picked specific
     // formats → leave shell sidecars alone for the others".
-    let all_formats_default = !clap && !vst3 && !au2 && !au3 && !standalone;
+    let all_formats_default = !clap && !vst3 && !au2 && !au3 && !aax && !standalone;
 
     // Default: all formats if none specified.
-    // `au3 = true` lands in a flag that's read only inside macOS-gated
-    // blocks; the assignment-never-read warning on Linux/Windows is
-    // intentional - keeping the flag uniform across platforms is more
-    // readable than a per-platform `if`.
+    // `au3 = true` / `aax = true` land in flags read only inside OS-gated
+    // blocks; the assignment-never-read warning on other OSes is intentional.
     #[allow(unused_assignments)]
     if all_formats_default {
         clap = true;
         vst3 = true;
         au2 = true;
         au3 = true;
+        aax = true;
         standalone = true;
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = aax;
 
     let vendor = &config.vendor.name;
     let known_names: Vec<&str> = config.plugin.iter().map(|p| p.name.as_str()).collect();
@@ -436,6 +439,12 @@ pub(crate) fn cmd_uninstall(args: &[String]) -> Res {
             if au3 && scan_system {
                 let path = PathBuf::from(format!("/Applications/{}.app", p.au3_app_name()));
                 push_if_exists("AU v3", path, true, &mut targets);
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if aax && scopes_to_scan.contains(&InstallScope::System) {
+                let path = crate::commands::install::aax::aax_plugins_dir()
+                    .join(format!("{}.aaxplugin", p.file_stem()));
+                push_if_exists("AAX", path, cfg!(target_os = "macos"), &mut targets);
             }
             if standalone {
                 #[cfg(target_os = "macos")]

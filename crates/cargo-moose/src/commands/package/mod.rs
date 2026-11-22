@@ -160,6 +160,7 @@ pub(crate) enum PkgFormat {
     Vst3,
     Au2,
     Au3,
+    Aax,
     /// Standalone host application built from the plugin's
     /// `[features].standalone`. Installs to `/Applications/` on macOS,
     /// `%PROGRAMFILES%\<Vendor>\<Plugin>\` on Windows, `/usr/bin/` (or
@@ -176,6 +177,7 @@ impl std::str::FromStr for PkgFormat {
             "vst3" => Ok(PkgFormat::Vst3),
             "au2" => Ok(PkgFormat::Au2),
             "au3" => Ok(PkgFormat::Au3),
+            "aax" => Ok(PkgFormat::Aax),
             "standalone" => Ok(PkgFormat::Standalone),
             other => Err(format!("unknown format: {other}").into()),
         }
@@ -200,7 +202,7 @@ struct PkgFormatMeta {
     choice_description: &'static str,
 }
 
-const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 5] = [
+const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 6] = [
     (
         PkgFormat::Clap,
         PkgFormatMeta {
@@ -247,6 +249,17 @@ const PKG_FORMAT_META: [(PkgFormat, PkgFormatMeta); 5] = [
             install_location: "/Applications/",
             is_native_bundle: true,
             choice_description: "Audio Unit v3 (appex)",
+        },
+    ),
+    (
+        PkgFormat::Aax,
+        PkgFormatMeta {
+            label: "AAX",
+            pkg_id_suffix: "aax",
+            extension: "aaxplugin",
+            install_location: "/Library/Application Support/Avid/Audio/Plug-Ins/",
+            is_native_bundle: true,
+            choice_description: "For Pro Tools",
         },
     ),
     (
@@ -338,7 +351,10 @@ impl PkgFormat {
     /// component still lands in the right place rather than failing
     /// with a permission-denied shove.
     pub(crate) fn is_system_only_on_macos(&self) -> bool {
-        matches!(self, PkgFormat::Au3 | PkgFormat::Standalone)
+        matches!(
+            self,
+            PkgFormat::Au3 | PkgFormat::Aax | PkgFormat::Standalone
+        )
     }
 }
 

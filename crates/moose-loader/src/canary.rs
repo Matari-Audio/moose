@@ -65,7 +65,10 @@ use moose_gui_types::theme::{Color, Theme};
 /// Event/ExactEventBody wire fields staying unchanged cannot make an old logic
 /// dylib safe to process/clear the new private Vec representation. Old hot logic
 /// must rebuild; reject by existing epoch before any state/process invocation.
-pub const ABI_EPOCH: u32 = 9;
+/// Epoch 10: removed dead `moose_snapshot_into` and `moose_snapshot_version`
+/// exports after `PluginLogic` removal (`moose::Plugin` keeps custom state in
+/// `#[persist]` or `SnapshotPublisher`).
+pub const ABI_EPOCH: u32 = 10;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///
@@ -242,7 +245,7 @@ mod tests {
         old.abi_epoch = 8;
         assert_eq!(current.event_size, old.event_size);
         assert_eq!(current.event_body_size, old.event_body_size);
-        assert_eq!(current.abi_epoch, 9);
+        assert!(current.abi_epoch >= 9);
         assert!(!current.matches(&old));
         assert!(current.diff_report(&old).contains("abi_epoch"));
     }

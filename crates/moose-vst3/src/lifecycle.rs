@@ -706,11 +706,18 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
 ) {
     run_extern_callback_with::<P, ()>("vst3", "reset", (), || unsafe {
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
+        // Hosts may call `setProcessing(false)` on the audio thread: use
+        // wait-free `try_enter` so an overlapping lifecycle call never parks
+        // the audio thread.
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         if !audio.prepared {
             return;
         }
-        let mut plugin = enter_plugin(&inst.plugin);
+        let Some(mut plugin) = inst.plugin.try_enter() else {
+            return;
+        };
         {
             // Hosts may call setProcessing(false) on the audio thread: the
             // author's `reset` must not allocate (rt-paranoid reports it).

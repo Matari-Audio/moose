@@ -2,6 +2,7 @@ pub mod audio_tap;
 pub mod buffer;
 pub mod bus;
 pub mod bus_routing;
+pub mod c_abi_driver;
 pub mod chunked_process;
 pub mod config;
 pub mod custom_state;

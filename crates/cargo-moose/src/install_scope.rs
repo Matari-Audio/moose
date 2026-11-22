@@ -118,6 +118,7 @@ pub(crate) fn effective_scope(
     // `--user` and the per-format default.
     let hard_upgrade: Option<&'static str> = match format {
         Format::Au3 => Some("AU v3 is system-only; ignoring --user"),
+        Format::Aax => Some("AAX is system-only; ignoring --user"),
         _ => None,
     };
     if let Some(msg) = hard_upgrade {

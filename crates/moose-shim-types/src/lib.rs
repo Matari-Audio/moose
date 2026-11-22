@@ -24,6 +24,9 @@
 /// The `au_shim_types.h` C header, embedded at compile time.
 pub const AU_SHIM_TYPES_H: &str = include_str!("../include/au_shim_types.h");
 
+/// The `aax_shim_types.h` C header, embedded at compile time.
+pub const AAX_SHIM_TYPES_H: &str = include_str!("../include/aax_shim_types.h");
+
 /// Returns the path to the `include/` directory within this crate.
 ///
 /// Useful for `moose-au`'s build.rs to set as a C include path.

@@ -5,8 +5,8 @@
 
 use super::PkgFormat;
 use super::stage::{
-    ExtraComponent, build_preset_component, generate_distribution_xml, stage_au2, stage_au3,
-    stage_clap, stage_standalone, stage_vst3, write_format_scripts,
+    ExtraComponent, build_preset_component, generate_distribution_xml, stage_aax, stage_au2,
+    stage_au3, stage_clap, stage_standalone, stage_vst3, write_format_scripts,
 };
 use crate::commands::build_dylibs::BuildFormat;
 use crate::commands::install::presets;
@@ -280,6 +280,7 @@ fn stage_components_only(root: &Path, p: &PluginDef, o: &PackageOpts) -> Res {
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
             PkgFormat::Au2 => stage_au2(root, p, o.config, &staging, None),
             PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
+            PkgFormat::Aax => stage_aax(root, p, o.config, &staging),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
         match result {
@@ -693,6 +694,11 @@ fn resolve_formats(
             fmts.push(PkgFormat::Au2);
             fmts.push(PkgFormat::Au3);
         }
+        if available.contains("aax")
+            && crate::commands::install::aax::resolve_aax_sdk_path().is_some()
+        {
+            fmts.push(PkgFormat::Aax);
+        }
         if available.contains("standalone") {
             fmts.push(PkgFormat::Standalone);
         }
@@ -767,6 +773,9 @@ fn build_all_formats(
             archs,
             reuse_au_artifacts,
         )?;
+    }
+    if formats.contains(&PkgFormat::Aax) {
+        build_and_lipo_format(root, plugins, archs, dt, BuildFormat::Aax)?;
     }
     if formats.contains(&PkgFormat::Standalone) {
         // Standalone is a `[[bin]]`, not a cdylib - the per-arch
@@ -1028,6 +1037,7 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
             PkgFormat::Au2 => stage_au2(root, p, o.config, &staging, None),
             PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
+            PkgFormat::Aax => stage_aax(root, p, o.config, &staging),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
         match result {
@@ -1380,6 +1390,39 @@ fn build_and_lipo_format(
         cargo_build_multi_arch(archs, &base, dt)?;
     }
 
+    if matches!(format, BuildFormat::Aax) {
+        // AAX links statically against `lib<stem>_aax.a` (zero dlopen).
+        for &arch in archs {
+            for p in plugins {
+                let src = release_static_for_target(root, &p.dylib_stem(), Some(arch.triple()));
+                let saved = release_static_for_target(
+                    root,
+                    &format!("{}{suffix}", p.dylib_stem()),
+                    Some(arch.triple()),
+                );
+                if src.exists() {
+                    fs::copy(&src, &saved)?;
+                }
+            }
+        }
+        for p in plugins {
+            let inputs: Vec<PathBuf> = archs
+                .iter()
+                .map(|a| {
+                    release_static_for_target(
+                        root,
+                        &format!("{}{suffix}", p.dylib_stem()),
+                        Some(a.triple()),
+                    )
+                })
+                .collect();
+            let output = moose_build::target_dir(root)
+                .join(format!("release/lib{}{suffix}.a", p.dylib_stem()));
+            lipo_into(&inputs, &output)?;
+        }
+        return Ok(());
+    }
+
     for &arch in archs {
         for p in plugins {
             let src = release_lib_for_target(root, &p.dylib_stem(), Some(arch.triple()));
@@ -1420,7 +1463,7 @@ fn build_and_lipo_format(
         let exports: &[&str] = match format {
             BuildFormat::Clap => CLAP_EXPORTS,
             BuildFormat::Vst3 => VST3_EXPORTS,
-            BuildFormat::Au2 => unreachable!(),
+            BuildFormat::Au2 | BuildFormat::Aax => unreachable!(),
         };
         for p in plugins {
             let mut staticlibs: Vec<(MacArch, PathBuf)> = Vec::with_capacity(archs.len());

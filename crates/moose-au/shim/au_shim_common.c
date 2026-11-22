@@ -15,28 +15,30 @@
 // so the appex binary (which compiles the ObjC/Swift classes separately) can access them.
 __attribute__((visibility("default"))) const AuPluginDescriptor *g_descriptor = NULL;
 __attribute__((visibility("default"))) const AuCallbacks *g_callbacks = NULL;
-__attribute__((visibility("default"))) const AuParamDescriptor *g_param_descriptors = NULL;
-__attribute__((visibility("default"))) uint32_t g_num_params = 0;
 
 static int g_registered = 0;
 
-/* `_v2` so a pre-2.0 Rust staticlib (which calls `moose_au_register`)
- * fails to link against a 2.x framework build instead of registering
- * an old-layout AuCallbacks that every consumer would misread. */
-void moose_au_register_v2(
+/* `_v3` so a pre-v14 Rust staticlib (which calls `moose_au_register_v2` with
+ * the removed static parameter table) fails to link against a v14 framework
+ * build instead of registering an old-layout AuCallbacks. */
+void moose_au_register_v3(
     const AuPluginDescriptor *descriptor,
-    const AuCallbacks *callbacks,
-    const AuParamDescriptor *param_descriptors,
-    uint32_t num_params
+    const AuCallbacks *callbacks
 ) {
     if (g_registered) return;
 
     g_descriptor = descriptor;
     g_callbacks = callbacks;
-    g_param_descriptors = param_descriptors;
-    g_num_params = num_params;
     g_registered = 1;
 }
+
+#ifdef MOOSE_AU_FAKE_AUDIOTOOLBOX
+void moose_au_test_reset_registration(void) {
+    g_descriptor = NULL;
+    g_callbacks = NULL;
+    g_registered = 0;
+}
+#endif
 
 // Constructor: populates globals when the dylib is loaded.
 __attribute__((constructor))

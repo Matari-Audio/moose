@@ -14,12 +14,8 @@ use crate::instance::AuInstance;
 use crate::instance::FeedbackEpoch;
 use crate::instance::LIFECYCLE_ACTIVE;
 use crate::instance::LIFECYCLE_INACTIVE;
-use crate::instance::LIFECYCLE_UNKNOWN;
 use crate::instance::ParamNotifyQueue;
 use crate::instance::ParamTrackEntry;
-use crate::instance::SYSEX_INPUT_SLOTS;
-use crate::instance::SysExInput;
-use crate::instance::SysExQueue;
 use crate::instance::drain_sysex_input;
 use crate::instance::new_param_edit_seqs;
 use crate::output_events::NthCursor;
@@ -36,9 +32,7 @@ use crate::ffi::{
 use moose_core::SYSEX_POOL_PREALLOC;
 use moose_core::TransportSlot;
 use moose_core::buffer::RawBufferScratch;
-use moose_core::bus_routing::{BusActivation, BusRouting};
 use moose_core::cast::{len_u32, sample_pos_i64};
-use moose_core::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::events::{
     AuEventMetadata, EVENT_LIST_PREALLOC, Event, EventBody, EventList, ExactEvent, ExactEventBody,
@@ -58,8 +52,8 @@ use moose_core::ump::{
     encode_ump_channel_voice_2,
 };
 use moose_core::wrapper::{
-    PluginCell, apply_or_queue_state, apply_queued_state, copy_c_str, custom_state_for_save,
-    enter_plugin, run_audio_block_latched, run_extern_callback_with,
+    PluginCell, apply_or_queue_state, apply_queued_state, enter_plugin, run_audio_block_latched,
+    run_extern_callback_with,
 };
 use moose_params::{CatalogSignal, Params};
 use std::ffi::{CStr, CString};
@@ -102,10 +96,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 // - MIDI events come from MusicDeviceMIDIEvent (v2) or
 //   AURenderEvent linked list (v3).
 // ---------------------------------------------------------------------------
-
-pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
-    unsafe { cb_create_with_sink::<P>(std::ptr::null()) }
-}
 
 #[allow(clippy::too_many_lines)]
 pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
@@ -175,11 +165,7 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
             ));
 
             let delay = moose_core::delay::ReportedDelay::new(plugin.latency(), plugin.tail());
-            let initial_lifecycle = if sink.is_null() {
-                LIFECYCLE_UNKNOWN
-            } else {
-                LIFECYCLE_INACTIVE
-            };
+            let (sysex_ready_q, sysex_free_q) = crate::instance::new_sysex_queues();
             let instance = Box::new(AuInstance::<P> {
                 persist_signal,
                 catalog_signal,
@@ -195,7 +181,11 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                 plugin: PluginCell::new(plugin),
                 delay,
                 render_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
-                lifecycle_state: AtomicU8::new(initial_lifecycle),
+                prepared_flag: std::sync::atomic::AtomicBool::new(false),
+                prepared_rate_bits: AtomicU64::new(0),
+                prepared_max_frames: std::sync::atomic::AtomicUsize::new(0),
+                prepared_mode: AtomicU8::new(ProcessMode::Realtime.as_u8()),
+                lifecycle_state: AtomicU8::new(LIFECYCLE_INACTIVE),
                 #[cfg(any(not(target_vendor = "apple"), test))]
                 owner_thread: std::thread::current().id(),
                 lifecycle_lock: Mutex::new(()),
@@ -226,7 +216,6 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                     native_output_ump_protocol: 0,
                     native_output_max_absolute_offset: u32::MAX,
                     native_output_ump_time_valid: true,
-                    native_output_param_feedback_available: false,
                     native_output_status: AU_OUTPUT_END,
                     sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
@@ -244,14 +233,8 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                 transport_slot: TransportSlot::new(),
                 pending_state: Arc::new(StateLoadQueue::new(1)),
                 panic_latch: moose_core::wrapper::PanicLatch::new(),
-                sysex_ready: SysExQueue::new(SYSEX_INPUT_SLOTS),
-                sysex_free: {
-                    let free = SysExQueue::new(SYSEX_INPUT_SLOTS);
-                    for _ in 0..SYSEX_INPUT_SLOTS {
-                        let _ = free.push(SysExInput::default());
-                    }
-                    free
-                },
+                sysex_ready: sysex_ready_q,
+                sysex_free: sysex_free_q,
                 legacy_key_cstrings: info
                     .legacy_au_keys
                     .iter()
@@ -354,6 +337,7 @@ pub(crate) unsafe extern "C" fn cb_set_active<P: PluginExport>(
             // re-run `prepare` + `delay.publish(...)`.
             {
                 let mut audio = inst.audio.enter();
+                inst.prepared_flag.store(false, Ordering::Release);
                 audio.prepared = false;
                 audio.active_ramps.clear();
                 audio.active_ramps_scratch.clear();
@@ -472,25 +456,40 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
     // the C ABI.
     run_extern_callback_with::<P, ()>("au", "reset", (), || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
-        audio.active_ramps.clear();
-        audio.active_ramps_scratch.clear();
         // Clamp host-supplied max_frames to a sane minimum.
         let max_frames = (max_frames as usize).max(1024);
         let mode_raw = inst.render_mode.load(Ordering::Relaxed);
         let mode = ProcessMode::from_u8(mode_raw);
+
         // The shim calls this from both `AudioUnitInitialize` (main thread)
         // and `AudioUnitReset`, which hosts may send from the render thread.
-        // Same rate, size and mode as the last prepare: a plain `reset`
-        // (no allocation, checked under rt-paranoid). Otherwise a full
-        // `prepare`, which may allocate.
+        // Detect a same-config reset atomically before entering any cell so a
+        // render-thread `AudioUnitReset` never blocks even under host overlap.
+        let likely_same_config = inst.prepared_flag.load(Ordering::Acquire)
+            && inst.prepared_rate_bits.load(Ordering::Relaxed) == sample_rate.to_bits()
+            && inst.prepared_max_frames.load(Ordering::Relaxed) == max_frames
+            && inst.prepared_mode.load(Ordering::Relaxed) == mode_raw;
+        let mut audio = if likely_same_config {
+            let Some(guard) = inst.audio.try_enter() else {
+                return;
+            };
+            guard
+        } else {
+            inst.audio.enter()
+        };
+
+        audio.active_ramps.clear();
+        audio.active_ramps_scratch.clear();
+
         #[allow(clippy::float_cmp, reason = "same host value, not arithmetic")]
         let same_config = audio.prepared
             && audio.sample_rate == sample_rate
             && audio.max_block_size == max_frames
             && audio.prepared_mode == mode_raw;
         if same_config {
-            let mut plugin = enter_plugin(&inst.plugin);
+            let Some(mut plugin) = inst.plugin.try_enter() else {
+                return;
+            };
             {
                 let _rt = RtSection::enter();
                 plugin.reset(&AudioConfig::new(sample_rate, max_frames).with_process_mode(mode));
@@ -499,6 +498,7 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
             // latency and tail; a change shows up at the next block.
             return;
         }
+        inst.prepared_flag.store(false, Ordering::Release);
         audio.prepared = false;
         if let Some(catalog) = inst
             .pending_audio_catalog
@@ -538,6 +538,12 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
         }
         audio.prepared_mode = mode_raw;
         audio.prepared = true;
+        inst.prepared_rate_bits
+            .store(sample_rate.to_bits(), Ordering::Relaxed);
+        inst.prepared_max_frames
+            .store(max_frames, Ordering::Relaxed);
+        inst.prepared_mode.store(mode_raw, Ordering::Relaxed);
+        inst.prepared_flag.store(true, Ordering::Release);
     });
 }
 
@@ -1360,8 +1366,22 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         // scratch is reached through its ownership cell, so a concurrent
         // host-thread `&*ctx` (param reads, GUI) can't alias us.
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
         let num_frames = nf;
+
+        // Strictly wait-free audio entry: if a misbehaving host overlaps a
+        // main-thread lifecycle call with render, zero outputs and return
+        // `AU_PROCESS_INVALID` so the shim skips output-event draining (which
+        // would otherwise re-emit the previous block's uncleared MIDI/SysEx).
+        let Some(mut audio) = inst.audio.try_enter() else {
+            for ch in 0..num_output_channels as usize {
+                let ptr = *outputs.add(ch);
+                if !ptr.is_null() {
+                    std::ptr::write_bytes(ptr, 0, num_frames);
+                }
+            }
+            process_status = AU_PROCESS_INVALID;
+            return;
+        };
 
         // Host called render before AU initialized us - sample rate
         // and smoothers haven't been primed. Zero outputs and bail. Same
@@ -1401,11 +1421,18 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         audio.midi_drain_cursor = NthCursor::HEAD;
         audio.sysex_drain_cursor = NthCursor::HEAD;
 
-        // Take ownership of the plugin for the whole block: an
-        // uncontended `Acquire`, never a wait, since the host contract
-        // keeps `process` from overlapping a lifecycle callback and host
-        // saves read the snapshot instead of the plugin.
-        let mut plugin = enter_plugin(&inst.plugin);
+        // Strictly wait-free plugin entry: an uncontended `Acquire`, never
+        // parking the audio thread. If a misbehaving host overlaps a
+        // main-thread callback with render, zero outputs and bail cleanly.
+        let Some(mut plugin) = inst.plugin.try_enter() else {
+            for ch in 0..num_output_channels as usize {
+                let ptr = *outputs.add(ch);
+                if !ptr.is_null() {
+                    std::ptr::write_bytes(ptr, 0, num_frames);
+                }
+            }
+            return;
+        };
 
         // Apply any pending state-load before per-block work so the
         // plugin sees consistent params and extra state for the
@@ -1644,44 +1671,14 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
             _ => {}
         }
         scr.feedback_epoch.automation = inst.current_edit_seq();
-        let mut audio_buffer = scr.scratch.build(
-            inputs,
-            outputs,
+        let bus_routing = moose_core::c_abi_driver::build_single_sidechain_bus_routing(
+            inst.input_bus_count,
+            inst.output_bus_count,
             num_input_channels,
             num_output_channels,
-            len_u32(num_frames),
-            P::supports_in_place(),
+            inst.sidechain_channels,
+            bus_active,
         );
-        let sidechain_channels = inst.sidechain_channels.min(num_input_channels);
-        let main_input_channels = num_input_channels.saturating_sub(sidechain_channels);
-        let activation = |direction_mask: Option<u32>, bus: usize| match direction_mask {
-            Some(mask) if mask & (1_u32 << bus) == 0 => BusActivation::Inactive,
-            Some(_) => BusActivation::Active,
-            None => BusActivation::Unknown,
-        };
-        let mut bus_routing = BusRouting::new();
-        for index in 0..inst.input_bus_count {
-            let channels = match index {
-                0 => main_input_channels,
-                1 => sidechain_channels,
-                _ => 0,
-            };
-            let state = if channels == 0 {
-                BusActivation::Inactive
-            } else {
-                activation(bus_active.map(|m| m.0), index)
-            };
-            debug_assert!(bus_routing.push_input(channels, state));
-        }
-        for index in 0..inst.output_bus_count {
-            let channels = if index == 0 { num_output_channels } else { 0 };
-            let state = if channels == 0 {
-                BusActivation::Inactive
-            } else {
-                activation(bus_active.map(|m| m.1), index)
-            };
-            debug_assert!(bus_routing.push_output(channels, state));
-        }
 
         let transport = if !transport_ptr.is_null() && (*transport_ptr).valid != 0 {
             let t = &*transport_ptr;
@@ -1713,43 +1710,29 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         };
         inst.transport_slot.write(&transport);
 
-        let mut transport_snap = transport;
-        let chunk_args = ChunkedProcess {
-            events: &scr.event_list,
-            sub_event_scratch: &mut scr.sub_event_scratch,
-            transport: &mut transport_snap,
-            sample_rate: scr.sample_rate,
-            // Host offline flag, forwarded by the shim (`cb_set_render_
-            // mode`); read per block so a mid-session toggle applies to
-            // the next block without waiting on a re-prep.
-            process_mode: ProcessMode::from_u8(inst.render_mode.load(Ordering::Relaxed)),
-            output_events: &mut scr.output_events,
-            params_fn: None,
-            meters_fn: None,
-            latency_change_request: None,
-            param_infos: &scr.catalog,
-            automation: inst.automation,
-        };
-        process_chunked_with_bus_routing_and_catalog(
-            &mut *plugin,
-            inst.params_arc.as_ref() as &dyn Params,
-            &mut audio_buffer,
-            chunk_args,
-            bus_routing,
-            &scr.catalog,
+        moose_core::c_abi_driver::run_c_abi_audio_block(
+            &mut moose_core::c_abi_driver::CAbiAudioBlock {
+                plugin: &mut *plugin,
+                params: inst.params_arc.as_ref(),
+                scratch: &mut scr.scratch,
+                inputs,
+                outputs,
+                num_input_channels,
+                num_output_channels,
+                num_frames: len_u32(num_frames),
+                event_list: &scr.event_list,
+                sub_event_scratch: &mut scr.sub_event_scratch,
+                output_events: &mut scr.output_events,
+                transport,
+                sample_rate: scr.sample_rate,
+                process_mode: moose_core::c_abi_driver::load_render_mode(&inst.render_mode),
+                catalog: &scr.catalog,
+                automation: inst.automation,
+                bus_routing,
+                delay: &inst.delay,
+                host_queue: &inst.host_queue,
+            },
         );
-        let _ = audio_buffer;
-        // Narrow rendered f64 output back to host f32 when needed.
-        // No-op for `f32` plugins.
-        scr.scratch
-            .finish_widening(outputs, num_output_channels, len_u32(num_frames));
-        scr.output_events.ensure_sorted_by_offset();
-
-        // Event-driven RT signalling: coalesce LATENCY / TAIL / PRESENTATION
-        // onto `HostQueue` and wake the main-queue `DATA_OR` source directly
-        // on the 0 -> non-zero edge (zero polling timers, zero allocations).
-        inst.delay
-            .observe_and_signal(plugin.latency(), plugin.tail(), &inst.host_queue);
         if presentation_affected {
             inst.host_queue.signal(HostSignal::PRESENTATION);
         }
@@ -1760,12 +1743,7 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
     }
     if !ok || process_status != AU_PROCESS_OK {
         unsafe {
-            for ch in 0..num_output_channels as usize {
-                let ptr = *outputs.add(ch);
-                if !ptr.is_null() {
-                    std::ptr::write_bytes(ptr, 0, nf);
-                }
-            }
+            moose_core::c_abi_driver::zero_raw_outputs(outputs, num_output_channels, nf);
         }
     }
     process_status
@@ -1788,7 +1766,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
     // `FRAMES`, and the event / param / transport pointers are null
     // (which `cb_process` tolerates).
     unsafe {
-        let ctx = cb_create::<P>();
+        let ctx = cb_create_with_sink::<P>(std::ptr::null());
         cb_reset::<P>(ctx, 48_000.0, FRAMES);
 
         let in_left = vec![0.5f32; frames];
@@ -1876,19 +1854,15 @@ pub(crate) unsafe extern "C" fn cb_param_format_value<P: PluginExport>(
     out: *mut c_char,
     out_len: u32,
 ) -> u32 {
-    // Author `format_value` can panic; firewall it (0 = no display text).
     run_extern_callback_with::<P, u32>("au", "format_value", 0, || unsafe {
-        // `out_len == 0` would underflow on `out_len as usize - 1`
-        // and let `copy_nonoverlapping` write past the host-supplied
-        // buffer. Treat zero capacity as "host wants nothing".
-        if out_len == 0 || out.is_null() {
-            return 0;
-        }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        match inst.params_arc.format_value(id, value) {
-            Some(text) => len_u32(copy_c_str(out, out_len as usize, &text)),
-            None => 0,
-        }
+        moose_core::c_abi_driver::format_param_to_c_buf(
+            inst.params_arc.as_ref(),
+            id,
+            value,
+            out,
+            out_len,
+        )
     })
 }
 
@@ -1898,24 +1872,14 @@ pub(crate) unsafe extern "C" fn cb_param_parse_value<P: PluginExport>(
     text: *const c_char,
     out_plain: *mut f64,
 ) -> i32 {
-    // Author `parse_value` can panic; firewall it (0 = "not parsed").
     run_extern_callback_with::<P, i32>("au", "parse_value", 0, || unsafe {
-        if text.is_null() || out_plain.is_null() {
-            return 0;
-        }
-        let Ok(text) = CStr::from_ptr(text).to_str() else {
-            return 0;
-        };
         let inst = &*ctx.cast::<AuInstance<P>>();
-        // AU parameter values are plain (min..max), so `parse_value`'s
-        // result goes straight through - no normalize step like VST3.
-        match inst.params_arc.parse_value(id, text) {
-            Some(v) => {
-                *out_plain = v;
-                1
-            }
-            None => 0,
-        }
+        moose_core::c_abi_driver::parse_param_from_c_str(
+            inst.params_arc.as_ref(),
+            id,
+            text,
+            out_plain,
+        )
     })
 }
 
@@ -1924,81 +1888,25 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
     out_data: *mut *mut u8,
     out_len: *mut u32,
 ) {
-    // Pre-zero the out pointers so a panic anywhere in the body below
-    // leaves the host seeing an empty blob rather than a stale buffer
-    // pointer paired with whatever length was last written.
     unsafe {
         *out_data = std::ptr::null_mut();
         *out_len = 0;
     }
     run_extern_callback_with::<P, ()>("au", "save_state", (), || unsafe {
-        // Own exactly one contiguous host buffer. RAII frees failed or panicked
-        // partial writes; successful transfer retains the original libc ABI.
-        struct Buffer(*mut u8);
-        impl Drop for Buffer {
-            fn drop(&mut self) {
-                if !self.0.is_null() {
-                    unsafe {
-                        free(self.0.cast());
-                    }
-                }
-            }
-        }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let (ids, values) = inst.params_arc.collect_values();
-        // AU gives the wrapper no "render stopped" signal it can trust, so
-        // the save always asks the render thread for a fresh snapshot
-        // (bounded wait), falling back to the last one.
-        //
-        // Allocator pin: this wrapper allocates with libc `malloc` and
-        // the AU shim frees with libc `free`. The Rust global allocator
-        // must not appear on either side; mixing allocators is UB.
-        let extra = custom_state_for_save(&inst.plugin, &inst.snapshot, &inst.pending_state, false);
-        let Ok(persist) = inst.params_arc.prepare_persist_write() else {
-            return;
-        };
-        let Some(len) = state::plugin_state_stream_size::<P>(
+        if let Some((ptr, len)) = moose_core::c_abi_driver::save_state_to_host_buf(
+            &inst.plugin,
             &inst.params_arc,
-            &ids,
-            &values,
-            &extra,
-            persist.byte_len(),
-            P::max_host_state_bytes(),
-        ) else {
-            return;
-        };
-        let Ok(host_len) = u32::try_from(len) else {
-            return;
-        };
-        let mut buffer = Buffer(malloc(len).cast::<u8>());
-        if buffer.0.is_null() {
-            return;
-        }
-        let mut offset = 0;
-        let ok = state::write_plugin_state_stream::<P>(
+            &inst.snapshot,
+            &inst.pending_state,
             inst.plugin_id_hash,
-            &inst.params_arc,
-            &ids,
-            &values,
-            &extra,
-            persist.byte_len(),
-            P::max_host_state_bytes(),
-            |output| moose_params::write_prepared_persist(persist.as_ref(), output),
-            |bytes| {
-                if bytes.len() > len - offset {
-                    return -1;
-                }
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.0.add(offset), bytes.len());
-                offset += bytes.len();
-                i64::try_from(bytes.len()).unwrap_or(-1)
-            },
-        );
-        if !ok {
-            return;
+            false,
+            malloc,
+            free,
+        ) {
+            *out_data = ptr;
+            *out_len = len;
         }
-        *out_data = buffer.0;
-        *out_len = host_len;
-        buffer.0 = std::ptr::null_mut();
     });
 }
 
@@ -2009,48 +1917,26 @@ pub(crate) unsafe extern "C" fn cb_state_load<P: PluginExport>(
 ) -> i32 {
     run_extern_callback_with::<P, i32>("au", "load_state", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        // `slice::from_raw_parts(null, n)` for `n > 0` is UB. Treat
-        // `(null, *)` and `(_, 0)` the same as "host gave us nothing".
         if data.is_null() || len == 0 {
             return 0;
         }
-        let mut blob = slice::from_raw_parts(data, len as usize);
-        let backup = state::ParamsBackup::capture(&*inst.params_arc);
-        // Not this plugin's envelope? Offer the bytes to the plugin's
-        // `migrate_state` hook (legacy sessions from a pre-moose
-        // build that stored foreign bytes under moose's key, or a
-        // renamed plugin's envelope).
-        if let Some(deserialized) = state::read_and_apply_params::<P>(
-            |dst| {
-                std::io::Read::read(&mut blob, dst).map_or(-1, |n| i64::try_from(n).unwrap_or(-1))
-            },
+        let blob = slice::from_raw_parts(data, len as usize);
+        let Some((deserialized, backup)) = moose_core::c_abi_driver::load_state_from_host_slice::<P>(
+            blob,
             inst.plugin_id_hash,
             state::PluginFormat::Au,
             Some("truce_state"),
-            &*inst.params_arc,
-            len as usize,
-        ) {
-            // Apply params synchronously on the host thread (atomic-safe)
-            // so host queries that read parameter values right after
-            // `setFullState:` see the restored values without first
-            // running a render block.
-
-            // Hand the deserialized state to the audio thread for
-            // application. `force_push` overwrites any older pending
-            // blob - see the `pending_state` field comment for why
-            // newest-wins is the right policy.
-            // Queue for the render thread and wait (bounded) so the editor
-            // notify below sees the applied state.
-            if !load_custom_state(inst, deserialized, &backup) {
-                return 0;
-            }
-            if let Some(ref mut editor) = inst.gui.enter().editor {
-                editor.state_changed();
-            }
-            1
-        } else {
-            0
+            &inst.params_arc,
+        ) else {
+            return 0;
+        };
+        if !load_custom_state(inst, deserialized, &backup) {
+            return 0;
         }
+        if let Some(ref mut editor) = inst.gui.enter().editor {
+            editor.state_changed();
+        }
+        1
     })
 }
 
@@ -2094,16 +1980,16 @@ pub(crate) unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
             return 0;
         };
         let bytes = slice::from_raw_parts(data, len as usize);
-        let Some(migrated) = P::migrate_state(&state::ForeignState::Raw {
-            format: state::PluginFormat::Au,
-            source_key: Some(key),
-            bytes,
-        }) else {
+        let Some((deserialized, backup)) =
+            moose_core::c_abi_driver::load_foreign_state_from_host_slice::<P>(
+                state::PluginFormat::Au,
+                Some(key),
+                bytes,
+                &inst.params_arc,
+            )
+        else {
             return 0;
         };
-        let deserialized: state::DeserializedState = migrated.into();
-        let backup = state::ParamsBackup::capture(&*inst.params_arc);
-        state::apply_params(&*inst.params_arc, &deserialized);
         if !load_custom_state(inst, deserialized, &backup) {
             return 0;
         }

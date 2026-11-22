@@ -115,24 +115,6 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         Vec::new()
     }
 
-    /// Lock-free state-save opt-in.
-    fn snapshot_into(state: &Self::DspState, buf: &mut Vec<u8>) -> bool {
-        let _ = (state, buf);
-        false
-    }
-
-    /// Snapshot generation token.
-    fn snapshot_version(state: &Self::DspState) -> Option<u64> {
-        let _ = state;
-        None
-    }
-
-    /// Inline snapshot buffer pre-warm hint.
-    #[must_use]
-    fn snapshot_prealloc_hint() -> usize {
-        moose_core::snapshot::SNAPSHOT_PREALLOC
-    }
-
     /// Restore plugin-specific state.
     ///
     /// # Errors

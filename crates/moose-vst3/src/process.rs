@@ -12,7 +12,7 @@ use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostSignal;
 use moose_core::rt::{RtSection, audit};
-use moose_core::wrapper::{apply_queued_state, enter_plugin, run_audio_block_latched};
+use moose_core::wrapper::{apply_queued_state, run_audio_block_latched};
 use moose_params::Params;
 use moose_params::sample::Sample;
 use std::slice;
@@ -126,8 +126,20 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
         // scratch is reached through its ownership cell, so a concurrent
         // host-thread `&*ctx` (param reads, GUI) can't alias us.
         let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
         let num_frames = nf;
+
+        // Strictly wait-free audio entry: if a misbehaving host overlaps a
+        // lifecycle callback with `process`, zero outputs and return instead
+        // of parking the audio thread.
+        let Some(mut audio) = inst.audio.try_enter() else {
+            for ch in 0..num_output_channels as usize {
+                let ptr = *outputs.add(ch);
+                if !ptr.is_null() {
+                    std::ptr::write_bytes(ptr, 0, num_frames);
+                }
+            }
+            return;
+        };
 
         // Host called process() before setActive(true) - the plugin
         // hasn't been told its sample rate / max block size yet, so
@@ -147,14 +159,23 @@ pub(crate) unsafe fn process_block<P: PluginExport, H: Sample>(
             return;
         }
 
-        // Take ownership of the plugin for the whole block: an
-        // uncontended `Acquire`, never a wait, since the host contract
-        // keeps `process` from overlapping a lifecycle callback and host
-        // saves read the snapshot instead of the plugin.
-        // A host that never calls `setProcessing(true)` still marks the
-        // audio thread as owner before the first block.
+        // Strictly wait-free plugin entry: an uncontended `Acquire`, never
+        // parking the audio thread. A host that never calls
+        // `setProcessing(true)` still marks the audio thread as owner before
+        // the first block.
         inst.processing.store(true, Ordering::Release);
-        let mut plugin = enter_plugin(&inst.plugin);
+        let Some(mut plugin) = inst.plugin.try_enter() else {
+            for ch in 0..num_output_channels as usize {
+                let ptr = *outputs.add(ch);
+                if !ptr.is_null() {
+                    std::ptr::write_bytes(ptr, 0, num_frames);
+                }
+            }
+            audio.event_list.clear();
+            audio.output_events.clear();
+            audio.output_events.clear_overflow();
+            return;
+        };
 
         // Apply any pending state-load before per-block work so the
         // plugin sees consistent params and extra state for the

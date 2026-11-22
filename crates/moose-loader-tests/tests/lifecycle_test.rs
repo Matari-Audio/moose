@@ -244,19 +244,11 @@ fn params_with_value(value: u32) -> LcParams {
 /// never publishes a snapshot or a save blob of its own.
 #[test]
 fn processor_side_custom_state_is_gone() {
-    type Logic = Lifecycle<Lc>;
     let (mut plugin, _params) = shell();
     plugin.prepare(&config()).expect("activates");
     let mut buf = Vec::new();
-    assert!(!<Logic as PluginLogicCore<f32>>::snapshot_into(
-        plugin.state_ref(),
-        &mut buf
-    ));
+    assert!(!plugin.snapshot_into(&mut buf));
     assert_eq!(buf, [] as [u8; 0]);
-    assert_eq!(
-        <Logic as PluginLogicCore<f32>>::snapshot_version(plugin.state_ref()),
-        None
-    );
     assert_eq!(plugin.save_state(), [] as [u8; 0]);
 }
 

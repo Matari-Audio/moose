@@ -380,11 +380,17 @@ pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *cons
     // the C ABI.
     run_extern_callback_with::<P, ()>("CLAP", "reset", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        let mut audio = data.audio.enter();
+        // CLAP `reset` is [audio-thread]: strictly wait-free entry so a
+        // misbehaving host overlapping lifecycle calls cannot park audio.
+        let Some(mut audio) = data.audio.try_enter() else {
+            return;
+        };
         audio.sounding_notes.clear_all();
         data.params_arc.clear_modulations();
         let mode = ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed));
-        let mut instance = enter_plugin(&data.plugin);
+        let Some(mut instance) = data.plugin.try_enter() else {
+            return;
+        };
         {
             // CLAP `reset` is [audio-thread]: the author's `reset` must not
             // allocate (rt-paranoid reports it). Sizing belongs in `prepare`.

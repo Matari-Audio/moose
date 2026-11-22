@@ -123,7 +123,9 @@ pub(crate) unsafe extern "C" fn cb_output_event_count<P: PluginExport>(
 ) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let audio = inst.audio.enter();
+        let Some(audio) = inst.audio.try_enter() else {
+            return 0;
+        };
         let n = audio
             .output_events
             .iter()
@@ -140,7 +142,9 @@ pub(crate) unsafe extern "C" fn cb_output_event_at<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         let scr = &mut *audio;
         if let Some(mut packet) = nth_matching(
             &scr.output_events,
@@ -347,7 +351,9 @@ pub(crate) unsafe extern "C" fn cb_output_ump_count<P: PluginExport>(
 ) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let audio = inst.audio.enter();
+        let Some(audio) = inst.audio.try_enter() else {
+            return 0;
+        };
         let list = &audio.output_events;
         let protocol = UmpProtocol::from_wire(protocol);
         len_u32(
@@ -366,7 +372,9 @@ pub(crate) unsafe extern "C" fn cb_output_ump_at<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         let scr = &mut *audio;
         if let Some(mut packet) = au_ump_packet_at(
             &scr.output_events,
@@ -439,7 +447,9 @@ pub(crate) unsafe extern "C" fn cb_output_sysex_count<P: PluginExport>(
 ) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let audio = inst.audio.enter();
+        let Some(audio) = inst.audio.try_enter() else {
+            return 0;
+        };
         len_u32(
             audio
                 .output_events
@@ -459,7 +469,9 @@ pub(crate) unsafe extern "C" fn cb_output_sysex_at<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         let scr = &mut *audio;
         if let Some(event) = nth_matching(
             &scr.output_events,
@@ -805,7 +817,6 @@ pub(crate) fn begin_output_events<P: PluginExport>(
     ump_protocol: u32,
     max_absolute_offset: u32,
     ump_time_valid: u32,
-    param_feedback_available: u32,
 ) {
     audio.native_output_cursor = LosslessEventCursor::default();
     audio.native_output_carriers = carrier_mask & (AU_NATIVE_CARRIER_BYTES | AU_NATIVE_CARRIER_UMP);
@@ -813,7 +824,6 @@ pub(crate) fn begin_output_events<P: PluginExport>(
     audio.native_output_ump_protocol = u8::try_from(ump_protocol).unwrap_or(0);
     audio.native_output_max_absolute_offset = max_absolute_offset;
     audio.native_output_ump_time_valid = ump_time_valid != 0;
-    audio.native_output_param_feedback_available = param_feedback_available != 0;
     if audio.output_events.overflow().is_some() {
         audio.native_output_status = AU_OUTPUT_QUEUE_FULL;
         return;
@@ -836,7 +846,7 @@ pub(crate) fn begin_output_events<P: PluginExport>(
             if !f32::from_f64(*value).is_finite() {
                 return Some(AU_OUTPUT_INVALID);
             }
-            if !audio.native_output_param_feedback_available || !inst.host_sink.has_set_param() {
+            if !inst.host_sink.has_set_param() {
                 return Some(AU_OUTPUT_UNSUPPORTED);
             }
             param_count += 1;
@@ -878,7 +888,9 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         begin_output_events(
             inst,
             &mut audio,
@@ -887,7 +899,6 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
             ump_protocol,
             u32::MAX,
             1,
-            0,
         );
     }
 }
@@ -902,7 +913,9 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events_v9<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         begin_output_events(
             inst,
             &mut audio,
@@ -911,23 +924,23 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events_v9<P: PluginExport>(
             ump_protocol,
             max_absolute_offset,
             ump_time_valid,
-            0,
         );
     }
 }
 
-pub(crate) unsafe extern "C" fn cb_begin_output_events_v10<P: PluginExport>(
+pub(crate) unsafe extern "C" fn cb_begin_output_events_v14<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     carrier_mask: u32,
     num_frames: u32,
     ump_protocol: u32,
     max_absolute_offset: u32,
     ump_time_valid: u32,
-    param_feedback_available: u32,
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         begin_output_events(
             inst,
             &mut audio,
@@ -936,7 +949,6 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events_v10<P: PluginExport>(
             ump_protocol,
             max_absolute_offset,
             ump_time_valid,
-            param_feedback_available,
         );
     }
 }
@@ -950,7 +962,9 @@ pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
             return AU_OUTPUT_INVALID;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return AU_OUTPUT_END;
+        };
         let scr = &mut *audio;
         if scr.native_output_status != AU_OUTPUT_END {
             return std::mem::replace(&mut scr.native_output_status, AU_OUTPUT_END);
@@ -996,22 +1010,11 @@ pub(crate) unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(
 ) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let audio = inst.audio.enter();
+        let Some(audio) = inst.audio.try_enter() else {
+            return AU_OUTPUT_END;
+        };
         if audio.output_events.overflow().is_some() {
             return AU_OUTPUT_QUEUE_FULL;
-        }
-        if !audio.native_output_param_feedback_available
-            && audio.output_events.lossless_iter().any(|event| {
-                matches!(
-                    event,
-                    LosslessEventRef::Typed(Event {
-                        body: EventBody::ParamChange { .. },
-                        ..
-                    })
-                )
-            })
-        {
-            return AU_OUTPUT_UNSUPPORTED;
         }
 
         let epoch = audio.feedback_epoch;
@@ -1059,7 +1062,9 @@ pub(crate) unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
 ) {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let mut audio = inst.audio.enter();
+        let Some(mut audio) = inst.audio.try_enter() else {
+            return;
+        };
         let status = audio.output_events.overflow().map_or_else(
             || match status {
                 AU_OUTPUT_END | AU_OUTPUT_EMITTED => OutputEventStatus::Success,

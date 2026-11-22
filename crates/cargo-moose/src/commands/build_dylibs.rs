@@ -28,6 +28,7 @@ pub(crate) enum BuildFormat {
     Clap,
     Vst3,
     Au2,
+    Aax,
 }
 
 impl BuildFormat {
@@ -37,6 +38,7 @@ impl BuildFormat {
             BuildFormat::Clap => "clap",
             BuildFormat::Vst3 => "vst3",
             BuildFormat::Au2 => "au",
+            BuildFormat::Aax => "aax",
         }
     }
 
@@ -46,6 +48,7 @@ impl BuildFormat {
             BuildFormat::Clap => "CLAP",
             BuildFormat::Vst3 => "VST3",
             BuildFormat::Au2 => "AU v2",
+            BuildFormat::Aax => "AAX",
         }
     }
 
@@ -57,6 +60,7 @@ impl BuildFormat {
             BuildFormat::Clap => "_clap",
             BuildFormat::Vst3 => "_vst3",
             BuildFormat::Au2 => "_au",
+            BuildFormat::Aax => "_aax",
         }
     }
 }
@@ -90,6 +94,13 @@ pub(crate) fn build_format_dylibs(
     if format == BuildFormat::Au2 {
         crate::log_skip(
             "AU v2: not supported on this platform. Audio Unit is macOS-only.".to_string(),
+        );
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if format == BuildFormat::Aax {
+        crate::log_skip(
+            "AAX: not supported on this platform. Pro Tools AAX is macOS/Windows only.".to_string(),
         );
         return Ok(());
     }
@@ -177,6 +188,22 @@ pub(crate) fn build_format_dylibs(
         // every format so the loop is uniformly tolerant.
         if src.exists() {
             fs_ctx::copy(&src, &dst)?;
+        }
+
+        // Static-linked AAX consumes the Rust `staticlib` (`lib<stem>.a` /
+        // `<stem>.lib`); copy it to `<stem>_aax` so subsequent format builds
+        // cannot overwrite the AAX archive.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if format == BuildFormat::Aax {
+            let static_src = crate::release_static_for_target(root, &p.dylib_stem(), target);
+            let static_dst = crate::release_static_for_target(
+                root,
+                &format!("{}{}", p.dylib_stem(), format.dylib_suffix()),
+                target,
+            );
+            if static_src.exists() {
+                fs_ctx::copy(&static_src, &static_dst)?;
+            }
         }
 
         // macOS bundle-format link path. The cdylib above is MH_DYLIB,
@@ -360,7 +387,7 @@ fn link_macos_bundle_for_plugin(
     let exports = match format {
         BuildFormat::Clap => crate::CLAP_EXPORTS,
         BuildFormat::Vst3 => crate::VST3_EXPORTS,
-        BuildFormat::Au2 => unreachable!("caller gates on bundle formats"),
+        BuildFormat::Au2 | BuildFormat::Aax => unreachable!("caller gates on bundle formats"),
     };
 
     let out = crate::release_bundle_bin(root, &p.dylib_stem(), format.dylib_suffix());

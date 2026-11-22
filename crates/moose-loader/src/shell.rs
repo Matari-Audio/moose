@@ -77,16 +77,8 @@ pub struct HotShell<P: Params, S: Sample = f32> {
     state_origin: Option<StateOrigin>,
     /// Meter values written by DSP, read by GUI.
     meters: Arc<moose_core::meters::MeterStore>,
-    /// Lock-free publish slot for `snapshot_into`-based state save.
+    /// Lock-free publish slot for off-thread `SnapshotPublisher` and on-demand saves.
     snapshots: Arc<moose_core::snapshot::SnapshotSlot>,
-    /// Whether the loaded logic opted into the per-block publish, probed in
-    /// `new_with_tasks` off the audio thread.
-    // ponytail: probed once; a reload that flips the opt-in keeps the old
-    // answer until the instance is recreated (dev-only shell).
-    try_snapshot: bool,
-    /// Last `moose_snapshot_version` the shell published; a block whose
-    /// version matches skips re-serialization (see `publish_snapshot_with`).
-    last_snapshot_version: Option<u64>,
     sample_rate: f64,
     max_block_size: usize,
     /// Processing mode from the last `reset`. Replayed when the audio
@@ -146,9 +138,6 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
             .map_or((std::ptr::null_mut(), None), |(st, origin)| {
                 (st, Some(origin))
             });
-        let try_snapshot = !state.is_null()
-            && (loader.snapshot_version(state).is_some()
-                || loader.snapshot_into(state, &mut Vec::new()));
         let loader = Arc::new(Mutex::new(loader));
         // Drive reloads off the audio thread. The watcher polls the
         // dylib path and runs `reload()` itself when mtime advances.
@@ -161,8 +150,6 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
             state_origin,
             meters: moose_core::meters::MeterStore::new(),
             snapshots: moose_core::snapshot::SnapshotSlot::new(),
-            try_snapshot,
-            last_snapshot_version: None,
             sample_rate: 44100.0,
             max_block_size: 1024,
             process_mode: ProcessMode::Realtime,
@@ -275,7 +262,6 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
     /// the host retries editor creation on a later idle tick. Editor and
     /// fixed task bundle are captured under that same lock, so every format's
     /// later `Editor::open` uses the exact generation that built the editor.
-    #[must_use]
     pub fn editor_builder(&self) -> moose_core::editor::EditorBuilder<P> {
         let loader = Arc::clone(&self.loader);
         Box::new(move |params: Arc<P>| {
@@ -462,28 +448,12 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         let status = loader.process(self.state, buffer, events, &mut ctx);
 
         let state = self.state.cast_const();
-        let version = loader.snapshot_version(state);
-        crate::static_shell::publish_snapshot_with(
-            &self.snapshots,
-            &mut self.try_snapshot,
-            &mut self.last_snapshot_version,
-            version,
-            |buf| {
-                loader.snapshot_into(state, buf)
-                    || (version.is_some() && {
-                        buf.extend_from_slice(&loader.save_state(state));
-                        true
-                    })
-            },
-        );
         if let Some(ticket) = self.snapshots.pending_request() {
             // On-demand save request; see `StaticShell::process`.
             moose_core::rt::allow_alloc(|| {
                 self.snapshots.serve(ticket, |buf| {
-                    if !loader.snapshot_into(state, buf) {
-                        buf.clear();
-                        buf.extend_from_slice(&loader.save_state(state));
-                    }
+                    buf.clear();
+                    buf.extend_from_slice(&loader.save_state(state));
                 });
             });
         }
@@ -521,23 +491,6 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         }
     }
 
-    fn snapshot_into(&self, buf: &mut Vec<u8>) -> bool {
-        // Same bounded-lock trade-off as `save_state`: on a hot-reload
-        // miss return "no snapshot" rather than hang the host.
-        let Some(loader) = self.loader.try_lock_for(GUI_LOCK_WAIT) else {
-            return false;
-        };
-        // A watcher swap can leave `self.state` a previous dylib's
-        // allocation; the current dylib's `snapshot_into` over it would
-        // read old bytes under the new layout. Until `process` / `reset`
-        // reconciles, report "no snapshot" - the host falls back to
-        // `save_state`, which serializes through the state's origin dylib.
-        if self.state.is_null() || loader.swap_generation() != self.state_generation {
-            return false;
-        }
-        loader.snapshot_into(self.state.cast_const(), buf)
-    }
-
     fn republish_snapshot(&mut self) {
         let loader_arc = Arc::clone(&self.loader);
         let Some(loader) = loader_arc.try_lock_for(GUI_LOCK_WAIT) else {
@@ -548,14 +501,11 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         if !self.reconcile_state(&loader) {
             return;
         }
-        // Host thread, plugin owned: serialize live, whatever the opt-in.
+        // Host thread, plugin owned: serialize live.
         let state = self.state.cast_const();
-        self.last_snapshot_version = None;
         self.snapshots.store_inline(|buf| {
-            if !loader.snapshot_into(state, buf) {
-                buf.clear();
-                buf.extend_from_slice(&loader.save_state(state));
-            }
+            buf.clear();
+            buf.extend_from_slice(&loader.save_state(state));
         });
     }
 
@@ -581,11 +531,6 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         // matching the static shell's policy.
         let result = loader.load_state(self.state, data);
         drop(loader);
-        // Invalidate the snapshot-version gate so the `republish_snapshot`
-        // the wrapper calls right after a load re-serializes, rather than
-        // skipping on a stale version and leaving pre-load bytes in the
-        // slot (see `StaticShell::load_state`).
-        self.last_snapshot_version = None;
         result
     }
 

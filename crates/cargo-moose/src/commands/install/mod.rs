@@ -32,6 +32,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
+// AAX build & install driver (macOS / Windows; skips cleanly on Linux).
+pub(crate) mod aax;
 // AU is macOS only.
 #[cfg(target_os = "macos")]
 pub(crate) mod au_v3;
@@ -98,6 +100,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
     let mut vst3 = false;
     let mut au2 = false;
     let mut au3 = false;
+    let mut aax = false;
     let mut no_build = false;
     let mut shell_mode = false;
     let mut debug = false;
@@ -114,6 +117,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
             "--vst3" => vst3 = true,
             "--au2" => au2 = true,
             "--au3" => au3 = true,
+            "--aax" => aax = true,
             "--no-build" => no_build = true,
             "--shell" => shell_mode = true,
             "--debug" => debug = true,
@@ -169,7 +173,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
     // shell dlopens at runtime) defaults to release for better DSP
     // perf, with `--debug` flipping it to debug for fast iteration.
 
-    if !clap && !vst3 && !au2 && !au3 {
+    if !clap && !vst3 && !au2 && !au3 && !aax {
         // No format flags specified - enable all formats that the project supports.
         // Check which features are defined in the first plugin's Cargo.toml.
         let available = detect_default_features();
@@ -180,6 +184,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
         // Linux / Windows users with `"au"` in their `[features].default`.
         au2 = available.contains("au");
         au3 = available.contains("au");
+        aax = available.contains("aax");
     }
 
     // Shell-mode preflight: bail early if the user's Cargo.toml is
@@ -255,6 +260,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
             (clap, BuildFormat::Clap),
             (vst3, BuildFormat::Vst3),
             (au2, BuildFormat::Au2),
+            (aax, BuildFormat::Aax),
         ];
         for &(selected, format) in format_selection {
             if selected {
@@ -308,6 +314,23 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
         }
     }
 
+    if aax {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let _ = scope_for(Format::Aax, cli_scope);
+            let bundles_dir = moose_build::target_dir(&root).join("bundles");
+            fs_ctx::create_dir_all(&bundles_dir)?;
+            for p in &plugins {
+                if !no_build {
+                    let _ = aax::emit_aax_bundle(&root, p, &config, &bundles_dir, None)?;
+                }
+                aax::install_aax(&root, p, &config)?;
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = (aax, cli_scope);
+    }
+
     if au3 {
         #[cfg(target_os = "macos")]
         {
@@ -350,7 +373,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
 fn print_help() {
     eprintln!(
         "\
-Usage: cargo moose install [--clap] [--vst3] [--au2] [--au3]
+Usage: cargo moose install [--clap] [--vst3] [--au2] [--au3] [--aax]
                            [--user|--system] [--shell] [--debug] [--no-build] [-p <crate>]
                            [--target-cpu <value>]
 
@@ -375,6 +398,7 @@ Options:
   --vst3           VST3 only
   --au2            AU v2 only (.component, macOS only)
   --au3            AU v3 only (.appex, macOS only)
+  --aax            AAX only (.aaxplugin, macOS/Windows with AAX_SDK_PATH)
   --user           Install per-user (default; exception: VST3 on Windows
                    defaults to system - pass --user to override).
   --system         Install system-wide (sudo / admin required).

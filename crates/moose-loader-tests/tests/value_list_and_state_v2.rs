@@ -180,6 +180,7 @@ mod presets {
             mute_preview_output: false,
             automation: Automation::DEFAULT,
             legacy_au_keys: &[],
+            legacy_aax_chunks: &[],
         }
     }
 

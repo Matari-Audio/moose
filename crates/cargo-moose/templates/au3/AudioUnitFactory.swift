@@ -37,14 +37,9 @@ private let midiEventPacketWordsOffset =
     MemoryLayout<MIDIEventPacket>.offset(of: \MIDIEventPacket.words)!
 
 /// The ABI tail version the plugin binary declares, or 0 when the
-/// version word lacks its 'TAu\0' magic tag. A pre-2.0 binary has the
-/// `create` function pointer at offset 0; without the magic check its
-/// low bits would masquerade as a version and every gated tail read
-/// would land one slot off. The renamed `moose_au_register_v2` only
-/// protects the staticlib/shim link inside the framework; this appex
-/// binds the framework through `g_callbacks` / `g_descriptor` /
-/// `moose_au_init`, whose names predate 2.0, so version skew across
-/// that boundary is caught only by this runtime check.
+/// version word lacks its 'MAu\0' magic tag. Checking the magic prevents
+/// cross-binary skew between older plugin frameworks and newer appexes
+/// (or vice versa) before any struct field past offset 0 is read.
 func mooseAbiTailVersion(_ cb: UnsafePointer<AuCallbacks>) -> UInt32 {
     let word = cb.pointee.abi_version
     guard word & MOOSE_AU_ABI_MAGIC_MASK == MOOSE_AU_ABI_MAGIC else { return 0 }
@@ -252,7 +247,6 @@ class MooseAUAudioUnit: AUAudioUnit {
     private var _applyingRustSync = false
     private var _syncOriginatorToken: AUParameterObserverToken?
     private var _sinkBox: MooseAuSinkBox?
-    private var _hasV13Sink = false
     private var _isActive = false
     /// View-controller hook for plugin-initiated editor resizes (`request_resize`).
     var onResizeRequested: ((UInt32, UInt32) -> Void)?
@@ -269,13 +263,15 @@ class MooseAUAudioUnit: AUAudioUnit {
 
         guard let callbacks = g_callbacks, let descriptor = g_descriptor else { return }
 
-        // Require ABI v13 (`create_with_sink` + `process_native_v13`) up front
-        // so an older framework binary fails cleanly at initialization instead
-        // of initializing and returning `kAudio_ParamError` on every render.
-        guard mooseAbiTailVersion(callbacks) >= 13,
+        // Require ABI v14 (`create_with_sink` + `process_native_v13` +
+        // `begin_output_events_v14`) up front so an older framework binary
+        // fails cleanly at initialization instead of returning
+        // `kAudio_ParamError` on every render.
+        guard mooseAbiTailVersion(callbacks) >= 14,
               callbacks.pointee.create_with_sink != nil,
-              callbacks.pointee.process_native_v13 != nil else {
-            logger.error("AU init: plugin binary lacks the ABI v13 render/sink contract; rebuild the framework and appex with the same moose version")
+              callbacks.pointee.process_native_v13 != nil,
+              callbacks.pointee.begin_output_events_v14 != nil else {
+            logger.error("AU init: plugin binary lacks the ABI v14 render/sink contract; rebuild the framework and appex with the same moose version")
             throw NSError(domain: NSOSStatusErrorDomain,
                           code: Int(kAudioUnitErr_FailedInitialization))
         }
@@ -298,7 +294,6 @@ class MooseAUAudioUnit: AUAudioUnit {
             sink.state_changed = au3SinkStateChanged
             sink.audio_ports_changed = au3SinkAudioPortsChanged
             rustCtx = createWithSink(&sink)
-            _hasV13Sink = (rustCtx != nil)
         }
         guard rustCtx != nil else {
             throw NSError(domain: NSOSStatusErrorDomain,
@@ -585,8 +580,7 @@ class MooseAUAudioUnit: AUAudioUnit {
             }
         }
 
-        if mooseAbiTailVersion(callbacks) >= 13,
-           let paramIdsFn = cb.param_ids,
+        if let paramIdsFn = cb.param_ids,
            let paramInfoFn = cb.param_info_by_id {
             let count = Int(paramIdsFn(rawCtx, nil, 0))
             if count > 0 {
@@ -608,22 +602,6 @@ class MooseAUAudioUnit: AUAudioUnit {
                         hidden: (pi.flags & UInt32(AU_PARAM_FLAG_HIDDEN)) != 0,
                         canRamp: (pi.flags & UInt32(AU_PARAM_FLAG_CAN_RAMP)) != 0)
                 }
-            }
-        } else {
-            for i in 0..<g_num_params {
-                let desc = g_param_descriptors.advanced(by: Int(i)).pointee
-                appendParameter(
-                    id: desc.id,
-                    name: String(cString: desc.name),
-                    group: String(cString: desc.group),
-                    unitStr: String(cString: desc.unit),
-                    minVal: desc.min,
-                    maxVal: desc.max,
-                    defaultVal: desc.default_value,
-                    stepCount: desc.step_count,
-                    readOnly: false,
-                    hidden: false,
-                    canRamp: desc.step_count == 0)
             }
         }
 
@@ -716,7 +694,6 @@ class MooseAUAudioUnit: AUAudioUnit {
         mainInScratch: UnsafeMutablePointer<Float>?,
         mainInABL: UnsafeMutableAudioBufferListPointer?,
         paramBuf: UnsafeMutablePointer<AuParamEventV2>,
-        hasV13Sink: Bool,
         transportBuf: UnsafeMutablePointer<AuTransportSnapshot>,
         sysexOutScratch: UnsafeMutablePointer<UInt8>,
         sysexOutScratchCap: Int,
@@ -995,9 +972,9 @@ class MooseAUAudioUnit: AUAudioUnit {
             }
         }
 
-        guard mooseAbiTailVersion(cb) >= 13,
+        guard mooseAbiTailVersion(cb) >= 14,
               let processNative = cb.pointee.process_native_v13,
-              let beginOutput = cb.pointee.begin_output_events_v10,
+              let beginOutput = cb.pointee.begin_output_events_v14,
               let nextOutput = cb.pointee.next_output_event,
               let finishOutput = cb.pointee.finish_output_events,
               let commitOutputParams = cb.pointee.commit_output_params else {
@@ -1028,7 +1005,7 @@ class MooseAUAudioUnit: AUAudioUnit {
             carrierMask |= UInt32(AU_NATIVE_CARRIER_UMP)
         }
         beginOutput(ctx, carrierMask, frameCount, midiOutputProtocol,
-                    maxAbsoluteOffset, 1, hasV13Sink ? 1 : 0)
+                    maxAbsoluteOffset, 1)
         while true {
             var out = AuNativeEvent()
             let result = nextOutput(ctx, &out)
@@ -1195,7 +1172,6 @@ class MooseAUAudioUnit: AUAudioUnit {
         // automation point. This capacity is independent of the native
         // event lane, so filling one never truncates the other.
         let paramBuf = UnsafeMutablePointer<AuParamEventV2>.allocate(capacity: 256)
-        let hasV13Sink = _hasV13Sink
         let transportBuf = UnsafeMutablePointer<AuTransportSnapshot>.allocate(capacity: 1)
         let sysexOutScratchCap = Int(MOOSE_SYSEX_POOL_PREALLOC) + 2
         let sysexOutScratch =
@@ -1266,7 +1242,6 @@ class MooseAUAudioUnit: AUAudioUnit {
                 scScratch: scScratch, scABL: scABL, scMaxFrames: scMaxFrames,
                 mainInScratch: mainInScratch, mainInABL: mainInABL,
                 paramBuf: paramBuf,
-                hasV13Sink: hasV13Sink,
                 transportBuf: transportBuf,
                 sysexOutScratch: sysexOutScratch,
                 sysexOutScratchCap: sysexOutScratchCap,
@@ -1502,20 +1477,18 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
     private var didInitialLayout = false
 
     override func loadView() {
-        // Query editor size using a temporary Rust context.
+        // Query the live instance's editor size when `createAudioUnit` has
+        // already run (the normal AUv3 order). If the host calls `loadView`
+        // earlier, start with a neutral placeholder and let `setupGUIIfReady`
+        // update `view.frame` and `preferredContentSize` once the instance
+        // exists — never instantiate a throwaway plugin just to read its size.
         var size = NSSize(width: 200, height: 150) // fallback
-        if let cb = g_callbacks {
-            let tmpCtx = cb.pointee.create()
-            if let ctx = tmpCtx {
-                if cb.pointee.gui_has_editor(ctx) != 0 {
-                    var w: UInt32 = 0, h: UInt32 = 0
-                    cb.pointee.gui_get_size(ctx, &w, &h)
-                    if w > 0 && h > 0 {
-                        // w/h are in logical points - use directly.
-                        size = NSSize(width: CGFloat(w), height: CGFloat(h))
-                    }
-                }
-                cb.pointee.destroy(ctx)
+        if let ctx = myCtx, let cb = g_callbacks, cb.pointee.gui_has_editor(ctx) != 0 {
+            var w: UInt32 = 0, h: UInt32 = 0
+            cb.pointee.gui_get_size(ctx, &w, &h)
+            if w > 0 && h > 0 {
+                // w/h are in logical points - use directly.
+                size = NSSize(width: CGFloat(w), height: CGFloat(h))
             }
         }
         let v = NSView(frame: NSRect(origin: .zero, size: size))
@@ -1587,6 +1560,11 @@ class AudioUnitFactory: AUViewController, AUAudioUnitFactory {
         cb.pointee.gui_open(ctx, Unmanaged.passUnretained(container).toOpaque())
 
         for sub in self.view.subviews { sub.removeFromSuperview() }
+        #if os(macOS)
+        if !didInitialLayout {
+            self.view.setFrameSize(guiPtSize)
+        }
+        #endif
         self.view.addSubview(container)
         guiContainer = container
         self.preferredContentSize = guiPtSize

@@ -85,7 +85,7 @@ pub(crate) fn fourcc_error(codes: &[(&str, &str)]) -> Option<String> {
     for (label, code) in codes {
         if code.len() != 4 || !code.is_ascii() {
             return Some(format!(
-                "`{label}` must be exactly 4 ASCII characters (an AU fourcc); \
+                "`{label}` must be exactly 4 ASCII characters (a 4-byte ASCII FourCC); \
                  got {code:?} ({} bytes)",
                 code.len(),
             ));
@@ -244,12 +244,28 @@ pub(crate) fn plugin_info() -> TokenStream {
         }
     };
 
-    // `[plugin.legacy_state]` AU probe keys, baked as a static slice.
+    // `[plugin.legacy_state]` AU probe keys & AAX FourCC chunk IDs, baked as static slices.
     let legacy_au_keys = plugin
         .legacy_state
         .as_ref()
         .map_or(&[][..], |l| &l.au_keys[..]);
     let legacy_au_keys = quote! { &[#(#legacy_au_keys),*] };
+
+    let raw_aax_chunks = plugin
+        .legacy_state
+        .as_ref()
+        .map_or(&[][..], |l| &l.aax_chunks[..]);
+    for chunk in raw_aax_chunks {
+        if let Some(msg) = fourcc_error(&[("legacy_state.aax_chunks", chunk.as_str())]) {
+            return quote! { compile_error!(#msg); }.into();
+        }
+    }
+    let legacy_aax_chunks = raw_aax_chunks.iter().map(|chunk| {
+        let b = chunk.as_bytes();
+        let (b0, b1, b2, b3) = (b[0], b[1], b[2], b[3]);
+        quote! { [#b0, #b1, #b2, #b3] }
+    });
+    let legacy_aax_chunks = quote! { &[#(#legacy_aax_chunks),*] };
 
     // `include_bytes!` registers `moose.toml` as a build-time dependency
     // through the compiler's normal dep-info tracking. Without it, edits
@@ -305,6 +321,7 @@ pub(crate) fn plugin_info() -> TokenStream {
                 mute_preview_output: #mute_preview_output,
                 automation: #automation,
                 legacy_au_keys: #legacy_au_keys,
+                legacy_aax_chunks: #legacy_aax_chunks,
             }
         }
     };

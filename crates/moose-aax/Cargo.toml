@@ -1,0 +1,20 @@
+[package]
+name = "moose-aax"
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "AAX format wrapper for moose (static-linked single-vtable C ABI)"
+
+[dependencies]
+moose-core = { workspace = true }
+moose-params = { workspace = true }
+
+[dev-dependencies]
+moose-derive = { workspace = true }
+moose-shim-types = { workspace = true }
+moose-test-fixtures = { workspace = true }
+
+[lints]
+workspace = true

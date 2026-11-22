@@ -280,20 +280,6 @@ macro_rules! export_plugin {
         }
 
         #[unsafe(no_mangle)]
-        pub fn moose_snapshot_into(state: *const (), buf: &mut Vec<u8>) -> bool {
-            let state =
-                unsafe { &*state.cast::<<$logic as $crate::PluginLogicCore<Sample>>::DspState>() };
-            <$logic as $crate::PluginLogicCore<Sample>>::snapshot_into(state, buf)
-        }
-
-        #[unsafe(no_mangle)]
-        pub fn moose_snapshot_version(state: *const ()) -> ::core::option::Option<u64> {
-            let state =
-                unsafe { &*state.cast::<<$logic as $crate::PluginLogicCore<Sample>>::DspState>() };
-            <$logic as $crate::PluginLogicCore<Sample>>::snapshot_version(state)
-        }
-
-        #[unsafe(no_mangle)]
         pub fn moose_load_state(
             state: *mut (),
             data: &[u8],

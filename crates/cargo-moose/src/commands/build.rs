@@ -28,6 +28,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
     let mut vst3 = false;
     let mut au2 = false;
     let mut au3 = false;
+    let mut aax = false;
     let mut shell_mode = false;
     let mut debug = false;
     let mut target_cpu_arg: Option<String> = None;
@@ -43,6 +44,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
             "--vst3" => vst3 = true,
             "--au2" => au2 = true,
             "--au3" => au3 = true,
+            "--aax" => aax = true,
             "--shell" => shell_mode = true,
             "--debug" => debug = true,
             "--target-cpu" => {
@@ -76,7 +78,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
 
     // No format flags → enable every format in the project's default
     // features, mirroring `install`'s discovery rule.
-    if !clap && !vst3 && !au2 && !au3 {
+    if !clap && !vst3 && !au2 && !au3 && !aax {
         let available = detect_default_features();
         clap = available.contains("clap");
         vst3 = available.contains("vst3");
@@ -85,6 +87,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
         // Windows users with `"au"` in their `[features].default`.
         au2 = available.contains("au");
         au3 = available.contains("au");
+        aax = available.contains("aax");
     }
 
     let plugins = super::pick_plugins(&config, plugin_filter.as_deref())?;
@@ -166,6 +169,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
         (clap, BuildFormat::Clap),
         (vst3, BuildFormat::Vst3),
         (au2, BuildFormat::Au2),
+        (aax, BuildFormat::Aax),
     ];
 
     let identity = crate::application_identity();
@@ -235,6 +239,23 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
                 }
                 // AU is macOS-only; the build phase already log_skip'd
                 // above for non-macOS, so nothing to do here.
+            }
+            if aax {
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                if crate::commands::install::aax::emit_aax_bundle(
+                    &root,
+                    p,
+                    &config,
+                    &plan.stage_dir,
+                    plan.target,
+                )? {
+                    let filename = format!("{}.aaxplugin", p.file_stem());
+                    crate::log_output(format!(
+                        "AAX:  {}",
+                        plan.stage_dir.join(&filename).display()
+                    ));
+                    produced.push(entry(p, "aax", filename));
+                }
             }
         }
 
@@ -353,7 +374,7 @@ fn write_bundle_manifest(
 fn print_help() {
     eprintln!(
         "\
-Usage: cargo moose build [--clap] [--vst3] [--au2] [--au3]
+Usage: cargo moose build [--clap] [--vst3] [--au2] [--au3] [--aax]
                          [-p <crate>] [--target <triple>]... [--shell] [--debug]
                          [--target-cpu <value>]
 
@@ -380,6 +401,7 @@ Options:
   --vst3           VST3 only
   --au2            AU v2 only (.component, macOS only)
   --au3            AU v3 only (.appex inside .app, macOS only)
+  --aax            AAX only (.aaxplugin, macOS/Windows with AAX_SDK_PATH)
   -p <crate>       Build only the plugin with this cargo crate name
   --target <triple>
                    Cargo target triple (e.g. aarch64-unknown-linux-gnu).

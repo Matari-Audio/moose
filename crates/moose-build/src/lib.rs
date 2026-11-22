@@ -504,16 +504,20 @@ pub fn load_vst3_class_ids(path: &Path) -> Result<Vec<(String, [u8; 16])>, Strin
 }
 
 /// `[plugin.legacy_state]` - foreign-state probe declarations for AU's
-/// keyed `ClassInfo` container. A legacy build stored its state under
-/// *its* own key, which moose never reads; only the developer knows it,
-/// so it's declared here and embedded into `PluginInfo` at proc-macro
-/// expansion time.
+/// keyed `ClassInfo` container and AAX's `FourCC` chunk table. A legacy build
+/// stored its state under *its* own key/chunk ID, which moose never reads;
+/// only the developer knows it, so it's declared here and embedded into
+/// `PluginInfo` at proc-macro expansion time.
 #[derive(Deserialize, Debug, Default)]
 pub struct LegacyStateConfig {
     /// AU `ClassInfo` dictionary keys to probe when moose's data key
     /// is absent (e.g. `"jucePluginState"` for a JUCE-era AU).
     #[serde(default)]
     pub au_keys: Vec<String>,
+    /// Legacy AAX 4-character `FourCC` chunk IDs to register in `Describe` and
+    /// route to `migrate_state` (e.g. `["Juce"]` for a JUCE-era AAX).
+    #[serde(default)]
+    pub aax_chunks: Vec<String>,
 }
 
 /// `[plugin.presets]` - factory-preset emission settings.

@@ -4,7 +4,6 @@
 //! `AUAudioUnit` subclass. The shim calls back into Rust for all
 //! plugin logic via C FFI.
 
-use crate::callbacks::cb_create;
 use crate::callbacks::cb_create_with_sink;
 use crate::callbacks::cb_destroy;
 use crate::callbacks::cb_legacy_state_key_at;
@@ -39,7 +38,7 @@ use crate::output_events::cb_au_push_sysex_input;
 use crate::output_events::cb_au_push_sysex_input_native;
 use crate::output_events::cb_begin_output_events;
 use crate::output_events::cb_begin_output_events_v9;
-use crate::output_events::cb_begin_output_events_v10;
+use crate::output_events::cb_begin_output_events_v14;
 use crate::output_events::cb_commit_output_params;
 use crate::output_events::cb_finish_output_events;
 use crate::output_events::cb_latency_samples;
@@ -72,6 +71,25 @@ mod presets;
 
 pub use callbacks::rt_paranoid_smoke;
 
+/// Test-only helper to pump one main-thread `HostQueue` drain on non-Apple
+/// platforms (e.g. the Linux AU C-shim harness) where libdispatch's main
+/// queue is absent.
+///
+/// # Safety
+/// `ctx` must be a live pointer returned by `callbacks::<P>().create_with_sink`
+/// and this must be called from the host's main thread.
+#[doc(hidden)]
+pub unsafe fn drain_host_queue_for_test<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    let queue = {
+        let inst = unsafe { &*ctx.cast::<instance::AuInstance<P>>() };
+        std::sync::Arc::clone(&inst.host_queue)
+    };
+    unsafe { host_drain::run_host_drain::<P>(&queue, ctx) };
+}
+
 // The inline test modules below `use super::*` and reach every split module.
 #[cfg(test)]
 use crate::{instance::*, output_events::*};
@@ -89,12 +107,10 @@ use moose_core::info::{MidiDialect, PluginInfo, resolve_name_override};
 // matching the `meter_store` field's gate.
 use moose_core::state;
 // Only the Apple-only editor path reads the spawner (see `AuInstance`).
-use moose_core::wrapper::{
-    ParamCStrings, default_io_channels, log_missing_bus_layout, run_register,
-};
+use moose_core::wrapper::{default_io_channels, log_missing_bus_layout, run_register};
 use moose_params::{MidiSource, ParamFlags};
 
-use ffi::{AuCallbacks, AuParamDescriptor, AuPluginDescriptor};
+use ffi::{AuCallbacks, AuPluginDescriptor};
 
 // ---------------------------------------------------------------------------
 // Registration: called once from the export_au! macro
@@ -121,7 +137,6 @@ fn resolved_plugin_name(info: &PluginInfo) -> &'static str {
 pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
     AuCallbacks {
         abi_version: ffi::MOOSE_AU_ABI_VERSION,
-        create: cb_create::<P>,
         destroy: cb_destroy::<P>,
         reset: cb_reset::<P>,
         process: cb_process::<P>,
@@ -162,7 +177,7 @@ pub fn callbacks<P: PluginExport>() -> ffi::AuCallbacks {
         finish_output_events: cb_finish_output_events::<P>,
         begin_output_events_v9: cb_begin_output_events_v9::<P>,
         commit_output_params: cb_commit_output_params::<P>,
-        begin_output_events_v10: cb_begin_output_events_v10::<P>,
+        begin_output_events_v14: cb_begin_output_events_v14::<P>,
         process_native_v11: cb_process_native_v11::<P>,
         create_with_sink: cb_create_with_sink::<P>,
         set_active: cb_set_active::<P>,
@@ -383,33 +398,9 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
 
     // Static metadata path: derive emits a `LazyLock`-cached
     // `Vec<ParamInfo>` so registration doesn't construct a plugin
-    // instance just to read parameter shape. Hand-written
-    // `PluginExport` impls without a `Params::param_infos_static`
-    // override fall back to the historical
-    // `Self::create().params().param_infos()` walk inside the trait
-    // default - see `PluginExport::param_infos_static`.
+    // instance just to read `bypass_param_id`. Per-instance parameter
+    // metadata is served live via `param_ids` / `param_info_by_id`.
     let param_infos = P::param_infos_static();
-    let mut param_descs: Vec<AuParamDescriptor> = Vec::with_capacity(param_infos.len());
-
-    for pi in &param_infos {
-        let cs = ParamCStrings::from_info(pi);
-        param_descs.push(AuParamDescriptor {
-            id: pi.id,
-            name: cs.name.into_raw(),
-            min: pi.range.min(),
-            max: pi.range.max(),
-            default_value: pi.default_plain,
-            step_count: pi.range.step_count().map_or(0, std::num::NonZero::get),
-            unit: cs.unit.into_raw(),
-            group: cs.group.into_raw(),
-            midi_status: pi.midi_map.map_or(0, midi_status_byte),
-            midi_data1: match pi.midi_map {
-                Some(MidiSource::Cc(n)) => n,
-                _ => 0,
-            },
-            midi_channel: pi.midi_channel.map_or(-1, i16::from),
-        });
-    }
 
     let name = CString::new(resolved_plugin_name(&info)).unwrap_or_default();
     let vendor = CString::new(info.vendor).unwrap_or_default();
@@ -489,14 +480,10 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
 
     let callbacks = Box::leak(Box::new(callbacks::<P>()));
 
-    let param_descs = param_descs.leak();
-
     unsafe {
-        ffi::moose_au_register_v2(
+        ffi::moose_au_register_v3(
             std::ptr::from_ref::<AuPluginDescriptor>(descriptor),
             std::ptr::from_ref::<AuCallbacks>(callbacks),
-            param_descs.as_ptr(),
-            len_u32(param_descs.len()),
         );
     }
 }
@@ -1523,7 +1510,6 @@ mod tests {
             {
                 let mut audio = inst.audio.enter();
                 audio.feedback_epoch.edits = block_seq;
-                audio.native_output_param_feedback_available = true;
                 audio.output_events.clear();
                 audio
                     .output_events
@@ -1541,14 +1527,14 @@ mod tests {
 
     #[test]
     fn feedback_publication_yields_to_an_in_flight_edit() {
-        use crate::callbacks::{cb_create, cb_destroy, cb_param_get_value};
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_param_get_value};
         use crate::instance::{AuInstance, FeedbackEpoch};
         use crate::large_state_fixture::LargePlugin;
         use moose_params::Params;
 
         type P = LargePlugin<16>;
         unsafe {
-            let ctx = cb_create::<P>();
+            let ctx = cb_create_with_sink::<P>(std::ptr::null());
             let inst = &*ctx.cast::<AuInstance<P>>();
             let epoch = FeedbackEpoch::default();
             inst.edit_param(0, || {
@@ -1566,13 +1552,13 @@ mod tests {
 
     #[test]
     fn accepted_automation_does_not_hide_an_edit_during_staging() {
-        use crate::callbacks::{cb_create, cb_destroy};
+        use crate::callbacks::{cb_create_with_sink, cb_destroy};
         use crate::instance::{AuInstance, FeedbackEpoch};
         use crate::large_state_fixture::LargePlugin;
 
         type P = LargePlugin<16>;
         unsafe {
-            let ctx = cb_create::<P>();
+            let ctx = cb_create_with_sink::<P>(std::ptr::null());
             let inst = &*ctx.cast::<AuInstance<P>>();
             let edits = inst.current_edit_seq();
             inst.accept_automation(0);
@@ -1962,9 +1948,9 @@ mod tests {
     }
 
     #[test]
-    fn v13_legacy_lifecycle_store_sync_and_can_ramp_flag() {
+    fn v14_lifecycle_store_sync_and_can_ramp_flag() {
         use crate::callbacks::{
-            cb_create, cb_create_with_sink, cb_destroy, cb_param_get_value, cb_set_active,
+            cb_create_with_sink, cb_destroy, cb_param_get_value, cb_set_active,
         };
         use crate::catalog::AuExposedParams;
         use crate::ffi::{
@@ -1982,12 +1968,7 @@ mod tests {
         unsafe extern "C" fn dummy_set(_ud: *mut std::ffi::c_void, _id: u32, _v: f32) {}
 
         unsafe {
-            // Legacy `cb_create()` must NOT treat missing `set_active` as known-inactive.
-            let legacy = cb_create::<P>();
-            assert!(!(*legacy.cast::<AuInstance<P>>()).is_known_inactive());
-            cb_destroy::<P>(legacy);
-
-            // v13 `cb_create_with_sink` starts known-inactive, flips active, and back.
+            // `cb_create_with_sink` starts known-inactive, flips active, and back.
             let sink = MooseAuHostSink {
                 set_param: Some(dummy_set),
                 ..MooseAuHostSink::default()
@@ -2004,7 +1985,6 @@ mod tests {
             // synchronous host `implementorValueProvider` reads see the emitted value.
             {
                 let mut audio = inst.audio.enter();
-                audio.native_output_param_feedback_available = true;
                 audio.output_events.clear();
                 audio.output_events.push(Event::new(
                     0,
@@ -2400,7 +2380,7 @@ mod large_state_tests {
     #[test]
     fn large_host_state_roundtrips_through_au_callbacks() {
         unsafe {
-            let ctx = cb_create::<Large>();
+            let ctx = cb_create_with_sink::<Large>(std::ptr::null());
             assert!(!ctx.is_null());
             let inst = &*ctx.cast::<AuInstance<Large>>();
             *inst.params_arc.payload.lock().unwrap() = payload();
@@ -2459,5 +2439,60 @@ mod large_state_tests {
             Some(expect[2]),
             "backwards"
         );
+    }
+
+    #[test]
+    fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_process, cb_reset};
+        use crate::ffi::MooseAuHostSink;
+        use crate::instance::AuInstance;
+        use crate::large_state_fixture::LargePlugin;
+
+        type P = LargePlugin<16>;
+
+        unsafe {
+            let sink = MooseAuHostSink::default();
+            let ctx = cb_create_with_sink::<P>(&raw const sink);
+            assert!(!ctx.is_null());
+            cb_reset::<P>(ctx, 48_000.0, 64);
+
+            let inst = &*ctx.cast::<AuInstance<P>>();
+            let ctx_addr = ctx as usize;
+            let held = inst.plugin.enter();
+
+            let (out_l, out_r) = std::thread::spawn(move || {
+                let ctx = ctx_addr as *mut std::ffi::c_void;
+                let in_l = [0.5f32; 16];
+                let in_r = [0.5f32; 16];
+                let mut out_l = [1.0f32; 16];
+                let mut out_r = [1.0f32; 16];
+                let in_ptrs = [in_l.as_ptr(), in_r.as_ptr()];
+                let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+                cb_process::<P>(
+                    ctx,
+                    in_ptrs.as_ptr(),
+                    out_ptrs.as_mut_ptr(),
+                    2,
+                    2,
+                    16,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                );
+                (out_l, out_r)
+            })
+            .join()
+            .expect("AU audio thread must not park on overlap");
+
+            assert!(out_l.iter().all(|&s| s == 0.0));
+            assert!(out_r.iter().all(|&s| s == 0.0));
+
+            drop(held);
+            cb_destroy::<P>(ctx);
+        }
     }
 }

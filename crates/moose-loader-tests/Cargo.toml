@@ -11,16 +11,21 @@ publish = false
 
 [dependencies]
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 moose = { workspace = true }
 moose-core = { workspace = true }
 moose-derive = { workspace = true }
-moose-gui = { workspace = true }
+moose-gui = { workspace = true, features = ["cpu"] }
+moose-gui-types = { workspace = true }
 moose-loader = { workspace = true }
 moose-params = { workspace = true }
 # Format wrappers driven in-process by `tests/cross_format_contract.rs`
 # through their real C ABIs. `clap-sys` / `vst3` pin the exact versions the
 # wrappers already lock, so no new crate enters Cargo.lock.
+moose-aax = { workspace = true }
 moose-au = { workspace = true }
 moose-clap = { workspace = true }
 moose-vst3 = { workspace = true }

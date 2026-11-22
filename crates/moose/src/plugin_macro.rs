@@ -113,7 +113,7 @@ macro_rules! __plugin_impl {
         mod __moose_dev_exports {
             use super::*;
 
-            #[cfg(not(any(feature = "clap", feature = "vst3", feature = "au")))]
+            #[cfg(not(any(feature = "clap", feature = "vst3", feature = "au", feature = "aax")))]
             $crate::__reexport::export_plugin!(
                 $logic,
                 $params
@@ -178,7 +178,7 @@ macro_rules! __plugin_impl {
         mod __moose_screenshot_export {
             use super::*;
 
-            #[cfg(not(any(feature = "clap", feature = "vst3", feature = "au")))]
+            #[cfg(not(any(feature = "clap", feature = "vst3", feature = "au", feature = "aax")))]
             /// FFI export driven by `cargo moose screenshot`. Renders
             /// the plugin's editor (optionally after loading a
             /// `.pluginstate` blob) and writes the PNG to the caller-
@@ -288,6 +288,9 @@ macro_rules! __plugin_impl {
 
             #[cfg(feature = "au")]
             ::moose_au::export_au!(__HotShellWrapper);
+
+            #[cfg(feature = "aax")]
+            $crate::aax_wrapper::export_aax!(__HotShellWrapper);
         }
     };
 }

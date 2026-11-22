@@ -98,8 +98,6 @@ struct LogicSymbols<S: Sample> {
     latency: fn(*const ()) -> u32,
     tail: fn(*const ()) -> u32,
     save_state: fn(*const ()) -> Vec<u8>,
-    snapshot_into: fn(*const (), &mut Vec<u8>) -> bool,
-    snapshot_version: fn(*const ()) -> Option<u64>,
     load_state: fn(*mut (), &[u8]) -> Result<(), StateLoadError>,
     state_changed: fn(*mut (), *const ()),
     /// Whether the plugin opts into DSP-state carry-over across a reload
@@ -160,8 +158,6 @@ impl<S: Sample> LogicSymbols<S> {
             latency: sym!(b"moose_latency", fn(*const ()) -> u32),
             tail: sym!(b"moose_tail", fn(*const ()) -> u32),
             save_state: sym!(b"moose_save_state", fn(*const ()) -> Vec<u8>),
-            snapshot_into: sym!(b"moose_snapshot_into", fn(*const (), &mut Vec<u8>) -> bool),
-            snapshot_version: sym!(b"moose_snapshot_version", fn(*const ()) -> Option<u64>),
             load_state: sym!(
                 b"moose_load_state",
                 fn(*mut (), &[u8]) -> Result<(), StateLoadError>
@@ -646,22 +642,6 @@ impl<S: Sample> NativeLoader<S> {
         self.symbols
             .as_ref()
             .map_or_else(Vec::new, |s| (s.save_state)(state))
-    }
-
-    pub fn snapshot_into(&self, state: *const (), buf: &mut Vec<u8>) -> bool {
-        self.symbols
-            .as_ref()
-            .is_some_and(|s| (s.snapshot_into)(state, buf))
-    }
-
-    /// Snapshot generation token for the loaded logic, or `None` when no
-    /// dylib is loaded or the plugin doesn't version its snapshot (in
-    /// which case the shell re-serializes every block, as before).
-    #[must_use]
-    pub fn snapshot_version(&self, state: *const ()) -> Option<u64> {
-        self.symbols
-            .as_ref()
-            .and_then(|s| (s.snapshot_version)(state))
     }
 
     /// Restore `state` from `data`, then fire `state_changed` in the same

@@ -316,7 +316,7 @@ pub(crate) fn keep_default_features() -> bool {
 /// through `--features` would cross-contaminate other formats' builds
 /// (a `--clap` build also lighting up VST3), so they are rejected with a
 /// pointer to the format flag.
-const RESERVED_FORMAT_FEATURES: &[&str] = &["clap", "vst3", "au", "standalone", "shell"];
+const RESERVED_FORMAT_FEATURES: &[&str] = &["clap", "vst3", "au", "aax", "standalone", "shell"];
 
 /// Split a `--features` value (`"a, b c"`) into individual feature
 /// names, rejecting the format features moose drives via its own flags.
@@ -429,13 +429,19 @@ pub(crate) fn release_lib_for_target(root: &Path, stem: &str, target: Option<&st
 /// emits `lib<stem>.a` regardless of platform. Used by the macOS
 /// bundle-format link path (VST3 / CLAP / VST2) which feeds the static
 /// archive to `clang -bundle` rather than the cdylib.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn release_static_for_target(root: &Path, stem: &str, target: Option<&str>) -> PathBuf {
     let dir = match target {
         Some(t) => moose_build::target_dir(root).join(t).join(profile_subdir()),
         None => moose_build::target_dir(root).join(profile_subdir()),
     };
-    dir.join(format!("lib{stem}.a"))
+    let os = target_os_of(target.unwrap_or_else(|| moose_build::host_triple()));
+    let filename = if os == "windows" {
+        format!("{stem}.lib")
+    } else {
+        format!("lib{stem}.a")
+    };
+    dir.join(filename)
 }
 
 /// Canonical path to the linked bundle binary for a given plugin +
@@ -1022,7 +1028,7 @@ pub(crate) fn tmp_au_v3(bundle_id: &str) -> PathBuf {
 ///
 /// Only macOS callers (`commands::package::{macos, stage}`, AU v3
 /// install).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> crate::Res {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {

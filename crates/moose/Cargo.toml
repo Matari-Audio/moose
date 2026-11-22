@@ -32,6 +32,7 @@ vst3 = ["dep:moose-vst3"]
 # MUI editors (`moose::mui`): `MuiEditor` and the parameter `Bridge`.
 mui = ["dep:moose-mui"]
 au = ["dep:moose-au"]
+aax = ["dep:moose-aax"]
 shell = ["moose-loader/shell"]
 hot-debug = ["moose-loader/hot-debug"]
 # Paranoid real-time allocation checking (dev/test). Enables the check in
@@ -52,6 +53,10 @@ workspace = true
 optional = true
 
 [dependencies.moose-au]
+workspace = true
+optional = true
+
+[dependencies.moose-aax]
 workspace = true
 optional = true
 

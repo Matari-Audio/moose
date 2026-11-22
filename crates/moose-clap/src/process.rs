@@ -52,7 +52,7 @@ use moose_core::midi::pitch_bend_to_bytes;
 use moose_core::process::ProcessStatus;
 use moose_core::rt::{RtSection, audit};
 use moose_core::ump::encode_ump_channel_voice_2;
-use moose_core::wrapper::{apply_queued_state, enter_plugin, run_audio_block_latched};
+use moose_core::wrapper::{apply_queued_state, run_audio_block_latched};
 use moose_params::Params;
 use std::ffi::{c_char, c_void};
 use std::mem::transmute;
@@ -267,22 +267,29 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             return CLAP_PROCESS_CONTINUE;
         }
 
+        // Strictly wait-free audio entry: if a misbehaving host overlaps a
+        // main-thread lifecycle call (`activate`/`deactivate`) with `process`,
+        // we cannot read `audio.bus_routing` to validate `proc.audio_outputs`
+        // channel counts, so returning `CLAP_PROCESS_ERROR` without touching
+        // unvalidated buffer pointers is the only sound option. Once validated
+        // below, contention on `data.plugin` zeroes outputs and returns
+        // `CLAP_PROCESS_CONTINUE` so the host graph stays alive.
+        let Some(mut audio) = data.audio.try_enter() else {
+            return CLAP_PROCESS_ERROR;
+        };
+        if num_frames > audio.max_block_size
+            || !audio_bus_channels_match(
+                proc.audio_inputs,
+                proc.audio_inputs_count,
+                audio.bus_routing.inputs().map(BusRoute::channel_count),
+            )
+            || !audio_bus_channels_match(
+                proc.audio_outputs,
+                proc.audio_outputs_count,
+                audio.bus_routing.outputs().map(BusRoute::channel_count),
+            )
         {
-            let audio = data.audio.enter();
-            if num_frames > audio.max_block_size
-                || !audio_bus_channels_match(
-                    proc.audio_inputs,
-                    proc.audio_inputs_count,
-                    audio.bus_routing.inputs().map(BusRoute::channel_count),
-                )
-                || !audio_bus_channels_match(
-                    proc.audio_outputs,
-                    proc.audio_outputs_count,
-                    audio.bus_routing.outputs().map(BusRoute::channel_count),
-                )
-            {
-                return CLAP_PROCESS_ERROR;
-            }
+            return CLAP_PROCESS_ERROR;
         }
         audio_buffers_valid = true;
 
@@ -293,11 +300,13 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             return CLAP_PROCESS_SLEEP;
         }
 
-        // Take ownership of the plugin for the whole block: an
-        // uncontended `Acquire`, never a wait, since the host contract
-        // keeps `process` from overlapping a lifecycle callback and host
-        // saves read the snapshot instead of the plugin.
-        let mut instance = enter_plugin(&data.plugin);
+        // Strictly wait-free plugin entry: an uncontended `Acquire`, never
+        // parking the audio thread. If a misbehaving host overlaps a
+        // main-thread callback with `process`, output silence for this block.
+        let Some(mut instance) = data.plugin.try_enter() else {
+            zero_clap_output_buffers(process);
+            return CLAP_PROCESS_CONTINUE;
+        };
 
         // Apply any state-load that the host or editor handed us
         // since the last block. Runs before per-block work so the
@@ -314,12 +323,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // allocates. No-op and zero-sized when the feature is off.
         let _rt = RtSection::enter();
 
-        // The audio scratch lives behind an ownership cell reached through the
-        // shared `&data`, so a concurrent host-thread `&data` (param reads,
-        // GUI) can't alias it. One reborrow so the disjoint scratch fields
-        // (event list, slices, output events, build scratch) can be borrowed
-        // simultaneously - the guard's `Deref` can't split-borrow.
-        let mut audio = data.audio.enter();
+        // One reborrow so the disjoint scratch fields (event list, slices,
+        // output events, build scratch) can be borrowed simultaneously -
+        // the guard's `Deref` can't split-borrow.
         let scr = &mut *audio;
 
         // Convert CLAP input events to our EventList - sort by
@@ -1218,6 +1224,7 @@ mod thread_pool_tests {
                 mute_preview_output: false,
                 automation: Automation::DEFAULT,
                 legacy_au_keys: &[],
+                legacy_aax_chunks: &[],
             }
         }
         fn bus_layouts() -> Vec<BusLayout> {

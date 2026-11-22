@@ -86,23 +86,9 @@ pub(crate) unsafe fn with_host_open<P: PluginExport, R>(
     result
 }
 
-#[cfg_attr(
-    not(any(target_vendor = "apple", test)),
-    allow(
-        dead_code,
-        reason = "used by drain_host_queue on Apple targets and in tests"
-    )
-)]
 struct FeedbackDrainGuard(Option<(*mut std::ffi::c_void, u32, u64)>);
 
 impl FeedbackDrainGuard {
-    #[cfg_attr(
-        not(any(target_vendor = "apple", test)),
-        allow(
-            dead_code,
-            reason = "used by drain_host_queue on Apple targets and in tests"
-        )
-    )]
     fn enter(ctx: *mut std::ffi::c_void, param_id: u32, value: f32) -> Self {
         let prev = IN_AU_FEEDBACK_DRAIN
             .with(|c| c.replace(Some((ctx, param_id, f64::from(value).to_bits()))));
@@ -489,13 +475,6 @@ impl<P: PluginExport> HostSink for AuSink<'_, P> {
 ///
 /// # Safety
 /// `ctx` is a live `AuInstance<P>` pointer.
-#[cfg_attr(
-    not(any(target_vendor = "apple", test)),
-    allow(
-        dead_code,
-        reason = "called by the Apple main-queue dispatch source and unit tests"
-    )
-)]
 pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     main: &MainThread,
@@ -699,7 +678,7 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callbacks::{cb_create, cb_destroy};
+    use crate::callbacks::{cb_create_with_sink, cb_destroy};
     use crate::large_state_fixture::LargePlugin;
     use moose_core::editor::PluginContextReadF64;
 
@@ -708,7 +687,7 @@ mod tests {
     #[test]
     fn au_host_context_routes_state_and_signals_through_host_queue() {
         unsafe {
-            let ctx = cb_create::<TestPlugin>();
+            let ctx = cb_create_with_sink::<TestPlugin>(std::ptr::null());
             assert!(!ctx.is_null());
             let inst = &*ctx.cast::<AuInstance<TestPlugin>>();
             let context = editor_context::<TestPlugin>(ctx);

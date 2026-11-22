@@ -26,12 +26,11 @@ use crate::export::PluginExport;
 
 pub use plugin_cell::{PluginCell, PluginGuard};
 
-/// Take ownership of the plugin for the current callback. Never blocks:
-/// the audio thread owns the plugin while active, the host thread while
-/// inactive, and the host contract keeps the two from overlapping, so
-/// there is nothing to wait on. The returned guard's `&mut` is exclusive
-/// by that contract; the `Acquire` inside observes the previous owner's
-/// writes.
+/// Take ownership of the plugin for a **non-real-time** lifecycle callback
+/// (host main thread). Uncontended entry takes no OS lock; if a misbehaving
+/// host overlaps audio processing, this waits politely for the in-flight block
+/// to finish. Real-time audio callbacks (`process`, audio-thread `reset`) MUST
+/// use [`PluginCell::try_enter`] instead so the audio thread never parks.
 pub fn enter_plugin<P>(plugin: &PluginCell<P>) -> PluginGuard<'_, P> {
     plugin.enter()
 }
@@ -268,11 +267,12 @@ mod plugin_cell {
 
         /// Take ownership, waiting while another thread holds the cell.
         ///
-        /// A spec-compliant host never overlaps the audio thread and a
-        /// lifecycle callback, so this normally returns at once. When a
-        /// host does overlap them, the caller parks until the other owner
-        /// releases (one block or one callback) instead of failing the
-        /// call. The wait is event-driven: the releasing owner unparks it.
+        /// Intended for **non-real-time** lifecycle callbacks (host main thread).
+        /// Real-time audio callbacks (`process`, audio-thread `reset`) MUST use
+        /// [`Self::try_enter`] so a misbehaving host overlapping a lifecycle call
+        /// can never park the audio thread. Under `rt-paranoid`, calling `enter()`
+        /// inside an [`RtSection`](crate::rt::RtSection) is flagged as a lock
+        /// violation.
         ///
         /// # Panics
         /// Panics when this thread already holds the cell: author code
@@ -280,6 +280,7 @@ mod plugin_cell {
         /// back into it while the wrapper held it, which can never be
         /// waited out. Use [`Self::try_enter`] on such paths.
         pub fn enter(&self) -> PluginGuard<'_, T> {
+            crate::rt::note_lock();
             let me = thread_token();
             loop {
                 if let Some(guard) = self.try_enter() {

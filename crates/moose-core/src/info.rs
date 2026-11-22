@@ -152,6 +152,13 @@ pub struct PluginInfo {
     /// `moose.toml`'s `[plugin.legacy_state]` `au_keys`; empty when
     /// undeclared (no probing).
     pub legacy_au_keys: &'static [&'static str],
+
+    /// Legacy AAX 4-byte `FourCC` chunk IDs a pre-moose build stored its
+    /// state under. Exposed by `moose-aax` in `MooseAaxDescriptor::legacy_chunk_ids`
+    /// so Pro Tools passes legacy chunks into `state_load_foreign` /
+    /// `migrate_state`. From `moose.toml`'s `[plugin.legacy_state]`
+    /// `aax_chunks`; empty when undeclared.
+    pub legacy_aax_chunks: &'static [[u8; 4]],
 }
 
 /// How a plugin receives parameter automation, baked into [`PluginInfo`]

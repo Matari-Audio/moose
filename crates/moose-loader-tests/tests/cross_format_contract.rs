@@ -315,6 +315,7 @@ mod fixture {
                 mute_preview_output: false,
                 automation: Automation::DEFAULT,
                 legacy_au_keys: &[],
+                legacy_aax_chunks: &[],
             }
         }
         fn bus_layouts() -> Vec<BusLayout> {
@@ -1680,13 +1681,228 @@ impl Harness for au_host_harness::Au {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 4. AAX host harness (moose_aax C ABI callbacks)
+// ---------------------------------------------------------------------------
+
+mod aax_host_harness {
+    use super::{Contract, HostEvent, MAX_FRAMES};
+    use moose_aax::ffi::{
+        MOOSE_AAX_EVENT_END, MOOSE_AAX_NATIVE_EVENT_MIDI1, MooseAaxCallbacks, MooseAaxHostSink,
+        MooseAaxNativeEvent,
+    };
+    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::ptr;
+
+    pub struct Aax {
+        pub cb: &'static MooseAaxCallbacks,
+        pub ctx: *mut c_void,
+        pub rate: f64,
+    }
+
+    impl Aax {
+        pub fn new() -> Self {
+            let cb = moose_aax::callbacks::<Contract>();
+            let sink = MooseAaxHostSink::default();
+            let ctx = unsafe { (cb.create_with_sink)(&raw const sink) };
+            assert!(!ctx.is_null(), "AAX create_with_sink");
+            Self { cb, ctx, rate: 0.0 }
+        }
+
+        pub fn reset_at(&mut self, rate: f64) {
+            self.rate = rate;
+            unsafe { (self.cb.reset)(self.ctx, rate, MAX_FRAMES) };
+        }
+
+        pub fn host_midi(events: &[HostEvent]) -> Vec<MooseAaxNativeEvent> {
+            let mut out = Vec::new();
+            for ev in events {
+                match *ev {
+                    HostEvent::NoteOn { at, key } => out.push(MooseAaxNativeEvent {
+                        sample_offset: at,
+                        kind: MOOSE_AAX_NATIVE_EVENT_MIDI1,
+                        midi: [0x90, key, 127, 0],
+                        data_len: 3,
+                        ..MooseAaxNativeEvent::default()
+                    }),
+                    HostEvent::NoteOff { at, key } => out.push(MooseAaxNativeEvent {
+                        sample_offset: at,
+                        kind: MOOSE_AAX_NATIVE_EVENT_MIDI1,
+                        midi: [0x80, key, 0, 0],
+                        data_len: 3,
+                        ..MooseAaxNativeEvent::default()
+                    }),
+                    HostEvent::Param { .. } => {}
+                }
+            }
+            out
+        }
+
+        pub fn process_raw(
+            &self,
+            frames: u32,
+            inputs: &[Vec<f32>; 2],
+            outputs: &mut [Vec<f32>; 2],
+            events: &[MooseAaxNativeEvent],
+        ) -> u32 {
+            let in_ptrs = [inputs[0].as_ptr(), inputs[1].as_ptr()];
+            let mut out_ptrs = [outputs[0].as_mut_ptr(), outputs[1].as_mut_ptr()];
+            unsafe {
+                (self.cb.process_native)(
+                    self.ctx,
+                    in_ptrs.as_ptr(),
+                    out_ptrs.as_mut_ptr(),
+                    2,
+                    2,
+                    1,
+                    1,
+                    frames,
+                    events.as_ptr(),
+                    events.len() as u32,
+                    MOOSE_AAX_EVENT_END,
+                    ptr::null(),
+                )
+            }
+        }
+
+        pub fn format_raw(&self, id: u32, plain: f64) -> Option<String> {
+            let mut buf = [0 as c_char; 256];
+            let n = unsafe { (self.cb.param_format)(self.ctx, id, plain, buf.as_mut_ptr(), 256) };
+            (n > 0).then(|| {
+                unsafe { CStr::from_ptr(buf.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        }
+
+        pub fn parse_raw(&self, id: u32, text: &str) -> Option<f64> {
+            let text = CString::new(text).unwrap();
+            let mut v = f64::NAN;
+            (unsafe { (self.cb.param_parse)(self.ctx, id, text.as_ptr(), &raw mut v) } != 0)
+                .then_some(v)
+        }
+
+        pub fn save_state(&self) -> Option<Vec<u8>> {
+            let mut data: *mut u8 = ptr::null_mut();
+            let len = unsafe { (self.cb.state_save)(self.ctx, &raw mut data) };
+            if data.is_null() {
+                return None;
+            }
+            let blob = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
+            unsafe { (self.cb.state_free)(data, len) };
+            Some(blob)
+        }
+
+        pub fn load_state(&self, blob: &[u8]) -> bool {
+            unsafe { (self.cb.state_load)(self.ctx, blob.as_ptr(), blob.len() as u32) != 0 }
+        }
+    }
+
+    impl Drop for Aax {
+        fn drop(&mut self) {
+            unsafe { (self.cb.destroy)(self.ctx) };
+        }
+    }
+}
+
+impl Harness for aax_host_harness::Aax {
+    const NAME: &'static str = "AAX";
+    fn create() -> Self {
+        Self::new()
+    }
+    fn start(&mut self, rate: f64) {
+        self.reset_at(rate);
+    }
+    fn stop(&mut self) {}
+    fn reset(&mut self) {
+        let rate = self.rate;
+        self.reset_at(rate);
+    }
+    fn process(&mut self, frames: u32, input: f32, events: &[HostEvent]) -> [Vec<f32>; 2] {
+        for ev in events {
+            if let HostEvent::Param { id, plain, .. } = *ev {
+                unsafe { (self.cb.param_set)(self.ctx, id, plain) };
+            }
+        }
+        let midi = Self::host_midi(events);
+        let inputs = [vec![input; frames as usize], vec![input; frames as usize]];
+        let mut outputs = [
+            vec![f32::NAN; frames as usize],
+            vec![f32::NAN; frames as usize],
+        ];
+        let _ = self.process_raw(frames, &inputs, &mut outputs, &midi);
+        outputs
+    }
+    fn suspended_param_flush(&mut self, events: &[(u32, f64)]) {
+        for &(id, plain) in events {
+            unsafe { (self.cb.param_set)(self.ctx, id, plain) };
+        }
+    }
+    fn get_plain(&self, id: u32) -> f64 {
+        unsafe { (self.cb.param_get)(self.ctx, id) }
+    }
+    fn format(&self, id: u32, plain: f64) -> Option<String> {
+        self.format_raw(id, plain)
+    }
+    fn parse(&self, id: u32, text: &str) -> Option<f64> {
+        self.parse_raw(id, text)
+    }
+    fn save(&self) -> Vec<u8> {
+        self.save_state().expect("AAX state save")
+    }
+    fn load(&mut self, blob: &[u8]) -> bool {
+        self.load_state(blob)
+    }
+    fn latency(&self) -> u32 {
+        unsafe { (self.cb.latency_samples)(self.ctx) }
+    }
+    fn tail(&self) -> u32 {
+        unsafe { (self.cb.tail_samples)(self.ctx) }
+    }
+    fn set_offline(&mut self, offline: bool) {
+        let mode = if offline {
+            ProcessMode::Offline
+        } else {
+            ProcessMode::Realtime
+        };
+        unsafe { (self.cb.set_render_mode)(self.ctx, u32::from(mode.as_u8())) };
+    }
+}
+
 type ClapH = clap_host_harness::Clap;
 type Vst3H = vst3_host_harness::Vst3;
 type AuH = au_host_harness::Au;
+type AaxH = aax_host_harness::Aax;
 
 /// Run `scenario` once per format, each on a fresh thread so the
 /// fixture's per-thread probes start clean.
 macro_rules! for_each_format {
+    ($scenario:ident) => {
+        mod $scenario {
+            #[test]
+            fn clap() {
+                super::$scenario::<super::ClapH>();
+            }
+            #[test]
+            fn vst3() {
+                super::$scenario::<super::Vst3H>();
+            }
+            #[test]
+            fn au() {
+                super::$scenario::<super::AuH>();
+            }
+            #[test]
+            fn aax() {
+                super::$scenario::<super::AaxH>();
+            }
+        }
+    };
+}
+
+/// Formats whose host ABI carries per-block sample-accurate parameter events
+/// alongside MIDI inside the render call (CLAP, VST3, AU; Pro Tools AAX
+/// updates parameters at block boundaries via `UpdateParameterNormalizedValue`).
+macro_rules! for_each_subblock_param_format {
     ($scenario:ident) => {
         mod $scenario {
             #[test]
@@ -1977,10 +2193,12 @@ fn state_saved_by_each_format_restores_identically_in_every_format() {
         ("CLAP", saved_by::<ClapH>()),
         ("VST3", saved_by::<Vst3H>()),
         ("AU", saved_by::<AuH>()),
+        ("AAX", saved_by::<AaxH>()),
     ] {
         restore::<ClapH>(&blob, from);
         restore::<Vst3H>(&blob, from);
         restore::<AuH>(&blob, from);
+        restore::<AaxH>(&blob, from);
     }
 }
 
@@ -2312,7 +2530,23 @@ fn dense_notes_and_automation_keep_exact_order<H: Harness>() {
     );
     assert!(out[0].iter().all(|s| s.is_finite()), "{}", H::NAME);
 }
-for_each_format!(dense_notes_and_automation_keep_exact_order);
+for_each_subblock_param_format!(dense_notes_and_automation_keep_exact_order);
+
+#[test]
+fn dense_notes_keep_exact_order_aax() {
+    let mut h = AaxH::create();
+    h.start(48_000.0);
+    let midi_only: Vec<HostEvent> = dense_block()
+        .into_iter()
+        .filter(|e| !matches!(e, HostEvent::Param { .. }))
+        .collect();
+    let _ = h.process(256, 1.0, &[]);
+    let _ = fixture::take_seen();
+    let out = h.process(256, 1.0, &midi_only);
+    let seen = fixture::take_seen();
+    assert_eq!(seen, expected_seen(&midi_only), "AAX exact MIDI order");
+    assert!(out[0].iter().all(|s| s.is_finite()), "AAX finite outputs");
+}
 
 fn at_of(seen: &Seen) -> u32 {
     match *seen {
@@ -2371,6 +2605,19 @@ fn zero_audio_thread_allocations_au() {
     fixture::SEEN.with(|_| {});
     let ((), ops) = heap_ops(|| au.process_raw(256, &inputs, &mut outputs, &midi, &params));
     assert_eq!(ops, 0, "AU process heap operations");
+}
+
+#[test]
+fn zero_audio_thread_allocations_aax() {
+    let mut aax = AaxH::new();
+    aax.start(48_000.0);
+    let midi = AaxH::host_midi(&dense_block());
+    let inputs = [vec![1.0; 256], vec![1.0; 256]];
+    let mut outputs = [vec![0.0; 256], vec![0.0; 256]];
+    fixture::SEEN.with(|_| {});
+    let (status, ops) = heap_ops(|| aax.process_raw(256, &inputs, &mut outputs, &midi));
+    assert_eq!(status, moose_aax::ffi::MOOSE_AAX_EVENT_END);
+    assert_eq!(ops, 0, "AAX process heap operations");
 }
 
 /// The counter itself works (guards against a vacuous zero).
@@ -2432,6 +2679,7 @@ fn param_text_is_identical_across_formats() {
     let clap = ClapH::new();
     let vst3 = Vst3H::new();
     let au = AuH::new();
+    let aax = AaxH::new();
     for (id, plain) in [
         (MIX, 0.5),
         (CUTOFF, 2500.0),
@@ -2442,9 +2690,11 @@ fn param_text_is_identical_across_formats() {
         let c = clap.format(id, plain);
         let v = vst3.format(id, plain);
         let a = au.format(id, plain);
+        let x = aax.format(id, plain);
         assert!(c.is_some(), "CLAP format {id}");
         assert_eq!(c, v, "CLAP vs VST3 text for {id}={plain}");
         assert_eq!(c, a, "CLAP vs AU text for {id}={plain}");
+        assert_eq!(c, x, "CLAP vs AAX text for {id}={plain}");
     }
 }
 

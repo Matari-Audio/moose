@@ -571,7 +571,7 @@ fn build_flag_for_format(f: &PkgFormat) -> Option<&'static str> {
         PkgFormat::Vst3 => Some("--vst3"),
         PkgFormat::Au2 => Some("--au2"),
         PkgFormat::Au3 => Some("--au3"),
-        PkgFormat::Standalone => None,
+        PkgFormat::Aax | PkgFormat::Standalone => None,
     }
 }
 

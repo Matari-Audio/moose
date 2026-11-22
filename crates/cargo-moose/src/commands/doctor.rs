@@ -130,6 +130,16 @@ pub(crate) fn cmd_doctor(args: &[String]) -> Res {
     // Compilers
     eprintln!();
     eprintln!("  Compilers");
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        match crate::commands::install::aax::resolve_aax_sdk_path() {
+            Some(sdk) => eprintln!("    {} AAX_SDK_PATH: {}", tag_ok(), sdk.display()),
+            None => eprintln!(
+                "    {} AAX_SDK_PATH not set (optional; needed only for `cargo moose build --aax`)",
+                tag_info()
+            ),
+        }
+    }
     #[cfg(not(target_os = "windows"))]
     {
         check_cmd("cc", &[OsStr::new("--version")], "C compiler");

@@ -21,6 +21,9 @@ pub use moose_clap as clap_wrapper;
 #[cfg(feature = "vst3")]
 pub use moose_vst3 as vst3_wrapper;
 
+#[cfg(feature = "aax")]
+pub use moose_aax as aax_wrapper;
+
 /// MUI editors: `moose::mui::MuiEditor`, the parameter `Bridge`, and the
 /// toolkit itself as `moose::mui::mui`.
 #[cfg(feature = "mui")]

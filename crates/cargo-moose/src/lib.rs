@@ -72,9 +72,11 @@ pub(crate) use util::read_workspace_version;
 pub(crate) use util::release_lib_for_target;
 // `target_os_of` maps a target triple to its OS so the build + staging
 // pipeline lays out bundles by target, not the build host. Always available.
-pub(crate) use util::target_os_of;
 #[cfg(target_os = "macos")]
-pub(crate) use util::{release_bundle_bin, release_static_for_target};
+pub(crate) use util::release_bundle_bin;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) use util::release_static_for_target;
+pub(crate) use util::target_os_of;
 
 // `tag_info` formats the doctor/packager status prefix; the `doctor`
 // command runs on every platform, so this stays unconditional.

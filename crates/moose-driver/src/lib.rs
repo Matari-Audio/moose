@@ -1530,6 +1530,7 @@ mod routing_tests {
                 mute_preview_output: false,
                 automation: moose_core::info::Automation::DEFAULT,
                 legacy_au_keys: &[],
+                legacy_aax_chunks: &[],
             }
         }
         fn bus_layouts() -> Vec<BusLayout> {

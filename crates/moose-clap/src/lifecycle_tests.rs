@@ -1469,3 +1469,65 @@ fn preset_load_enforces_bounded_file_read_and_rejects_oversized_files() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+#[test]
+fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
+    with_probe(|plugin| unsafe {
+        assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
+        assert!((*plugin).start_processing.unwrap()(plugin));
+
+        let data = data_from_plugin::<Probe>(plugin);
+        let plugin_addr = plugin as usize;
+        let held = data.plugin.enter();
+
+        // Simulate a misbehaving host overlapping a main-thread lifecycle call
+        // with audio processing on another thread: `process` must return
+        // immediately (wait-free) with zeroed outputs instead of parking.
+        let (status, out_l, out_r) = std::thread::spawn(move || {
+            let plugin = plugin_addr as *const clap_plugin;
+            let in_l = [0.5f32; 16];
+            let in_r = [0.5f32; 16];
+            let mut out_l = [1.0f32; 16];
+            let mut out_r = [1.0f32; 16];
+            let mut in_ptrs = [in_l.as_ptr().cast_mut(), in_r.as_ptr().cast_mut()];
+            let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            let in_buf = clap_audio_buffer {
+                data32: in_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let mut out_buf = clap_audio_buffer {
+                data32: out_ptrs.as_mut_ptr(),
+                data64: ptr::null_mut(),
+                channel_count: 2,
+                latency: 0,
+                constant_mask: 0,
+            };
+            let proc = clap_process {
+                steady_time: -1,
+                frames_count: 16,
+                transport: ptr::null(),
+                audio_inputs: &raw const in_buf,
+                audio_outputs: &raw mut out_buf,
+                audio_inputs_count: 1,
+                audio_outputs_count: 1,
+                in_events: ptr::null(),
+                out_events: ptr::null(),
+            };
+            let status = (*plugin).process.unwrap()(plugin, &raw const proc);
+            (status, out_l, out_r)
+        })
+        .join()
+        .expect("audio thread must not panic or park on overlap");
+
+        assert_eq!(status, clap_sys::process::CLAP_PROCESS_CONTINUE);
+        assert!(out_l.iter().all(|&s| s == 0.0));
+        assert!(out_r.iter().all(|&s| s == 0.0));
+
+        drop(held);
+        (*plugin).stop_processing.unwrap()(plugin);
+        (*plugin).deactivate.unwrap()(plugin);
+    });
+}

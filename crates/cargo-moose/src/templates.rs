@@ -1,7 +1,42 @@
-//! Embedded template files for AU v3 builds.
+//! Embedded template files for AU v3 and AAX builds.
 //!
 //! These are compiled into the binary via `include_str!` so the tool
-//! works without the `au3-template/` directory.
+//! works without external template directories.
+
+// ---------------------------------------------------------------------------
+// AAX template files (static-linked AAX_CMonolithicParameters C++ wrapper)
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub mod aax {
+    pub const SHIM_TYPES_H: &str = moose_shim_types::AAX_SHIM_TYPES_H;
+    pub const CMAKE_LISTS: &str = include_str!("../templates/aax/CMakeLists.txt");
+    pub const INFO_PLIST_IN: &str = include_str!("../templates/aax/Info.plist.in");
+    pub const BRIDGE_H: &str = include_str!("../templates/aax/MooseAAX_Bridge.h");
+    pub const DESCRIBE_CPP: &str = include_str!("../templates/aax/MooseAAX_Describe.cpp");
+    pub const PARAMETERS_H: &str = include_str!("../templates/aax/MooseAAX_Parameters.h");
+    pub const PARAMETERS_CPP: &str = include_str!("../templates/aax/MooseAAX_Parameters.cpp");
+    pub const GUI_H: &str = include_str!("../templates/aax/MooseAAX_GUI.h");
+    pub const GUI_CPP: &str = include_str!("../templates/aax/MooseAAX_GUI.cpp");
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn aax_templates_link_statically_and_use_vtable() {
+            assert!(CMAKE_LISTS.contains("MOOSE_RUST_STATICLIB"));
+            assert!(BRIDGE_H.contains("MOOSE_AAX_ABI_VERSION"));
+            assert!(BRIDGE_H.contains("moose_aax_callbacks"));
+            assert!(!BRIDGE_H.contains("dlopen("));
+            assert!(!DESCRIBE_CPP.contains("dlopen("));
+            assert!(!DESCRIBE_CPP.contains("LoadLibrary"));
+            assert!(PARAMETERS_CPP.contains("drain_host_queue"));
+            assert!(PARAMETERS_CPP.contains("CompareActiveChunk"));
+            assert!(SHIM_TYPES_H.contains("MooseAaxCallbacks"));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // AU v3 template files
