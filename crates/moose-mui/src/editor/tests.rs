@@ -777,3 +777,34 @@ fn param_at_resolves_bound_widgets_and_rejects_empty_space() {
         None
     );
 }
+
+#[test]
+fn bridge_request_resize_routes_to_host_context() {
+    let params = Arc::new(Synth::default());
+    let requested = Arc::new(Mutex::new(Vec::<(u32, u32)>::new()));
+    let seen = Arc::clone(&requested);
+    let (writer, reader) = (params.clone(), params.clone());
+    let bridge = ClosureBridge {
+        begin_edit: Box::new(|_| {}),
+        end_edit: Box::new(|_| {}),
+        set_param: Box::new(move |id, v| writer.set_normalized(id, v)),
+        get_param: Box::new(move |id| reader.get_normalized(id).unwrap_or(0.0)),
+        get_param_plain: Box::new(|_| 0.0),
+        format_param: Box::new(|_| String::new()),
+        request_resize: Box::new(move |w, h| {
+            seen.lock().unwrap().push((w, h));
+            true
+        }),
+        get_meter: Box::new(|_| 0.0),
+        get_state: Box::new(Vec::new),
+        set_state: Box::new(|_| {}),
+        transport: Box::new(|| None),
+    };
+    let ctx = PluginContext::from_closures(bridge, params.clone() as Arc<dyn Params>)
+        .with_params(params.clone());
+    let mut ui_bridge = Bridge::new(params);
+    assert!(!ui_bridge.request_resize(640, 480));
+    ui_bridge.attach(ctx);
+    assert!(ui_bridge.request_resize(960, 640));
+    assert_eq!(*requested.lock().unwrap(), vec![(960, 640)]);
+}

@@ -41,6 +41,8 @@ pub struct Bridge<P: ?Sized = dyn Params> {
     /// Every parameter and meter as last seen, bit for bit: `changed`
     /// compares against it without hashing or allocating.
     seen: Box<[u64]>,
+    #[cfg(target_os = "linux")]
+    native_requests: std::sync::Weak<crate::window::Requests>,
 }
 
 impl<P: Params + ?Sized> Bridge<P> {
@@ -60,6 +62,8 @@ impl<P: Params + ?Sized> Bridge<P> {
             building_widgets: Vec::new(),
             bound_widgets: Vec::new(),
             seen,
+            #[cfg(target_os = "linux")]
+            native_requests: std::sync::Weak::new(),
         }
     }
 
@@ -73,6 +77,30 @@ impl<P: Params + ?Sized> Bridge<P> {
     #[must_use]
     pub fn context(&self) -> Option<&PluginContext<P>> {
         self.context.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_native_requests(
+        &mut self,
+        requests: std::sync::Weak<crate::window::Requests>,
+    ) {
+        self.native_requests = requests;
+    }
+
+    /// Ask the host (or native Wayland window on Linux) to resize the editor
+    /// to `(width, height)` logical points.
+    #[must_use]
+    pub fn request_resize(&self, width: u32, height: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(requests) = self.native_requests.upgrade()
+            && requests.wayland_open()
+        {
+            requests.resize(width, height);
+            return true;
+        }
+        self.context
+            .as_ref()
+            .is_some_and(|c| c.request_resize(width, height))
     }
 
     /// Start talking to a host. Replacing a context ends the gestures the
@@ -92,6 +120,10 @@ impl<P: Params + ?Sized> Bridge<P> {
         }
         self.open.clear();
         self.held.clear();
+        #[cfg(target_os = "linux")]
+        {
+            self.native_requests = std::sync::Weak::new();
+        }
     }
 
     /// Drop the host without calling it: for `Drop`, when the host may have
@@ -100,6 +132,10 @@ impl<P: Params + ?Sized> Bridge<P> {
         self.open.clear();
         self.held.clear();
         self.context = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.native_requests = std::sync::Weak::new();
+        }
     }
 
     /// End every open gesture but stay attached: a state load replaced the
