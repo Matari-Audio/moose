@@ -60,6 +60,11 @@ fn cargo_moose_bin() -> PathBuf {
 /// directory, including selections made via CLI flags or config.
 /// Keep artifacts beside Cargo's integration-test tmp directory,
 /// which `Swatinem/rust-cache@v2` excludes.
+///
+/// Writes a standard `CACHEDIR.TAG` marker because pre-creating the
+/// directory before Cargo runs causes Cargo to skip writing one, which
+/// otherwise hides gigabytes of e2e artifacts from `build-reap` and
+/// cache-aware backup tools.
 fn shared_target() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -68,6 +73,14 @@ fn shared_target() -> &'static Path {
             .expect("Cargo's integration-test tmp directory should have a parent");
         let p = target_root.join("scaffold-e2e-target");
         std::fs::create_dir_all(&p).unwrap();
+        let tag = p.join("CACHEDIR.TAG");
+        if !tag.exists() {
+            let _ = std::fs::write(
+                &tag,
+                "Signature: 8a477f597d28d172789f06886806bc55\n\
+                 # This file is a cache directory tag created by cargo-moose scaffold_e2e.\n",
+            );
+        }
         p
     })
 }
@@ -462,6 +475,16 @@ impl Scaffold {
             bundles.display(),
             diagnose_target_layout(),
         );
+    }
+}
+
+impl Drop for Scaffold {
+    fn drop(&mut self) {
+        if std::env::var_os("MOOSE_KEEP_E2E_TMP").is_some() {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.run_dir);
+        let _ = std::fs::remove_dir_all(&self.bundles_snapshot);
     }
 }
 
