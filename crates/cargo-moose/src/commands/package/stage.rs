@@ -473,8 +473,15 @@ pub(crate) fn stage_au3(root: &Path, p: &PluginDef, _config: &Config, staging: &
 /// statically linking the universal Rust `staticlib` (`lib{stem}_aax.a`)
 /// against the Avid AAX SDK (`AAX_SDK_PATH`).
 #[cfg(target_os = "macos")]
-pub(crate) fn stage_aax(root: &Path, p: &PluginDef, config: &Config, staging: &Path) -> Res {
-    if !crate::commands::install::aax::emit_aax_bundle(root, p, config, staging, None)? {
+pub(crate) fn stage_aax(
+    root: &Path,
+    p: &PluginDef,
+    config: &Config,
+    staging: &Path,
+    archs: &[crate::MacArch],
+) -> Res {
+    let slices: Vec<_> = archs.iter().map(|arch| arch.cmake_arch()).collect();
+    if !crate::commands::install::aax::emit_aax_bundle(root, p, config, staging, None, &slices)? {
         return Err(
             "AAX packaging requested, but AAX_SDK_PATH is not set to a valid Avid AAX SDK directory."
                 .into(),

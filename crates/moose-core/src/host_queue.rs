@@ -167,6 +167,7 @@ pub struct HostQueue {
     /// now, which [`Self::close`] waits for.
     waking: AtomicUsize,
     wake: Box<dyn Fn() + Send + Sync>,
+    defer_wake: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl HostQueue {
@@ -189,7 +190,21 @@ impl HostQueue {
             armed: AtomicUsize::new(0),
             waking: AtomicUsize::new(0),
             wake: Box::new(wake),
+            defer_wake: None,
         }
+    }
+
+    /// Build a queue with a producer-side gate for timer-driven wakeups.
+    ///
+    /// After publication, `defer_wake` can arrange a later drain and return
+    /// true to leave the immediate wake unarmed for other producers.
+    pub fn with_deferred_wake(
+        wake: impl Fn() + Send + Sync + 'static,
+        defer_wake: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let mut queue = Self::new(wake);
+        queue.defer_wake = Some(Box::new(defer_wake));
+        queue
     }
 
     /// Raise `signal`. Allocation-free, any thread, with unbounded wake retries.
@@ -198,7 +213,7 @@ impl HostQueue {
         if signal.is_empty() {
             return;
         }
-        self.signals.fetch_or(signal.bits(), Ordering::AcqRel);
+        self.signal_no_wake(signal);
         self.wake_once();
     }
 
@@ -263,6 +278,9 @@ impl HostQueue {
     /// Call the wake unless one is already pending. Callers have just
     /// published a signal bit or a message.
     fn wake_once(&self) {
+        if self.defer_wake.as_ref().is_some_and(|defer| defer()) {
+            return;
+        }
         // Pairs with the RMW in `disarm` (see the type docs).
         let claim = self.armed.fetch_or(1, Ordering::AcqRel);
         if claim & 1 != 0 {
@@ -660,6 +678,36 @@ mod tests {
         queue.signal(HostSignal::RESTART);
         assert_eq!(wakes.load(Ordering::Relaxed), 0);
         assert_eq!(queue.drain(&main()).signals, HostSignal::RESTART);
+    }
+
+    #[test]
+    fn a_deferred_producer_leaves_the_immediate_wake_available() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let defer = Arc::new(AtomicBool::new(true));
+        let wakes = Arc::new(AtomicU32::new(0));
+        let queue = HostQueue::with_deferred_wake(
+            {
+                let wakes = Arc::clone(&wakes);
+                move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            {
+                let defer = Arc::clone(&defer);
+                move || defer.load(Ordering::Relaxed)
+            },
+        );
+        queue.signal(HostSignal::LATENCY);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        defer.store(false, Ordering::Relaxed);
+        queue.signal(HostSignal::PRESENTATION);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            queue.pending(),
+            HostSignal::LATENCY | HostSignal::PRESENTATION
+        );
     }
 
     #[test]

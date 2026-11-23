@@ -520,6 +520,8 @@ pub struct AuParamEvent {
 }
 
 pub const AU_PARAM_EVENT_HAS_START_VALUE: u32 = 1 << 0;
+/// Preserve the host offset of a scheduled `AUv2` step in block-split mode.
+pub const AU_PARAM_EVENT_EXACT_OFFSET: u32 = 1 << 1;
 
 /// Unified step/ramp parameter event (ABI v13). Mirrors `AuParamEventV2` in
 /// `au_shim_types.h`.

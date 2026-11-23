@@ -606,6 +606,8 @@ mod tests {
         let ctx = unsafe { (cbs.create_with_sink)(&raw const sink) };
         unsafe { (cbs.reset)(ctx, 48_000.0, 128) };
         assert_eq!(unsafe { (cbs.latency_samples)(ctx) }, 64);
+        unsafe { (cbs.drain_host_queue)(ctx) };
+        assert_eq!(log.latency.load(Ordering::SeqCst), 64);
 
         let in_l = [1.0f32; 32];
         let in_r = [1.0f32; 32];

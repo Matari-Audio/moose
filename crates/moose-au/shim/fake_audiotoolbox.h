@@ -216,6 +216,7 @@ typedef OSStatus (*AudioComponentMethod)(void *self, ...);
 #define kAudioUnitRenderSelect 14
 #define kAudioUnitResetSelect 9
 #define kAudioUnitAddPropertyListenerSelect 10
+#define kAudioUnitRemovePropertyListenerSelect 11
 #define kAudioUnitRemovePropertyListenerWithUserDataSelect 18
 #define kAudioUnitScheduleParametersSelect 17
 #define kAudioUnitAddRenderNotifySelect 15

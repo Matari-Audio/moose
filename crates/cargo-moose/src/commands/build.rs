@@ -248,6 +248,7 @@ pub(crate) fn cmd_build(args: &[String]) -> Res {
                     &config,
                     &plan.stage_dir,
                     plan.target,
+                    &[],
                 )? {
                     let filename = format!("{}.aaxplugin", p.file_stem());
                     crate::log_output(format!(

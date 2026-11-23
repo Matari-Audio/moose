@@ -1047,6 +1047,53 @@ mod tests {
     }
 
     #[test]
+    fn retained_block_split_ramps_keep_both_terminals_with_two_event_slots() {
+        use crate::callbacks::push_param_events_v2;
+        use crate::ffi::AU_PROCESS_OK;
+        use crate::instance::ActiveAuRamp;
+        use crate::large_state_fixture::LargePlugin;
+        use moose_core::export::PluginExport;
+        use moose_core::info::Automation;
+
+        let params = LargePlugin::<16>::create().params_arc();
+        let mut list = EventList::with_capacity(2);
+        let mut active_ramps = vec![
+            ActiveAuRamp {
+                param_id: 0,
+                current_val: 0.25,
+                target_val: 1.0,
+                remaining_frames: 64,
+            },
+            ActiveAuRamp {
+                param_id: 1,
+                current_val: 0.75,
+                target_val: 0.0,
+                remaining_frames: 64,
+            },
+        ];
+        let mut tracker = Vec::with_capacity(2);
+
+        let (status, _) = push_param_events_v2(
+            &mut list,
+            params.as_ref(),
+            Automation::BlockSplit { min: 32 },
+            &[],
+            64,
+            &mut active_ramps,
+            &mut tracker,
+        );
+
+        assert_eq!(status, AU_PROCESS_OK);
+        assert_eq!(list.len(), 2);
+        assert!(active_ramps.is_empty());
+        for (event, (param_id, target)) in list.iter().zip([(0, 1.0_f64), (1, 0.0)]) {
+            assert_eq!(event.sample_offset, 64);
+            assert!(matches!(event.body, EventBody::ParamChange { id, value }
+                if id == param_id && value.to_bits() == target.to_bits()));
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "exercises both ramp modes end-to-end"
@@ -1168,7 +1215,9 @@ mod tests {
             }
             other => panic!("expected ParamRamp, got {other:?}"),
         }
-        // Host that DOES re-deliver Block 2 with start=-256: retained ramp defers without duplicating.
+        // A host repeating the original ramp still starts from the retained
+        // interpolated value even if the store has since changed.
+        params.set_plain(0, 0.75);
         list.clear();
         let auv3_b2 = [AuParamEventV2 {
             start_offset: -256,
@@ -1202,7 +1251,7 @@ mod tests {
             other => panic!("expected ParamRamp, got {other:?}"),
         }
 
-        // 3. BlockSplit { min: 32 } subdivides a 512-sample ramp into 16 stepped ParamChanges
+        // 3. BlockSplit samples chunk starts and emits the terminal value at 512.
         list.clear();
         let full_ramp = [AuParamEventV2 {
             start_offset: 0,
@@ -1222,13 +1271,46 @@ mod tests {
             &mut tracker,
         );
         assert_eq!(s3, AU_PROCESS_OK);
-        assert_eq!(list.len(), 16);
-        assert_eq!(list.get(0).unwrap().sample_offset, 0);
-        assert_eq!(list.get(15).unwrap().sample_offset, 480);
-        match list.get(15).unwrap().body {
-            EventBody::ParamChange { value, .. } => assert!((value - 1.0).abs() < 1e-6),
-            other => panic!("expected ParamChange, got {other:?}"),
+        assert_eq!(list.len(), 17);
+        for (index, event) in (0..=16_u32).zip(list.iter()) {
+            assert_eq!(event.sample_offset, index * 32);
+            assert!(matches!(event.body, EventBody::ParamChange { value, .. }
+                    if (value - f64::from(index) / 16.0).abs() < 1e-6));
         }
+
+        // The last slot carries the terminal, even if a later ramp starts
+        // exactly at the next slice and must not cancel this continuation.
+        let mut last_slot = EventList::with_capacity(1);
+        let boundary = [
+            AuParamEventV2 {
+                duration_frames: 1024,
+                flags: 0,
+                ..full_ramp[0]
+            },
+            AuParamEventV2 {
+                start_offset: 512,
+                ..full_ramp[0]
+            },
+        ];
+        params.set_plain(0, 0.0);
+        let (status, _) = push_param_events_v2(
+            &mut last_slot,
+            params.as_ref(),
+            Automation::BlockSplit { min: 32 },
+            &boundary,
+            512,
+            &mut active_ramps,
+            &mut tracker,
+        );
+        assert_eq!(status, AU_PROCESS_OK);
+        assert_eq!(active_ramps.len(), 1);
+        assert_eq!(active_ramps[0].remaining_frames, 512);
+        let terminal = last_slot.get(0).unwrap();
+        assert_eq!(terminal.sample_offset, 512);
+        assert!(
+            matches!(terminal.body, EventBody::ParamChange { value, .. } if (value - 0.5).abs() < 1e-6)
+        );
+        active_ramps.clear();
 
         // 4. Future ramp is ignored; past-ended ramp snaps to target at offset 0
         list.clear();
@@ -1358,9 +1440,14 @@ mod tests {
             &mut tracker,
         );
         assert_eq!(status, AU_PROCESS_OK);
-        assert_eq!(list.len(), 1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.get(0).unwrap().sample_offset, 0);
+        assert_eq!(list.get(1).unwrap().sample_offset, 16);
         assert!(
-            matches!(list.get(0).unwrap().body, EventBody::ParamChange { value, .. } if (value - 0.25).abs() < 1e-6)
+            matches!(list.get(0).unwrap().body, EventBody::ParamChange { value, .. } if (value - 0.125).abs() < 1e-6)
+        );
+        assert!(
+            matches!(list.get(1).unwrap().body, EventBody::ParamChange { value, .. } if (value - 0.25).abs() < 1e-6)
         );
 
         // 6. Tracker supports >64 distinct parameters without truncating
@@ -1734,8 +1821,8 @@ mod tests {
     }
 
     #[test]
-    fn v13_combined_presentation_and_rescan_fires_both_and_defers_active_catalog() {
-        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_set_active};
+    fn combined_presentation_and_rescan_with_live_catalog_swap() {
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_reset, cb_set_active};
         use crate::ffi::MooseAuHostSink;
         use crate::instance::AuInstance;
         use crate::large_state_fixture::LargePlugin;
@@ -1776,17 +1863,45 @@ mod tests {
             let inst = &*ctx.cast::<AuInstance<P>>();
             let main = moose_core::thread::MainThread::assume();
 
-            // Activate, stash a pending audio catalog update, and verify it is
-            // installed into `audio.catalog` on deactivation.
+            cb_reset::<P>(ctx, 48_000.0, 32);
             cb_set_active::<P>(ctx, 1);
+            // Keep only the audio reference to this generation so reclaim
+            // can be distinguished from the render-time swap.
+            let retired = inst.params_arc.param_catalog();
+            let old = std::sync::Arc::downgrade(&retired);
+            inst.audio.enter().catalog = retired;
             let replacement = inst.params_arc.param_catalog();
             let replacement_ptr = std::sync::Arc::as_ptr(&replacement);
-            *inst.pending_audio_catalog.lock().unwrap() = Some(replacement);
-            cb_set_active::<P>(ctx, 0);
-            assert!(inst.pending_audio_catalog.lock().unwrap().is_none());
+            inst.render_catalog.publish(replacement);
+            assert_ne!(
+                std::sync::Arc::as_ptr(&inst.audio.enter().catalog),
+                replacement_ptr
+            );
+            let status = crate::callbacks::cb_process_native_v13::<P>(
+                ctx,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                32,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+            );
+            assert_eq!(status, crate::ffi::AU_PROCESS_OK);
             assert_eq!(
                 std::sync::Arc::as_ptr(&inst.audio.enter().catalog),
                 replacement_ptr
+            );
+            assert!(
+                old.upgrade().is_some(),
+                "render retains the retired Arc for control"
             );
 
             // Combined PRESENTATION + PARAM_RESCAN must still deliver PARAM_RESCAN
@@ -1795,6 +1910,10 @@ mod tests {
                 .signal(HostSignal::PRESENTATION | HostSignal::PARAM_RESCAN);
             crate::gui::drain_host_queue::<P>(ctx, &main);
             assert_eq!(counts.values.load(Ordering::Relaxed), 1);
+            assert!(
+                old.upgrade().is_none(),
+                "control reclaims the render catalog"
+            );
 
             cb_destroy::<P>(ctx);
         }
@@ -2063,17 +2182,13 @@ mod tests {
             let first_id = catalog[0].id;
             let first_chunked = catalog[0].flags.contains(moose_params::ParamFlags::CHUNKED);
             let mut per_sample_info = AuParamInfoOut::default();
-            let per_sample_exposed = AuExposedParams::new(
-                std::sync::Arc::clone(&catalog),
-                inst.params_arc.as_ref(),
-                Automation::PerSample,
-            );
+            let per_sample_exposed =
+                AuExposedParams::capture(inst.params_arc.as_ref(), Automation::PerSample);
             assert!(per_sample_exposed.fill_info(first_id, &mut per_sample_info));
             assert_ne!(per_sample_info.flags & AU_PARAM_FLAG_CAN_RAMP, 0);
 
             let mut block_split_info = AuParamInfoOut::default();
-            let block_split_exposed = AuExposedParams::new(
-                catalog,
+            let block_split_exposed = AuExposedParams::capture(
                 inst.params_arc.as_ref(),
                 Automation::BlockSplit { min: 32 },
             );
@@ -2228,7 +2343,7 @@ mod tests {
 
     #[test]
     fn v13_stopped_latency_and_tail_change_notifies_independently() {
-        use crate::callbacks::{cb_create_with_sink, cb_destroy};
+        use crate::callbacks::{cb_create_with_sink, cb_destroy, cb_reset, cb_set_active};
         use crate::ffi::MooseAuHostSink;
         use crate::instance::AuInstance;
         use crate::large_state_fixture::LargePlugin;
@@ -2296,6 +2411,26 @@ mod tests {
             assert_eq!(host.tail_calls.load(Ordering::Relaxed), 1);
             assert_eq!(host.tail_seen.load(Ordering::Relaxed), 2048);
 
+            // A render observation survives off-main deactivation and a
+            // reset that republishes both delay slots before the main drain.
+            cb_set_active::<P>(ctx, 1);
+            assert!(
+                inst.delay
+                    .observe_and_signal_no_wake(32, 2048, &inst.host_queue)
+            );
+            let ctx_address = ctx as usize;
+            std::thread::spawn(move || {
+                cb_set_active::<P>(ctx_address as *mut std::ffi::c_void, 0);
+            })
+            .join()
+            .unwrap();
+            cb_reset::<P>(ctx, 48_000.0, 64);
+            cb_set_active::<P>(ctx, 1);
+            assert_eq!(host.lat_calls.load(Ordering::Relaxed), 1);
+            crate::gui::drain_host_queue::<P>(ctx, &main);
+            assert_eq!(host.lat_calls.load(Ordering::Relaxed), 2);
+            assert_eq!(host.tail_calls.load(Ordering::Relaxed), 1);
+
             cb_destroy::<P>(ctx);
         }
     }
@@ -2339,6 +2474,7 @@ mod tests {
                 _main: &moose_core::thread::MainThread,
                 info: &TrackInfo,
             ) {
+                assert_ne!(info.name.as_deref(), Some("panic probe"), "plugin panic");
                 HOOK_LOG
                     .get_or_init(|| Mutex::new(Vec::new()))
                     .lock()
@@ -2416,12 +2552,37 @@ mod tests {
                 "HostNotifier passed to connect() must target the instance's HostQueue"
             );
 
-            let track = CString::new("Bass Bus").unwrap();
-            cb_set_context_name::<HookPlugin>(ctx, track.as_ptr());
+            let drain = || {
+                crate::host_drain::run_host_drain::<HookPlugin>(&inst.host_queue, ctx);
+            };
+            let ctx_address = ctx as usize;
+            std::thread::spawn(move || {
+                let ctx = ctx_address as *mut std::ffi::c_void;
+                let first = CString::new("Scratch").unwrap();
+                let latest = CString::new("Bass Bus").unwrap();
+                cb_set_context_name::<HookPlugin>(ctx, first.as_ptr());
+                cb_set_context_name::<HookPlugin>(ctx, latest.as_ptr());
+            })
+            .join()
+            .unwrap();
+            assert!(HOOK_LOG.get().unwrap().lock().unwrap().is_empty());
+            let main = moose_core::thread::MainThread::assume();
+            let hooks = inst.main_thread.try_borrow_mut(&main).unwrap();
+            drain();
+            assert!(HOOK_LOG.get().unwrap().lock().unwrap().is_empty());
+            drop(hooks);
+            drain();
             cb_set_context_name::<HookPlugin>(ctx, std::ptr::null());
+            drain();
 
             let seen = HOOK_LOG.get().unwrap().lock().unwrap().clone();
             assert_eq!(seen, vec![Some("Bass Bus".to_string()), None]);
+
+            let probe = CString::new("panic probe").unwrap();
+            cb_set_context_name::<HookPlugin>(ctx, probe.as_ptr());
+            inst.host_queue.signal(HostSignal::NOTE_NAMES);
+            drain();
+            assert!(!inst.host_queue.pending().contains(HostSignal::NOTE_NAMES));
 
             cb_destroy::<HookPlugin>(ctx);
         }

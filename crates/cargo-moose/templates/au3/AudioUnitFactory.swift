@@ -3,6 +3,35 @@
 import os.log
 import AudioToolbox
 import CoreMIDI
+import Darwin
+
+private typealias MooseAuParamSnapshotBeginFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
+private typealias MooseAuParamSnapshotEndFn = @convention(c) () -> Void
+
+/// Resolve the optional v14 pair from the image that supplies the catalog
+/// callbacks. The table itself is heap allocated, so use a function address.
+private func mooseAuParamSnapshotFunctions(
+    _ callbacks: UnsafePointer<AuCallbacks>
+) -> (MooseAuParamSnapshotBeginFn, MooseAuParamSnapshotEndFn)? {
+    guard let paramCount = callbacks.pointee.param_count else { return nil }
+    var image = Dl_info()
+    guard dladdr(unsafeBitCast(paramCount, to: UnsafeRawPointer.self), &image) != 0,
+          let path = image.dli_fname,
+          let handle = dlopen(path, RTLD_LAZY | RTLD_NOLOAD | RTLD_FIRST) else {
+        return nil
+    }
+    defer { dlclose(handle) }
+    // The framework is already linked by the extension. Drop only the extra
+    // reference used for lookup, and allow older v14 frameworks without the pair.
+    guard let begin = dlsym(handle, "moose_au_param_snapshot_begin"),
+          let end = dlsym(handle, "moose_au_param_snapshot_end") else {
+        return nil
+    }
+    return (
+        unsafeBitCast(begin, to: MooseAuParamSnapshotBeginFn.self),
+        unsafeBitCast(end, to: MooseAuParamSnapshotEndFn.self)
+    )
+}
 
 private let logger = Logger(subsystem: "com.moose.au3", category: "AUExt")
 import AVFAudio
@@ -240,12 +269,47 @@ private func au3SinkRequestResize(_ ud: UnsafeMutableRawPointer?, _ width: UInt3
     au.handleSinkRequestResize(width: width, height: height)
 }
 
+private final class MooseParamEcho: NSObject {
+    let context: UnsafeMutableRawPointer
+    let address: AUParameterAddress
+    let valueBits: UInt32
+
+    init(_ context: UnsafeMutableRawPointer, _ address: AUParameterAddress, _ value: AUValue) {
+        self.context = context
+        self.address = address
+        self.valueBits = value.bitPattern
+    }
+
+    static let key = "com.moose.au3.paramEcho"
+
+    static func withValue(_ context: UnsafeMutableRawPointer, _ address: AUParameterAddress,
+                          _ value: AUValue, _ body: () -> Void) {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary.object(forKey: key)
+        dictionary.setObject(MooseParamEcho(context, address, value), forKey: key as NSString)
+        defer {
+            if let previous = previous {
+                dictionary.setObject(previous, forKey: key as NSString)
+            } else {
+                dictionary.removeObject(forKey: key)
+            }
+        }
+        body()
+    }
+
+    static func take(_ context: UnsafeMutableRawPointer, _ address: AUParameterAddress,
+                     _ value: AUValue) -> Bool {
+        let dictionary = Thread.current.threadDictionary
+        guard let echo = dictionary.object(forKey: key) as? MooseParamEcho,
+              echo.context == context, echo.address == address,
+              echo.valueBits == value.bitPattern else { return false }
+        dictionary.removeObject(forKey: key)
+        return true
+    }
+}
+
 class MooseAUAudioUnit: AUAudioUnit {
     private(set) var rustCtx: UnsafeMutableRawPointer?
-    /// Main-thread guard while pushing Rust-originated parameter changes into
-    /// `_parameterTree` so `implementorValueObserver` does not echo them back.
-    private var _applyingRustSync = false
-    private var _syncOriginatorToken: AUParameterObserverToken?
     private var _sinkBox: MooseAuSinkBox?
     private var _isActive = false
     /// View-controller hook for plugin-initiated editor resizes (`request_resize`).
@@ -253,7 +317,9 @@ class MooseAUAudioUnit: AUAudioUnit {
 
     private var _inputBusArray: AUAudioUnitBusArray!
     private var _outputBusArray: AUAudioUnitBusArray!
-    private var _parameterTree: AUParameterTree?
+    private typealias ParameterTreeState = (tree: AUParameterTree, token: AUParameterObserverToken?)
+    private let parameterTreeLock = NSLock()
+    private var _parameterTree: ParameterTreeState?
     private var _sampleRate: Double = 44100.0
     private var _maxFrames: UInt32 = 1024
 
@@ -261,14 +327,17 @@ class MooseAUAudioUnit: AUAudioUnit {
                   options: AudioComponentInstantiationOptions = []) throws {
         try super.init(componentDescription: componentDescription, options: options)
 
-        guard let callbacks = g_callbacks, let descriptor = g_descriptor else { return }
+        guard let callbacks = g_callbacks, let descriptor = g_descriptor,
+              callbacks.pointee.abi_version == MOOSE_AU_ABI_VERSION else {
+            throw NSError(domain: NSOSStatusErrorDomain,
+                          code: Int(kAudioUnitErr_FailedInitialization))
+        }
 
         // Require ABI v14 (`create_with_sink` + `process_native_v13` +
         // `begin_output_events_v14`) up front so an older framework binary
         // fails cleanly at initialization instead of returning
         // `kAudio_ParamError` on every render.
-        guard mooseAbiTailVersion(callbacks) >= 14,
-              callbacks.pointee.create_with_sink != nil,
+        guard callbacks.pointee.create_with_sink != nil,
               callbacks.pointee.process_native_v13 != nil,
               callbacks.pointee.begin_output_events_v14 != nil else {
             logger.error("AU init: plugin binary lacks the ABI v14 render/sink contract; rebuild the framework and appex with the same moose version")
@@ -348,7 +417,7 @@ class MooseAUAudioUnit: AUAudioUnit {
         let outBus = try AUAudioUnitBus(format: outputFmt)
         _outputBusArray = AUAudioUnitBusArray(audioUnit: self, busType: .output, busses: [outBus])
 
-        buildParameterTree()
+        replaceParameterTree(notify: false)
 
     }
 
@@ -357,8 +426,8 @@ class MooseAUAudioUnit: AUAudioUnit {
         if let ctx = rustCtx, let callbacks = g_callbacks {
             if _isActive, mooseAbiTailVersion(callbacks) >= 13,
                let setActive = callbacks.pointee.set_active {
-                setActive(ctx, 0)
                 _isActive = false
+                setActive(ctx, 0)
             }
             callbacks.pointee.destroy(ctx)
         }
@@ -381,25 +450,31 @@ class MooseAUAudioUnit: AUAudioUnit {
 
     // MARK: - MooseAuHostSink handlers (main queue)
 
+    private func setParameterFromRust(_ param: AUParameter, value: AUValue,
+                                      originator: AUParameterObserverToken?,
+                                      eventType: AUParameterAutomationEventType) {
+        guard let ctx = rustCtx else { return }
+        MooseParamEcho.withValue(ctx, param.address, value) {
+            param.setValue(value, originator: originator, atHostTime: 0, eventType: eventType)
+        }
+    }
+
     fileprivate func handleSinkBeginEdit(_ paramID: UInt32) {
-        guard let param = _parameterTree?.parameter(withAddress: AUParameterAddress(paramID)) else { return }
-        _applyingRustSync = true
-        param.setValue(param.value, originator: _syncOriginatorToken, atHostTime: 0, eventType: .touch)
-        _applyingRustSync = false
+        guard let state = currentParameterTree(),
+              let param = state.tree.parameter(withAddress: AUParameterAddress(paramID)) else { return }
+        setParameterFromRust(param, value: param.value, originator: state.token, eventType: .touch)
     }
 
     fileprivate func handleSinkSetParam(_ paramID: UInt32, value: Float) {
-        guard let param = _parameterTree?.parameter(withAddress: AUParameterAddress(paramID)) else { return }
-        _applyingRustSync = true
-        param.setValue(AUValue(value), originator: _syncOriginatorToken, atHostTime: 0, eventType: .value)
-        _applyingRustSync = false
+        guard let state = currentParameterTree(),
+              let param = state.tree.parameter(withAddress: AUParameterAddress(paramID)) else { return }
+        setParameterFromRust(param, value: AUValue(value), originator: state.token, eventType: .value)
     }
 
     fileprivate func handleSinkEndEdit(_ paramID: UInt32) {
-        guard let param = _parameterTree?.parameter(withAddress: AUParameterAddress(paramID)) else { return }
-        _applyingRustSync = true
-        param.setValue(param.value, originator: _syncOriginatorToken, atHostTime: 0, eventType: .release)
-        _applyingRustSync = false
+        guard let state = currentParameterTree(),
+              let param = state.tree.parameter(withAddress: AUParameterAddress(paramID)) else { return }
+        setParameterFromRust(param, value: param.value, originator: state.token, eventType: .release)
     }
 
     fileprivate func handleSinkLatencyChanged() {
@@ -419,9 +494,7 @@ class MooseAUAudioUnit: AUAudioUnit {
     }
 
     fileprivate func handleSinkParamPresentationChanged() {
-        willChangeValue(forKey: "parameterTree")
-        buildParameterTree()
-        didChangeValue(forKey: "parameterTree")
+        replaceParameterTree(notify: true)
     }
 
     fileprivate func handleSinkStateChanged() {
@@ -463,8 +536,24 @@ class MooseAUAudioUnit: AUAudioUnit {
     override func select(_ viewConfiguration: AUAudioUnitViewConfiguration) {}
 
     override var parameterTree: AUParameterTree? {
-        get { _parameterTree }
-        set { _parameterTree = newValue }
+        get { currentParameterTree()?.tree }
+        set { setParameterTree(newValue.map { (tree: $0, token: nil) }) }
+    }
+
+    private func currentParameterTree() -> ParameterTreeState? {
+        parameterTreeLock.lock()
+        defer { parameterTreeLock.unlock() }
+        return _parameterTree
+    }
+
+    private func setParameterTree(_ state: ParameterTreeState?) {
+        parameterTreeLock.lock()
+        // Keep the displaced tree live until its observer closures can be
+        // released outside the lock.
+        let previous = _parameterTree
+        _parameterTree = state
+        parameterTreeLock.unlock()
+        withExtendedLifetime(previous) {}
     }
 
     /// MIDI output ports exposed to the host, gated on the plugin's
@@ -510,9 +599,27 @@ class MooseAUAudioUnit: AUAudioUnit {
         return ._1_0
     }
 
-    private func buildParameterTree() {
-        guard let callbacks = g_callbacks, case .some = rustCtx else { return }
-        let rawCtx = rustCtx!
+    private func replaceParameterTree(notify: Bool) {
+        guard let state = buildParameterTree() else { return }
+        if notify { willChangeValue(forKey: "parameterTree") }
+        setParameterTree(state)
+        if notify { didChangeValue(forKey: "parameterTree") }
+    }
+
+    private func buildParameterTree() -> ParameterTreeState? {
+        guard let callbacks = g_callbacks, let rawCtx = rustCtx else { return nil }
+        if let (begin, end) = mooseAuParamSnapshotFunctions(callbacks) {
+            begin(rawCtx)
+            defer { end() }
+            return buildParameterTreeBody(callbacks: callbacks, rawCtx: rawCtx)
+        }
+        return buildParameterTreeBody(callbacks: callbacks, rawCtx: rawCtx)
+    }
+
+    private func buildParameterTreeBody(
+        callbacks: UnsafePointer<AuCallbacks>,
+        rawCtx: UnsafeMutableRawPointer
+    ) -> ParameterTreeState? {
         let cb = callbacks.pointee
         var params: [AUParameter] = []
         var groups: [String: [AUParameter]] = [:]
@@ -610,15 +717,13 @@ class MooseAUAudioUnit: AUAudioUnit {
             children.append(AUParameterTree.createGroup(withIdentifier: gn, name: gn, children: groups[gn]!))
         }
         let tree = AUParameterTree.createTree(withChildren: children)
-        _parameterTree = tree
-        _syncOriginatorToken = tree.token(byAddingParameterObserver: { _, _ in })
-
         tree.implementorValueObserver = { [weak self] p, v in
-            guard let self = self, !self._applyingRustSync, let ctx = self.rustCtx else { return }
+            guard let self = self, let ctx = self.rustCtx,
+                  !MooseParamEcho.take(ctx, p.address, v) else { return }
             cb.param_set_value(ctx, UInt32(p.address), Double(v))
         }
         tree.implementorValueProvider = { [weak self] p in
-            guard let self = self, let ctx = self.rustCtx else { return p.value }
+            guard let self = self, let ctx = self.rustCtx else { return p.minValue }
             return AUValue(cb.param_get_value(ctx, UInt32(p.address)))
         }
         tree.implementorStringFromValueCallback = { [weak self] p, vp in
@@ -644,6 +749,7 @@ class MooseAUAudioUnit: AUAudioUnit {
             }
             return AUValue(Float(str) ?? p.value)
         }
+        return (tree, tree.token(byAddingParameterObserver: { _, _ in }))
     }
 
     // MARK: Render
@@ -668,8 +774,8 @@ class MooseAUAudioUnit: AUAudioUnit {
     override func deallocateRenderResources() {
         if _isActive, let ctx = rustCtx, let cb = g_callbacks,
            mooseAbiTailVersion(cb) >= 13, let setActive = cb.pointee.set_active {
-            setActive(ctx, 0)
             _isActive = false
+            setActive(ctx, 0)
         }
         super.deallocateRenderResources()
     }
@@ -836,7 +942,8 @@ class MooseAUAudioUnit: AUAudioUnit {
             } else if head.eventType == .parameterRamp {
                 // A ramp can start before `bufStart` (negative relative offset)
                 // when it continues from a previous render slice. Preserve its
-                // exact signed offset and duration for `process_native_v13`.
+                // exact signed offset, target and duration so Rust can identify
+                // a repeated ramp and resume from its retained boundary value.
                 let p = event.pointee.parameter
                 let (rel, overflow) = p.eventSampleTime.subtractingReportingOverflow(bufStart)
                 guard !overflow,
@@ -1310,13 +1417,12 @@ class MooseAUAudioUnit: AUAudioUnit {
     /// Push the Rust side's current parameter values into the AU
     /// parameter tree so host UIs reflect a state / preset load.
     private func syncParameterTreeFromRust() {
-        guard let ctx = rustCtx, let cb = g_callbacks, let tree = _parameterTree else { return }
-        _applyingRustSync = true
-        for param in tree.allParameters {
+        guard let ctx = rustCtx, let cb = g_callbacks,
+              let state = currentParameterTree() else { return }
+        for param in state.tree.allParameters {
             let rustVal = AUValue(cb.pointee.param_get_value(ctx, UInt32(param.address)))
-            param.setValue(rustVal, originator: _syncOriginatorToken, atHostTime: 0, eventType: .value)
+            setParameterFromRust(param, value: rustVal, originator: state.token, eventType: .value)
         }
-        _applyingRustSync = false
     }
 
     // MARK: Factory presets

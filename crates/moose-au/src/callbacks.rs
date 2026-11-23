@@ -1,12 +1,12 @@
 //! C callbacks the AU shim calls: lifecycle, parameters, state and process.
 
 use crate::au_process_capacity;
-use crate::catalog::AuExposedParams;
+use crate::catalog::{self, AuExposedParams};
 use crate::gui::free;
 use crate::gui::malloc;
 #[cfg(target_os = "macos")]
 use crate::gui::moose_au_view_detach;
-use crate::host_drain::{self, HostSink};
+use crate::host_drain::{self, HostSink, RenderSignals};
 use crate::instance::ActiveAuRamp;
 use crate::instance::AuAudio;
 use crate::instance::AuGui;
@@ -25,9 +25,9 @@ use crate::state::StateLoadQueue;
 
 use crate::ffi::{
     AU_NATIVE_EVENT_MIDI1, AU_NATIVE_EVENT_SYSEX, AU_NATIVE_EVENT_UMP, AU_OUTPUT_END,
-    AU_PARAM_EVENT_HAS_START_VALUE, AU_PROCESS_INVALID, AU_PROCESS_OK, AU_PROCESS_QUEUE_FULL,
-    AuMidi2Event, AuMidiEvent, AuNativeEvent, AuParamEvent, AuParamEventV2, AuParamInfoOut,
-    AuTransportSnapshot, MooseAuHostSink,
+    AU_PARAM_EVENT_EXACT_OFFSET, AU_PARAM_EVENT_HAS_START_VALUE, AU_PROCESS_INVALID, AU_PROCESS_OK,
+    AU_PROCESS_QUEUE_FULL, AuMidi2Event, AuMidiEvent, AuNativeEvent, AuParamEvent, AuParamEventV2,
+    AuParamInfoOut, AuTransportSnapshot, MooseAuHostSink,
 };
 use moose_core::SYSEX_POOL_PREALLOC;
 use moose_core::TransportSlot;
@@ -46,14 +46,14 @@ use moose_core::midi::decode_short_message;
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::{RtSection, audit};
 use moose_core::state;
-use moose_core::thread::{MainThread, MainThreadCell};
+use moose_core::thread::MainThreadCell;
 use moose_core::ump::{
     SysExAssembler, SysExFeed, decode_ump_channel_voice_2, encode_ump_channel_voice_1,
     encode_ump_channel_voice_2,
 };
 use moose_core::wrapper::{
-    PluginCell, apply_or_queue_state, apply_queued_state, enter_plugin, run_audio_block_latched,
-    run_extern_callback_with,
+    PluginCell, apply_or_queue_state, apply_queued_state, copy_c_str, enter_plugin,
+    run_audio_block_latched, run_extern_callback_with,
 };
 use moose_params::{CatalogSignal, Params};
 use std::ffi::{CStr, CString};
@@ -122,9 +122,12 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
             let params_arc = plugin.params_arc();
             let wants_persist = params_arc.wants_persist_notifications();
 
+            let render_signals = Arc::new(RenderSignals::default());
             let (host_dispatch, host_queue) =
                 if let Some((dispatch, wake)) = unsafe { host_drain::Dispatcher::new() } {
-                    (Some(dispatch), Arc::new(HostQueue::new(wake)))
+                    let signals = Arc::clone(&render_signals);
+                    let queue = HostQueue::with_deferred_wake(wake, move || signals.defer());
+                    (Some(dispatch), Arc::new(queue))
                 } else {
                     // Without a main-queue wake, runtime delay and persist
                     // changes could never reach the host. Fail instantiation
@@ -157,12 +160,13 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
 
             // Build the live exposed catalog AFTER `init` and `main_thread`
             // so instance-level defaults / dynamic slots are reflected.
-            let param_infos = params_arc.param_catalog();
-            let exposed = Mutex::new(AuExposedParams::new(
-                Arc::clone(&param_infos),
-                params_arc.as_ref(),
-                info.automation,
-            ));
+            let Some(snapshot) = AuExposedParams::try_capture(params_arc.as_ref(), info.automation)
+            else {
+                host_queue.close();
+                return std::ptr::null_mut();
+            };
+            let param_infos = snapshot.render_catalog();
+            let exposed = Mutex::new(Arc::new(snapshot));
 
             let delay = moose_core::delay::ReportedDelay::new(plugin.latency(), plugin.tail());
             let (sysex_ready_q, sysex_free_q) = crate::instance::new_sysex_queues();
@@ -170,6 +174,8 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                 persist_signal,
                 catalog_signal,
                 host_queue,
+                render_signals,
+                pending_context_name: Mutex::new(None),
                 host_dispatch,
                 main_thread,
                 params_arc,
@@ -189,7 +195,7 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                 #[cfg(any(not(target_vendor = "apple"), test))]
                 owner_thread: std::thread::current().id(),
                 lifecycle_lock: Mutex::new(()),
-                pending_audio_catalog: Mutex::new(None),
+                render_catalog: crate::catalog::RenderCatalog::default(),
                 global_edit_seq: AtomicU64::new(0),
                 param_edit_seqs: new_param_edit_seqs(&param_infos),
                 editor_gestures: Mutex::default(),
@@ -205,7 +211,9 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                     param_tracker: Vec::with_capacity(512),
                     feedback_epoch: FeedbackEpoch::default(),
                     catalog: param_infos,
-                    event_list: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                    // Preallocate enough capacity for a full AUv2 shim block
+                    // (256 MIDI + 512 parameter events) plus ramp subdivisions.
+                    event_list: EventList::with_capacity(EVENT_LIST_PREALLOC.max(1024)),
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     ump_drain_cursor: UmpDrainCursor::HEAD,
                     midi_drain_cursor: NthCursor::HEAD,
@@ -217,7 +225,7 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                     native_output_max_absolute_offset: u32::MAX,
                     native_output_ump_time_valid: true,
                     native_output_status: AU_OUTPUT_END,
-                    sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC),
+                    sub_event_scratch: EventList::with_capacity(EVENT_LIST_PREALLOC.max(1024)),
                     sysex_assembler: SysExAssembler::with_capacity(SYSEX_POOL_PREALLOC),
                     sample_rate: 44100.0,
                     max_block_size: 8192,
@@ -312,52 +320,47 @@ pub(crate) unsafe extern "C" fn cb_set_active<P: PluginExport>(
             return;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        let _lifecycle = inst
+        let lifecycle = inst
             .lifecycle_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if active != 0 {
             if !inst.is_active()
-                && let Some(catalog) = inst
-                    .pending_audio_catalog
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
+                && let Some(dispatch) = &inst.host_dispatch
             {
-                inst.audio.enter().catalog = catalog;
+                dispatch.start_render_polling(&inst.render_signals);
             }
             inst.lifecycle_state
                 .store(LIFECYCLE_ACTIVE, Ordering::Release);
-        } else {
-            inst.lifecycle_state
-                .store(LIFECYCLE_INACTIVE, Ordering::Release);
-            // Inactive now: no audio thread runs. Drain any stranded
-            // `pending_state`, clear stale multi-slice AUv3 ramps, install any
-            // deferred catalog update, and force the next `Initialize` to
-            // re-run `prepare` + `delay.publish(...)`.
-            {
-                let mut audio = inst.audio.enter();
-                inst.prepared_flag.store(false, Ordering::Release);
-                audio.prepared = false;
-                audio.active_ramps.clear();
-                audio.active_ramps_scratch.clear();
-                if let Some(catalog) = inst
-                    .pending_audio_catalog
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                {
-                    audio.catalog = catalog;
-                }
-                let mut plugin = enter_plugin(&inst.plugin);
-                if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
-                    plugin.republish_snapshot();
-                }
+            return;
+        }
+
+        inst.lifecycle_state
+            .store(LIFECYCLE_INACTIVE, Ordering::Release);
+        {
+            let mut audio = inst.audio.enter();
+            inst.prepared_flag.store(false, Ordering::Release);
+            audio.prepared = false;
+            audio.active_ramps.clear();
+            audio.active_ramps_scratch.clear();
+            inst.render_catalog.reclaim();
+            inst.render_catalog.install(&mut audio.catalog);
+            inst.render_catalog.reclaim();
+            let mut plugin = enter_plugin(&inst.plugin);
+            if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
+                plugin.republish_snapshot();
             }
-            // Flush any pending main-queue work promptly on deactivation.
-            if let Some(dispatch) = &inst.host_dispatch {
-                dispatch.trigger_now();
-            }
+        }
+        if let Some(dispatch) = &inst.host_dispatch {
+            dispatch.stop_render_polling();
+        }
+        drop(lifecycle);
+
+        if inst.is_ui_thread() {
+            let queue = Arc::clone(&inst.host_queue);
+            host_drain::run_host_drain::<P>(&queue, ctx);
+        } else if let Some(dispatch) = &inst.host_dispatch {
+            dispatch.trigger_now();
         }
     });
 }
@@ -382,9 +385,12 @@ pub(crate) unsafe extern "C" fn cb_set_context_name<P: PluginExport>(
         };
         let mut info = TrackInfo::new();
         info.name = name;
-        let main = MainThread::assume();
-        if let Some(mut hooks) = inst.main_thread.try_borrow_mut(&main) {
-            hooks.track_info_changed(&main, &info);
+        *inst
+            .pending_context_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(info);
+        if let Some(dispatch) = &inst.host_dispatch {
+            dispatch.trigger_now();
         }
     });
 }
@@ -399,10 +405,7 @@ pub(crate) unsafe extern "C" fn cb_param_ids<P: PluginExport>(
             return 0;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        inst.exposed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .write_ids(out_ids, cap)
+        catalog::control_snapshot(ctx, &inst.exposed).write_ids(out_ids, cap)
     })
 }
 
@@ -417,11 +420,7 @@ pub(crate) unsafe extern "C" fn cb_param_info_by_id<P: PluginExport>(
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut local = AuParamInfoOut::default();
-        let found = inst
-            .exposed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .fill_info(id, &mut local);
+        let found = catalog::control_snapshot(ctx, &inst.exposed).fill_info(id, &mut local);
         if found {
             out.write(local);
         }
@@ -440,10 +439,7 @@ pub(crate) unsafe extern "C" fn cb_param_clump_name<P: PluginExport>(
             return 0;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        inst.exposed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .write_clump_name(clump_id, out, out_len)
+        catalog::control_snapshot(ctx, &inst.exposed).write_clump_name(clump_id, out, out_len)
     })
 }
 
@@ -491,6 +487,7 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
                 return;
             };
             {
+                let _render_signals = inst.render_signals.enter();
                 let _rt = RtSection::enter();
                 plugin.reset(&AudioConfig::new(sample_rate, max_frames).with_process_mode(mode));
             }
@@ -500,14 +497,9 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
         }
         inst.prepared_flag.store(false, Ordering::Release);
         audio.prepared = false;
-        if let Some(catalog) = inst
-            .pending_audio_catalog
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            audio.catalog = catalog;
-        }
+        inst.render_catalog.reclaim();
+        inst.render_catalog.install(&mut audio.catalog);
+        inst.render_catalog.reclaim();
         audio.sample_rate = sample_rate;
         audio.max_block_size = max_frames;
         // Match the exact AU flattening: main + first sidechain input and
@@ -819,6 +811,7 @@ fn emit_ramp_segment(
     seg_start_val: f64,
     seg_end_val: f64,
     remaining_inputs: u32,
+    overridden_at_end: bool,
 ) {
     let seg_len = clipped_end - clipped_start;
     if seg_len == 0 {
@@ -840,35 +833,35 @@ fn emit_ramp_segment(
         Automation::BlockSplit { min } => {
             let base_stride = min.max(32);
             let free_slots = len_u32(events.capacity().saturating_sub(events.len()));
+            let terminal_slots = u32::from(!overridden_at_end);
             let max_pts = free_slots
-                .saturating_sub(remaining_inputs.saturating_sub(1))
-                .clamp(1, 16);
-            if max_pts == 1 || seg_len <= base_stride {
-                events.push(Event {
-                    sample_offset: clipped_start,
-                    port: 0,
-                    body: EventBody::ParamChange {
+                .saturating_sub(
+                    remaining_inputs
+                        .saturating_sub(1)
+                        .saturating_add(terminal_slots),
+                )
+                .clamp(u32::from(overridden_at_end), 16);
+            let stride = base_stride.max(seg_len.div_ceil(max_pts.max(1)));
+            let mut offset = clipped_start;
+            while max_pts != 0 && offset < clipped_end {
+                let frac = f64::from(offset - clipped_start) / f64::from(seg_len);
+                events.push(Event::new(
+                    offset,
+                    EventBody::ParamChange {
+                        id: param_id,
+                        value: seg_start_val + (seg_end_val - seg_start_val) * frac,
+                    },
+                ));
+                offset = offset.saturating_add(stride);
+            }
+            if !overridden_at_end {
+                events.push(Event::new(
+                    clipped_end,
+                    EventBody::ParamChange {
                         id: param_id,
                         value: seg_end_val,
                     },
-                });
-            } else {
-                let stride = base_stride.max(seg_len.div_ceil(max_pts));
-                let mut off = clipped_start;
-                while off < clipped_end {
-                    let chunk_end = off.saturating_add(stride).min(clipped_end);
-                    let frac = f64::from(chunk_end - clipped_start) / f64::from(seg_len);
-                    let value = seg_start_val + (seg_end_val - seg_start_val) * frac;
-                    events.push(Event {
-                        sample_offset: off,
-                        port: 0,
-                        body: EventBody::ParamChange {
-                            id: param_id,
-                            value,
-                        },
-                    });
-                    off = chunk_end;
-                }
+                ));
             }
         }
     }
@@ -962,10 +955,27 @@ pub(crate) fn push_param_events_v2(
         // If the host explicitly delivered an event for this parameter at or
         // before frame 0 (either re-delivering the ramp or replacing it),
         // defer to `input` instead of double-emitting.
-        let replaced_at_start = input
+        if let Some(event) = input
             .iter()
-            .any(|ev| ev.param_id == ramp.param_id && ev.start_offset <= 0);
-        if replaced_at_start {
+            .find(|event| event.param_id == ramp.param_id && event.start_offset <= 0)
+        {
+            let repeats_ramp = event.duration_frames != 0
+                && event.flags & AU_PARAM_EVENT_HAS_START_VALUE == 0
+                && i64::from(event.start_offset) + i64::from(event.duration_frames)
+                    == i64::from(ramp.remaining_frames)
+                && f64::from(event.end_value).to_bits() == ramp.target_val.to_bits();
+            if repeats_ramp || event.start_offset == 0 {
+                record_track(
+                    tracker,
+                    ParamTrackEntry {
+                        id: ramp.param_id,
+                        start_offset: 0,
+                        end_offset: 0,
+                        start_val: ramp.current_val,
+                        end_val: ramp.current_val,
+                    },
+                );
+            }
             continue;
         }
         if params.parameter_affects_presentation(ramp.param_id) {
@@ -1001,7 +1011,8 @@ pub(crate) fn push_param_events_v2(
                     end_val: seg_end_val,
                 },
             );
-            let remaining_budget = len_u32(total_active.saturating_sub(i + 1) + input.len()).max(1);
+            // The emitter subtracts the segment being emitted from this count.
+            let remaining_budget = len_u32(total_active - i + input.len());
             emit_ramp_segment(
                 events,
                 automation,
@@ -1011,6 +1022,7 @@ pub(crate) fn push_param_events_v2(
                 seg_start_val,
                 seg_end_val,
                 remaining_budget,
+                stop_at != num_frames && seg_end == stop_at,
             );
             ramp.current_val = seg_end_val;
             ramp.remaining_frames -= seg_end;
@@ -1100,7 +1112,8 @@ pub(crate) fn push_param_events_v2(
             .filter(|later| {
                 later.param_id == ev.param_id
                     && i64::from(later.start_offset) >= start
-                    && i64::from(later.start_offset) < i64::from(clipped_end)
+                    && i64::from(later.start_offset) < nf
+                    && i64::from(later.start_offset) <= i64::from(clipped_end)
             })
             .map(|later| {
                 #[allow(clippy::cast_sign_loss)]
@@ -1177,6 +1190,7 @@ pub(crate) fn push_param_events_v2(
             seg_start_val,
             seg_end_val,
             len_u32(input.len() - idx),
+            next_override.is_some(),
         );
     }
 
@@ -1383,6 +1397,8 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
             return;
         };
 
+        let _render_signals = inst.render_signals.enter();
+
         // Host called render before AU initialized us - sample rate
         // and smoothers haven't been primed. Zero outputs and bail. Same
         // after a panic until the next prepare (plugin state unknown).
@@ -1452,6 +1468,9 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         // can be borrowed simultaneously - the guard's `Deref` can't
         // split-borrow.
         let scr = &mut *audio;
+        if inst.render_catalog.install(&mut scr.catalog) {
+            inst.render_signals.mark();
+        }
 
         // Start the block's event list fresh, then drain any `SysEx` the
         // host queued through `MusicDeviceSysEx` (the shim's `au_v2_sysex`
@@ -1530,6 +1549,8 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         scr.feedback_epoch.edits = inst.current_edit_seq();
         let mut presentation_affected = false;
         let mut staged_v2_ramps = false;
+        let mut exact_ramp_boundaries = false;
+        let mut exact_step_boundaries = false;
         match param_input {
             AuParamInput::V1 {
                 events: param_events,
@@ -1584,6 +1605,11 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
                     } else {
                         &[]
                     };
+                    exact_ramp_boundaries = !scr.active_ramps.is_empty()
+                        || pe_slice.iter().any(|event| event.duration_frames != 0);
+                    exact_step_boundaries = pe_slice.iter().any(|event| {
+                        event.start_offset > 0 && event.flags & AU_PARAM_EVENT_EXACT_OFFSET != 0
+                    });
                     // Stage ramp mutations into `active_ramps_scratch` and commit
                     // only after input staging succeeds so a rejected slice never
                     // loses in-flight multi-slice AUv3 ramps.
@@ -1727,14 +1753,38 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
                 sample_rate: scr.sample_rate,
                 process_mode: moose_core::c_abi_driver::load_render_mode(&inst.render_mode),
                 catalog: &scr.catalog,
-                automation: inst.automation,
+                automation: if (exact_ramp_boundaries || exact_step_boundaries)
+                    && matches!(inst.automation, Automation::BlockSplit { .. })
+                {
+                    // Preserve scheduled AUv2 steps and the boundaries emitted
+                    // by the ramp generator, which spaces intermediate points itself.
+                    Automation::BlockSplit { min: 1 }
+                } else {
+                    inst.automation
+                },
                 bus_routing,
-                delay: &inst.delay,
-                host_queue: &inst.host_queue,
             },
         );
+        if exact_ramp_boundaries && matches!(inst.automation, Automation::BlockSplit { .. }) {
+            for event in scr
+                .event_list
+                .iter()
+                .filter(|event| event.sample_offset == len_u32(num_frames))
+            {
+                if let EventBody::ParamChange { id, value } = event.body {
+                    inst.params_arc.set_plain(id, value);
+                }
+            }
+        }
+        if inst
+            .delay
+            .observe_and_signal_no_wake(plugin.latency(), plugin.tail(), &inst.host_queue)
+        {
+            inst.render_signals.mark();
+        }
         if presentation_affected {
-            inst.host_queue.signal(HostSignal::PRESENTATION);
+            inst.host_queue.signal_no_wake(HostSignal::PRESENTATION);
+            inst.render_signals.mark();
         }
     })
     .is_some();
@@ -1810,12 +1860,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
 pub(crate) unsafe extern "C" fn cb_param_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        len_u32(
-            inst.exposed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len(),
-        )
+        len_u32(catalog::control_snapshot(ctx, &inst.exposed).len())
     }
 }
 
@@ -1856,6 +1901,14 @@ pub(crate) unsafe extern "C" fn cb_param_format_value<P: PluginExport>(
 ) -> u32 {
     run_extern_callback_with::<P, u32>("au", "format_value", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
+        if let Some(snapshot) = catalog::scoped_snapshot(ctx, &inst.exposed)
+            && let Some(label) = snapshot.choice_label(id, value)
+        {
+            if out.is_null() || out_len == 0 {
+                return 0;
+            }
+            return len_u32(copy_c_str(out, out_len as usize, label));
+        }
         moose_core::c_abi_driver::format_param_to_c_buf(
             inst.params_arc.as_ref(),
             id,

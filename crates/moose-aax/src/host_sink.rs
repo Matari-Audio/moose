@@ -393,10 +393,11 @@ impl<P: PluginExport> HostSink for AaxSink<'_, P> {
         if self.inst.host_queue.is_closed() {
             return;
         }
-        if self.inst.delay.commit_latency() {
-            let samples = self.inst.delay.latency();
-            unsafe { self.inst.host_sink.latency_changed(samples) };
-        }
+        // A reset may already have published the prepared latency to both
+        // slots. The queued signal still carries a submission obligation.
+        let _ = self.inst.delay.commit_latency();
+        let samples = self.inst.delay.latency();
+        unsafe { self.inst.host_sink.latency_changed(samples) };
     }
 
     fn tail_changed(&mut self) {

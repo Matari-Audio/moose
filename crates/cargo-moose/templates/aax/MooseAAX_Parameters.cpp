@@ -160,12 +160,14 @@ void MooseAAX_Parameters::SinkReleaseParam(void* user_data, uint32_t param_id) {
 void MooseAAX_Parameters::SinkLatencyChanged(void* user_data, uint32_t samples) {
     auto* self = static_cast<MooseAAX_Parameters*>(user_data);
     if (!self) return;
-    const int32_t latency = static_cast<int32_t>(samples);
-    if (latency == self->mLastReportedLatency) return;
-    AAX_IController* controller = self->Controller();
-    if (controller && controller->SetSignalLatency(latency) == AAX_SUCCESS) {
-        self->mLastReportedLatency = latency;
-    }
+    self->mLatency.Request(samples);
+}
+
+void MooseAAX_Parameters::SubmitLatency() {
+    mLatency.Flush([this](uint32_t samples) {
+        AAX_IController* controller = Controller();
+        return controller && controller->SetSignalLatency(static_cast<int32_t>(samples)) == AAX_SUCCESS;
+    });
 }
 
 void MooseAAX_Parameters::SinkStateDirty(void* user_data) {
@@ -311,8 +313,10 @@ AAX_Result MooseAAX_Parameters::EffectInit() {
         AddSynchronizedParameter(*rawParam);
     }
 
-    // Drain initial latency signal immediately so Pro Tools has delay compensation up front.
+    // The prepared value is available before the first render or timer turn.
     cbs->drain_host_queue(mRustCtx);
+    mLatency.Request(cbs->latency_samples(mRustCtx));
+    SubmitLatency();
     return AAX_SUCCESS;
 }
 
@@ -337,6 +341,7 @@ AAX_Result MooseAAX_Parameters::TimerWakeup() {
     const MooseAaxCallbacks* cbs = MooseAax_Callbacks();
     if (mRustCtx && cbs) {
         cbs->drain_host_queue(mRustCtx);
+        SubmitLatency();
     }
     return AAX_CMonolithicParameters::TimerWakeup();
 }

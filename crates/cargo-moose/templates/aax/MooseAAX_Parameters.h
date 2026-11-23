@@ -56,6 +56,7 @@ private:
     static void SinkSetParamNormalized(void* user_data, uint32_t param_id, double normalized);
     static void SinkReleaseParam(void* user_data, uint32_t param_id);
     static void SinkLatencyChanged(void* user_data, uint32_t samples);
+    void SubmitLatency();
     static void SinkStateDirty(void* user_data);
     static void SinkParamValuesChanged(void* user_data);
     static void SinkParamPresentationChanged(void* user_data);
@@ -71,7 +72,7 @@ private:
     std::vector<float> mSilence;
     std::vector<MooseAaxNativeEvent> mNativeEvents;
     std::vector<uint8_t> mNativeSysex;
-    int32_t mLastReportedLatency = -1;
+    MooseAaxLatency mLatency;
     std::atomic<uint64_t> mStateGeneration{0};
     mutable std::atomic<uint64_t> mSavedGeneration{0};
 };

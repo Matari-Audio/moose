@@ -477,6 +477,9 @@ impl<const N: usize> DynamicParams<N> {
             defs: &mut layout.defs,
         });
         let change = self.commit(&mut layout, &before, true);
+        if !change.is_empty() {
+            self.revision.fetch_add(1, Ordering::Release);
+        }
         drop(layout);
         self.publish(change);
         result
@@ -538,7 +541,6 @@ impl<const N: usize> DynamicParams<N> {
         if change.is_empty() {
             return;
         }
-        self.revision.fetch_add(1, Ordering::Release);
         self.note_edit();
         self.pending.fetch_or(change.bits(), Ordering::AcqRel);
         let signal = self
@@ -833,6 +835,7 @@ impl<const N: usize> Params for DynamicParams<N> {
         let mut layout = self.lock();
         let before = std::mem::replace(&mut layout.defs, defs);
         let change = self.commit(&mut layout, &before, false);
+        self.revision.fetch_add(1, Ordering::Release);
         drop(layout);
         self.publish(change | CatalogChange::VALUES);
     }

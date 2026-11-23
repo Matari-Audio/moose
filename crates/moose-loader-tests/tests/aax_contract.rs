@@ -331,3 +331,16 @@ fn aax_render_offline_mode_latency_drain_and_zero_audio_allocations() {
 
     unsafe { (cbs.destroy)(ctx) };
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn aax_adapter_retries_initial_pdc_until_the_controller_accepts_it() {
+    #[link(name = "aax_latency_harness", kind = "static")]
+    #[link(name = "stdc++")]
+    unsafe extern "C" {
+        fn moose_test_aax_latency_retry() -> bool;
+    }
+
+    // SAFETY: the harness uses only its local fake controller state.
+    assert!(unsafe { moose_test_aax_latency_retry() });
+}

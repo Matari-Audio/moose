@@ -16,10 +16,8 @@ use crate::bus_routing::{BusActivation, BusRouting};
 use crate::cast::len_u32;
 use crate::chunked_process::{ChunkedProcess, process_chunked_with_bus_routing_and_catalog};
 use crate::config::ProcessMode;
-use crate::delay::ReportedDelay;
 use crate::events::{EventList, ExactEvent, ExactEventBody, SYSEX_POOL_PREALLOC, TransportInfo};
 use crate::export::PluginExport;
-use crate::host_queue::HostQueue;
 use crate::info::Automation;
 use crate::plugin::PluginRuntime;
 use crate::snapshot::SnapshotSlot;
@@ -253,13 +251,10 @@ pub struct CAbiAudioBlock<'a, P: PluginExport> {
     pub catalog: &'a ParamCatalog,
     pub automation: Automation,
     pub bus_routing: BusRouting,
-    pub delay: &'a ReportedDelay,
-    pub host_queue: &'a HostQueue,
 }
 
 /// Execute one chunked audio block over raw host `f32` channel pointers,
-/// handling `f64` widening/narrowing, output event sorting, and event-driven
-/// `ReportedDelay` signalling.
+/// handling `f64` widening/narrowing and output event sorting.
 ///
 /// # Safety
 /// `block.inputs` and `block.outputs` must be valid for the declared channel
@@ -304,11 +299,6 @@ pub unsafe fn run_c_abi_audio_block<P: PluginExport>(block: &mut CAbiAudioBlock<
             .finish_widening(block.outputs, block.num_output_channels, block.num_frames);
     }
     block.output_events.ensure_sorted_by_offset();
-    block.delay.observe_and_signal(
-        block.plugin.latency(),
-        block.plugin.tail(),
-        block.host_queue,
-    );
 }
 
 // ---------------------------------------------------------------------------

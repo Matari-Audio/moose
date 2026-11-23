@@ -196,6 +196,7 @@ pub(crate) fn cmd_package_macos(args: &[String], selection: &super::SuiteSelecti
     let opts = PackageOpts {
         config: &config,
         formats: &formats,
+        archs: &archs,
         scope,
         effective_scope,
         version: &version,
@@ -280,7 +281,7 @@ fn stage_components_only(root: &Path, p: &PluginDef, o: &PackageOpts) -> Res {
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
             PkgFormat::Au2 => stage_au2(root, p, o.config, &staging, None),
             PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
-            PkgFormat::Aax => stage_aax(root, p, o.config, &staging),
+            PkgFormat::Aax => stage_aax(root, p, o.config, &staging, o.archs),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
         match result {
@@ -916,6 +917,7 @@ pub(crate) fn build_and_lipo_standalone(
 struct PackageOpts<'a> {
     config: &'a Config,
     formats: &'a [PkgFormat],
+    archs: &'a [MacArch],
     /// The developer-requested scope. Drives the `.pkg` filename suffix
     /// so a build's output name stays stable regardless of widening.
     scope: PkgScope,
@@ -1037,7 +1039,7 @@ fn package_one_plugin(root: &Path, p: &PluginDef, dist_dir: &Path, o: &PackageOp
             PkgFormat::Vst3 => stage_vst3(root, p, o.config, &staging, None),
             PkgFormat::Au2 => stage_au2(root, p, o.config, &staging, None),
             PkgFormat::Au3 => stage_au3(root, p, o.config, &staging),
-            PkgFormat::Aax => stage_aax(root, p, o.config, &staging),
+            PkgFormat::Aax => stage_aax(root, p, o.config, &staging, o.archs),
             PkgFormat::Standalone => stage_standalone(root, p, o.config, &staging),
         };
         match result {

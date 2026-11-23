@@ -26,11 +26,11 @@ moose::enable_rt_paranoid!();
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moose::prelude::*;
-use moose_au::ffi::{AuCallbacks, AuPluginDescriptor};
+use moose_au::ffi::{AU_PROCESS_OK, AuCallbacks, AuParamEventV2, AuPluginDescriptor};
 use moose_core::bus::BusLayout;
 use moose_core::editor::RawWindowHandle;
 use moose_core::export::PluginExport;
@@ -58,6 +58,7 @@ const K_PROP_SUPPORTED_NUM_CHANNELS: u32 = 13;
 const K_PROP_TAIL_TIME: u32 = 20;
 const K_PROP_CONTEXT_NAME: u32 = 25;
 const K_PROP_PARAMETER_CLUMP_NAME: u32 = 31;
+const K_PROP_OFFLINE_RENDER: u32 = 37;
 
 const K_SEL_INITIALIZE: i16 = 1;
 const K_SEL_UNINITIALIZE: i16 = 2;
@@ -68,6 +69,10 @@ const K_SEL_GET_PARAMETER: i16 = 6;
 const K_SEL_SET_PARAMETER: i16 = 7;
 const K_SEL_RESET: i16 = 9;
 const K_SEL_ADD_PROPERTY_LISTENER: i16 = 10;
+const K_SEL_REMOVE_PROPERTY_LISTENER: i16 = 11;
+const K_SEL_REMOVE_PROPERTY_LISTENER_WITH_DATA: i16 = 18;
+const K_SEL_ADD_RENDER_NOTIFY: i16 = 15;
+const K_SEL_REMOVE_RENDER_NOTIFY: i16 = 16;
 const K_SEL_RENDER: i16 = 14;
 const K_SEL_SCHEDULE_PARAMETERS: i16 = 17;
 const K_SEL_MIDI_EVENT: i16 = 257;
@@ -76,6 +81,17 @@ const K_EVENT_PARAM_VALUE_CHANGE: u32 = 0;
 const K_EVENT_PROPERTY_CHANGE: u32 = 3;
 
 const K_PARAM_EVENT_RAMPED: u32 = 2;
+const K_RENDER_PRE: u32 = 1 << 2;
+
+type PropertyListener = unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32);
+type RenderNotify = unsafe extern "C" fn(
+    *mut c_void,
+    *mut u32,
+    *const AudioTimeStamp,
+    u32,
+    u32,
+    *mut AudioBufferList2,
+) -> i32;
 
 #[repr(C)]
 struct AudioComponentPlugInInterface {
@@ -332,11 +348,11 @@ impl Editor for NoEditor {
     fn close(&mut self) {}
 }
 
-struct ExportHarness {
+struct ExportHarness<const BLOCK_SPLIT: bool = false> {
     inner: StaticShell<HarnessParams, moose::Lifecycle<HarnessPlugin>, f32>,
 }
 
-impl moose_core::plugin::PluginRuntime for ExportHarness {
+impl<const BLOCK_SPLIT: bool> moose_core::plugin::PluginRuntime for ExportHarness<BLOCK_SPLIT> {
     type Sample = f32;
     fn info() -> PluginInfo {
         PluginInfo {
@@ -369,7 +385,11 @@ impl moose_core::plugin::PluginRuntime for ExportHarness {
             au_name: None,
             au3_name: None,
             mute_preview_output: false,
-            automation: Automation::PerSample,
+            automation: if BLOCK_SPLIT {
+                Automation::BlockSplit { min: 32 }
+            } else {
+                Automation::PerSample
+            },
             legacy_au_keys: &[],
             legacy_aax_chunks: &[],
         }
@@ -403,7 +423,7 @@ impl moose_core::plugin::PluginRuntime for ExportHarness {
     }
 }
 
-impl PluginExport for ExportHarness {
+impl<const BLOCK_SPLIT: bool> PluginExport for ExportHarness<BLOCK_SPLIT> {
     type Params = HarnessParams;
     fn create() -> Self {
         Self {
@@ -530,20 +550,40 @@ impl FakeAuUnit {
         }
     }
 
-    fn add_property_listener(
+    fn add_property_listener(&self, prop: u32, cb: PropertyListener, ud: *mut c_void) -> i32 {
+        unsafe {
+            let f: unsafe extern "C" fn(*mut c_void, u32, PropertyListener, *mut c_void) -> i32 =
+                std::mem::transmute(self.lookup(K_SEL_ADD_PROPERTY_LISTENER));
+            f(self.iface.cast(), prop, cb, ud)
+        }
+    }
+
+    fn remove_property_listener(&self, prop: u32, cb: PropertyListener) -> i32 {
+        unsafe {
+            let f: unsafe extern "C" fn(*mut c_void, u32, PropertyListener) -> i32 =
+                std::mem::transmute(self.lookup(K_SEL_REMOVE_PROPERTY_LISTENER));
+            f(self.iface.cast(), prop, cb)
+        }
+    }
+
+    fn remove_property_listener_with_data(
         &self,
         prop: u32,
-        cb: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32),
+        cb: PropertyListener,
         ud: *mut c_void,
     ) -> i32 {
         unsafe {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                u32,
-                unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32),
-                *mut c_void,
-            ) -> i32 = std::mem::transmute(self.lookup(K_SEL_ADD_PROPERTY_LISTENER));
+            let f: unsafe extern "C" fn(*mut c_void, u32, PropertyListener, *mut c_void) -> i32 =
+                std::mem::transmute(self.lookup(K_SEL_REMOVE_PROPERTY_LISTENER_WITH_DATA));
             f(self.iface.cast(), prop, cb, ud)
+        }
+    }
+
+    fn add_render_notify(&self, cb: RenderNotify, ud: *mut c_void) -> i32 {
+        unsafe {
+            let f: unsafe extern "C" fn(*mut c_void, RenderNotify, *mut c_void) -> i32 =
+                std::mem::transmute(self.lookup(K_SEL_ADD_RENDER_NOTIFY));
+            f(self.iface.cast(), cb, ud)
         }
     }
 
@@ -643,7 +683,11 @@ impl Drop for FakeAuUnit {
     }
 }
 
-fn register_harness_plugin() {
+fn register_harness_plugin() -> &'static AuPluginDescriptor {
+    register_harness_plugin_for::<ExportHarness>()
+}
+
+fn register_harness_plugin_for<P: PluginExport>() -> &'static AuPluginDescriptor {
     static NAME: &[u8] = b"AU Harness\0";
     static VENDOR: &[u8] = b"Moose\0";
     unsafe {
@@ -669,14 +713,240 @@ fn register_harness_plugin() {
             num_layouts: 0,
             sidechain_in_channels: 0,
         }));
-        let cb = Box::leak(Box::new(moose_au::callbacks::<ExportHarness>()));
+        let cb = Box::leak(Box::new(moose_au::callbacks::<P>()));
         moose_au_register_v3(desc, cb);
+        desc
     }
 }
 
 // ---------------------------------------------------------------------------
 // Tests exercising the real AU v2 C shim on Linux
 // ---------------------------------------------------------------------------
+
+#[test]
+fn au_v2_loader_rejects_a_version_only_table_before_open_reads_the_tail() {
+    let _guard = HARNESS_LOCK.lock().unwrap();
+    let descriptor = register_harness_plugin();
+    unsafe {
+        moose_au_test_reset_registration();
+        for bad_version in [0_u32, moose_au::ffi::MOOSE_AU_ABI_VERSION - 1] {
+            moose_au_register_v3(descriptor, ptr::from_ref(&bad_version).cast());
+            let iface = moose_au_v2_factory_bridge(ptr::null());
+            assert!(!iface.is_null());
+            let rejected = (*iface).open.unwrap()(iface.cast(), iface.cast());
+            (*iface).close.unwrap()(iface.cast());
+            assert_eq!(rejected, -10875);
+        }
+        let callbacks = moose_au::callbacks::<ExportHarness>();
+        moose_au_register_v3(descriptor, &raw const callbacks);
+        drop(FakeAuUnit::open());
+        moose_au_test_reset_registration();
+    }
+}
+
+#[test]
+fn au_v2_property_listener_removal_uses_the_selected_identity() {
+    let _guard = HARNESS_LOCK.lock().unwrap();
+    register_harness_plugin();
+    let unit = FakeAuUnit::open();
+
+    unsafe extern "C" fn listener(ud: *mut c_void, _: *mut c_void, _: u32, _: u32, _: u32) {
+        unsafe { &*ud.cast::<AtomicU32>() }.fetch_add(1, Ordering::Relaxed);
+    }
+    let first = AtomicU32::new(0);
+    let second = AtomicU32::new(0);
+    let first_ud = ptr::from_ref(&first).cast_mut().cast();
+    let second_ud = ptr::from_ref(&second).cast_mut().cast();
+    for _ in 0..31 {
+        assert_eq!(
+            unit.add_property_listener(K_PROP_CONTEXT_NAME, listener, first_ud),
+            0
+        );
+    }
+    assert_eq!(
+        unit.add_property_listener(K_PROP_CONTEXT_NAME, listener, second_ud),
+        0
+    );
+    assert_eq!(
+        unit.add_property_listener(K_PROP_CONTEXT_NAME, listener, second_ud),
+        -108
+    );
+    assert_eq!(
+        unit.remove_property_listener_with_data(K_PROP_CONTEXT_NAME, listener, first_ud),
+        0
+    );
+
+    let empty: *const c_void = ptr::null();
+    assert_eq!(
+        unit.set_property(K_PROP_CONTEXT_NAME, K_SCOPE_GLOBAL, 0, &empty),
+        0
+    );
+    assert_eq!(first.load(Ordering::Relaxed), 0);
+    assert_eq!(second.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        unit.add_property_listener(K_PROP_CONTEXT_NAME, listener, first_ud),
+        0
+    );
+    assert_eq!(
+        unit.add_property_listener(K_PROP_TAIL_TIME, listener, first_ud),
+        0
+    );
+    assert_eq!(
+        unit.remove_property_listener(K_PROP_CONTEXT_NAME, listener),
+        0
+    );
+    assert_eq!(
+        unit.set_property(K_PROP_CONTEXT_NAME, K_SCOPE_GLOBAL, 0, &empty),
+        0
+    );
+    assert_eq!(first.load(Ordering::Relaxed), 0);
+    assert_eq!(second.load(Ordering::Relaxed), 1);
+    assert_eq!(unit.remove_property_listener(K_PROP_TAIL_TIME, listener), 0);
+}
+
+#[test]
+fn au_v2_render_notify_removal_waits_for_its_refcon() {
+    use std::sync::Barrier;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    let _guard = HARNESS_LOCK.lock().unwrap();
+    register_harness_plugin();
+    let unit = FakeAuUnit::open();
+    assert_eq!(unit.initialize(), 0);
+
+    struct Callback {
+        entered: Barrier,
+        release: Barrier,
+        calls: AtomicU32,
+    }
+    unsafe extern "C" fn notify(
+        ud: *mut c_void,
+        _: *mut u32,
+        _: *const AudioTimeStamp,
+        _: u32,
+        _: u32,
+        _: *mut AudioBufferList2,
+    ) -> i32 {
+        let cb = unsafe { &*ud.cast::<Callback>() };
+        if cb.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            cb.entered.wait();
+            cb.release.wait();
+        }
+        0
+    }
+    let callback = Box::new(Callback {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+        calls: AtomicU32::new(0),
+    });
+    let ud = ptr::from_ref(callback.as_ref()) as usize;
+    assert_eq!(unit.add_render_notify(notify, ud as *mut c_void), 0);
+
+    let iface = unit.iface as usize;
+    let remove: unsafe extern "C" fn(*mut c_void, RenderNotify, *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(unit.lookup(K_SEL_REMOVE_RENDER_NOTIFY)) };
+    std::thread::scope(|scope| {
+        let render = scope.spawn(move || {
+            let unit = std::mem::ManuallyDrop::new(FakeAuUnit {
+                iface: iface as *mut AudioComponentPlugInInterface,
+            });
+            unit.render(32, &mut [0.0; 32], &mut [0.0; 32])
+        });
+        callback.entered.wait();
+        let (starting, started) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let removing = scope.spawn(move || {
+            starting.send(()).unwrap();
+            let result = unsafe { remove(iface as *mut c_void, notify, ud as *mut c_void) };
+            finished.send(result).unwrap();
+        });
+        started.recv().unwrap();
+        let early = done.recv_timeout(Duration::from_millis(30));
+        callback.release.wait();
+        assert_eq!(render.join().unwrap(), 0);
+        removing.join().unwrap();
+        assert_eq!(early, Err(RecvTimeoutError::Timeout));
+        assert_eq!(done.recv().unwrap(), 0);
+    });
+    assert_eq!(callback.calls.load(Ordering::Relaxed), 1);
+    drop(callback);
+    assert_eq!(unit.render(32, &mut [0.0; 32], &mut [0.0; 32]), 0);
+}
+
+#[test]
+fn au_v2_render_thread_set_parameter_preserves_the_requested_offset() {
+    let _guard = HARNESS_LOCK.lock().unwrap();
+    register_harness_plugin_for::<ExportHarness<true>>();
+    let unit = FakeAuUnit::open();
+    assert_eq!(unit.set_parameter(0, 0.25), 0);
+    assert_eq!(
+        unit.set_property(K_PROP_OFFLINE_RENDER, K_SCOPE_GLOBAL, 0, &1u32),
+        0
+    );
+    assert_eq!(unit.initialize(), 0);
+
+    struct Write {
+        iface: *mut AudioComponentPlugInInterface,
+        before_render: AtomicU32,
+        status: AtomicI32,
+    }
+    unsafe extern "C" fn notify(
+        ud: *mut c_void,
+        flags: *mut u32,
+        _: *const AudioTimeStamp,
+        _: u32,
+        _: u32,
+        _: *mut AudioBufferList2,
+    ) -> i32 {
+        if unsafe { *flags } & K_RENDER_PRE != 0 {
+            let write = unsafe { &*ud.cast::<Write>() };
+            let unit = std::mem::ManuallyDrop::new(FakeAuUnit { iface: write.iface });
+            let set: unsafe extern "C" fn(*mut c_void, u32, u32, u32, f32, u32) -> i32 =
+                unsafe { std::mem::transmute(unit.lookup(K_SEL_SET_PARAMETER)) };
+            let status = unsafe { set(unit.iface.cast(), 0, K_SCOPE_GLOBAL, 0, 1.0, 16) };
+            write.status.store(status, Ordering::Relaxed);
+            write
+                .before_render
+                .store(unit.get_parameter(0).to_bits(), Ordering::Relaxed);
+        }
+        0
+    }
+
+    let write = Write {
+        iface: unit.iface,
+        before_render: AtomicU32::new(0),
+        status: AtomicI32::new(i32::MIN),
+    };
+    assert_eq!(
+        unit.add_render_notify(notify, ptr::from_ref(&write).cast_mut().cast()),
+        0
+    );
+    let mut out_l = [0.0; 32];
+    let mut out_r = [0.0; 32];
+    assert_eq!(unit.render(32, &mut out_l, &mut out_r), 0);
+    assert_eq!(write.status.load(Ordering::Relaxed), 0);
+    for output in [&out_l, &out_r] {
+        assert_eq!(&output[..16], &[0.25; 16]);
+        assert_eq!(&output[16..], &[1.0; 16]);
+    }
+    assert!((f32::from_bits(write.before_render.load(Ordering::Relaxed)) - 0.25).abs() < 1e-6);
+    assert!((unit.get_parameter(0) - 1.0).abs() < 1e-6);
+    assert_eq!(unit.set_parameter(0, 0.5), 0);
+    assert!((unit.get_parameter(0) - 0.5).abs() < 1e-6);
+
+    let iface = unit.iface as usize;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let worker = std::mem::ManuallyDrop::new(FakeAuUnit {
+                iface: iface as *mut AudioComponentPlugInInterface,
+            });
+            assert_eq!(worker.render(32, &mut [0.0; 32], &mut [0.0; 32]), 0);
+            assert_eq!(worker.set_parameter(0, 0.75), 0);
+            assert!((worker.get_parameter(0) - 0.75).abs() < 1e-6);
+        });
+    });
+}
 
 #[test]
 fn au_v2_shim_200_instances_no_global_map_limit() {
@@ -883,7 +1153,10 @@ fn au_v2_shim_context_name_live_catalog_ramps_midi_and_class_info() {
         unit.set_property(K_PROP_CONTEXT_NAME, K_SCOPE_GLOBAL, 0, &cf_track),
         0
     );
-    unsafe { CFRelease(cf_track) };
+    unsafe {
+        CFRelease(cf_track);
+        moose_au::drain_host_queue_for_test::<ExportHarness>(unit.rust_ctx());
+    }
     assert_eq!(LAST_TRACK_NAME.lock().unwrap().as_deref(), Some("Lead Vox"));
 
     // 3. Ramped parameter scheduling + off-render-thread MIDI SPSC queue.
@@ -959,6 +1232,86 @@ fn au_v2_shim_context_name_live_catalog_ramps_midi_and_class_info() {
 }
 
 #[test]
+fn au_block_split_renders_boundaries_and_retains_an_auv3_ramp() {
+    let _guard = HARNESS_LOCK.lock().unwrap();
+    register_harness_plugin_for::<ExportHarness<true>>();
+    let unit = FakeAuUnit::open();
+    assert_eq!(unit.set_parameter(0, 0.0), 0);
+    assert_eq!(unit.initialize(), 0);
+    let callbacks = moose_au::callbacks::<ExportHarness<true>>();
+
+    let render = |events: &[AuParamEventV2]| {
+        let mut left = [0.0; 64];
+        let mut right = [0.0; 64];
+        let inputs = [ptr::null(), ptr::null()];
+        let mut outputs = [left.as_mut_ptr(), right.as_mut_ptr()];
+        let status = unsafe {
+            (callbacks.process_native_v13)(
+                unit.rust_ctx(),
+                inputs.as_ptr(),
+                outputs.as_mut_ptr(),
+                2,
+                2,
+                1,
+                1,
+                64,
+                ptr::null(),
+                0,
+                0,
+                events.as_ptr(),
+                events.len() as u32,
+                0,
+                ptr::null(),
+            )
+        };
+        assert_eq!(status, AU_PROCESS_OK);
+        left
+    };
+    let ramp = AuParamEventV2 {
+        start_offset: 0,
+        duration_frames: 160,
+        param_id: 0,
+        flags: 0,
+        start_value: 0.0,
+        end_value: 1.0,
+    };
+    let near = |value: f32, expected: f32| {
+        assert!((value - expected).abs() < 1e-6, "{value} != {expected}");
+    };
+
+    let first = render(&[ramp]);
+    near(first[0], 0.0);
+    near(first[31], 0.0);
+    near(first[32], 0.2);
+    near(first[63], 0.2);
+    near(unit.get_parameter(0), 0.4);
+
+    let second = render(&[]);
+    near(second[0], 0.4);
+    near(second[32], 0.6);
+    near(unit.get_parameter(0), 0.8);
+
+    let third = render(&[AuParamEventV2 {
+        start_offset: 13,
+        duration_frames: 0,
+        end_value: 0.25,
+        ..ramp
+    }]);
+    near(third[0], 0.8);
+    near(third[12], 0.8);
+    near(third[13], 0.25);
+    near(unit.get_parameter(0), 0.25);
+
+    let exact_end = render(&[AuParamEventV2 {
+        duration_frames: 64,
+        ..ramp
+    }]);
+    near(exact_end[0], 0.25);
+    near(exact_end[63], 0.625);
+    near(unit.get_parameter(0), 1.0);
+}
+
+#[test]
 fn au_v2_shim_render_is_allocation_free() {
     let _g = HARNESS_LOCK.lock().unwrap();
     register_harness_plugin();
@@ -979,5 +1332,102 @@ fn au_v2_shim_render_is_allocation_free() {
     assert_eq!(
         allocs, 0,
         "au_v2_render allocated {allocs} times on the audio thread"
+    );
+}
+
+#[test]
+fn au_v2_render_set_parameter_overflow_falls_back_instead_of_dropping() {
+    let _g = HARNESS_LOCK.lock().unwrap();
+    register_harness_plugin_for::<ExportHarness<true>>();
+    SEEN_MIDI_NOTES.lock().unwrap().clear();
+
+    let unit = FakeAuUnit::open();
+    assert_eq!(unit.initialize(), 0);
+    assert_eq!(unit.set_parameter(0, 0.1), 0);
+    assert_eq!(unit.set_parameter(1, 0.2), 0);
+
+    let iface_addr = unit.iface as usize;
+    let (before_change, at_change) = std::thread::spawn(move || {
+        let audio_unit = std::mem::ManuallyDrop::new(FakeAuUnit {
+            iface: iface_addr as *mut AudioComponentPlugInInterface,
+        });
+        let mut out_l = [0.0f32; 32];
+        let mut out_r = [0.0f32; 32];
+        // Establish this thread as `audioThreadId` distinct from `controlThreadId`.
+        assert_eq!(audio_unit.render(32, &mut out_l, &mut out_r), 0);
+
+        let set_at: unsafe extern "C" fn(*mut c_void, u32, u32, u32, f32, u32) -> i32 =
+            unsafe { std::mem::transmute(audio_unit.lookup(K_SEL_SET_PARAMETER)) };
+        let midi_event: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> i32 =
+            unsafe { std::mem::transmute(audio_unit.lookup(K_SEL_MIDI_EVENT)) };
+
+        // Queue a full 256-event MIDI burst alongside a valid earlier parameter
+        // (param 0 -> 0.5 at offset 16).
+        for i in 0..256u32 {
+            assert_eq!(
+                unsafe { midi_event(audio_unit.iface.cast(), 0x90, 24 + (i % 64), 100, 0) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { set_at(audio_unit.iface.cast(), 0, K_SCOPE_GLOBAL, 0, 0.5, 16) },
+            0
+        );
+        // Fill the remaining 511 slots with distinct dummy IDs.
+        for dummy_id in 10_000u32..(10_000 + 511) {
+            assert_eq!(
+                unsafe {
+                    set_at(
+                        audio_unit.iface.cast(),
+                        dummy_id,
+                        K_SCOPE_GLOBAL,
+                        0,
+                        0.25,
+                        1,
+                    )
+                },
+                0
+            );
+        }
+        // Coalesce an existing queued ID (param 0 -> 0.6 at offset 16) and send
+        // a 513th distinct ID (param 1 -> 0.75) that overflows into fallback.
+        assert_eq!(
+            unsafe { set_at(audio_unit.iface.cast(), 0, K_SCOPE_GLOBAL, 0, 0.6, 16) },
+            0
+        );
+        assert_eq!(
+            unsafe { set_at(audio_unit.iface.cast(), 1, K_SCOPE_GLOBAL, 0, 0.75, 1) },
+            0
+        );
+
+        // Render must still succeed and process all 256 MIDI + 512 param events.
+        assert_eq!(audio_unit.render(32, &mut out_l, &mut out_r), 0);
+        (out_l[15], out_l[16])
+    })
+    .join()
+    .unwrap();
+
+    assert!(
+        (before_change - 0.1).abs() < 1e-6,
+        "param 0 applied before offset 16: got {before_change}, expected 0.1"
+    );
+    assert!(
+        (at_change - 0.6).abs() < 1e-6,
+        "coalesced param 0 not applied at offset 16: got {at_change}, expected 0.6"
+    );
+    assert_eq!(
+        SEEN_MIDI_NOTES.lock().unwrap().len(),
+        256,
+        "all 256 MIDI notes must survive full parameter queue overflow"
+    );
+    let got0 = unit.get_parameter(0);
+    assert!(
+        (got0 - 0.6).abs() < 1e-6,
+        "coalesced param 0 lost: got {got0}, expected 0.6"
+    );
+    let got1 = unit.get_parameter(1);
+    assert!(
+        (got1 - 0.75).abs() < 1e-6,
+        "overflowing render-thread SetParameter dropped param 1: got {got1}, expected 0.75"
     );
 }

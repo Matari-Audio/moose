@@ -1,6 +1,6 @@
 //! Per-instance state behind the AU shim's opaque context.
 
-use crate::catalog::AuExposedParams;
+use crate::catalog::{AuExposedParams, RenderCatalog};
 use crate::host_drain::{self, HostSink};
 use crate::output_events::NthCursor;
 use crate::output_events::UmpDrainCursor;
@@ -113,6 +113,8 @@ pub(crate) struct AuInstance<P: PluginExport> {
     /// Per-instance main-queue `DATA_OR` dispatch source for event-driven
     /// main-thread drains (open..close).
     pub(crate) host_dispatch: Option<host_drain::Dispatcher>,
+    pub(crate) render_signals: Arc<host_drain::RenderSignals>,
+    pub(crate) pending_context_name: Mutex<Option<moose_core::main_thread::TrackInfo>>,
     /// Main-thread plugin hooks (`connect`, `track_info_changed`, ...).
     pub(crate) main_thread: MainThreadCell<Box<dyn MainThreadHooks>>,
     /// The plugin owned directly by this AU instance inside [`PluginCell`]:
@@ -123,7 +125,7 @@ pub(crate) struct AuInstance<P: PluginExport> {
     pub(crate) params_arc: Arc<P::Params>,
     /// Per-instance live exposed parameter catalog & clump names, queried by
     /// main/control-thread property callbacks and rebuilt on `PRESENTATION`.
-    pub(crate) exposed: Mutex<AuExposedParams>,
+    pub(crate) exposed: Mutex<Arc<AuExposedParams>>,
     /// Shared meter storage, set once at instance creation.
     pub(crate) meter_store: Arc<MeterStore>,
     /// Lock-free custom-state slot the audio thread publishes into.
@@ -155,12 +157,10 @@ pub(crate) struct AuInstance<P: PluginExport> {
     #[cfg(any(not(target_vendor = "apple"), test))]
     pub(crate) owner_thread: std::thread::ThreadId,
     /// Main/control-thread lock serializing activation/deactivation against
-    /// idle `state_load` handoffs and `pending_audio_catalog` installation.
+    /// idle `state_load` handoffs.
     /// NEVER acquired on the audio thread.
     pub(crate) lifecycle_lock: Mutex<()>,
-    /// Fresh `ParamCatalog` built while active; adopted into `audio.catalog`
-    /// on the next deactivation / preparation. Main/control-thread only.
-    pub(crate) pending_audio_catalog: Mutex<Option<Arc<ParamCatalog>>>,
+    pub(crate) render_catalog: RenderCatalog,
     /// Monotonic host/editor edit clock sampled once at block start before
     /// `process()` runs.
     pub(crate) global_edit_seq: AtomicU64,

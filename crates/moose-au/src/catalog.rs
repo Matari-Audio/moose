@@ -13,9 +13,12 @@ use moose_core::cast::len_u32;
 use moose_core::info::Automation;
 use moose_core::wrapper::copy_c_str;
 use moose_params::{CatalogChange, MidiSource, ParamCatalog, ParamFlags, ParamInfo, Params};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::os::raw::c_char;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 struct ExposedEntry {
     catalog_index: usize,
@@ -23,6 +26,7 @@ struct ExposedEntry {
     group: String,
     clump_id: u32,
     hidden: bool,
+    choice_labels: Vec<String>,
 }
 
 /// Per-instance exposed parameter list, O(1) ID lookup, and clump names.
@@ -38,13 +42,26 @@ pub(crate) struct AuExposedParams {
 }
 
 impl AuExposedParams {
-    pub(crate) fn new(
-        catalog: Arc<ParamCatalog>,
-        params: &dyn Params,
-        automation: Automation,
-    ) -> Self {
-        let presentation_revision = params.parameter_presentation_revision();
-        Self::build(catalog, params, automation, presentation_revision)
+    #[cfg(test)]
+    pub(crate) fn capture(params: &dyn Params, automation: Automation) -> Self {
+        Self::try_capture(params, automation)
+            .expect("presentation revision did not stabilize during test capture")
+    }
+
+    pub(crate) fn try_capture(params: &dyn Params, automation: Automation) -> Option<Self> {
+        const MAX_CAPTURE_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_CAPTURE_ATTEMPTS {
+            let revision = params.parameter_presentation_revision();
+            let built = Self::build(params.param_catalog(), params, automation, revision);
+            if revision == params.parameter_presentation_revision() {
+                return Some(built);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn render_catalog(&self) -> Arc<ParamCatalog> {
+        Arc::clone(&self.catalog)
     }
 
     fn build(
@@ -83,12 +100,32 @@ impl AuExposedParams {
                 id
             };
             let entry_idx = entries.len();
+            let choice_labels = info
+                .range
+                .step_count()
+                .map(std::num::NonZero::get)
+                .filter(|&count| count <= 1024)
+                .map_or_else(Vec::new, |count| {
+                    let min = info.range.min();
+                    let width = info.range.max() - min;
+                    (0..=count)
+                        .map(|step| {
+                            params
+                                .format_value(
+                                    info.id,
+                                    min + width * (f64::from(step) / f64::from(count)),
+                                )
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                });
             entries.push(ExposedEntry {
                 catalog_index,
                 name,
                 group,
                 clump_id,
                 hidden,
+                choice_labels,
             });
             by_id.insert(info.id, entry_idx);
         }
@@ -103,32 +140,35 @@ impl AuExposedParams {
         }
     }
 
-    /// Synchronize against `params` on the main thread. Returns
-    /// `(values_changed, presentation_changed)` plus the fresh `Arc<ParamCatalog>`
-    /// whenever the underlying catalog structure changed.
-    pub(crate) fn sync(&mut self, params: &dyn Params) -> (bool, bool, Option<Arc<ParamCatalog>>) {
+    /// Consume changes and capture the replacement generation, when needed.
+    pub(crate) fn sync(&self, params: &dyn Params) -> (bool, Option<Arc<Self>>, bool) {
         let changes = params.take_catalog_changes();
-        let revision = params.parameter_presentation_revision();
-        let revised = revision != self.presentation_revision;
-        let structure_changed = changes.flags.contains(CatalogChange::STRUCTURE);
-        let info_changed = changes.flags.contains(CatalogChange::INFO) || revised;
-        let values_changed = changes.flags.contains(CatalogChange::VALUES);
+        let revised = params.parameter_presentation_revision() != self.presentation_revision;
+        let refresh = changes
+            .flags
+            .intersects(CatalogChange::STRUCTURE | CatalogChange::INFO);
+        let (fresh, retry) = if refresh || revised {
+            match Self::try_capture(params, self.automation) {
+                Some(snapshot) => (Some(Arc::new(snapshot)), false),
+                None => (None, true),
+            }
+        } else {
+            (None, false)
+        };
+        (changes.flags.contains(CatalogChange::VALUES), fresh, retry)
+    }
 
-        let mut new_catalog = None;
-        if structure_changed || info_changed {
-            // Re-fetch `param_catalog()` on INFO changes too (e.g. dynamic
-            // slot default updates) so `fill_info` and audio-thread metadata
-            // never keep stale `ParamInfo` fields.
-            let fresh = params.param_catalog();
-            new_catalog = Some(Arc::clone(&fresh));
-            *self = Self::build(fresh, params, self.automation, revision);
-        }
-
-        (
-            values_changed,
-            structure_changed || info_changed,
-            new_catalog,
-        )
+    pub(crate) fn choice_label(&self, id: u32, value: f64) -> Option<&str> {
+        let entry = &self.entries[*self.by_id.get(&id)?];
+        let info = &self.catalog[entry.catalog_index];
+        let count = info.range.step_count()?.get();
+        let frac = (value - info.range.min()) / (info.range.max() - info.range.min());
+        let index = (frac * f64::from(count))
+            .round()
+            .clamp(0.0, f64::from(count));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let index = index as usize;
+        entry.choice_labels.get(index).map(String::as_str)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -206,5 +246,162 @@ impl AuExposedParams {
             return 0;
         };
         len_u32(unsafe { copy_c_str(out, out_len as usize, name) })
+    }
+}
+
+struct ControlSnapshot {
+    ctx: *const c_void,
+    exposed: Option<Arc<AuExposedParams>>,
+}
+
+thread_local! {
+    static CONTROL_SNAPSHOTS: RefCell<Vec<ControlSnapshot>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Start a control-thread enumeration without changing the v14 callback table.
+#[unsafe(no_mangle)]
+extern "C" fn moose_au_rust_param_snapshot_begin(ctx: *const c_void) {
+    CONTROL_SNAPSHOTS.with_borrow_mut(|snapshots| {
+        snapshots.push(ControlSnapshot { ctx, exposed: None });
+    });
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn moose_au_rust_param_snapshot_end() {
+    CONTROL_SNAPSHOTS.with_borrow_mut(Vec::pop);
+}
+
+pub(crate) fn scoped_snapshot(
+    ctx: *const c_void,
+    exposed: &Mutex<Arc<AuExposedParams>>,
+) -> Option<Arc<AuExposedParams>> {
+    CONTROL_SNAPSHOTS.with_borrow_mut(|snapshots| {
+        let snapshot = snapshots
+            .last_mut()
+            .filter(|snapshot| snapshot.ctx == ctx)?;
+        Some(Arc::clone(
+            snapshot
+                .exposed
+                .get_or_insert_with(|| current_snapshot(exposed)),
+        ))
+    })
+}
+
+pub(crate) fn current_snapshot(exposed: &Mutex<Arc<AuExposedParams>>) -> Arc<AuExposedParams> {
+    Arc::clone(&exposed.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+pub(crate) fn control_snapshot(
+    ctx: *const c_void,
+    exposed: &Mutex<Arc<AuExposedParams>>,
+) -> Arc<AuExposedParams> {
+    scoped_snapshot(ctx, exposed).unwrap_or_else(|| current_snapshot(exposed))
+}
+
+/// Latest catalog from control and one retired render catalog. Only the
+/// exclusive audio owner installs a catalog, and only control drains retire it.
+#[derive(Default)]
+pub(crate) struct RenderCatalog {
+    pending: AtomicPtr<ParamCatalog>,
+    retired: AtomicPtr<ParamCatalog>,
+}
+
+impl RenderCatalog {
+    pub(crate) fn publish(&self, catalog: Arc<ParamCatalog>) {
+        let previous = self
+            .pending
+            .swap(Arc::into_raw(catalog).cast_mut(), Ordering::AcqRel);
+        if !previous.is_null() {
+            // SAFETY: the swap transferred exclusive ownership of this Arc reference.
+            drop(unsafe { Arc::from_raw(previous) });
+        }
+    }
+
+    pub(crate) fn install(&self, current: &mut Arc<ParamCatalog>) -> bool {
+        if self.pending.load(Ordering::Relaxed).is_null()
+            || !self.retired.load(Ordering::Acquire).is_null()
+        {
+            return false;
+        }
+        let pending = self.pending.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if pending.is_null() {
+            return false;
+        }
+        // SAFETY: the swap removed this Arc reference from pending. This call
+        // holds the audio cell, so no other installer can write retired.
+        let old = std::mem::replace(current, unsafe { Arc::from_raw(pending) });
+        self.retired
+            .store(Arc::into_raw(old).cast_mut(), Ordering::Release);
+        true
+    }
+
+    pub(crate) fn reclaim(&self) {
+        let retired = self.retired.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            // SAFETY: the swap transferred exclusive ownership of this Arc reference.
+            drop(unsafe { Arc::from_raw(retired) });
+        }
+    }
+}
+
+impl Drop for RenderCatalog {
+    fn drop(&mut self) {
+        self.reclaim();
+        let pending = *self.pending.get_mut();
+        if !pending.is_null() {
+            // SAFETY: exclusive access to the mailbox, owning this Arc reference.
+            drop(unsafe { Arc::from_raw(pending) });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moose_params::{DynamicParams, SlotDef, SlotRange};
+
+    #[test]
+    fn an_enumeration_pins_info_and_choice_labels_across_a_catalog_update() {
+        let params = DynamicParams::<1>::new();
+        let slot = params.slot(0).unwrap();
+        let id = params.id(slot);
+        let bind = |name, first, second| {
+            params.edit(|edit| {
+                edit.bind(
+                    slot,
+                    SlotDef::new(name, SlotRange::Choice(vec![first, second])),
+                );
+            });
+        };
+        bind("Original", "Dry".into(), "Wet".into());
+        let exposed = Mutex::new(Arc::new(AuExposedParams::capture(
+            &params,
+            Automation::PerSample,
+        )));
+        let ctx = std::ptr::from_ref(&exposed).cast();
+        moose_au_rust_param_snapshot_begin(ctx);
+        let mut ids = [u32::MAX];
+        assert_eq!(
+            control_snapshot(ctx, &exposed).write_ids(ids.as_mut_ptr(), 1),
+            1
+        );
+        assert_eq!(ids, [id]);
+
+        bind("Replacement", "Clean".into(), "Driven".into());
+        let (_, fresh, retry) = current_snapshot(&exposed).sync(&params);
+        assert!(!retry);
+        *exposed.lock().unwrap() = fresh.unwrap();
+
+        let pinned = control_snapshot(ctx, &exposed);
+        let mut info = AuParamInfoOut::default();
+        assert!(pinned.fill_info(id, &mut info));
+        assert_eq!(info.name[0], c_char::try_from(b'O').unwrap());
+        assert_eq!(pinned.choice_label(id, 1.0), Some("Wet"));
+        moose_au_rust_param_snapshot_end();
+
+        let latest = control_snapshot(ctx, &exposed);
+        assert!(latest.fill_info(id, &mut info));
+        assert_eq!(info.name[0], c_char::try_from(b'R').unwrap());
+        assert_eq!(latest.choice_label(id, 1.0), Some("Driven"));
     }
 }

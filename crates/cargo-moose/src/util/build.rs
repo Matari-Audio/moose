@@ -737,19 +737,29 @@ fn rustflags_env_plan(
         .collect()
 }
 
+/// Use the dynamic MSVC runtime only when the entire plugin build opts in.
+pub(crate) fn msvc_dynamic_crt() -> bool {
+    crate::read_build_env("MOOSE_MSVC_CRT").is_some_and(|value| value.eq_ignore_ascii_case("MD"))
+}
+
 /// Extra rustflags cargo-moose adds for `triple`: the resolved
-/// `target-cpu`, and `+crt-static` on Windows MSVC so a plugin DLL
+/// `target-cpu`, and `+crt-static` by default on Windows MSVC so a plugin DLL
 /// carries its C runtime instead of importing `VCRUNTIME140`, which
 /// hosts that `LoadLibrary` without `LOAD_WITH_ALTERED_SEARCH_PATH`
 /// (FL Studio's scanner) cannot find. The VST3 shim's build script
 /// follows the same `crt-static` setting. (windows-gnu ignores the
 /// feature; the shim links libstdc++ statically there instead.)
 fn target_rustflags(triple: &str, profile: &str) -> Option<String> {
+    target_rustflags_with_crt(triple, profile, msvc_dynamic_crt())
+}
+
+fn target_rustflags_with_crt(triple: &str, profile: &str, dynamic_crt: bool) -> Option<String> {
     let cpu =
         crate::util::resolve_target_cpu(triple, profile).map(|cpu| format!("-C target-cpu={cpu}"));
-    let crt = triple
-        .ends_with("-windows-msvc")
-        .then(|| "-C target-feature=+crt-static".to_string());
+    let crt = triple.ends_with("-windows-msvc").then(|| {
+        let sign = if dynamic_crt { '-' } else { '+' };
+        format!("-C target-feature={sign}crt-static")
+    });
     match (cpu, crt) {
         (Some(a), Some(b)) => Some(format!("{a} {b}")),
         (a, b) => a.or(b),
@@ -822,6 +832,13 @@ impl MacArch {
         match self {
             MacArch::X86_64 => "x86_64-apple-darwin",
             MacArch::Arm64 => "aarch64-apple-darwin",
+        }
+    }
+
+    pub(crate) fn cmake_arch(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Arm64 => "arm64",
         }
     }
 
@@ -942,7 +959,7 @@ pub(crate) fn cargo_build_multi_arch_with_profile(
 #[cfg(test)]
 mod rustflags_tests {
     use super::{
-        args_for_target, extract_target_triples, rustflags_env_plan, target_rustflags,
+        args_for_target, extract_target_triples, rustflags_env_plan, target_rustflags_with_crt,
         targets_need_different_flags,
     };
 
@@ -950,7 +967,7 @@ mod rustflags_tests {
     const ARM: &str = "aarch64-pc-windows-msvc";
 
     fn flags(triple: &str) -> Option<String> {
-        target_rustflags(triple, "release")
+        target_rustflags_with_crt(triple, "release", false)
     }
 
     fn plan(targets: &[&str], env: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
@@ -1054,15 +1071,20 @@ mod rustflags_tests {
     }
 
     #[test]
-    fn windows_targets_link_the_crt_statically() {
-        for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-            let flags = target_rustflags(triple, "release").unwrap_or_default();
-            assert!(flags.contains("+crt-static"), "{triple}: {flags}");
+    fn only_windows_msvc_targets_get_the_selected_crt_flag() {
+        for (dynamic, feature) in [(false, "+crt-static"), (true, "-crt-static")] {
+            for triple in [X86, ARM] {
+                let flags =
+                    target_rustflags_with_crt(triple, "release", dynamic).unwrap_or_default();
+                assert!(flags.contains(feature), "{triple}: {flags}");
+            }
+            let linux = target_rustflags_with_crt("x86_64-unknown-linux-gnu", "release", dynamic)
+                .unwrap_or_default();
+            assert!(!linux.contains("crt-static"));
         }
-        let linux = target_rustflags("x86_64-unknown-linux-gnu", "release").unwrap_or_default();
-        assert!(!linux.contains("crt-static"));
         // The command's own profile decides, not the process-global one.
-        let debug = target_rustflags("x86_64-unknown-linux-gnu", "debug").unwrap_or_default();
+        let debug = target_rustflags_with_crt("x86_64-unknown-linux-gnu", "debug", false)
+            .unwrap_or_default();
         assert!(!debug.contains("target-cpu"), "{debug}");
     }
 }
