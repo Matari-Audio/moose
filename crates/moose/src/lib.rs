@@ -6,12 +6,9 @@ pub use moose_core as core;
 /// [`enable_rt_paranoid!`]. See the audio-testing guide.
 pub use moose_core::rt;
 pub use moose_derive::{ParamEnum, Params, State};
-// `moose` is renderer-agnostic - it no longer re-exports `moose-gui`.
-// Plugins pick a renderer crate (moose-gui, moose-egui, moose-mui) directly
-// in their Cargo.toml and use it inside `Plugin::editor()`. The prelude
-// below sources GUI types from the lightweight `moose-gui-types` so layout /
-// interaction / theme remain available without dragging tiny-skia + baseview
-// + wgpu.
+// `moose` is renderer-agnostic. Plugins that want a GUI enable `moose`'s
+// `mui` feature (`moose::mui`) or implement `moose_core::Editor` directly.
+// The prelude below sources legacy layout/theme types from `moose-gui-types`.
 pub use moose_params as params;
 pub use moose_plugin::{Lifecycle, Plugin, ProcessorSlot};
 
@@ -129,14 +126,11 @@ mod prelude_impl {
     // signals it as an internal contract.
     pub use moose_core::{
         AudioConfig, BusActivation, BusConfig, BusKind, BusLayout, BusRoute, BusRouting,
-        ChannelConfig, Editor, Event, EventBody, EventList, IntoEditor, PluginCategory,
+        ChannelConfig, Editor, Event, EventBody, EventList, IntoEditor, NoEditor, PluginCategory,
         PluginContext, PluginExport, PluginInfo, ProcessContext, ProcessMode, ProcessStatus,
         TransportInfo,
     };
     pub use moose_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
-    // Source from `moose_gui_types` (types only, no rasterizer or
-    // windowing) so the prelude doesn't drag the heavy `moose_gui`
-    // crate in for plugins that just describe a layout.
     pub use moose_gui_types::interaction::WidgetRegion;
     pub use moose_gui_types::render::RenderBackend;
     pub use moose_gui_types::theme::{Color, Theme};

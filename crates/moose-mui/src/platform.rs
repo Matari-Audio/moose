@@ -1,12 +1,8 @@
-//! The two pieces of `moose_gui::platform` the editor uses, ported so the
-//! plugin does not link moose-gui, whose wgpu 29 would sit in the graph next
-//! to MUI's wgpu 30.
+//! Platform parent-window and host-scale helpers for `MuiEditor`.
 //!
 //! Ported from truce-gui 6.3.0 `src/platform.rs`
 //! (<https://github.com/truce-audio/truce>), licensed
 //! `LicenseRef-TruceLicense-1.0`.
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use moose_core::editor::RawWindowHandle;
 use raw_window_handle as rwh;
 
@@ -71,18 +67,12 @@ impl rwh::HasDisplayHandle for ParentWindow {
     }
 }
 
-/// The last scale any host passed to [`HostScale::set`], f64 bits, 0 = never.
+/// Per-instance host scale for an embedded editor window.
 ///
-/// moose's CLAP wrapper builds a new editor on every `gui.create` and tells
-/// it the host scale only when the host calls `gui.set_scale`, which hosts
-/// that set it once per instance do not repeat, so a reopened editor came
-/// back at 1.0 inside a 1.5x frame. (moose's VST3 wrapper replays it.)
-// ponytail: one scale per process; per-instance if a host ever mixes scales.
-static HOST_SCALE: AtomicU64 = AtomicU64::new(0);
-
-/// What moose's editor tells it about scale, as the scale an embedded
-/// window opens with. Feed it `Editor::set_scale_factor`; it remembers the
-/// last host scale across editors.
+/// Feed it `Editor::set_scale_factor`. Kept strictly per-instance (never in a
+/// process-global static) so multiple plugin instances on monitors with
+/// different DPI scales (e.g. 100% + 200%) never clobber one another; format
+/// wrappers replay each instance's stored host scale across editor reopen.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostScale {
     host: Option<f64>,
@@ -93,15 +83,12 @@ impl HostScale {
     pub fn set(&mut self, factor: f64) {
         if factor.is_finite() && factor > 0.0 {
             self.host = Some(factor);
-            HOST_SCALE.store(factor.to_bits(), Ordering::Relaxed);
         }
     }
-    /// This editor's host scale, else the last one any editor was given.
+    /// This editor instance's host scale, or `None` if unset.
+    #[must_use]
     pub fn get(&self) -> Option<f64> {
-        self.host.or(match HOST_SCALE.load(Ordering::Relaxed) {
-            0 => None,
-            bits => Some(f64::from_bits(bits)),
-        })
+        self.host
     }
     /// The scale to pin the window to: the host's when it gave one, else
     /// `None` for the OS scale, never the two multiplied. `None` on macOS,
@@ -113,5 +100,31 @@ impl HostScale {
         } else {
             self.get()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostScale;
+
+    #[test]
+    fn instances_hold_independent_host_scales() {
+        let mut monitor_a = HostScale::default();
+        let mut monitor_b = HostScale::default();
+        let untouched = HostScale::default();
+
+        monitor_a.set(1.0);
+        monitor_b.set(2.0);
+
+        assert_eq!(monitor_a.get(), Some(1.0));
+        assert_eq!(monitor_b.get(), Some(2.0));
+        assert_eq!(untouched.get(), None);
+
+        // Non-finite or non-positive values are ignored without clobbering.
+        monitor_a.set(0.0);
+        monitor_a.set(-1.5);
+        monitor_a.set(f64::NAN);
+        monitor_a.set(f64::INFINITY);
+        assert_eq!(monitor_a.get(), Some(1.0));
     }
 }

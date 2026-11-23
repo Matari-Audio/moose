@@ -763,12 +763,17 @@ mod tests {
         );
         unsafe { (cbs.finish_output_events)(ctx, MOOSE_AAX_EVENT_EMITTED) };
 
-        out_l.fill(1.0);
+        let over_in_l = [0.0f32; 256];
+        let over_in_r = [0.0f32; 256];
+        let mut over_out_l = [1.0f32; 256];
+        let mut over_out_r = [1.0f32; 256];
+        let over_inputs = [over_in_l.as_ptr(), over_in_r.as_ptr()];
+        let mut over_outputs = [over_out_l.as_mut_ptr(), over_out_r.as_mut_ptr()];
         let bad = unsafe {
             (cbs.process_native)(
                 ctx,
-                inputs.as_ptr(),
-                outputs.as_mut_ptr(),
+                over_inputs.as_ptr(),
+                over_outputs.as_mut_ptr(),
                 2,
                 2,
                 1,
@@ -781,6 +786,8 @@ mod tests {
             )
         };
         assert_eq!(bad, MOOSE_AAX_EVENT_INVALID);
+        assert!(over_out_l.iter().all(|&s| s == 0.0));
+        assert!(over_out_r.iter().all(|&s| s == 0.0));
 
         unsafe { (cbs.destroy)(ctx) };
     }

@@ -48,8 +48,9 @@ cargo moose new my-suite --workspace gain synth arp \
 ## Minimal Example
 
 ```rust
+use moose::mui::MuiEditor;
+use moose::mui::mui::prelude::*;
 use moose::prelude::*;
-use moose_gui_types::layout::{GridLayout, knob, widgets};
 
 #[derive(Params)]
 pub struct GainParams {
@@ -119,10 +120,21 @@ impl Plugin for Gain {
     }
 
     fn editor(params: Arc<GainParams>) -> Box<dyn Editor> {
-        moose_gui::default_editor(
-            params,
-            GridLayout::build(vec![widgets(vec![knob(P::Gain, "Gain")])]),
-        )
+        let mut ui = Ui::default();
+        if let Ok(font) = Font::new(moose_font::JETBRAINS_MONO) {
+            ui = ui.font(font);
+        }
+        MuiEditor::new(params, ui, (260, 180), |ui, bridge| {
+            let gain = bridge.bind(ui, P::Gain, |ui, id, v| {
+                knob(ui, id, "Gain", v, 0.0..=1.0).size(L)
+            });
+            col![gain, title(bridge.text(P::Gain))]
+                .gap(S)
+                .pad(L)
+                .center()
+                .fill(Role::Surface)
+        })
+        .into_editor()
     }
 }
 
@@ -145,9 +157,8 @@ moose::plugin! { plugin: Gain, params: GainParams }
 *\*Requires a licensed Avid AAX SDK (`AAX_SDK_PATH`) and `cmake`.*
 
 **GUI backends:**
-- Built-in widget set (`moose-gui`, CPU or wgpu rendering)
-- egui (`moose-egui`)
-- [MUI](https://github.com/Matari-Audio/MUI) (`moose-mui`, enabled via `moose`'s `mui` feature)
+- [MUI](https://github.com/Matari-Audio/MUI) (`moose-mui`, enabled via `moose`'s `mui` feature) — retained native UI with SDF-quad GPU rendering and CPU software fallback
+- Headless (`NoEditor`, the default `Plugin::editor` implementation)
 - Any custom renderer via a raw window handle (`Editor` trait, supporting Cocoa, Win32, X11, and Wayland)
 
 ## Presets
@@ -158,12 +169,12 @@ Place `.preset` TOML files in a `presets/` directory next to your crate and `car
 
 - **Core & DSP:** `moose`, `moose-core`, `moose-params`, `moose-derive`, `moose-dsp`, `moose-simd`, `moose-utils`
 - **Formats & Runtime:** `moose-clap`, `moose-vst3`, `moose-au`, `moose-aax`, `moose-standalone`, `moose-plugin`, `moose-loader`, `moose-shim-types`
-- **GUI:** `moose-gui`, `moose-gui-types`, `moose-gui-utils`, `moose-cpu`, `moose-gpu`, `moose-font`, `moose-egui`, `moose-mui`
+- **GUI & Assets:** `moose-mui`, `moose-font`, `moose-gui-types`, `moose-gui-utils`
 - **Tooling & Testing:** `cargo-moose`, `moose-build`, `moose-driver`, `moose-test`
 
 ## Requirements
 
-- **Rust:** 1.92+
+- **Rust:** 1.92+ (1.98+ for `moose-mui`)
 - **macOS:** Xcode command-line tools (full Xcode for AU v3 `.appex` builds)
 - **Windows:** MSVC build tools (`x86_64-pc-windows-msvc`); run `cargo moose install --system` from an Administrator prompt for system-wide directories
 - **Linux:** Wayland / X11 and Vulkan development headers, ALSA / JACK (or PipeWire's JACK shim)

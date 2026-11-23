@@ -20,21 +20,14 @@ use crate::state::restore_plugin;
 /// explicit override is supplied. Pinned to a `HiDPI` value so a
 /// reference PNG baked on one host (CI runner, dev machine, headless
 /// container) renders at the same physical dimensions on any other.
-/// Without a pin, `moose_gui::backing_scale()` would return whatever
-/// the host's main-screen DPI happens to be - 1.0 on a virtualized
-/// CI runner, 2.0 on a Retina `MacBook` - and reference PNGs would
-/// mismatch across machines.
 pub const DEFAULT_SCREENSHOT_SCALE: f64 = 2.0;
 
 /// Process-wide screenshot scale override (f64 bits). Zero means "no
-/// override active"; any non-zero value is consulted by
-/// `moose_gui::backing_scale()` ahead of the platform query so the
-/// editor backends construct their `EditorScale` at the override.
+/// override active"; any non-zero value is consulted by editors during
+/// headless screenshot capture.
 static SCREENSHOT_SCALE_BITS: AtomicU64 = AtomicU64::new(0);
 
-/// Read the active screenshot-scale override, if any. `moose-gui`
-/// consults this from `backing_scale()` before falling back to the
-/// per-OS main-screen DPI query.
+/// Read the active screenshot-scale override, if any.
 #[must_use]
 pub fn override_scale() -> Option<f64> {
     let bits = SCREENSHOT_SCALE_BITS.load(Ordering::Relaxed);
@@ -129,12 +122,10 @@ pub fn render_pixels_for<P: PluginExport>(plugin: &mut P) -> (Vec<u8>, u32, u32)
 
 /// Render the given (already-mutated) plugin's editor at an explicit
 /// scale. The scale is published via [`override_scale`] for the
-/// duration of the call so the editor's `EditorScale` (initialized
-/// from `moose_gui::backing_scale()` during `PluginExport::editor_builder()`)
-/// picks up the screenshot value rather than the host's main-screen
-/// DPI. The override is cleared on return - including on panic - so
-/// any subsequent live-editor construction sees the regular
-/// platform scale.
+/// duration of the call so the editor picks up the screenshot scale
+/// rather than the host's main-screen DPI. The override is cleared on
+/// return - including on panic - so any subsequent live-editor
+/// construction sees the regular platform scale.
 ///
 /// Lets callers prepare plugin state - set params, load a state
 /// blob, drive a `process()` block to populate meters - before the
@@ -155,10 +146,8 @@ pub fn render_pixels_for_at_scale<P: PluginExport>(
     let mut editor = plugin.editor_builder()(plugin.params_arc()).unwrap_or_else(|| {
         panic!(
             "plugin {} returned no editor: PluginExport::editor_builder() returned None. \
-             Implement `fn editor(params)` on your plugin (or one of \
-             the built-in editor wrappers - moose-gpu / moose-egui / \
-             moose-iced / moose-slint) so screenshot rendering has \
-             something to draw.",
+             Implement `fn editor(params)` on your plugin (for example with \
+             `moose::mui::MuiEditor`) so screenshot rendering has something to draw.",
             std::any::type_name::<P>()
         )
     });
@@ -171,9 +160,8 @@ pub fn render_pixels_for_at_scale<P: PluginExport>(
         panic!(
             "editor for {} returned None from Editor::screenshot(). \
              If this is a custom editor implementation, override \
-             Editor::screenshot() to return RGBA pixels. Built-in \
-             backends (moose-gpu / moose-egui / moose-iced / \
-             moose-slint) all implement it.",
+             Editor::screenshot() to return RGBA pixels (`moose::mui::MuiEditor` \
+             implements it automatically).",
             std::any::type_name::<P>()
         )
     })

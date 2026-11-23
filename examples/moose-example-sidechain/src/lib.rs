@@ -15,8 +15,6 @@
 
 use moose::prelude::*;
 use moose_core::bus::{BusLayout, ChannelConfig};
-use moose_gui::IntoLayoutEditor;
-use moose_gui_types::layout::{GridLayout, knob, meter, widgets};
 
 use SidechainParamsParamId as P;
 use std::sync::Arc;
@@ -44,9 +42,6 @@ pub struct SidechainParams {
 
 /// The plugin descriptor; its DSP state is the mix smoothing.
 pub struct Sidechain;
-
-const IN_METERS: [P; 2] = [P::InL, P::InR];
-const SC_METERS: [P; 2] = [P::ScL, P::ScR];
 
 /// The processor's ramp for each smoothed parameter. Plain state owned by
 /// the audio side: only each parameter's target crosses threads.
@@ -144,20 +139,6 @@ impl Plugin for Sidechain {
         context.set_meter(P::ScR, sc_r);
         ProcessStatus::Normal
     }
-
-    fn editor(params: Arc<SidechainParams>) -> Box<dyn Editor> {
-        // Side by side in separate columns so nothing overlaps: the
-        // input meter, the sidechain meter, then the Mix knob. The meters
-        // span two rows for height; the knob matches so it sits centered
-        // alongside them.
-        GridLayout::build(vec![widgets(vec![
-            meter(&IN_METERS, "IN").at(0, 0).rows(2),
-            meter(&SC_METERS, "SC").at(1, 0).rows(2),
-            knob(P::Mix, "Mix").at(2, 0).rows(2),
-        ])])
-        .with_title("SIDECHAIN")
-        .into_editor(&params)
-    }
 }
 
 moose::plugin! {
@@ -174,11 +155,6 @@ mod tests {
     #[test]
     fn info_is_valid() {
         moose_test::assert_valid_info::<PluginShell>();
-    }
-
-    #[test]
-    fn has_editor() {
-        moose_test::assert_has_editor::<PluginShell>();
     }
 
     #[test]

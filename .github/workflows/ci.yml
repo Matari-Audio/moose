@@ -163,14 +163,6 @@ jobs:
       # old `build --all-targets` + `test` pair compiled everything twice).
       # Benches are the one target `cargo test` skips; only moose-simd has
       # any, so build and smoke-run them on their own.
-      #
-      # Screenshot tests run here too. They used to be split cpu/gpu
-      # because moose-example-eq opted into `moose-gui/gpu`, which would
-      # have unified the GpuEditor onto every cpu example. Nothing enables
-      # `gpu` any more (eq is `features = ["cpu"]`), so one invocation
-      # builds the same cpu-only graph the baselines were baked with. If a
-      # crate opts into `moose-gui/gpu` again, test it with its own `-p`
-      # invocation and `--exclude` it here.
       - name: test
         # Windows runs cargo-moose's tests (scaffold_e2e: ~6 min of
         # scaffolded cargo builds) in the parallel `cargo-moose tests
@@ -178,11 +170,6 @@ jobs:
         run: cargo test --workspace ${{ runner.os == 'Windows' && '--exclude cargo-moose' || '' }}
       - name: CLAP activation allocation checks
         run: cargo test --locked -p moose-clap --features rt-paranoid --lib lifecycle_tests
-      - name: X11 hidden host reparenting
-        if: runner.os == 'Linux'
-        run: >-
-          env -u WAYLAND_DISPLAY xvfb-run -a
-          cargo test -p moose-gui --locked --test x11_visibility
           -- --ignored --test-threads=1
       - name: benches (test mode)
         run: cargo test -p moose-simd --benches

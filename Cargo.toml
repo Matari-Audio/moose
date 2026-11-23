@@ -10,7 +10,6 @@ members = [
     "crates/moose-aax",
     "crates/moose-standalone",
     "crates/moose-driver",
-    "crates/moose-gui",
     "crates/moose-gui-types",
     "crates/moose-gui-utils",
     "crates/moose-plugin",
@@ -25,9 +24,6 @@ members = [
     "crates/moose-loader-tests/fixtures/reload-fixture-reset",
     "crates/moose-derive",
     "crates/cargo-moose",
-    "crates/moose-cpu",
-    "crates/moose-gpu",
-    "crates/moose-egui",
     "crates/moose-mui",
     "crates/moose-shim-types",
     "crates/moose-simd",
@@ -35,35 +31,9 @@ members = [
     "crates/moose-utils",
     "crates/moose-dsp",
     "examples/moose-example-gain",
-    "examples/moose-example-gain-inplace",
-    "examples/moose-example-block-gain",
-    "examples/moose-example-block-saturate",
-    "examples/moose-example-block-drywet",
-    "examples/moose-example-block-gate",
-    "examples/moose-example-block-widen",
-    "examples/moose-example-block-surround-meter",
+    "examples/moose-example-gain-mui",
     "examples/moose-example-sidechain",
     "examples/moose-example-synth",
-    "examples/moose-example-eq",
-    "examples/moose-example-stereo-utility",
-    "examples/moose-example-transpose",
-    "examples/moose-example-arpeggio",
-    "examples/moose-example-gain-egui",
-    "examples/moose-example-gain-egui-aspect",
-    "examples/moose-example-gain-mui",
-    "examples/moose-example-tremolo",
-    "examples/moose-example-state",
-    "examples/moose-example-fundsp-reverb-worker",
-    "examples/moose-example-fundsp-reverb-simple",
-    "examples/moose-example-gui-zoo",
-    "examples/moose-example-gui-zoo-egui",
-    "examples/moose-example-dasp-bitcrusher",
-    "examples/moose-example-envelope",
-    "examples/moose-example-chord",
-    "examples/moose-example-cc-filter",
-    "examples/moose-example-mpe-spreader",
-    "examples/moose-example-sysex-echo",
-    "examples/moose-example-mpe-synth",
     "examples/moose-example-multiport",
 ]
 
@@ -117,35 +87,20 @@ moose-au = { version = "7.0.0", path = "crates/moose-au" }
 moose-aax = { version = "7.0.0", path = "crates/moose-aax" }
 moose-standalone = { version = "7.0.0", path = "crates/moose-standalone" }
 moose-driver = { version = "7.0.0", path = "crates/moose-driver" }
-# `default-features = false` at the workspace so members pick a
-# renderer feature (`cpu` / `gpu`) explicitly - lets one example
-# (moose-example-eq) opt into `gpu` while the rest use `cpu`, and
-# lets the renderer crate (moose-egui) build
-# moose-gui featureless for its types-only surface. External users
-# adding `moose-gui = "x"` still get the `cpu` default.
-moose-gui = { version = "7.0.0", path = "crates/moose-gui", default-features = false }
 moose-gui-types = { version = "7.0.0", path = "crates/moose-gui-types" }
-moose-gui-utils = { version = "7.0.0", path = "crates/moose-gui-utils" }
 moose-plugin = { version = "7.0.0", path = "crates/moose-plugin" }
 moose-test = { version = "7.0.0", path = "crates/moose-test" }
 moose-test-fixtures = { path = "test-support" }
 moose-loader = { version = "7.0.0", path = "crates/moose-loader" }
 moose-derive = { version = "7.0.0", path = "crates/moose-derive" }
-moose-cpu = { version = "7.0.0", path = "crates/moose-cpu" }
-moose-gpu = { version = "7.0.0", path = "crates/moose-gpu" }
-moose-egui = { version = "7.0.0", path = "crates/moose-egui" }
 moose-mui = { version = "7.0.0", path = "crates/moose-mui" }
-moose-simd = { version = "7.0.0", path = "crates/moose-simd" }
 moose-font = { version = "7.0.0", path = "crates/moose-font" }
 moose-build = { version = "7.0.0", path = "crates/moose-build" }
 moose-shim-types = { version = "7.0.0", path = "crates/moose-shim-types" }
 moose-utils = { version = "7.0.0", path = "crates/moose-utils" }
 
 # Common third-party deps consumed by multiple workspace crates.
-# Hoisted here so version bumps are a one-line change. wgpu and the
-# wgpu-backed UI bridge crates use the same wgpu version under the
-# hood; pinning them together prevents the GUI crates from drifting
-# onto incompatible wgpu major versions.
+# Hoisted here so version bumps are a one-line change.
 thiserror = "2"
 toml = "1"
 # Plist `<data>` payloads and the
@@ -155,20 +110,10 @@ base64 = "0.22"
 # The one windows-sys version for Win32 imports in workspace crates;
 # members add the `Win32_*` features they call.
 windows-sys = "0.61"
-# wgpu's default features include `webgpu` (browser) and `webgl`
-# (browser GLES fallback). Plugins ship as native dylibs in DAWs,
-# never the browser, so opt out of those. Only `wgsl` (the shader
-# source format) lives here; per-OS backends (`metal`, `dx12`,
-# `vulkan`, `gles`) are added via target-conditional deps in
-# `moose-gpu/Cargo.toml`, then unified across the workspace.
-# wgpu-hal 29 and gpu-allocator 0.28 must use the same Windows API types.
-# Keep the allocator's Cargo.lock edge on windows 0.62, and check downstream
-# lockfiles after dependency updates with a Windows build.
-wgpu = { version = "29", default-features = false, features = ["wgsl"] }
 
-# All editor backends share MUI's maintained native window implementation.
+# Native windowing and MUI UI stack.
 baseview = { package = "moose-baseview", git = "https://github.com/Matari-Audio/MUI" }
-mui = { git = "https://github.com/Matari-Audio/MUI", features = ["gpu-quad"] }
+mui = { git = "https://github.com/Matari-Audio/MUI", features = ["gpu-quad", "cpu"] }
 mui-baseview = { git = "https://github.com/Matari-Audio/MUI" }
 
 # Custom profile for shell-mode (hot-reload) builds. `cargo moose

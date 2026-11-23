@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 use moose::prelude64::*;
 use moose_core::midi::{norm_7bit, norm_pitch_bend};
-use moose_gui::IntoLayoutEditor;
-use moose_gui_types::layout::{GridLayout, dropdown, knob, section, widgets};
 
 mod voice;
 use voice::Voice;
@@ -26,8 +24,6 @@ pub enum Waveform {
 }
 
 // --- Parameters ---
-
-use SynthParamsParamId as P;
 
 #[derive(Params)]
 pub struct FilterParams {
@@ -338,33 +334,6 @@ impl Plugin<Sample> for Synth {
             ProcessStatus::Normal
         }
     }
-
-    fn editor(params: Arc<SynthParams>) -> Box<dyn Editor> {
-        GridLayout::build(vec![
-            widgets(vec![
-                dropdown(P::Waveform, "Wave").cols(2),
-                knob(P::Volume, "Volume"),
-            ]),
-            section(
-                "FILTER",
-                vec![
-                    knob(params.filter.cutoff.id(), "Cutoff"),
-                    knob(params.filter.resonance.id(), "Reso"),
-                ],
-            ),
-            section(
-                "ENVELOPE",
-                vec![
-                    knob(params.envelope.attack.id(), "Attack"),
-                    knob(params.envelope.decay.id(), "Decay"),
-                    knob(params.envelope.sustain.id(), "Sustain"),
-                    knob(params.envelope.release.id(), "Release"),
-                ],
-            ),
-        ])
-        .with_title("MOOSE SYNTH")
-        .into_editor(&params)
-    }
 }
 
 moose::plugin! {
@@ -377,6 +346,7 @@ moose::enable_rt_paranoid!();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use SynthParamsParamId as P;
 
     #[test]
     fn process_is_allocation_free() {
@@ -533,11 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn has_editor() {
-        moose_test::assert_has_editor::<PluginShell>();
-    }
-
-    #[test]
     fn state_round_trips() {
         moose_test::assert_state_round_trip::<PluginShell>();
     }
@@ -557,18 +522,6 @@ mod tests {
     #[test]
     fn bus_config_instrument() {
         moose_test::assert_bus_config_instrument::<PluginShell>();
-    }
-
-    // --- GUI lifecycle ---
-
-    #[test]
-    fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<PluginShell>();
-    }
-
-    #[test]
-    fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     // --- Parameters ---
@@ -608,27 +561,5 @@ mod tests {
     #[test]
     fn empty_state_no_crash() {
         moose_test::assert_empty_state_no_crash::<PluginShell>();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gui_screenshot_macos() {
-        moose_test::screenshot!(PluginShell, "screenshots/synth_default_macos.png").run();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn gui_screenshot_linux() {
-        moose_test::screenshot!(PluginShell, "screenshots/synth_default_linux.png")
-            .pixel_threshold(2)
-            .run();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn gui_screenshot_windows() {
-        moose_test::screenshot!(PluginShell, "screenshots/synth_default_windows.png")
-            .pixel_threshold(2)
-            .run();
     }
 }

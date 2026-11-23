@@ -173,7 +173,6 @@ struct Handle(window::baseview::Window);
 // auto-`Send`. moose calls `open`, `set_size`, `window_scale` and `close`
 // from one GUI thread, never concurrently, so the window never leaves the
 // thread that made it; `Send` is only what `Box<dyn Editor>` asks for.
-// moose-gui's own `GpuEditor` makes the same argument.
 #[cfg(not(target_os = "linux"))]
 #[expect(unsafe_code, reason = "vouches Send for the baseview window alone")]
 unsafe impl Send for Handle {}
@@ -460,6 +459,7 @@ impl<P: Params> MuiEditor<P> {
 
     #[cfg(target_os = "linux")]
     fn pump_embedded(&mut self) {
+        embedded::reap_retired();
         let Some(result) = self
             .embedded
             .as_ref()
@@ -482,6 +482,7 @@ impl<P: Params> MuiEditor<P> {
             }
             drop(self.floating.take());
             drop(self.embedded.take());
+            embedded::reap_retired();
         }
         if let Some(Handle(window)) = self.window.take() {
             #[cfg(target_os = "linux")]
@@ -780,6 +781,39 @@ impl<P: Params> Editor for MuiEditor<P> {
             }
         }
         None
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "screenshot dimensions are bounded positive pixel counts"
+    )]
+    fn screenshot(&mut self, _params: Arc<dyn Params>) -> Option<(Vec<u8>, u32, u32)> {
+        let scale = moose_core::screenshot::override_scale().unwrap_or(1.0);
+        let (lw, lh) = self.size;
+        if lw == 0 || lh == 0 {
+            return None;
+        }
+        let pw = (f64::from(lw) * scale).round().max(1.0) as u32;
+        let ph = (f64::from(lh) * scale).round().max(1.0) as u32;
+        let window = Size::new(f64::from(lw), f64::from(lh));
+        let mut s = lock(&self.shared);
+        let zoom = s.view.zoom(window);
+        let zoom = if zoom.is_finite() && zoom > 0.0 {
+            zoom
+        } else {
+            1.0
+        };
+        let logical = Size::new(window.width / zoom, window.height / zoom);
+        let s = &mut *s;
+        let root = s.view.build(&mut s.ui, &Input::default());
+        let frame =
+            s.ui.frame(root, Some(logical), Input::default(), 0.0)
+                .ok()?;
+        let mut renderer = mui::vello::software::Renderer::new((pw, ph)).ok()?;
+        let transform = mui::vello::kurbo::Affine::scale(scale * zoom);
+        renderer.render(frame.scene, transform).ok()?;
+        Some((renderer.rgba8(), pw, ph))
     }
 }
 

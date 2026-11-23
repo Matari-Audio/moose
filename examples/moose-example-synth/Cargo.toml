@@ -34,8 +34,6 @@ moose-vst3 = { workspace = true, optional = true }
 moose-au = { workspace = true, optional = true }
 clap-sys = { version = "0.5", optional = true }
 moose-standalone = { workspace = true, features = ["gui"], optional = true }
-moose-gui-types = { workspace = true }
-moose-gui = { workspace = true, features = ["cpu"] }
 moose-loader = { workspace = true }
 
 

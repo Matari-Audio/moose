@@ -66,6 +66,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
         // struct is sound here - the write-once fields below (`exposed`,
         // the host extension pointers) have no concurrent reader yet.
         let data = &mut *(*plugin).plugin_data.cast::<ClapPluginData<P>>();
+        #[cfg(target_os = "linux")]
+        crate::gui::warm_x11_probe();
         enter_plugin(&data.plugin).init();
         // Bind the signal first, then drop what `init` changed: the catalog
         // built next already holds it, and any later edit wakes us.

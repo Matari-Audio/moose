@@ -38,7 +38,7 @@ pub use bus_routing::{
     bus_layouts_fit_routing,
 };
 pub use config::{AudioConfig, ProcessMode};
-pub use editor::{Editor, EditorBuilder, HostContext, IntoEditor, PluginContext};
+pub use editor::{Editor, EditorBuilder, HostContext, IntoEditor, NoEditor, PluginContext};
 pub use events::{
     AuEventMetadata, Event, EventBody, EventList, ExactAddress, ExactEvent, ExactEventBody,
     ExactEventMetadata, ExactEventQualifiers, ExactEventRef, ExactEventToken, ExactNoteAddress,

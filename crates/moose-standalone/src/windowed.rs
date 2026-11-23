@@ -17,8 +17,9 @@ use crossbeam_queue::ArrayQueue;
 
 use baseview::{Event, EventStatus, WindowContext, WindowSize};
 use keyboard_types::{Code, KeyState, Modifiers};
-use moose_gui::window::EditorWindowHandler;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle as RwhHandle};
+
+use crate::window::EditorWindowHandler;
 
 use moose_core::editor::{
     Editor, EditorBridge, EditorNotificationDelivery, HostContext, PluginContext, RawWindowHandle,
@@ -100,7 +101,7 @@ where
         };
         build(params)
     };
-    let Some(mut editor) = editor else {
+    let Some(mut editor) = editor.filter(|editor| editor.has_ui()) else {
         eprintln!("Plugin returned no editor - falling back to headless mode.");
         drop(audio_handles);
         crate::headless::run::<P>(opts);
@@ -263,7 +264,7 @@ where
     // host, so the process-wide window setup baseview skips for plugins
     // (e.g. DPI awareness on Windows) is ours to do.
     unsafe { baseview::assume_standalone_in_process() };
-    let window = moose_gui::window::open_window(window_settings, move |window| {
+    let window = crate::window::open_window(window_settings, move |window| {
         let moose_parent = match raw_window(window) {
             Some(RwhHandle::AppKit(h)) => RawWindowHandle::AppKit(h.ns_view.as_ptr()),
             Some(RwhHandle::Win32(h)) => {

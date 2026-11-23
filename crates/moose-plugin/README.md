@@ -12,9 +12,9 @@ It splits a plugin into three ownership-clean types:
 - `Processor`: audio-thread DSP state created in `activate` and dropped in `deactivate`
 
 The crate is intentionally light: it depends on `moose-core`, `moose-gui-types`
-(data + render-trait surface only), and `moose-params`. No tiny-skia, no
-baseview, no fonts. Custom editors (egui, MUI, raw window handles) never pull
-in the built-in editor's rendering stack.
+(data + render-trait surface only), and `moose-params`. No windowing, no
+renderer, no fonts. Custom editors (`moose-mui` or raw window handles) stay
+opt-in per plugin.
 
 ## Wrapper Bridge
 

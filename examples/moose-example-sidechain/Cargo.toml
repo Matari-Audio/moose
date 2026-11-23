@@ -36,8 +36,6 @@ clap-sys = { version = "0.5", optional = true }
 # `playback` so `cargo moose run --input-file x.wav` can feed the file
 # into the sidechain input (the mic stays on the main input).
 moose-standalone = { workspace = true, features = ["gui", "playback"], optional = true }
-moose-gui-types = { workspace = true }
-moose-gui = { workspace = true, features = ["cpu"] }
 moose-loader = { workspace = true }
 
 

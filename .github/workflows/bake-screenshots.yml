@@ -40,34 +40,7 @@ env:
   # matches the convention enforced by each example's
   # `gui_screenshot_<os>` test.
   EXAMPLE_CRATES: >-
-    moose-example-gain
-    moose-example-block-gain
-    moose-example-synth
-    moose-example-eq
-    moose-example-stereo-utility
-    moose-example-block-saturate
-    moose-example-block-drywet
-    moose-example-block-gate
-    moose-example-block-widen
-    moose-example-block-surround-meter
-    moose-example-gain-egui
-    moose-example-gain-egui-aspect
-    moose-example-arpeggio
-    moose-example-tremolo
-    moose-example-state
-    moose-example-fundsp-reverb-worker
-    moose-example-fundsp-reverb-simple
-    moose-example-transpose
-    moose-example-gui-zoo
-    moose-example-gui-zoo-egui
-    moose-example-dasp-bitcrusher
-    moose-example-envelope
-    moose-example-chord
-    moose-example-cc-filter
-    moose-example-mpe-spreader
-    moose-example-sysex-echo
-    moose-example-mpe-synth
-    moose-example-multiport
+    moose-example-gain-mui
 
 jobs:
   linux:

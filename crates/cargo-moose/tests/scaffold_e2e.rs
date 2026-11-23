@@ -9,10 +9,9 @@
 //!
 //! Run: `cargo test -p cargo-moose --test scaffold_e2e`
 //!
-//! Tests self-serialize at the build step via a process-level mutex,
-//! so `--test-threads=1` is optional - scaffolding and rewriting run
-//! concurrently, only `cargo check` is single-threaded to share the
-//! target dir safely.
+//! A file lock serializes access to the shared target directory, even
+//! when nextest runs each test in a separate process. Scaffolding and
+//! rewriting still run concurrently.
 //!
 //! Most tests run `cargo check` only - ~7s warm. `workspace_full_build`
 //! does a full `cargo build` on a multi-plugin workspace to catch
@@ -25,10 +24,11 @@
 //! ```
 
 use std::fmt::Write;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use moose_utils::cast::sample_count_usize;
 
@@ -83,12 +83,18 @@ fn shared_target_uses_absolute_path() {
     );
 }
 
-/// Global mutex around `cargo check`. Scaffolding + rewriting can
-/// parallelize (each test has its own scratch dir); only the
-/// cache-sharing build step needs serialization.
-fn build_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// Guard the shared target across both threads and nextest processes.
+fn build_lock() -> Result<File, String> {
+    let path = shared_target().join("build.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open scaffold build lock {}: {e}", path.display()))?;
+    file.lock()
+        .map_err(|e| format!("acquire scaffold build lock {}: {e}", path.display()))?;
+    Ok(file)
 }
 
 /// Unique per-test scratch dir. `pid + atomic counter` keeps parallel
@@ -222,6 +228,26 @@ impl Scaffold {
                 std::fs::write(&f, rewritten).map_err(|e| format!("write {}: {e}", f.display()))?;
             }
         }
+        // In a monorepo checkout where `../mui` sits beside `moose`, patch
+        // MUI git dependencies to the in-tree copy so scaffold tests stay
+        // offline and test against the local MUI crates.
+        if let Some(mui_root) = moose_root().parent().map(|p| p.join("mui"))
+            && mui_root.is_dir()
+        {
+            let root_toml = self.generated.join("Cargo.toml");
+            let mut content = std::fs::read_to_string(&root_toml)
+                .map_err(|e| format!("read {}: {e}", root_toml.display()))?;
+            let mui = mui_root.to_string_lossy().replace('\\', "/");
+            let patch = format!(
+                "\n[patch.\"https://github.com/Matari-Audio/MUI\"]\n\
+                 moose-baseview = {{ path = \"{mui}/vendor/moose-baseview\" }}\n\
+                 mui = {{ path = \"{mui}/crates/mui\" }}\n\
+                 mui-baseview = {{ path = \"{mui}/crates/mui-baseview\" }}\n"
+            );
+            content.push_str(&patch);
+            std::fs::write(&root_toml, content)
+                .map_err(|e| format!("write {}: {e}", root_toml.display()))?;
+        }
         Ok(())
     }
 
@@ -246,9 +272,7 @@ impl Scaffold {
     /// emit lint-noisy boilerplate that would surface in every user's
     /// project.
     fn cargo_clippy(&self) -> Result<(), String> {
-        let _guard = build_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = build_lock()?;
         let out = Command::new("cargo")
             .args([
                 "clippy",
@@ -286,9 +310,7 @@ impl Scaffold {
         bin: &str,
         features: &[&str],
     ) -> Result<PathBuf, String> {
-        let _guard = build_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = build_lock()?;
         let mut cmd = Command::new("cargo");
         cmd.arg("build").args(["--package", package, "--bin", bin]);
         if !features.is_empty() {
@@ -327,9 +349,7 @@ impl Scaffold {
     /// Shared body for `cargo check` / `cargo build` / `cargo test`.
     /// All hold `build_lock` (cache safety) and share the target dir.
     fn run_cargo(&self, subcommand: &str) -> Result<(), String> {
-        let _guard = build_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = build_lock()?;
         let out = Command::new("cargo")
             .arg(subcommand)
             .arg("--workspace")
@@ -362,9 +382,7 @@ impl Scaffold {
     /// outputs. xtask honors this env var for both inner cargo
     /// invocations and its own staging-path resolution.
     fn moose_subcommand(&self, args: &[&str]) -> Result<(), String> {
-        let _guard = build_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = build_lock()?;
         // Wipe the staged-bundles dir so this test's assertions don't
         // pick up artifacts from earlier `moose_subcommand` runs.
         // Cargo build artifacts under `release/` survive - that's the
@@ -855,8 +873,7 @@ fn workspace_mixed_types_tests_pass() {
 // xtask-side regressions - `project_root` resolution from a child
 // cwd, per-format feature gating in `detect_default_features`,
 // bundle staging into `target/bundles/` - surface here. Single
-// plugin + CLAP only to keep the test under a minute. Does not use
-// the shared target dir; see `moose_subcommand` for why.
+// plugin + CLAP only to keep the test under a minute.
 #[test]
 fn scaffold_cargo_moose_build_clap() {
     let s = Scaffold::new("moose-build-clap", "demo_effect");

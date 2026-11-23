@@ -4,10 +4,8 @@ Host-side platform helpers shared by moose GUI backends.
 
 ## Overview
 
-Small helper crate shared by the GUI backends that embed a child view
-(wgpu- or CALayer-backed) into a DAW-provided parent window. It exists so
-each backend (`moose-gui`, `moose-egui`) does not
-re-implement the same host-window quirks. No rendering, no widgets.
+Small helper crate shared by GUI backends that embed a child view
+into a DAW-provided parent window. No rendering, no widgets.
 
 The re-anchoring helpers are macOS-only: on Linux and Windows the host
 manages child-window positioning natively, so they compile to no-ops

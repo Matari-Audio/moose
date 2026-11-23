@@ -98,8 +98,12 @@ impl PluginKind {
     #[must_use]
     pub fn layout_knob(self) -> &'static str {
         match self {
-            Self::Midi => "knob(P::Semitones, \"Semitones\")",
-            _ => "knob(P::Gain, \"Gain\")",
+            Self::Midi => {
+                "bridge.bind(ui, P::Semitones, |ui, id, v| knob(ui, id, \"Semitones\", v, 0.0..=1.0).size(L))"
+            }
+            _ => {
+                "bridge.bind(ui, P::Gain, |ui, id, v| knob(ui, id, \"Gain\", v, 0.0..=1.0).size(L))"
+            }
         }
     }
 

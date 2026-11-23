@@ -35,12 +35,8 @@ shell = ["moose/shell"]
 rt-paranoid = ["moose/rt-paranoid"]
 
 [dependencies]
-moose = \{ {dep_args | unescaped} }
-# Lightweight types for layout / theme / widget descriptions.
-moose-gui-types = \{ {dep_args | unescaped} }
-# Built-in renderer. Plugins that supply their own editor (egui)
-# can drop this dep.
-moose-gui = \{ {dep_args | unescaped} }
+moose = \{ {dep_args | unescaped}, features = ["mui"] }
+moose-font = \{ {dep_args | unescaped} }
 moose-clap = \{ {dep_args | unescaped}, optional = true }
 moose-vst3 = \{ {dep_args | unescaped}, optional = true }
 moose-au = \{ {dep_args | unescaped}, optional = true }
