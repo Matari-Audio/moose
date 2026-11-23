@@ -99,10 +99,10 @@ impl PluginKind {
     pub fn layout_knob(self) -> &'static str {
         match self {
             Self::Midi => {
-                "bridge.bind(ui, P::Semitones, |ui, id, v| knob(ui, id, \"Semitones\", v, 0.0..=1.0).size(L))"
+                "bridge.bind(ui, P::Semitones, |ui, id, v| {\n                knob(ui, id, \"Semitones\", v, 0.0..=1.0).size(L)\n            })"
             }
             _ => {
-                "bridge.bind(ui, P::Gain, |ui, id, v| knob(ui, id, \"Gain\", v, 0.0..=1.0).size(L))"
+                "bridge.bind(ui, P::Gain, |ui, id, v| {\n                knob(ui, id, \"Gain\", v, 0.0..=1.0).size(L)\n            })"
             }
         }
     }
