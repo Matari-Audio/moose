@@ -27,8 +27,6 @@ while IFS= read -r p; do
     crates/moose-standalone/src/menu_macos.rs | \
     crates/moose-standalone/src/windowed_macos.rs | \
     crates/cargo-moose/src/commands/install/au_v3.rs | \
-    crates/moose-egui/src/editor_ios.rs | \
-    crates/moose-gui/src/editor_ios.rs | \
     crates/moose-gui-types/src/ios.rs | \
     crates/moose-au/* | \
     crates/cargo-moose/templates/au3/* | \
@@ -38,7 +36,6 @@ while IFS= read -r p; do
     # cfg(target_os = "windows") (Inno Setup script is generated in windows.rs)
     crates/cargo-moose/src/commands/package/windows.rs | \
     crates/cargo-moose/src/commands/package/windows_manifest.rs | \
-    crates/moose-egui/src/render_thread.rs | \
     crates/moose-standalone/src/menu_windows.rs | \
     crates/moose-standalone/src/windowed_windows.rs | \
     */screenshots/*_windows.png)

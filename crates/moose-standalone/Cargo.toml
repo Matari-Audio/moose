@@ -23,8 +23,6 @@ hound = { version = "3", optional = true }
 # with `playback`, the only build that has a capture sink to finalize.
 ctrlc = { version = "3", optional = true }
 
-moose-gui = { workspace = true, optional = true }
-moose-gpu = { workspace = true, optional = true }
 baseview = { workspace = true, optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 keyboard-types = { version = "0.8", optional = true }
@@ -63,7 +61,6 @@ rfd = { version = "0.15", default-features = false, optional = true }
 [features]
 default = []
 gui = [
-    "dep:moose-gui",
     "dep:baseview",
     "dep:raw-window-handle",
     "dep:keyboard-types",

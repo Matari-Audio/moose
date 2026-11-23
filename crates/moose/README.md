@@ -13,11 +13,12 @@ Main entry point for the moose audio plugin framework.
 ## Key re-exports
 
 - `Plugin` and `BackgroundTask` from `moose-plugin`
-- `PluginExport`, `Editor`, `EventList`, `ProcessContext`, `ProcessStatus`
+- `PluginExport`, `Editor`, `NoEditor`, `EventList`, `ProcessContext`, `ProcessStatus`
   and the core runtime types from `moose-core` (`AudioBuffer` is a per-prelude
   precision-pinned type alias)
 - `FloatParam`, `IntParam`, `BoolParam`, `EnumParam`, `ParamSmoother` from `moose-params`
 - `#[derive(Params)]`, `#[derive(ParamEnum)]`, `#[derive(State)]` from `moose-derive`
+- `moose::mui` (`MuiEditor`, `Bridge`, and the `mui` crate) when the `mui` feature is enabled
 - `moose::plugin!` generates all format-export glue from one declaration
 
 ## Preludes
@@ -35,6 +36,7 @@ Main entry point for the moose audio plugin framework.
 | `clap` (default) | Enable CLAP format export |
 | `vst3` | Enable VST3 format export |
 | `au` | Enable Audio Unit (v2 `.component` / v3 `.appex`) export; macOS only |
+| `aax` | Enable Pro Tools AAX format export |
 | `mui` | Re-export `moose-mui` as `moose::mui` |
 | `shell` | Build a dynamic shell that dlopens a hot-reloadable logic dylib |
 | `rt-paranoid` | Enable real-time allocation checking via `moose::enable_rt_paranoid!()` |
@@ -43,8 +45,9 @@ Main entry point for the moose audio plugin framework.
 ## Usage
 
 ```rust
+use moose::mui::MuiEditor;
+use moose::mui::mui::prelude::*;
 use moose::prelude::*;
-use moose_gui_types::layout::{GridLayout, knob, widgets};
 
 #[derive(Params)]
 pub struct MyParams {
@@ -89,10 +92,14 @@ impl Plugin for MyPlugin {
     }
 
     fn editor(params: Arc<MyParams>) -> Box<dyn Editor> {
-        moose_gui::default_editor(
-            params,
-            GridLayout::build(vec![widgets(vec![knob(P::Gain, "Gain")])]),
-        )
+        let ui = Ui::default();
+        MuiEditor::new(params, ui, (260, 180), |ui, bridge| {
+            let gain = bridge.bind(ui, P::Gain, |ui, id, v| {
+                knob(ui, id, "Gain", v, 0.0..=1.0).size(L)
+            });
+            col![gain].pad(L).center().fill(Role::Surface)
+        })
+        .into_editor()
     }
 }
 

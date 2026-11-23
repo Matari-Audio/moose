@@ -480,6 +480,11 @@ fn start_pool(pin_module: bool) -> bool {
 /// workers, and separately retains the mapping for editor/vtable safety.
 #[cfg(all(unix, not(miri)))]
 fn pin_current_module() {
+    let _ = try_pin_current_module();
+}
+
+#[cfg(all(unix, not(miri)))]
+fn try_pin_current_module() -> bool {
     // Field names mirror the platform's `Dl_info`; only `dli_fname` is
     // read, the rest are here for correct C layout (`dladdr` writes all).
     #[repr(C)]
@@ -494,26 +499,60 @@ fn pin_current_module() {
         fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
         fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     }
-    // RTLD_NOLOAD | RTLD_NODELETE: re-reference the already-loaded object
-    // and mark it non-deletable. The flag values differ between glibc and
-    // Darwin.
+    // Re-reference the mapped object (NOLOAD) and mark it non-deletable
+    // (NODELETE). Linux also requires a binding mode (NOW).
     #[cfg(target_os = "linux")]
-    const FLAGS: c_int = 0x0004 | 0x1000;
+    const FLAGS: c_int = 0x0002 | 0x0004 | 0x1000;
     #[cfg(not(target_os = "linux"))]
     const FLAGS: c_int = 0x0010 | 0x0080;
 
-    // SAFETY: `dladdr` reads the address of a live function in this module
-    // and fills `info` with loader-owned strings valid for the immediate
-    // `dlopen`. NOLOAD only re-references the already-mapped object; the
-    // returned handle is intentionally leaked so NODELETE persists.
-    unsafe {
-        let mut info: DlInfo = core::mem::zeroed();
-        if dladdr(pin_current_module as *const c_void, &raw mut info) != 0
-            && !info.dli_fname.is_null()
-        {
-            let _ = dlopen(info.dli_fname, FLAGS);
-        }
+    // SAFETY: `dladdr` reads the address of a live function in this
+    // module and writes loader-owned strings to the out parameter.
+    let mut info = std::mem::MaybeUninit::<DlInfo>::uninit();
+    if unsafe { dladdr(try_pin_current_module as *const c_void, info.as_mut_ptr()) } == 0 {
+        return false;
     }
+    // SAFETY: successful dladdr initialized info; dli_fname is valid for
+    // the immediate dlopen. NOLOAD re-references the already-mapped object.
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return false;
+    }
+    // SAFETY: dli_fname is a live C string returned by dladdr. Leak the
+    // reference so the module stays pinned.
+    if !unsafe { dlopen(info.dli_fname, FLAGS) }.is_null() {
+        return true;
+    }
+    // dlopen refuses PIE executables, which cannot be unloaded anyway.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        // SAFETY: dladdr returned a non-null, loader-owned C string.
+        let image = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .is_ok_and(|exe| {
+                std::fs::canonicalize(std::ffi::OsStr::from_bytes(image.to_bytes()))
+                    .is_ok_and(|path| path == exe)
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// Keep the Linux plugin image mapped while an independent worker may outlive
+/// the instance. Callers must not detach work if pinning fails.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[doc(hidden)]
+pub fn pin_linux_image_for_detached_work() -> bool {
+    static PINNED: OnceLock<bool> = OnceLock::new();
+    *PINNED.get_or_init(try_pin_current_module)
+}
+
+#[cfg(all(target_os = "linux", miri))]
+#[doc(hidden)]
+pub fn pin_linux_image_for_detached_work() -> bool {
+    false
 }
 
 #[cfg(all(windows, not(miri)))]

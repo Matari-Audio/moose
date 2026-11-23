@@ -199,9 +199,10 @@ pub(crate) unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
             // Embedded X11 whenever an X server (incl. XWayland) is reachable:
             // embedding hosts such as Bitwig follow this preference and never
             // show a floating window. Floating Wayland stays available to
-            // hosts that request it, and is preferred only without X11.
-            if std::env::var_os("DISPLAY").is_none()
-                && std::env::var_os("WAYLAND_DISPLAY").is_some()
+            // hosts that request it, and is preferred only when no X11 server
+            // is reachable.
+            if wayland_display_present()
+                && cached_x11_reachability() == Some(false)
                 && gui_is_api_supported::<P>(plugin, CLAP_WINDOW_API_WAYLAND.as_ptr(), true)
             {
                 *api = CLAP_WINDOW_API_WAYLAND.as_ptr();
@@ -234,7 +235,7 @@ unsafe fn resolve_create_api<P: PluginExport>(
     }
     #[cfg(target_os = "linux")]
     unsafe {
-        let candidates = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        let candidates = if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
             [
                 CLAP_WINDOW_API_WAYLAND.as_ptr(),
                 CLAP_WINDOW_API_X11.as_ptr(),
@@ -1290,4 +1291,316 @@ pub(crate) unsafe fn access_dsp_state<P: PluginExport, T: 'static, R>(
     }))
     .ok()
     .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_display_present() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn warm_x11_probe() {
+    if wayland_display_present() {
+        let _ = cached_x11_reachability();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cached_x11_reachability() -> Option<bool> {
+    use std::sync::Mutex;
+
+    static PROBE: Mutex<X11Probe> = Mutex::new(X11Probe {
+        in_flight: false,
+        completed: None,
+    });
+    let Some(display) = std::env::var_os("DISPLAY").filter(|v| !v.is_empty()) else {
+        return Some(false);
+    };
+    X11Probe::query(&PROBE, display, |display| {
+        x11_display_reachable_in_dir(Some(display), std::path::Path::new("/tmp/.X11-unix"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct X11Probe {
+    in_flight: bool,
+    completed: Option<(std::ffi::OsString, std::time::Instant, bool)>,
+}
+
+#[cfg(target_os = "linux")]
+impl X11Probe {
+    fn query(
+        cache: &'static std::sync::Mutex<Self>,
+        display: std::ffi::OsString,
+        probe: impl FnOnce(&std::ffi::OsStr) -> bool + Send + 'static,
+    ) -> Option<bool> {
+        let mut state = cache.try_lock().ok()?;
+        let previous = state
+            .completed
+            .as_ref()
+            .filter(|(key, _, _)| *key == display);
+        let reachable = previous.map(|(_, _, reachable)| *reachable);
+        if state.in_flight
+            || previous.is_some_and(|(_, at, _)| at.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return reachable;
+        }
+        // A system resolver can outlive this instance and even the host's
+        // final CLAP deinit. Never leave detached work in an unloadable image.
+        if !moose_core::tasks::pin_linux_image_for_detached_work() {
+            return reachable;
+        }
+        state.in_flight = true;
+        drop(state);
+        let spawned = std::thread::Builder::new()
+            .name("moose-x11-probe".into())
+            .spawn(move || {
+                let reachable = probe(&display);
+                let mut state = cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.completed = Some((display, std::time::Instant::now(), reachable));
+                state.in_flight = false;
+            });
+        if spawned.is_err() {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .in_flight = false;
+        }
+        // No result yet means negotiation keeps the embedded X11 default.
+        reachable
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_display_reachable_in_dir(
+    display: Option<&std::ffi::OsStr>,
+    socket_dir: &std::path::Path,
+) -> bool {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
+    use std::path::Path;
+    use std::time::Duration;
+
+    const TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
+    let Some(display) = display else {
+        return false;
+    };
+    if display.is_empty() {
+        return false;
+    }
+
+    // Absolute socket path (e.g. launchd or custom Unix socket path).
+    let raw_path = Path::new(display);
+    if raw_path.is_absolute() {
+        return UnixStream::connect(raw_path).is_ok();
+    }
+
+    let Some(spec) = display.to_str() else {
+        return false;
+    };
+
+    // Standard X11 DISPLAY syntax: `[protocol/]host:display[.screen]`.
+    let Some((host_part, disp_part)) = spec.rsplit_once(':') else {
+        return false;
+    };
+    let disp_str = disp_part.split('.').next().unwrap_or("");
+    if disp_str.is_empty() || !disp_str.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(display_num) = disp_str.parse::<u16>() else {
+        return false;
+    };
+
+    let (proto, host) = match host_part.split_once('/') {
+        Some((p, h)) => (Some(p), h),
+        None => (None, host_part),
+    };
+
+    let try_local_unix = |num: u16| -> bool {
+        let sock_path = socket_dir.join(format!("X{num}"));
+        if UnixStream::connect(&sock_path).is_ok() {
+            return true;
+        }
+        // Linux Xorg / XWayland also listens in the abstract namespace.
+        if socket_dir == Path::new("/tmp/.X11-unix") {
+            let abstract_name = format!("/tmp/.X11-unix/X{num}");
+            if let Ok(addr) = UnixSocketAddr::from_abstract_name(abstract_name.as_bytes())
+                && UnixStream::connect_addr(&addr).is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    let try_tcp = |target_host: &str, num: u16| -> bool {
+        let Some(port) = 6000u16.checked_add(num) else {
+            return false;
+        };
+        let addrs: Vec<SocketAddr> = if target_host == "localhost" {
+            vec![
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+            ]
+        } else {
+            match (target_host, port).to_socket_addrs() {
+                Ok(iter) => iter.collect(),
+                Err(_) => return false,
+            }
+        };
+        addrs
+            .into_iter()
+            .any(|addr| TcpStream::connect_timeout(&addr, TCP_PROBE_TIMEOUT).is_ok())
+    };
+
+    match (proto, host) {
+        (Some("unix"), _) | (None, "" | "unix") => try_local_unix(display_num),
+        (Some("tcp" | "inet" | "inet6") | None, h) if !h.is_empty() => try_tcp(h, display_num),
+        _ => false,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod x11_probe_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::net::TcpListener;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    #[cfg(not(miri))]
+    fn pending_probe_does_not_block_queries_or_reuse_a_different_display() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::{Duration, Instant};
+
+        static CACHE: Mutex<X11Probe> = Mutex::new(X11Probe {
+            in_flight: false,
+            completed: None,
+        });
+        let (started, running) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel();
+        let query = |display: &str| {
+            X11Probe::query(&CACHE, display.into(), |_| {
+                panic!("unexpected second probe")
+            })
+        };
+        assert_eq!(
+            X11Probe::query(&CACHE, "slow-host:0".into(), move |_| {
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                true
+            }),
+            None
+        );
+        running.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(query("slow-host:0"), None);
+        assert_eq!(query("other-host:0"), None);
+        unblock.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while query("slow-host:0") != Some(true) {
+            assert!(Instant::now() < deadline, "probe result was not published");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            X11Probe::query(&CACHE, "other-host:0".into(), |_| false),
+            None
+        );
+    }
+
+    fn temp_socket_dir(label: &str) -> std::path::PathBuf {
+        // Keep the socket path well below Linux's 108-byte `SUN_LEN` even when
+        // `TMPDIR` points to a deeply nested sandbox directory.
+        let base = std::path::Path::new("/tmp");
+        let root = if base.is_dir() {
+            base.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("mclap-x11-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn empty_missing_and_malformed_display_are_unreachable() {
+        let dir = temp_socket_dir("malformed");
+        assert!(!x11_display_reachable_in_dir(None, &dir));
+        assert!(!x11_display_reachable_in_dir(Some(OsStr::new("")), &dir));
+        assert!(!x11_display_reachable_in_dir(
+            Some(OsStr::new("not-a-display")),
+            &dir
+        ));
+        assert!(!x11_display_reachable_in_dir(Some(OsStr::new(":")), &dir));
+        assert!(!x11_display_reachable_in_dir(
+            Some(OsStr::new(":abc")),
+            &dir
+        ));
+        assert!(!x11_display_reachable_in_dir(
+            Some(OsStr::new("bogus/host:0")),
+            &dir
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probes_live_vs_missing_unix_display_socket() {
+        let dir = temp_socket_dir("unix");
+        // Missing display socket must report unreachable even though DISPLAY is non-empty.
+        assert!(!x11_display_reachable_in_dir(Some(OsStr::new(":42")), &dir));
+
+        let sock_path = dir.join("X42");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        assert!(x11_display_reachable_in_dir(Some(OsStr::new(":42")), &dir));
+        assert!(x11_display_reachable_in_dir(
+            Some(OsStr::new(":42.0")),
+            &dir
+        ));
+        assert!(x11_display_reachable_in_dir(
+            Some(OsStr::new("unix:42")),
+            &dir
+        ));
+        assert!(x11_display_reachable_in_dir(
+            Some(OsStr::new("unix/:42.1")),
+            &dir
+        ));
+        // Absolute socket path form.
+        assert!(x11_display_reachable_in_dir(
+            Some(sock_path.as_os_str()),
+            &dir
+        ));
+        assert!(!x11_display_reachable_in_dir(
+            Some(dir.join("X99").as_os_str()),
+            &dir
+        ));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probes_localhost_tcp_display_socket() {
+        let dir = temp_socket_dir("tcp");
+        // Pick an ephemeral localhost port >= 6000 so `display_num = port - 6000`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if let Some(display_num) = port.checked_sub(6000) {
+            let spec = format!("localhost:{display_num}.0");
+            assert!(x11_display_reachable_in_dir(Some(OsStr::new(&spec)), &dir));
+            let unix = UnixListener::bind(dir.join(format!("X{display_num}"))).unwrap();
+            drop(listener);
+            assert!(x11_display_reachable_in_dir(
+                Some(OsStr::new(&format!(":{display_num}"))),
+                &dir,
+            ));
+            assert!(!x11_display_reachable_in_dir(Some(OsStr::new(&spec)), &dir));
+            drop(unix);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -42,6 +42,9 @@ pub mod state;
 pub mod transport;
 
 #[cfg(feature = "gui")]
+mod window;
+
+#[cfg(feature = "gui")]
 pub mod windowed;
 
 #[cfg(all(target_os = "macos", feature = "gui"))]

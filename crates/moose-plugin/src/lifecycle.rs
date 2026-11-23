@@ -210,7 +210,11 @@ pub trait Plugin<S: Sample = f32>: 'static {
     }
 
     /// Build the editor from the shared part.
-    fn editor(shared: Arc<Self::Shared>) -> Box<dyn Editor>;
+    ///
+    /// Defaults to [`moose_core::editor::NoEditor`] for headless plugins.
+    fn editor(_shared: Arc<Self::Shared>) -> Box<dyn Editor> {
+        Box::new(moose_core::editor::NoEditor)
+    }
 }
 
 /// Runs a [`Plugin`] through the format wrappers (`moose::plugin!`).

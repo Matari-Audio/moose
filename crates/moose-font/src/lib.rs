@@ -1,10 +1,8 @@
 //! Bundled fonts for the moose audio plugin framework.
 //!
 //! Currently exposes a single font - `JetBrains` Mono Regular - as a
-//! `&'static [u8]` of the TTF bytes, suitable for hand-off to
-//! `egui::FontData::from_static`, `iced::Font` (via the
-//! `with_font` helpers on each editor backend), or any other font
-//! consumer that takes raw bytes.
+//! `&'static [u8]` of the TTF bytes, suitable for hand-off to `mui::prelude::Font`
+//! or any other font consumer that takes raw bytes.
 //!
 //! ## License
 //!
@@ -25,8 +23,3 @@
 /// (also packaged into the crates.io tarball via the manifest's
 /// `include` list).
 pub static JETBRAINS_MONO: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
-
-/// Glyph rasterization over the bundled font. Behind the `raster`
-/// feature so byte-only consumers don't pull skrifa / tiny-skia.
-#[cfg(feature = "raster")]
-pub mod raster;

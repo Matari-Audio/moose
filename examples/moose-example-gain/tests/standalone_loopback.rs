@@ -91,6 +91,26 @@ fn minus_six_db_halves_amplitude() {
 // ---------------------------------------------------------------------------
 
 fn locate_standalone_bin() -> PathBuf {
+    let probe = |candidate: &Path| {
+        if !candidate.is_file() {
+            return false;
+        }
+        let help = Command::new(candidate).arg("--help").output();
+        help.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("--input-file"))
+    };
+    let mut skipped = Vec::new();
+    // Cargo sets `CARGO_BIN_EXE_*` to the exact binary built for this test
+    // invocation, honouring `~/.cargo/config.toml` `build.target-dir` as well
+    // as `CARGO_TARGET_DIR`.
+    if let Some(bin) = option_env!("CARGO_BIN_EXE_moose-example-gain-standalone") {
+        let candidate = PathBuf::from(bin);
+        if probe(&candidate) {
+            return candidate;
+        }
+        if candidate.is_file() {
+            skipped.push(candidate);
+        }
+    }
     let target_root = workspace_target_dir();
     let exe = format!("moose-example-gain-standalone{}", env::consts::EXE_SUFFIX);
     // Same-profile first: `cargo moose build/install` drops a
@@ -104,19 +124,14 @@ fn locate_standalone_bin() -> PathBuf {
     } else {
         ["release", "debug"]
     };
-    let mut skipped = Vec::new();
     for profile in profiles {
         let candidate = target_root.join(profile).join(&exe);
-        if !candidate.is_file() {
-            continue;
-        }
-        let help = Command::new(&candidate).arg("--help").output();
-        let advertises_playback =
-            help.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("--input-file"));
-        if advertises_playback {
+        if probe(&candidate) {
             return candidate;
         }
-        skipped.push(candidate);
+        if candidate.is_file() {
+            skipped.push(candidate);
+        }
     }
     panic!(
         "no {exe} with the `standalone-playback` feature under {} \

@@ -2,15 +2,14 @@
 
 Bundled fonts for the moose audio plugin framework.
 
-Exposes `JETBRAINS_MONO` - JetBrains Mono Regular as `&'static [u8]`
-of TTF bytes - for use by the built-in GUI rasterizer (`moose-gui`),
-the egui editor backend, and the headless screenshot
-rendering pipelines.
+Exposes `JETBRAINS_MONO` — JetBrains Mono Regular as `&'static [u8]`
+of TTF bytes — as a zero-dependency crate for `moose-mui` (`mui::prelude::Font`)
+and any other consumer that takes raw font bytes.
 
 ## Why a separate crate
 
 Keeps the font's binary payload + license file out of the
-framework's main crates.
+framework's core crates.
 
 ## License
 

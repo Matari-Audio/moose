@@ -15,10 +15,10 @@ publish = false
 cc = "1"
 
 [dev-dependencies]
-moose = { workspace = true }
+moose = { workspace = true, features = ["mui"] }
 moose-core = { workspace = true }
 moose-derive = { workspace = true }
-moose-gui = { workspace = true, features = ["cpu"] }
+moose-font = { workspace = true }
 moose-gui-types = { workspace = true }
 moose-loader = { workspace = true }
 moose-params = { workspace = true }

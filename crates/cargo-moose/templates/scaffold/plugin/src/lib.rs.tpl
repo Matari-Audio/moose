@@ -1,5 +1,6 @@
+use moose::mui::MuiEditor;
+use moose::mui::mui::prelude::*;
 use moose::prelude::*;
-use moose_gui_types::layout::\{GridLayout, knob, widgets};
 
 {params_struct | unescaped}
 
@@ -17,10 +18,15 @@ impl Plugin for {struct_name} \{
 {activate_method | unescaped}{reset_method | unescaped}{bus_layouts_method | unescaped}{process_body | unescaped}
 
     fn editor(params: Arc<{struct_name}Params>) -> Box<dyn Editor> \{
-        moose_gui::default_editor(
-            params,
-            GridLayout::build(vec![widgets(vec![{layout_knob | unescaped}])]),
-        )
+        let mut ui = Ui::default();
+        if let Ok(font) = Font::new(moose_font::JETBRAINS_MONO) \{
+            ui = ui.font(font);
+        }
+        MuiEditor::new(params, ui, (260, 180), |ui, bridge| \{
+            let control = {layout_knob | unescaped};
+            col![control].gap(M).pad(L).center().fill(Role::Surface)
+        })
+        .into_editor()
     }
 }
 

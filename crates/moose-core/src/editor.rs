@@ -52,6 +52,11 @@ pub enum RawWindowHandle {
 
 /// Plugin GUI editor.
 pub trait Editor: Send {
+    /// Whether this editor provides a UI, independent of its size or open state.
+    fn has_ui(&self) -> bool {
+        true
+    }
+
     /// Initial window size in logical points.
     ///
     /// On a 2x Retina display, `(400, 300)` produces an 800x600 pixel window.
@@ -333,6 +338,10 @@ struct TaskBoundEditor {
 }
 
 impl Editor for TaskBoundEditor {
+    fn has_ui(&self) -> bool {
+        self.editor.has_ui()
+    }
+
     fn size(&self) -> (u32, u32) {
         self.editor.size()
     }
@@ -470,17 +479,13 @@ impl Editor for TaskBoundEditor {
 ///
 /// ```ignore
 /// fn editor(params: Arc<MyParams>) -> Box<dyn Editor> {
-///     EguiEditor::new(params, (W, H), ui)
-///         .with_visuals(theme)
-///         .into_editor()
+///     MuiEditor::new(params, ui, (W, H), build).into_editor()
 /// }
 /// ```
 ///
 /// Implemented for every [`Editor`] via a blanket impl and re-exported
 /// from every `moose::prelude*`, so it's in scope without an extra
-/// import - egui / iced / slint / hand-rolled editors all use it.
-/// Layout-only plugins use `moose_gui::IntoLayoutEditor` instead (its
-/// `into_editor` takes `&Arc<Params>` and picks the built-in renderer).
+/// import.
 pub trait IntoEditor {
     /// Box this editor into a `Box<dyn Editor>`.
     fn into_editor(self) -> Box<dyn Editor>;
@@ -490,6 +495,31 @@ impl<E: Editor + 'static> IntoEditor for E {
     fn into_editor(self) -> Box<dyn Editor> {
         Box::new(self)
     }
+}
+
+/// No-op editor for headless plugins that provide no custom GUI.
+///
+/// Reports a `(0, 0)` size and `is_open() == false`, so hosts fall back to
+/// their generic parameter view and standalone runs headless.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoEditor;
+
+impl Editor for NoEditor {
+    fn has_ui(&self) -> bool {
+        false
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    fn open(&mut self, _parent: RawWindowHandle, _context: PluginContext) {}
+
+    fn is_open(&self) -> bool {
+        false
+    }
+
+    fn close(&mut self) {}
 }
 
 /// Bridge between the editor and the host / plugin. Format wrappers

@@ -1,6 +1,4 @@
 use moose::prelude::*;
-use moose_gui::IntoLayoutEditor;
-use moose_gui_types::layout::{GridLayout, knob, meter, widgets, xy_pad};
 
 // --- Parameters ---
 
@@ -105,43 +103,6 @@ impl Plugin for Gain {
 
         ProcessStatus::Normal
     }
-
-    fn editor(params: Arc<GainParams>) -> Box<dyn Editor> {
-        // Knob row at top-left, XY pad below them, meter pinned to
-        // column 2 spanning three rows. With `.resizable(true)`,
-        // host-driven resize snaps to a whole-cell width and
-        // reflows the grid via `GridLayout::refit_cols`: auto-flow
-        // widgets repack into the new column count and the height
-        // re-computes from the new layout. The explicit `.at(...)`
-        // placements stay put, so `min_cols(3)` keeps the meter's
-        // column reachable at any host-allowed size.
-        GridLayout::build(vec![widgets(vec![
-            knob(P::Gain, "Gain").at(0, 0),
-            knob(P::Pan, "Pan").at(1, 0),
-            xy_pad(P::Pan, P::Gain, "XY").at(0, 1),
-            meter(&[P::MeterLeft, P::MeterRight], "Level")
-                .at(2, 0)
-                .rows(3),
-        ])])
-        .with_title("GAIN")
-        // `build()` derives `cols` from the widest section's widget
-        // count (4 for this layout: knob + knob + xy_pad + meter),
-        // which is wider than the rightmost widget edge (col 2 -
-        // span 1 = 3 cols). Pin to 3 explicitly so the natural
-        // size is tight to the actual content and `refit_cols`
-        // snaps from there.
-        .with_cols(3)
-        .resizable(true)
-        // Cell-count bounds on (cols, rows). Call shape matches the
-        // other backends' `min_size` / `max_size` builders; the unit
-        // is cells because the grid snaps to whole cells anyway.
-        // 3 cols / 3 rows is the floor (the meter at col 2 spans 3
-        // rows, so dropping below 3 would clip it); 8 / 6 caps the
-        // stretch at a size the layout still reads as tight.
-        .min_size((3, 3))
-        .max_size((8, 6))
-        .into_editor(&params)
-    }
 }
 
 moose::plugin! {
@@ -242,11 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn has_editor() {
-        moose_test::assert_has_editor::<PluginShell>();
-    }
-
-    #[test]
     fn state_round_trips() {
         moose_test::assert_state_round_trip::<PluginShell>();
     }
@@ -307,16 +263,6 @@ mod tests {
     #[test]
     fn bus_config_effect() {
         moose_test::assert_bus_config_effect::<PluginShell>();
-    }
-
-    #[test]
-    fn editor_lifecycle() {
-        moose_test::assert_editor_lifecycle::<PluginShell>();
-    }
-
-    #[test]
-    fn editor_size_consistent() {
-        moose_test::assert_editor_size_consistent::<PluginShell>();
     }
 
     #[test]
@@ -416,28 +362,6 @@ mod tests {
     #[test]
     fn empty_state_no_crash() {
         moose_test::assert_empty_state_no_crash::<PluginShell>();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gui_screenshot_macos() {
-        moose_test::screenshot!(PluginShell, "screenshots/gain_default_macos.png").run();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn gui_screenshot_linux() {
-        moose_test::screenshot!(PluginShell, "screenshots/gain_default_linux.png")
-            .pixel_threshold(2)
-            .run();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn gui_screenshot_windows() {
-        moose_test::screenshot!(PluginShell, "screenshots/gain_default_windows.png")
-            .pixel_threshold(2)
-            .run();
     }
 
     /// End-to-end check of [`moose_test::PluginDriver`] on an

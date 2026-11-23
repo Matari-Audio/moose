@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.26.3"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "accesskit_unix"
 version = "0.22.1"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "accesskit",
  "accesskit_atspi_common",
@@ -190,12 +190,6 @@ dependencies = [
  "windows-sys 0.59.0",
  "x11rb",
 ]
-
-[[package]]
-name = "arrayref"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
 
 [[package]]
 name = "arrayvec"
@@ -420,24 +414,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "biquad"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dee8f423f64504139bdc53d7fbe6a1cd8eff4f354be3652e7cf26385c9f1cb4"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "bit-set"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34ddef2995421ab6a5c779542c81ee77c115206f4ad9d5a8e05f4ff49716a3dd"
-dependencies = [
- "bit-vec",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,7 +539,7 @@ dependencies = [
  "moose-shim-types",
  "moose-utils",
  "plist",
- "png 0.18.1",
+ "png",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -849,7 +825,7 @@ dependencies = [
  "clap",
  "criterion-plot",
  "is-terminal",
- "itertools 0.10.5",
+ "itertools",
  "num-traits",
  "once_cell",
  "oorandom",
@@ -868,7 +844,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
 dependencies = [
  "cast",
- "itertools 0.10.5",
+ "itertools",
 ]
 
 [[package]]
@@ -982,72 +958,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
 
 [[package]]
-name = "dyn-clone"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
-
-[[package]]
-name = "ecolor"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6758be723a3f298bbfda4db75748bc2ba0abafe096b6383c7c32da264764fbc3"
-dependencies = [
- "bytemuck",
- "emath",
-]
-
-[[package]]
-name = "egui"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796c98d50b79631281d516343a6f6e93c0666462ca36e2c93b39f25d7793325"
-dependencies = [
- "accesskit",
- "ahash",
- "bitflags 2.13.0",
- "emath",
- "epaint",
- "itertools 0.14.0",
- "log",
- "nohash-hasher",
- "profiling",
- "smallvec",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "egui-wgpu"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e6cfac0725563555fa4f91e9f799b9d7c6c5dd831fca6abc8234afc64b7a34"
-dependencies = [
- "ahash",
- "bytemuck",
- "document-features",
- "epaint",
- "log",
- "profiling",
- "thiserror 2.0.18",
- "type-map",
- "web-time",
- "wgpu 29.0.4",
-]
-
-[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
-
-[[package]]
-name = "emath"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4ec073c9898516584d8c6cfdcee95b530b3d941cd5031ef4050aa36812308b"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "encoding_rs"
@@ -1084,37 +998,6 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
-
-[[package]]
-name = "epaint"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e60a8888b51da911df23918fd7301359b1d43a406a0ff3b8863af093dd7fc6c"
-dependencies = [
- "ahash",
- "bytemuck",
- "ecolor",
- "emath",
- "epaint_default_fonts",
- "font-types 0.11.3",
- "harfrust 0.7.0",
- "log",
- "nohash-hasher",
- "parking_lot",
- "profiling",
- "self_cell",
- "skrifa 0.42.1",
- "smallvec",
- "unicode-general-category",
- "unicode-segmentation",
- "vello_cpu 0.0.9",
-]
-
-[[package]]
-name = "epaint_default_fonts"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ee4e1f553a3584c301f3a56ff1a775f1384781396cea301c8d952e9b93f560"
 
 [[package]]
 name = "equivalent"
@@ -1168,12 +1051,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "extended"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1190,26 +1067,9 @@ dependencies = [
 
 [[package]]
 name = "fearless_simd"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
-
-[[package]]
-name = "fearless_simd"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4beca3cb2444e3304ac30843cc091f44ed58932353cd492ce740067bfce6b12"
-
-[[package]]
-name = "fft-convolver"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecb4fbed063c755ecaa4cd1356cd82cc48e9d5c7edd5c30cd144656833fc0661"
-dependencies = [
- "realfft",
- "rtsan-standalone",
- "thiserror 2.0.18",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1229,31 +1089,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "float_next_after"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "font-types"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "font-types"
@@ -1262,40 +1101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8eb065f3251655b3c90e22e5e363f310fc5332fb3402e37bbc94752283248f6"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "fundsp"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6969e5c9d5c5c704723f547237494fde9b1addf16f718f65cd786b3b6e320a4f"
-dependencies = [
- "dyn-clone",
- "fft-convolver",
- "funutd",
- "hashbrown 0.16.1",
- "libm",
- "microfft",
- "num-complex",
- "numeric-array",
- "once_cell",
- "resampler",
- "symphonia",
- "thingbuf",
- "tinyvec",
- "wide 1.5.0",
-]
-
-[[package]]
-name = "funutd"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30f658de1fbeca3b70faf090e33d1ecf32b0efd1805bede4a8fd6ef562b7ab83"
-dependencies = [
- "dyn-clone",
- "glam",
- "hashbrown 0.14.5",
- "libm",
 ]
 
 [[package]]
@@ -1357,16 +1162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generic-array"
-version = "1.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2e55f16dcf0e9c00efbe2e655ffe45fc98e7066b52bc92f8a79e64060a79351"
-dependencies = [
- "rustversion",
- "typenum",
-]
-
-[[package]]
 name = "gethostname"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1407,76 +1202,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
-name = "gl_generator"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a95dfc23a2b4a9a2f5ab41d194f8bfda3cabec42af4e39f08c339eb2a0c124d"
-dependencies = [
- "khronos_api",
- "log",
- "xml-rs",
-]
-
-[[package]]
-name = "glam"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "779ae4bf7e8421cf91c0b3b64e7e8b40b862fba4d393f59150042de7c4965a94"
-dependencies = [
- "libm",
-]
-
-[[package]]
-name = "glifo"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d99fc21d493812643aae86d53b7bbd02f376434a90317e8a790bc209fdd6605e"
-dependencies = [
- "bytemuck",
- "foldhash 0.2.0",
- "hashbrown 0.17.1",
- "log",
- "peniko",
- "skrifa 0.42.1",
- "smallvec",
- "vello_common 0.0.9",
-]
-
-[[package]]
 name = "glifo"
 version = "0.4.0"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "bytemuck",
- "foldhash 0.2.0",
+ "foldhash",
  "hashbrown 0.17.1",
  "log",
  "peniko",
- "png 0.18.1",
- "skrifa 0.44.0",
+ "png",
+ "skrifa",
  "smallvec",
- "vello_common 0.3.0",
-]
-
-[[package]]
-name = "glow"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29038e1c483364cc6bb3cf78feee1816002e127c331a1eec55a4d202b9e1adb5"
-dependencies = [
- "js-sys",
- "slotmap",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "glutin_wgl_sys"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
-dependencies = [
- "gl_generator",
+ "vello_common",
 ]
 
 [[package]]
@@ -1491,26 +1229,6 @@ dependencies = [
  "presser",
  "thiserror 2.0.18",
  "windows 0.62.2",
-]
-
-[[package]]
-name = "gpu-descriptor"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b89c83349105e3732062a895becfc71a8f921bb71ecbbdd8ff99263e3b53a0ca"
-dependencies = [
- "bitflags 2.13.0",
- "gpu-descriptor-types",
- "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "gpu-descriptor-types"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdf242682df893b86f33a73828fb09ca4b2d3bb6cc95249707fc684d27484b91"
-dependencies = [
- "bitflags 2.13.0",
 ]
 
 [[package]]
@@ -1536,18 +1254,6 @@ dependencies = [
 
 [[package]]
 name = "harfrust"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0431e8e389aa0f1e72bb9d1c2db8957a1a7a3580e8ed97db819c14837aac9b3e"
-dependencies = [
- "bitflags 2.13.0",
- "bytemuck",
- "read-fonts 0.39.2",
- "smallvec",
-]
-
-[[package]]
-name = "harfrust"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "948d0741125ba89cd3e1c23e5642415b6ade7e1d29d67ba25fb925b533e989d6"
@@ -1555,7 +1261,7 @@ dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
  "once_cell",
- "read-fonts 0.43.3",
+ "read-fonts",
  "smallvec",
 ]
 
@@ -1564,19 +1270,6 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
- "allocator-api2",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "foldhash 0.1.5",
-]
 
 [[package]]
 name = "hashbrown"
@@ -1586,7 +1279,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -1595,7 +1288,7 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -1609,12 +1302,6 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
-name = "hexf-parse"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hound"
@@ -1695,15 +1382,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1773,23 +1451,6 @@ dependencies = [
  "bitflags 2.13.0",
  "serde",
 ]
-
-[[package]]
-name = "khronos-egl"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
-dependencies = [
- "libc",
- "libloading 0.8.9",
- "pkg-config",
-]
-
-[[package]]
-name = "khronos_api"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kurbo"
@@ -1888,38 +1549,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lyon_geom"
-version = "1.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4336502e29e32af93cf2dad2214ed6003c17ceb5bd499df77b1de663b9042b92"
-dependencies = [
- "arrayvec",
- "euclid",
- "num-traits",
-]
-
-[[package]]
-name = "lyon_path"
-version = "1.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c463f9c428b7fc5ec885dcd39ce4aa61e29111d0e33483f6f98c74e89d8621e"
-dependencies = [
- "lyon_geom",
- "num-traits",
-]
-
-[[package]]
-name = "lyon_tessellation"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e43b7e44161571868f5c931d12583592c223c5583eef86b08aa02b7048a3552"
-dependencies = [
- "float_next_after",
- "lyon_path",
- "num-traits",
-]
-
-[[package]]
 name = "mach-dxcompiler-rs"
 version = "0.1.4+2024.11.22-df583a3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1993,17 +1622,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "microfft"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b6673eb0cc536241d6734c2ca45abfdbf90e9e7791c66a36a7ba3c315b76cf"
-dependencies = [
- "cfg-if",
- "num-complex",
- "static_assertions",
 ]
 
 [[package]]
@@ -2088,7 +1706,7 @@ dependencies = [
 [[package]]
 name = "moose-baseview"
 version = "0.4.1-moose.1"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "block2 0.6.2",
  "bytemuck",
@@ -2156,18 +1774,8 @@ dependencies = [
  "loom",
  "moose-params",
  "moose-utils",
- "png 0.18.1",
+ "png",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "moose-cpu"
-version = "7.0.0"
-dependencies = [
- "moose-core",
- "moose-font",
- "moose-gui-types",
- "tiny-skia",
 ]
 
 [[package]]
@@ -2201,291 +1809,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moose-egui"
-version = "7.0.0"
-dependencies = [
- "egui",
- "egui-wgpu",
- "keyboard-types",
- "log",
- "moose-baseview",
- "moose-core",
- "moose-gui",
- "moose-params",
- "objc",
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
- "pollster",
- "raw-window-handle",
- "wgpu 29.0.4",
-]
-
-[[package]]
-name = "moose-example-arpeggio"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-block-drywet"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-block-gain"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-block-gate"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-block-saturate"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-block-surround-meter"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-block-widen"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-cc-filter"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-chord"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-dasp-bitcrusher"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "dasp_sample",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-envelope"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-eq"
-version = "7.0.0"
-dependencies = [
- "biquad",
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-simd",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
- "num-traits",
- "wide 0.7.33",
-]
-
-[[package]]
-name = "moose-example-fundsp-reverb-simple"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "fundsp",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-fundsp-reverb-worker"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "crossbeam-queue",
- "fundsp",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
 name = "moose-example-gain"
 version = "7.0.0"
 dependencies = [
@@ -2496,64 +1819,6 @@ dependencies = [
  "moose-clap",
  "moose-core",
  "moose-driver",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-gain-egui"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "egui",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-egui",
- "moose-font",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-gain-egui-aspect"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "egui",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-egui",
- "moose-font",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-gain-inplace"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
  "moose-loader",
  "moose-params",
  "moose-standalone",
@@ -2575,79 +1840,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moose-example-gui-zoo"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-gui-zoo-egui"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "egui",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-egui",
- "moose-font",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
- "png 0.17.16",
-]
-
-[[package]]
-name = "moose-example-mpe-spreader"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-mpe-synth"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
 name = "moose-example-multiport"
 version = "7.0.0"
 dependencies = [
@@ -2657,8 +1849,6 @@ dependencies = [
  "moose-au",
  "moose-clap",
  "moose-core",
- "moose-gui",
- "moose-gui-types",
  "moose-loader",
  "moose-params",
  "moose-standalone",
@@ -2675,45 +1865,6 @@ dependencies = [
  "moose-au",
  "moose-clap",
  "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-state"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "egui",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-egui",
- "moose-font",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-stereo-utility"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
  "moose-loader",
  "moose-params",
  "moose-standalone",
@@ -2731,8 +1882,6 @@ dependencies = [
  "moose-build",
  "moose-clap",
  "moose-core",
- "moose-gui",
- "moose-gui-types",
  "moose-loader",
  "moose-params",
  "moose-standalone",
@@ -2742,110 +1891,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "moose-example-sysex-echo"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-transpose"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-gui",
- "moose-gui-types",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
-name = "moose-example-tremolo"
-version = "7.0.0"
-dependencies = [
- "clap-sys",
- "egui",
- "moose",
- "moose-au",
- "moose-clap",
- "moose-core",
- "moose-egui",
- "moose-font",
- "moose-loader",
- "moose-params",
- "moose-standalone",
- "moose-test",
- "moose-vst3",
-]
-
-[[package]]
 name = "moose-font"
 version = "7.0.0"
-dependencies = [
- "skrifa 0.43.2",
- "tiny-skia",
-]
-
-[[package]]
-name = "moose-gpu"
-version = "7.0.0"
-dependencies = [
- "bytemuck",
- "log",
- "lyon_tessellation",
- "moose-baseview",
- "moose-core",
- "moose-font",
- "moose-gui-types",
- "moose-params",
- "pollster",
- "raw-window-handle",
- "wgpu 29.0.4",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "moose-gui"
-version = "7.0.0"
-dependencies = [
- "keyboard-types",
- "log",
- "moose-baseview",
- "moose-core",
- "moose-cpu",
- "moose-gpu",
- "moose-gui-types",
- "moose-gui-utils",
- "moose-params",
- "moose-plugin",
- "objc",
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
- "objc2-ui-kit",
- "pollster",
- "raw-window-handle",
- "wgpu 29.0.4",
- "windows-sys 0.61.2",
- "x11-dl",
-]
 
 [[package]]
 name = "moose-gui-types"
@@ -2890,7 +1937,7 @@ dependencies = [
  "moose-clap",
  "moose-core",
  "moose-derive",
- "moose-gui",
+ "moose-font",
  "moose-gui-types",
  "moose-loader",
  "moose-params",
@@ -2939,7 +1986,7 @@ dependencies = [
  "criterion",
  "moose-core",
  "moose-params",
- "wide 0.7.33",
+ "wide",
 ]
 
 [[package]]
@@ -2955,8 +2002,6 @@ dependencies = [
  "moose-baseview",
  "moose-core",
  "moose-driver",
- "moose-gpu",
- "moose-gui",
  "moose-params",
  "moose-utils",
  "objc",
@@ -2976,7 +2021,7 @@ dependencies = [
  "moose-driver",
  "moose-params",
  "moose-plugin",
- "png 0.18.1",
+ "png",
  "toml",
 ]
 
@@ -3009,7 +2054,7 @@ dependencies = [
 [[package]]
 name = "mui"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "color",
  "mui-geometry",
@@ -3027,7 +2072,7 @@ dependencies = [
 [[package]]
 name = "mui-access"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "accesskit",
  "mui-geometry",
@@ -3038,7 +2083,7 @@ dependencies = [
 [[package]]
 name = "mui-baseview"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "accesskit_macos",
  "accesskit_unix",
@@ -3054,7 +2099,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "raw-window-handle",
  "serde_json",
- "wgpu 30.0.1",
+ "wgpu",
  "windows 0.62.2",
  "windows-sys 0.61.2",
  "x11-dl",
@@ -3064,7 +2109,7 @@ dependencies = [
 [[package]]
 name = "mui-geometry"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "i_overlay",
  "kurbo",
@@ -3074,7 +2119,7 @@ dependencies = [
 [[package]]
 name = "mui-input"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "mui-geometry",
  "mui-layout",
@@ -3084,7 +2129,7 @@ dependencies = [
 [[package]]
 name = "mui-layout"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "arrayvec",
  "rustc-hash 2.1.3",
@@ -3094,7 +2139,7 @@ dependencies = [
 [[package]]
 name = "mui-material"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "mui-scene",
 ]
@@ -3102,12 +2147,12 @@ dependencies = [
 [[package]]
 name = "mui-motion"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 
 [[package]]
 name = "mui-scene"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "mui-geometry",
  "mui-layout",
@@ -3123,7 +2168,7 @@ dependencies = [
 [[package]]
 name = "mui-style"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "color",
  "kurbo",
@@ -3136,16 +2181,16 @@ dependencies = [
 [[package]]
 name = "mui-symbols"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 
 [[package]]
 name = "mui-text"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
- "harfrust 0.13.3",
+ "harfrust",
  "mui-geometry",
- "skrifa 0.46.2",
+ "skrifa",
  "smallvec",
  "unicode-bidi",
  "unicode-linebreak",
@@ -3155,9 +2200,9 @@ dependencies = [
 [[package]]
 name = "mui-vello"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
- "glifo 0.4.0",
+ "glifo",
  "mach-dxcompiler-rs",
  "mui-geometry",
  "mui-scene",
@@ -3167,45 +2212,19 @@ dependencies = [
  "raw-window-handle",
  "rustc-hash 2.1.3",
  "softbuffer",
- "vello_common 0.3.0",
- "vello_cpu 0.3.0",
- "wgpu 30.0.1",
+ "vello_common",
+ "vello_cpu",
+ "wgpu",
 ]
 
 [[package]]
 name = "mui-weld"
 version = "0.4.2"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "color",
  "kurbo",
  "rustc-hash 2.1.3",
-]
-
-[[package]]
-name = "naga"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bf919621e7975acb27d881bae2fb993e0d45c8e0446e85e6272971e00dc8df"
-dependencies = [
- "arrayvec",
- "bit-set 0.9.1",
- "bitflags 2.13.0",
- "cfg-if",
- "cfg_aliases",
- "codespan-reporting",
- "half",
- "hashbrown 0.16.1",
- "hexf-parse",
- "indexmap",
- "libm",
- "log",
- "num-traits",
- "once_cell",
- "rustc-hash 1.1.0",
- "spirv",
- "thiserror 2.0.18",
- "unicode-ident",
 ]
 
 [[package]]
@@ -3215,7 +2234,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130"
 dependencies = [
  "arrayvec",
- "bit-set 0.10.0",
+ "bit-set",
  "bitflags 2.13.0",
  "cfg-if",
  "cfg_aliases",
@@ -3302,12 +2321,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nohash-hasher"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3362,16 +2375,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
-]
-
-[[package]]
 name = "num_enum"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3391,16 +2394,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "numeric-array"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60a6096447d657bfba01c49d38338b6c8e68e0e34d595360345375b798a4a765"
-dependencies = [
- "generic-array",
- "num-traits",
 ]
 
 [[package]]
@@ -3447,8 +2440,8 @@ dependencies = [
  "block2 0.5.1",
  "libc",
  "objc2 0.5.2",
- "objc2-core-data 0.2.2",
- "objc2-core-image 0.2.2",
+ "objc2-core-data",
+ "objc2-core-image",
  "objc2-foundation 0.2.2",
  "objc2-quartz-core 0.2.2",
 ]
@@ -3494,17 +2487,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "objc2-cloud-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ad74d880bb43877038da939b7427bba67e9dd42004a18b809ba7d87cee241c"
-dependencies = [
- "bitflags 2.13.0",
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
-]
-
-[[package]]
 name = "objc2-core-audio"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3537,16 +2519,6 @@ dependencies = [
  "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
-]
-
-[[package]]
-name = "objc2-core-data"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b402a653efbb5e82ce4df10683b6b28027616a2715e90009947d50b8dd298fa"
-dependencies = [
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -3585,51 +2557,6 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
  "objc2-metal 0.2.2",
-]
-
-[[package]]
-name = "objc2-core-image"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d563b38d2b97209f8e861173de434bd0214cf020e3423a52624cd1d989f006"
-dependencies = [
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
-]
-
-[[package]]
-name = "objc2-core-location"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca347214e24bc973fc025fd0d36ebb179ff30536ed1f80252706db19ee452009"
-dependencies = [
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
-]
-
-[[package]]
-name = "objc2-core-text"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
-dependencies = [
- "bitflags 2.13.0",
- "objc2 0.6.4",
- "objc2-core-foundation",
- "objc2-core-graphics",
-]
-
-[[package]]
-name = "objc2-core-video"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
-dependencies = [
- "bitflags 2.13.0",
- "objc2 0.6.4",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-io-surface",
 ]
 
 [[package]]
@@ -3718,45 +2645,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
 dependencies = [
  "bitflags 2.13.0",
- "block2 0.6.2",
- "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
- "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
-]
-
-[[package]]
-name = "objc2-ui-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
-dependencies = [
- "bitflags 2.13.0",
- "block2 0.6.2",
- "objc2 0.6.4",
- "objc2-cloud-kit",
- "objc2-core-data 0.3.2",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-core-image 0.3.2",
- "objc2-core-location",
- "objc2-core-text",
- "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
- "objc2-user-notifications",
-]
-
-[[package]]
-name = "objc2-user-notifications"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
-dependencies = [
- "objc2 0.6.4",
- "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -3897,26 +2790,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
 
 [[package]]
-name = "pin-project"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
-dependencies = [
- "pin-project-internal",
-]
-
-[[package]]
-name = "pin-project-internal"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3950,19 +2823,6 @@ dependencies = [
  "quick-xml",
  "serde",
  "time",
-]
-
-[[package]]
-name = "png"
-version = "0.17.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
-dependencies = [
- "bitflags 1.3.2",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide",
 ]
 
 [[package]]
@@ -4117,54 +2977,13 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
-version = "0.39.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4ed38b89c2c77ff968c524145ad65fb010f38af5c7a224b53b81d47ac2daa81"
-dependencies = [
- "bytemuck",
- "font-types 0.11.3",
-]
-
-[[package]]
-name = "read-fonts"
-version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487889119a5f19ff7c0a20637196bdc76b9f54ebec17e3588b5d75e4999f8773"
-dependencies = [
- "bytemuck",
- "font-types 0.12.5",
- "once_cell",
-]
-
-[[package]]
-name = "read-fonts"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
-dependencies = [
- "bytemuck",
- "font-types 0.12.5",
- "once_cell",
-]
-
-[[package]]
-name = "read-fonts"
 version = "0.43.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "005c8acf251756c478b0bf402885bfd88a1476020c4c7e6060edc1aa68da38ea"
 dependencies = [
  "bytemuck",
- "font-types 0.12.5",
+ "font-types",
  "once_cell",
-]
-
-[[package]]
-name = "realfft"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677"
-dependencies = [
- "rustfft",
 ]
 
 [[package]]
@@ -4246,15 +3065,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "resampler"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80f5ab61459422b1a350caae1aadef48ebae234b12e80248e9ba9557018ef060"
-dependencies = [
- "libm",
-]
-
-[[package]]
 name = "rfd"
 version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4273,36 +3083,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "rtsan-standalone"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fd1b6d61d69481a68e555916d3a52213846f5c2d2140bdc74ebc308e2338fc3"
-dependencies = [
- "rtsan-standalone-macros",
- "rtsan-standalone-sys",
-]
-
-[[package]]
-name = "rtsan-standalone-macros"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8320af894782374141c8e0d4521ee613a8f24d7ab08b6ad359881311e37b9ef"
-dependencies = [
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "rtsan-standalone-sys"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "362a9c531f731e574a870cdb28ee7d81178ba7a87ed54380eb9b8d8f0c3b5301"
-dependencies = [
- "num_cpus",
- "tempfile",
 ]
 
 [[package]]
@@ -4366,15 +3146,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "safe_arch"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4394,12 +3165,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "self_cell"
-version = "1.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
 
 [[package]]
 name = "serde"
@@ -4503,42 +3268,12 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "skrifa"
-version = "0.42.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c34617370ae968efb7161bb2beb517d9084659aae19e24b89e3db25b46e4564"
-dependencies = [
- "bytemuck",
- "read-fonts 0.39.2",
-]
-
-[[package]]
-name = "skrifa"
-version = "0.43.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cbe997d0f2480442d727488fbe2150779114cbe480ecdbadef58b33e0318ffb"
-dependencies = [
- "bytemuck",
- "read-fonts 0.40.2",
-]
-
-[[package]]
-name = "skrifa"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
-dependencies = [
- "bytemuck",
- "read-fonts 0.41.0",
-]
-
-[[package]]
-name = "skrifa"
 version = "0.46.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4febebda507fb889c545a37a135517769d1391941013561292897961d1887d6"
 dependencies = [
  "bytemuck",
- "read-fonts 0.43.3",
+ "read-fonts",
 ]
 
 [[package]]
@@ -4546,15 +3281,6 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
-
-[[package]]
-name = "slotmap"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
-dependencies = [
- "version_check",
-]
 
 [[package]]
 name = "smallvec"
@@ -4653,207 +3379,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
 
 [[package]]
-name = "strict-num"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
-
-[[package]]
-name = "symphonia"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5773a4c030a19d9bfaa090f49746ff35c75dfddfa700df7a5939d5e076a57039"
-dependencies = [
- "lazy_static",
- "symphonia-bundle-flac",
- "symphonia-bundle-mp3",
- "symphonia-codec-aac",
- "symphonia-codec-adpcm",
- "symphonia-codec-alac",
- "symphonia-codec-pcm",
- "symphonia-codec-vorbis",
- "symphonia-core",
- "symphonia-format-caf",
- "symphonia-format-isomp4",
- "symphonia-format-mkv",
- "symphonia-format-ogg",
- "symphonia-format-riff",
- "symphonia-metadata",
-]
-
-[[package]]
-name = "symphonia-bundle-flac"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c91565e180aea25d9b80a910c546802526ffd0072d0b8974e3ebe59b686c9976"
-dependencies = [
- "log",
- "symphonia-core",
- "symphonia-metadata",
- "symphonia-utils-xiph",
-]
-
-[[package]]
-name = "symphonia-bundle-mp3"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4872dd6bb56bf5eac799e3e957aa1981086c3e613b27e0ac23b176054f7c57ed"
-dependencies = [
- "lazy_static",
- "log",
- "symphonia-core",
- "symphonia-metadata",
-]
-
-[[package]]
-name = "symphonia-codec-aac"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c263845aa86881416849c1729a54c7f55164f8b96111dba59de46849e73a790"
-dependencies = [
- "lazy_static",
- "log",
- "symphonia-core",
-]
-
-[[package]]
-name = "symphonia-codec-adpcm"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2dddc50e2bbea4cfe027441eece77c46b9f319748605ab8f3443350129ddd07f"
-dependencies = [
- "log",
- "symphonia-core",
-]
-
-[[package]]
-name = "symphonia-codec-alac"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8413fa754942ac16a73634c9dfd1500ed5c61430956b33728567f667fdd393ab"
-dependencies = [
- "log",
- "symphonia-core",
-]
-
-[[package]]
-name = "symphonia-codec-pcm"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e89d716c01541ad3ebe7c91ce4c8d38a7cf266a3f7b2f090b108fb0cb031d95"
-dependencies = [
- "log",
- "symphonia-core",
-]
-
-[[package]]
-name = "symphonia-codec-vorbis"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f025837c309cd69ffef572750b4a2257b59552c5399a5e49707cc5b1b85d1c73"
-dependencies = [
- "log",
- "symphonia-core",
- "symphonia-utils-xiph",
-]
-
-[[package]]
-name = "symphonia-core"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea00cc4f79b7f6bb7ff87eddc065a1066f3a43fe1875979056672c9ef948c2af"
-dependencies = [
- "arrayvec",
- "bitflags 1.3.2",
- "bytemuck",
- "lazy_static",
- "log",
-]
-
-[[package]]
-name = "symphonia-format-caf"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8faf379316b6b6e6bbc274d00e7a592e0d63ff1a7e182ce8ba25e24edd3d096"
-dependencies = [
- "log",
- "symphonia-core",
- "symphonia-metadata",
-]
-
-[[package]]
-name = "symphonia-format-isomp4"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "243739585d11f81daf8dac8d9f3d18cc7898f6c09a259675fc364b382c30e0a5"
-dependencies = [
- "encoding_rs",
- "log",
- "symphonia-core",
- "symphonia-metadata",
- "symphonia-utils-xiph",
-]
-
-[[package]]
-name = "symphonia-format-mkv"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "122d786d2c43a49beb6f397551b4a050d8229eaa54c7ddf9ee4b98899b8742d0"
-dependencies = [
- "lazy_static",
- "log",
- "symphonia-core",
- "symphonia-metadata",
- "symphonia-utils-xiph",
-]
-
-[[package]]
-name = "symphonia-format-ogg"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b4955c67c1ed3aa8ae8428d04ca8397fbef6a19b2b051e73b5da8b1435639cb"
-dependencies = [
- "log",
- "symphonia-core",
- "symphonia-metadata",
- "symphonia-utils-xiph",
-]
-
-[[package]]
-name = "symphonia-format-riff"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2d7c3df0e7d94efb68401d81906eae73c02b40d5ec1a141962c592d0f11a96f"
-dependencies = [
- "extended",
- "log",
- "symphonia-core",
- "symphonia-metadata",
-]
-
-[[package]]
-name = "symphonia-metadata"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36306ff42b9ffe6e5afc99d49e121e0bd62fe79b9db7b9681d48e29fa19e6b16"
-dependencies = [
- "encoding_rs",
- "lazy_static",
- "log",
- "symphonia-core",
-]
-
-[[package]]
-name = "symphonia-utils-xiph"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee27c85ab799a338446b68eec77abf42e1a6f1bb490656e121c6e27bfbab9f16"
-dependencies = [
- "symphonia-core",
- "symphonia-metadata",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4886,15 +3411,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "thingbuf"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "662b54ef6f7b4e71f683dadc787bbb2d8e8ef2f91b682ebed3164a5a7abca905"
-dependencies = [
- "pin-project",
 ]
 
 [[package]]
@@ -4987,32 +3503,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-skia"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
-dependencies = [
- "arrayref",
- "arrayvec",
- "bytemuck",
- "cfg-if",
- "log",
- "png 0.18.1",
- "tiny-skia-path",
-]
-
-[[package]]
-name = "tiny-skia-path"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
-dependencies = [
- "arrayref",
- "bytemuck",
- "strict-num",
-]
-
-[[package]]
 name = "tiny-xlib"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5034,21 +3524,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "tinyvec"
-version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
-dependencies = [
- "tinyvec_macros",
-]
-
-[[package]]
-name = "tinyvec_macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
@@ -5213,25 +3688,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "type-map"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
-dependencies = [
- "rustc-hash 2.1.3",
-]
-
-[[package]]
 name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
-
-[[package]]
-name = "typenum"
-version = "1.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uds_windows"
@@ -5249,12 +3709,6 @@ name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
-
-[[package]]
-name = "unicode-general-category"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"
@@ -5299,58 +3753,30 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vello_common"
-version = "0.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d672facaa2d697285a786cd9d44d614cd2ce54cdc022504bf339f8fff3b750"
-dependencies = [
- "bytemuck",
- "fearless_simd 0.4.1",
- "guillotiere",
- "hashbrown 0.17.1",
- "log",
- "peniko",
- "smallvec",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "vello_common"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73c2fbe53548bcd25c8ff42f75a93770a8611a16b37bee56d7ef7b44e36027f1"
 dependencies = [
  "bytemuck",
- "fearless_simd 0.7.0",
+ "fearless_simd",
  "guillotiere",
  "log",
  "peniko",
- "png 0.18.1",
+ "png",
  "smallvec",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "vello_cpu"
-version = "0.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588691169aed86b5c8fb487266afee01323234e6fd0a3f2aaec0eaa8e4007f23"
-dependencies = [
- "bytemuck",
- "glifo 0.1.1",
- "hashbrown 0.17.1",
- "vello_common 0.0.9",
-]
-
-[[package]]
-name = "vello_cpu"
 version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "bytemuck",
- "glifo 0.4.0",
+ "glifo",
  "hashbrown 0.17.1",
- "png 0.18.1",
- "vello_common 0.3.0",
+ "png",
+ "vello_common",
 ]
 
 [[package]]
@@ -5573,44 +3999,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "web-time"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "wgpu"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76e8840e1ba2881d4cbb18d2147627a56af426ff064c0401eb0c8410c6325d07"
-dependencies = [
- "arrayvec",
- "bitflags 2.13.0",
- "bytemuck",
- "cfg-if",
- "cfg_aliases",
- "document-features",
- "hashbrown 0.16.1",
- "js-sys",
- "log",
- "portable-atomic",
- "profiling",
- "raw-window-handle",
- "smallvec",
- "static_assertions",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "wgpu-core 29.0.4",
- "wgpu-hal 29.0.4",
- "wgpu-types 29.0.4",
-]
-
-[[package]]
 name = "wgpu"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5633,42 +4021,9 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "wgpu-core 30.0.1",
- "wgpu-hal 30.0.1",
- "wgpu-types 30.0.1",
-]
-
-[[package]]
-name = "wgpu-core"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f519832254e56965a9940c4af57dcb75f702b6f6fa4a0b172f685395843a4d7"
-dependencies = [
- "arrayvec",
- "bit-set 0.9.1",
- "bit-vec",
- "bitflags 2.13.0",
- "bytemuck",
- "cfg_aliases",
- "document-features",
- "hashbrown 0.16.1",
- "indexmap",
- "log",
- "naga 29.0.4",
- "once_cell",
- "parking_lot",
- "portable-atomic",
- "profiling",
- "raw-window-handle",
- "rustc-hash 1.1.0",
- "smallvec",
- "thiserror 2.0.18",
- "wgpu-core-deps-apple 29.0.4",
- "wgpu-core-deps-emscripten 29.0.4",
- "wgpu-core-deps-windows-linux-android 29.0.4",
- "wgpu-hal 29.0.4",
- "wgpu-naga-bridge 29.0.4",
- "wgpu-types 29.0.4",
+ "wgpu-core",
+ "wgpu-hal",
+ "wgpu-types",
 ]
 
 [[package]]
@@ -5678,7 +4033,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14c018fce9b6270aa203c2fdd56f3cce996713534bd757e4ea58c8560b121f14"
 dependencies = [
  "arrayvec",
- "bit-set 0.10.0",
+ "bit-set",
  "bit-vec",
  "bitflags 2.13.0",
  "bytemuck",
@@ -5687,7 +4042,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "log",
- "naga 30.0.1",
+ "naga",
  "naga-types",
  "once_cell",
  "parking_lot",
@@ -5697,21 +4052,11 @@ dependencies = [
  "rustc-hash 1.1.0",
  "smallvec",
  "thiserror 2.0.18",
- "wgpu-core-deps-apple 30.0.1",
- "wgpu-core-deps-emscripten 30.0.1",
- "wgpu-core-deps-windows-linux-android 30.0.1",
- "wgpu-hal 30.0.1",
- "wgpu-naga-bridge 30.0.1",
- "wgpu-types 30.0.1",
-]
-
-[[package]]
-name = "wgpu-core-deps-apple"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5e39e26c4c0e07589e67d18546cf79ff45383659fc72fca4dd293358a0347f3"
-dependencies = [
- "wgpu-hal 29.0.4",
+ "wgpu-core-deps-apple",
+ "wgpu-core-deps-windows-linux-android",
+ "wgpu-hal",
+ "wgpu-naga-bridge",
+ "wgpu-types",
 ]
 
 [[package]]
@@ -5720,34 +4065,7 @@ version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "061f3d319a40d39d00b1ecc2c33b89fe21d4e6fe01859df3500a3a8ecccd6b68"
 dependencies = [
- "wgpu-hal 30.0.1",
-]
-
-[[package]]
-name = "wgpu-core-deps-emscripten"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01e09be551dc939498bdd5f6b2c66e55ab275dad25825267a08605a80fc9f0af"
-dependencies = [
- "wgpu-hal 29.0.4",
-]
-
-[[package]]
-name = "wgpu-core-deps-emscripten"
-version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98b86cf4abf524a902dd35f18ca6a3f08fc2ae9847c8f10b48e30491b1f0b86"
-dependencies = [
- "wgpu-hal 30.0.1",
-]
-
-[[package]]
-name = "wgpu-core-deps-windows-linux-android"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e592c1bbef6ad047647ae6e666ebd8cee7a32bb4544d9700ec96cbf73230257"
-dependencies = [
- "wgpu-hal 29.0.4",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -5756,61 +4074,7 @@ version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7586165fd5f6d881cb9ce4bb71f40d6caab2c0f1837e3fc1d9788a197fb6004f"
 dependencies = [
- "wgpu-hal 30.0.1",
-]
-
-[[package]]
-name = "wgpu-hal"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97ace1c17727311c22a46e4e3faf56ea6de81af99dcc839bdfb54857b94d448d"
-dependencies = [
- "android_system_properties",
- "arrayvec",
- "ash",
- "bit-set 0.9.1",
- "bitflags 2.13.0",
- "block2 0.6.2",
- "bytemuck",
- "cfg-if",
- "cfg_aliases",
- "glow",
- "glutin_wgl_sys",
- "gpu-allocator",
- "gpu-descriptor",
- "hashbrown 0.16.1",
- "js-sys",
- "khronos-egl",
- "libc",
- "libloading 0.8.9",
- "log",
- "naga 29.0.4",
- "ndk-sys",
- "objc2 0.6.4",
- "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-metal 0.3.2",
- "objc2-quartz-core 0.3.2",
- "once_cell",
- "ordered-float",
- "parking_lot",
- "portable-atomic",
- "portable-atomic-util",
- "profiling",
- "range-alloc",
- "raw-window-handle",
- "raw-window-metal",
- "renderdoc-sys",
- "smallvec",
- "thiserror 2.0.18",
- "wasm-bindgen",
- "wayland-sys",
- "web-sys",
- "wgpu-naga-bridge 29.0.4",
- "wgpu-types 29.0.4",
- "windows 0.62.2",
- "windows-core 0.62.2",
- "windows-result 0.4.1",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -5822,25 +4086,20 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
- "bit-set 0.10.0",
+ "bit-set",
  "bitflags 2.13.0",
  "block2 0.6.2",
  "bytemuck",
  "cfg-if",
  "cfg_aliases",
- "glow",
- "glutin_wgl_sys",
  "gpu-allocator",
  "hashbrown 0.17.1",
- "js-sys",
- "khronos-egl",
  "libc",
  "libloading 0.8.9",
  "log",
  "mach-dxcompiler-rs",
- "naga 30.0.1",
+ "naga",
  "naga-types",
- "ndk-sys",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -5860,24 +4119,10 @@ dependencies = [
  "smallvec",
  "static_assertions",
  "thiserror 2.0.18",
- "wasm-bindgen",
- "wayland-sys",
- "web-sys",
- "wgpu-naga-bridge 30.0.1",
- "wgpu-types 30.0.1",
+ "wgpu-naga-bridge",
+ "wgpu-types",
  "windows 0.62.2",
  "windows-core 0.62.2",
- "windows-result 0.4.1",
-]
-
-[[package]]
-name = "wgpu-naga-bridge"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95226013f547544b223281cd16a4fb549aa9dcb562adbda0faae4c73ffbbc161"
-dependencies = [
- "naga 29.0.4",
- "wgpu-types 29.0.4",
 ]
 
 [[package]]
@@ -5886,22 +4131,8 @@ version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f62e73117bb7a62bfd9c5a5841438a823f6566c6442a808ee269d2d055c081"
 dependencies = [
- "naga 30.0.1",
- "wgpu-types 30.0.1",
-]
-
-[[package]]
-name = "wgpu-types"
-version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84bf84cd9ca8ca45e2b223a3868f1adf9bfc0c66aeac212e76ee7e40fdadf8f5"
-dependencies = [
- "bitflags 2.13.0",
- "bytemuck",
- "js-sys",
- "log",
- "raw-window-handle",
- "web-sys",
+ "naga",
+ "wgpu-types",
 ]
 
 [[package]]
@@ -5927,17 +4158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
 dependencies = [
  "bytemuck",
- "safe_arch 0.7.4",
-]
-
-[[package]]
-name = "wide"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfdfe6a32973f2d1b268b8895845a8a96cac2f0191e72c27cc929036060dbf89"
-dependencies = [
- "bytemuck",
- "safe_arch 1.0.0",
+ "safe_arch",
 ]
 
 [[package]]
@@ -6342,7 +4563,7 @@ checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 [[package]]
 name = "xim-ctext"
 version = "0.3.0"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "encoding_rs",
 ]
@@ -6350,7 +4571,7 @@ dependencies = [
 [[package]]
 name = "xim-parser"
 version = "0.2.1"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -6387,12 +4608,6 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 dependencies = [
  "bytemuck",
 ]
-
-[[package]]
-name = "xml-rs"
-version = "0.8.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "zbus"
@@ -6503,7 +4718,7 @@ dependencies = [
 [[package]]
 name = "zed-xim"
 version = "0.4.0-zed"
-source = "git+https://github.com/Matari-Audio/MUI#c91adff71c77b87dfd8cac234ac523aec80fdaf7"
+source = "git+https://github.com/Matari-Audio/MUI#7c5834ccd71fcd688d94b42dc2456810d39f207d"
 dependencies = [
  "ahash",
  "hashbrown 0.14.5",

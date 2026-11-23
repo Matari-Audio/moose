@@ -19,7 +19,7 @@ use moose_core::plugin::{
     PluginRuntime, PreparationConfig, PreparationError, PreparationFrameBound,
 };
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::tasks::{AnyTaskSpawner, InitContext, TaskSpawner, TaskSpawnerBundle};
+use moose_core::tasks::{AnyTaskSpawner, InitContext, TaskSpawner, TaskSpawnerBundle, warm_pool};
 use moose_derive::Params;
 
 #[derive(Params)]
@@ -156,6 +156,8 @@ impl BackgroundTask for Absent {
 
 #[test]
 fn multiple_lanes_resolve_by_type_and_run_independently() {
+    // This fixture bypasses StaticShell, which normally starts the pool.
+    warm_pool();
     let params = Arc::new(TaskParams::new());
     let ran = Arc::clone(&params.ran);
 
@@ -204,6 +206,8 @@ fn multiple_lanes_resolve_by_type_and_run_independently() {
 fn background_task_runs_when_scheduled_from_editor_context() {
     use moose_core::editor::{PluginContext, for_test_params};
 
+    // This fixture constructs the editor context without a shell.
+    warm_pool();
     let params = Arc::new(TaskParams::new());
     let ran = Arc::clone(&params.ran);
 

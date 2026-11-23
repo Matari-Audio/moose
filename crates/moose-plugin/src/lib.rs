@@ -4,9 +4,7 @@
 //! processor parts as three types) and export it via `moose::plugin!`.
 //!
 //! `moose-plugin` depends on `moose-gui-types` (light: layout, render
-//! trait, widget regions) - not the full `moose-gui`, so custom editors
-//! (egui, MUI, or a raw window handle) never pull in tiny-skia or
-//! `moose-font`.
+//! trait, widget regions) without pulling in any windowing or renderer crate.
 
 use moose_core::buffer::AudioBuffer;
 use moose_core::bus::BusLayout;

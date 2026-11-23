@@ -23,8 +23,6 @@ use std::sync::Arc;
 
 use moose::prelude::*;
 use moose_core::midi::norm_7bit;
-use moose_gui::IntoLayoutEditor;
-use moose_gui_types::layout::{GridLayout, dropdown, knob, section};
 
 const NUM_VOICES: usize = 16;
 
@@ -365,33 +363,6 @@ impl Plugin for Multiport {
             ProcessStatus::Tail(0)
         }
     }
-
-    fn editor(params: Arc<MultiportParams>) -> Box<dyn Editor> {
-        // Nested-group params are addressed by their flattened id
-        // (`base + local`), read off each lane.
-        GridLayout::build(vec![
-            section(
-                "PORT 0",
-                vec![
-                    dropdown(params.port0.wave.id(), "Wave"),
-                    knob(params.port0.cutoff.id(), "Cutoff"),
-                    knob(params.port0.release.id(), "Release"),
-                    knob(params.port0.volume.id(), "Volume"),
-                ],
-            ),
-            section(
-                "PORT 1",
-                vec![
-                    dropdown(params.port1.wave.id(), "Wave"),
-                    knob(params.port1.cutoff.id(), "Cutoff"),
-                    knob(params.port1.release.id(), "Release"),
-                    knob(params.port1.volume.id(), "Volume"),
-                ],
-            ),
-        ])
-        .with_title("MULTIPORT")
-        .into_editor(&params)
-    }
 }
 
 moose::plugin! {
@@ -627,27 +598,5 @@ mod tests {
             a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6),
             "lane 0 set to Saw should match lane 1's default Saw"
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn gui_screenshot_macos() {
-        moose_test::screenshot!(PluginShell, "screenshots/multiport_default_macos.png").run();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn gui_screenshot_linux() {
-        moose_test::screenshot!(PluginShell, "screenshots/multiport_default_linux.png")
-            .pixel_threshold(2)
-            .run();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn gui_screenshot_windows() {
-        moose_test::screenshot!(PluginShell, "screenshots/multiport_default_windows.png")
-            .pixel_threshold(2)
-            .run();
     }
 }

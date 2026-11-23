@@ -440,14 +440,19 @@ fn set_size_holds_the_floor_and_a_fixed_editor_refuses() {
     assert_eq!(sized.size(), (200, 100));
 }
 
-/// moose's CLAP wrapper builds a fresh editor per `gui.create` and a host
-/// may set the scale only once: the next editor still opens at it.
+/// Host scale is strictly per-instance so editors on monitors with different
+/// DPI factors (e.g. 100% + 200%) do not clobber one another.
 #[test]
-fn a_reopened_editor_keeps_the_host_scale() {
+fn separate_editors_hold_independent_host_scales() {
     let params = Arc::new(Synth::new());
-    editor(&params).set_scale_factor(1.5);
-    let reopened = editor(&params);
-    assert_eq!(reopened.scale.get(), Some(1.5));
+    let mut first = editor(&params);
+    let mut second = editor(&params);
+    let third = editor(&params);
+    first.set_scale_factor(1.0);
+    second.set_scale_factor(2.0);
+    assert_eq!(first.scale.get(), Some(1.0));
+    assert_eq!(second.scale.get(), Some(2.0));
+    assert_eq!(third.scale.get(), None);
 }
 
 /// The host scale pins the window, never times the OS scale; macOS follows

@@ -12,6 +12,7 @@
 #include "AAX_ITaperDelegate.h"
 #include "AAX_ITransport.h"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

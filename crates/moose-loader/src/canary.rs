@@ -68,7 +68,9 @@ use moose_gui_types::theme::{Color, Theme};
 /// Epoch 10: removed dead `moose_snapshot_into` and `moose_snapshot_version`
 /// exports after `PluginLogic` removal (`moose::Plugin` keeps custom state in
 /// `#[persist]` or `SnapshotPublisher`).
-pub const ABI_EPOCH: u32 = 10;
+/// Epoch 11: adds `Editor::has_ui` to the editor vtable returned by
+/// `moose_build_editor`. Shell and logic must be rebuilt together.
+pub const ABI_EPOCH: u32 = 11;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///
