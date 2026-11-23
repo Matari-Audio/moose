@@ -80,12 +80,6 @@ where
     // - it loads BEFORE `snap_smoothers` so the editor + first audio
     // block see the restored values, not defaults ramping toward them.
 
-    let (midi_thread, midi_ctrl) = MidiInputThread::start(
-        opts,
-        usize::from(P::info().midi_input_ports),
-        Arc::clone(&audio_handles.pending),
-    );
-
     let editor: Option<Box<dyn Editor>> = {
         // The editor is built through the lock-free builder, not the
         // plugin instance, so lock only long enough to grab the builder
@@ -103,10 +97,17 @@ where
     };
     let Some(mut editor) = editor.filter(|editor| editor.has_ui()) else {
         eprintln!("Plugin returned no editor - falling back to headless mode.");
-        drop(audio_handles);
-        crate::headless::run::<P>(opts);
+        // Keep the stream open: shutting it down is asynchronous and a
+        // second open can fail on devices that only allow one stream.
+        crate::headless::run_with_audio(opts, audio_handles);
         return;
     };
+    let (midi_thread, midi_ctrl) = MidiInputThread::start(
+        opts,
+        usize::from(P::info().midi_input_ports),
+        Arc::clone(&audio_handles.pending),
+    );
+
     let (lw, lh) = editor.size();
     // Consulted inside the per-OS cfg blocks below: Linux/Windows
     // skip the lock-window pin, macOS ORs the

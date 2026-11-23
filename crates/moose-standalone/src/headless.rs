@@ -14,8 +14,7 @@ use crate::vlog;
 /// runs dry - at which point the capture sink is finalized and
 /// the runner returns cleanly).
 pub fn run<P: PluginExport>(opts: &Options) {
-    #[cfg_attr(not(feature = "playback"), allow(unused_mut))]
-    let mut handles = match audio::start_audio::<P>(opts) {
+    let handles = match audio::start_audio::<P>(opts) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -23,6 +22,12 @@ pub fn run<P: PluginExport>(opts: &Options) {
         }
     };
 
+    run_with_audio(opts, handles);
+}
+
+/// Enter the headless loop using an already opened audio stream.
+#[cfg_attr(not(feature = "playback"), allow(unused_mut))]
+pub(crate) fn run_with_audio<P: PluginExport>(opts: &Options, mut handles: audio::AudioHandles<P>) {
     // MIDI device input (if requested and available). On success
     // this spawns a background thread that pushes events into
     // `handles.pending`.
