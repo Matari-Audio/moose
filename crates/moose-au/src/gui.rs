@@ -490,9 +490,9 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
             .take();
         if let Some(info) = info {
             // Keep draining the armed host queue even if the plugin hook panics.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_extern_callback_with::<P, ()>("au", "track_info_changed", (), || {
                 hooks.track_info_changed(main, &info);
-            }));
+            });
         }
     } else if inst
         .pending_context_name
@@ -554,7 +554,8 @@ pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut gui = inst.gui.enter();
         if gui.editor.is_none() {
-            gui.editor = (inst.editor_builder)(inst.params_arc.clone());
+            gui.editor =
+                (inst.editor_builder)(inst.params_arc.clone()).filter(|editor| editor.has_ui());
         }
         i32::from(gui.editor.is_some())
     })
@@ -622,7 +623,8 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
             return;
         };
         if gui.editor.is_none() {
-            gui.editor = (inst.editor_builder)(inst.params_arc.clone());
+            gui.editor =
+                (inst.editor_builder)(inst.params_arc.clone()).filter(|editor| editor.has_ui());
         }
         let packed = inst.pending_resize.swap(0, Ordering::Relaxed);
         if packed != 0

@@ -1047,6 +1047,42 @@ mod tests {
     }
 
     #[test]
+    fn sixteen_ramps_retain_their_starts_and_terminals_in_256_slots() {
+        use crate::ffi::{AU_PARAM_EVENT_HAS_START_VALUE, AU_PROCESS_OK, AuParamEventV2};
+        use crate::large_state_fixture::LargePlugin;
+        use moose_core::export::PluginExport;
+
+        let input: Vec<_> = (0..16)
+            .map(|param_id| AuParamEventV2 {
+                start_offset: 0,
+                duration_frames: 512,
+                param_id,
+                flags: AU_PARAM_EVENT_HAS_START_VALUE,
+                start_value: 0.0,
+                end_value: 1.0,
+            })
+            .collect();
+        let mut list = EventList::with_capacity(256);
+        let (status, _) = crate::callbacks::push_param_events_v2(
+            &mut list,
+            LargePlugin::<16>::create().params_arc().as_ref(),
+            moose_core::info::Automation::BlockSplit { min: 32 },
+            &input,
+            512,
+            &mut Vec::with_capacity(16),
+            &mut Vec::with_capacity(16),
+        );
+        assert_eq!(status, AU_PROCESS_OK);
+        assert!(list.overflow().is_none());
+        for id in 0..16 {
+            for offset in [0, 512] {
+                assert!(list.iter().any(|ev| ev.sample_offset == offset
+                    && matches!(ev.body, EventBody::ParamChange { id: found, .. } if id == found)));
+            }
+        }
+    }
+
+    #[test]
     fn retained_block_split_ramps_keep_both_terminals_with_two_event_slots() {
         use crate::callbacks::push_param_events_v2;
         use crate::ffi::AU_PROCESS_OK;
@@ -2591,6 +2627,8 @@ mod tests {
 
 #[cfg(test)]
 extern crate self as moose;
+#[cfg(test)]
+use moose_params as params;
 #[cfg(test)]
 use moose_test_fixtures::large_state_fixture;
 #[cfg(test)]

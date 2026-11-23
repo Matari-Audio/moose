@@ -647,9 +647,11 @@ mod host_value_tests {
             assert!(clap_plugin_init::<TestPlugin>(b));
             let data = data_from_plugin::<TestPlugin>(a);
             let other = data_from_plugin::<TestPlugin>(b);
+            // This headless fixture does not publish a GUI. Exercise its
+            // callback table directly with the test editors installed below.
+            assert!((*a).get_extension.unwrap()(a, CLAP_EXT_GUI.as_ptr()).is_null());
             data.gui.enter().editor = Some(Box::new(DefaultScaleEditor));
-            let gui =
-                &*((*a).get_extension.unwrap()(a, CLAP_EXT_GUI.as_ptr()).cast::<clap_plugin_gui>());
+            let gui = &data.extensions.gui;
             assert!(!gui.create.unwrap()(a, ptr::null(), false));
             assert!(gui.create.unwrap()(a, CLAP_WINDOW_API_X11.as_ptr(), false));
             let mut window: clap_window = std::mem::zeroed();
@@ -1024,8 +1026,6 @@ use clap_sys::ext::gui::CLAP_WINDOW_API_X11;
 #[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::clap_host_gui;
 #[cfg(all(test, target_os = "linux"))]
-use clap_sys::ext::gui::clap_plugin_gui;
-#[cfg(all(test, target_os = "linux"))]
 use clap_sys::ext::gui::clap_window;
 #[cfg(test)]
 use clap_sys::ext::latency::CLAP_EXT_LATENCY;
@@ -1340,7 +1340,6 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             // its host pointer go away.
             unsafe { host.request_callback() };
         }));
-        let host_notifier = HostNotifier::from_queue(Arc::clone(&host_queue));
         let exposed = Mutex::new(catalog_sync::ExposedParams::new(
             Arc::clone(&param_infos),
             params_arc.as_ref(),
@@ -1380,6 +1379,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             meter_store,
             snapshot,
             task_spawner,
+            has_editor: false,
             editor_builder,
             delay,
             selected_config: AtomicU32::new(0),
@@ -1390,8 +1390,8 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             catalog_signal: None,
             pending_structure: MainThreadCell::new(None),
             hooks,
+            host_notifier: HostNotifier::from_queue(Arc::clone(&host_queue)),
             host_queue,
-            host_notifier,
             note_names: MainThreadCell::new(Vec::new()),
             voice_info_supported: AtomicBool::new(false),
             info,

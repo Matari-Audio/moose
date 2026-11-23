@@ -69,6 +69,13 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
         #[cfg(target_os = "linux")]
         crate::gui::warm_x11_probe();
         enter_plugin(&data.plugin).init();
+        // get_extension is thread-safe; determine the GUI capability once on
+        // the main thread and retain the editor for the first GUI session.
+        let editor = run_extern_callback_with::<P, _>("CLAP", "editor", None, || {
+            (data.editor_builder)(Arc::clone(&data.params_arc)).filter(|editor| editor.has_ui())
+        });
+        data.has_editor = editor.is_some();
+        data.gui.enter().editor = editor;
         // Bind the signal first, then drop what `init` changed: the catalog
         // built next already holds it, and any later edit wakes us.
         data.catalog_signal = Some(catalog_sync::install_catalog_signal(data));

@@ -141,6 +141,7 @@ pub struct EventList {
 #[derive(Clone, Debug)]
 pub(super) struct StoredTypedEvent {
     pub(super) event: Event,
+    split_before: bool,
     exact_link: EventExactLink,
     pub(super) companion_next: Option<u32>,
     sequence: u64,
@@ -249,6 +250,19 @@ impl EventList {
     /// we treat that as a contract violation rather than panicking).
     pub fn push(&mut self, event: Event) {
         let _ = self.try_push(event);
+    }
+
+    /// Append an event that requires a DSP boundary in block-split mode.
+    pub fn push_at_boundary(&mut self, event: Event) {
+        if self.try_push(event).is_ok()
+            && let Some(stored) = self.typed.last_mut()
+        {
+            stored.split_before = true;
+        }
+    }
+
+    pub(crate) fn requires_boundary(&self, index: usize) -> bool {
+        self.typed[self.typed_order[index] as usize].split_before
     }
 
     /// Fallible form of [`Self::push`]. No lane grows beyond the capacity
@@ -1028,6 +1042,7 @@ impl EventList {
         }
         self.typed.push(StoredTypedEvent {
             event,
+            split_before: false,
             exact_link,
             companion_next: None,
             sequence,

@@ -274,17 +274,35 @@ extern "C" fn moose_au_rust_param_snapshot_end() {
 pub(crate) fn scoped_snapshot(
     ctx: *const c_void,
     exposed: &Mutex<Arc<AuExposedParams>>,
+    params: &dyn Params,
 ) -> Option<Arc<AuExposedParams>> {
-    CONTROL_SNAPSHOTS.with_borrow_mut(|snapshots| {
-        let snapshot = snapshots
-            .last_mut()
-            .filter(|snapshot| snapshot.ctx == ctx)?;
-        Some(Arc::clone(
-            snapshot
-                .exposed
-                .get_or_insert_with(|| current_snapshot(exposed)),
-        ))
-    })
+    // Pin the published generation as a fallback before invoking plugin
+    // formatters. A reentrant lookup can use it without borrowing our TLS.
+    let (published, refresh) = CONTROL_SNAPSHOTS.with_borrow_mut(|snapshots| {
+        let scope = snapshots.last_mut().filter(|scope| scope.ctx == ctx)?;
+        let refresh = scope.exposed.is_none();
+        let pinned = scope
+            .exposed
+            .get_or_insert_with(|| current_snapshot(exposed));
+        Some((Arc::clone(pinned), refresh))
+    })?;
+    if refresh
+        && published
+            .entries
+            .iter()
+            .any(|entry| !entry.choice_labels.is_empty())
+        && let Some(fresh) = AuExposedParams::try_capture(params, published.automation)
+        && fresh.presentation_revision == published.presentation_revision
+    {
+        let fresh = Arc::new(fresh);
+        CONTROL_SNAPSHOTS.with_borrow_mut(|snapshots| {
+            if let Some(scope) = snapshots.last_mut().filter(|scope| scope.ctx == ctx) {
+                scope.exposed = Some(Arc::clone(&fresh));
+            }
+        });
+        return Some(fresh);
+    }
+    Some(published)
 }
 
 pub(crate) fn current_snapshot(exposed: &Mutex<Arc<AuExposedParams>>) -> Arc<AuExposedParams> {
@@ -294,8 +312,9 @@ pub(crate) fn current_snapshot(exposed: &Mutex<Arc<AuExposedParams>>) -> Arc<AuE
 pub(crate) fn control_snapshot(
     ctx: *const c_void,
     exposed: &Mutex<Arc<AuExposedParams>>,
+    params: &dyn Params,
 ) -> Arc<AuExposedParams> {
-    scoped_snapshot(ctx, exposed).unwrap_or_else(|| current_snapshot(exposed))
+    scoped_snapshot(ctx, exposed, params).unwrap_or_else(|| current_snapshot(exposed))
 }
 
 /// Latest catalog from control and one retired render catalog. Only the
@@ -360,6 +379,56 @@ mod tests {
     use super::*;
     use moose_params::{DynamicParams, SlotDef, SlotRange};
 
+    #[derive(moose_derive::Params)]
+    #[params(value_format = "display")]
+    struct Labels {
+        #[param(id = 0, name = "Time", range = "discrete(0, 1)", default = 0)]
+        time: moose_params::IntParam,
+        #[skip]
+        synced: std::sync::atomic::AtomicBool,
+    }
+
+    impl Labels {
+        #[allow(clippy::unnecessary_wraps, reason = "formatter hook signature")]
+        fn display(&self, _: u32, _: f64) -> Option<String> {
+            Some(
+                if self.synced.load(Ordering::Relaxed) {
+                    "1 beat"
+                } else {
+                    "500 ms"
+                }
+                .into(),
+            )
+        }
+    }
+
+    #[test]
+    fn formatter_changes_are_visible_only_on_the_next_enumeration() {
+        let params = Labels::default();
+        let exposed = Mutex::new(Arc::new(AuExposedParams::capture(
+            &params,
+            Automation::PerSample,
+        )));
+        let ctx = std::ptr::from_ref(&exposed).cast();
+        moose_au_rust_param_snapshot_begin(ctx);
+        assert_eq!(
+            control_snapshot(ctx, &exposed, &params).choice_label(0, 1.0),
+            Some("500 ms")
+        );
+        params.synced.store(true, Ordering::Relaxed);
+        assert_eq!(
+            control_snapshot(ctx, &exposed, &params).choice_label(0, 1.0),
+            Some("500 ms")
+        );
+        moose_au_rust_param_snapshot_end();
+        moose_au_rust_param_snapshot_begin(ctx);
+        assert_eq!(
+            control_snapshot(ctx, &exposed, &params).choice_label(0, 1.0),
+            Some("1 beat")
+        );
+        moose_au_rust_param_snapshot_end();
+    }
+
     #[test]
     fn an_enumeration_pins_info_and_choice_labels_across_a_catalog_update() {
         let params = DynamicParams::<1>::new();
@@ -382,7 +451,7 @@ mod tests {
         moose_au_rust_param_snapshot_begin(ctx);
         let mut ids = [u32::MAX];
         assert_eq!(
-            control_snapshot(ctx, &exposed).write_ids(ids.as_mut_ptr(), 1),
+            control_snapshot(ctx, &exposed, &params).write_ids(ids.as_mut_ptr(), 1),
             1
         );
         assert_eq!(ids, [id]);
@@ -392,14 +461,14 @@ mod tests {
         assert!(!retry);
         *exposed.lock().unwrap() = fresh.unwrap();
 
-        let pinned = control_snapshot(ctx, &exposed);
+        let pinned = control_snapshot(ctx, &exposed, &params);
         let mut info = AuParamInfoOut::default();
         assert!(pinned.fill_info(id, &mut info));
         assert_eq!(info.name[0], c_char::try_from(b'O').unwrap());
         assert_eq!(pinned.choice_label(id, 1.0), Some("Wet"));
         moose_au_rust_param_snapshot_end();
 
-        let latest = control_snapshot(ctx, &exposed);
+        let latest = control_snapshot(ctx, &exposed, &params);
         assert!(latest.fill_info(id, &mut info));
         assert_eq!(info.name[0], c_char::try_from(b'R').unwrap());
         assert_eq!(latest.choice_label(id, 1.0), Some("Driven"));

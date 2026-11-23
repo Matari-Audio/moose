@@ -143,6 +143,9 @@ function(moose_aax_sdk_archive result)
         " | ${CMAKE_GENERATOR_PLATFORM} | ${CMAKE_GENERATOR_TOOLSET} | ${config}"
         " | ${CMAKE_CXX_COMPILER_ID} | ${CMAKE_CXX_COMPILER_VERSION}"
         " | ${CMAKE_LINKER} | ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    if(WIN32 AND NOT CMAKE_GENERATOR MATCHES "^Visual Studio")
+        string(APPEND identity "| WindowsSDK=$ENV{WindowsSdkDir}|$ENV{WindowsSDKVersion}")
+    endif()
     if(APPLE)
         list(APPEND toolchain_vars
             CMAKE_OBJCXX_COMPILER CMAKE_OBJCXX_COMPILER_TARGET

@@ -109,7 +109,10 @@ fn build_descriptor<P: PluginExport>() -> &'static MooseAaxDescriptor {
     let info = P::info();
     let plugin = P::create();
     let params = plugin.params_arc();
-    let has_editor = u32::from((plugin.editor_builder())(std::sync::Arc::clone(&params)).is_some());
+    let has_editor = u32::from(
+        (plugin.editor_builder())(std::sync::Arc::clone(&params))
+            .is_some_and(|editor| editor.has_ui()),
+    );
 
     let bypass_param_id = params
         .param_infos()

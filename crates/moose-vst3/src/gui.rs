@@ -237,7 +237,8 @@ pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
             // Built from the lock-free param store the wrapper already
             // holds outside the plugin, so opening the GUI never
             // stalls the audio thread.
-            gui.editor = (inst.editor_builder)(inst.params_arc.clone());
+            gui.editor =
+                (inst.editor_builder)(inst.params_arc.clone()).filter(|editor| editor.has_ui());
             // Replay a content scale the host reported before the editor
             // existed (a valid VST3 ordering - `setContentScaleFactor`
             // can precede the editor object). Only a scale the host really

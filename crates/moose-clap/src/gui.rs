@@ -118,7 +118,8 @@ pub(crate) unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
             let data = data_from_plugin::<P>(plugin);
             let mut gui = data.gui.enter();
             if gui.editor.is_none() {
-                gui.editor = (data.editor_builder)(data.params_arc.clone());
+                gui.editor =
+                    (data.editor_builder)(data.params_arc.clone()).filter(|editor| editor.has_ui());
             }
             return gui
                 .editor
@@ -130,7 +131,8 @@ pub(crate) unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
             let data = data_from_plugin::<P>(plugin);
             let mut gui = data.gui.enter();
             if gui.editor.is_none() {
-                gui.editor = (data.editor_builder)(data.params_arc.clone());
+                gui.editor =
+                    (data.editor_builder)(data.params_arc.clone()).filter(|editor| editor.has_ui());
             }
             return gui
                 .editor
@@ -145,7 +147,8 @@ pub(crate) unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
             }
             let mut gui = data.gui.enter();
             if gui.editor.is_none() {
-                gui.editor = (data.editor_builder)(data.params_arc.clone());
+                gui.editor =
+                    (data.editor_builder)(data.params_arc.clone()).filter(|editor| editor.has_ui());
             }
             return gui
                 .editor
@@ -290,7 +293,8 @@ pub(crate) unsafe extern "C" fn gui_create<P: PluginExport>(
         // the GUI never stalls the audio thread (and `--shell` rebuilds
         // from the reloaded dylib).
         if gui.editor.is_none() {
-            gui.editor = (data.editor_builder)(data.params_arc.clone());
+            gui.editor =
+                (data.editor_builder)(data.params_arc.clone()).filter(|editor| editor.has_ui());
         }
         gui.mode = mode;
         data.floating_mode.store(is_floating, Ordering::Release);
@@ -1141,6 +1145,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
             return (&raw const extensions.note_ports).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_GUI {
+            if !data.has_editor {
+                return ptr::null();
+            }
             return (&raw const extensions.gui).cast::<c_void>();
         }
         if ext_id == CLAP_EXT_LATENCY {
@@ -1446,6 +1453,12 @@ fn x11_display_reachable_in_dir(
                 SocketAddr::from(([127, 0, 0, 1], port)),
                 SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
             ]
+        } else if let Some(ip) = target_host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.parse::<std::net::Ipv6Addr>().ok())
+        {
+            vec![SocketAddr::from((ip, port))]
         } else {
             match (target_host, port).to_socket_addrs() {
                 Ok(iter) => iter.collect(),
@@ -1581,6 +1594,16 @@ mod x11_probe_tests {
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probes_bracketed_ipv6_display() {
+        let listener = TcpListener::bind("[::1]:0").unwrap();
+        let display = format!("[::1]:{}", listener.local_addr().unwrap().port() - 6000);
+        assert!(x11_display_reachable_in_dir(
+            Some(OsStr::new(&display)),
+            std::path::Path::new("/tmp")
+        ));
     }
 
     #[test]

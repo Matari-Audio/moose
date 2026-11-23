@@ -158,6 +158,7 @@ typedef OSStatus (*AudioComponentMethod)(void *self, ...);
 #define kAudioUnitRenderAction_OutputIsSilence (1u << 4)
 
 /* Error codes */
+#define kAudioUnitErr_CannotDoInCurrentContext ((OSStatus)-10863)
 #define kAudioUnitErr_InvalidProperty ((OSStatus)-10879)
 #define kAudioUnitErr_InvalidParameter ((OSStatus)-10878)
 #define kAudioUnitErr_InvalidElement ((OSStatus)-10877)

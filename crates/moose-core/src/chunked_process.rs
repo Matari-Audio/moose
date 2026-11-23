@@ -257,7 +257,7 @@ where
         // into this sub-block's leading apply batch.
         let next_split = min_sub.and_then(|min_sub| {
             let coalesce_until = block_start.saturating_add(min_sub).min(total);
-            find_next_split(events, &chunked, event_idx, coalesce_until)
+            find_next_split(events, &chunked, event_idx, block_start + 1, coalesce_until)
         });
         let block_end = next_split.map_or(total, |(s, _)| s.min(total));
 
@@ -393,10 +393,14 @@ fn find_next_split(
     events: &EventList,
     chunked: &impl Fn(u32) -> bool,
     from: usize,
+    first_offset: usize,
     min_offset: usize,
 ) -> Option<(usize, usize)> {
     for (i, ev) in (from..).zip(events.iter_from(from)) {
         let offset = ev.sample_offset as usize;
+        if offset >= first_offset && events.requires_boundary(i) {
+            return Some((offset, i));
+        }
         if offset < min_offset {
             continue;
         }
@@ -701,8 +705,21 @@ mod tests {
                 .by_id(id)
                 .is_some_and(|info| info.flags.contains(ParamFlags::CHUNKED))
         };
-        assert_eq!(find_next_split(&events, &chunked, 0, 0), Some((23, 1)));
-        assert_eq!(find_next_split(&events, &chunked, 0, 24), None);
+        assert_eq!(find_next_split(&events, &chunked, 0, 0, 0), Some((23, 1)));
+        assert_eq!(find_next_split(&events, &chunked, 0, 0, 24), None);
+    }
+
+    #[test]
+    fn marked_plain_step_splits_without_uncoalescing_other_steps() {
+        let mut events = EventList::with_capacity(2);
+        events.push_at_boundary(Event::new(17, EventBody::ParamChange { id: 0, value: 1.0 }));
+        events.push(Event::new(5, EventBody::ParamChange { id: 1, value: 1.0 }));
+        events.ensure_sorted_by_offset();
+        assert_eq!(
+            find_next_split(&events, &|id| id == 1, 0, 1, 32),
+            Some((17, 1))
+        );
+        assert_eq!(find_next_split(&events, &|id| id == 1, 1, 18, 49), None);
     }
 
     #[test]
@@ -718,7 +735,7 @@ mod tests {
             EventBody::ParamChange { id: 0, value: 0.5 },
         ));
         // Non-chunked param at 100 doesn't split; chunked at 200 does.
-        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0, 0);
         assert_eq!(next, Some((200, 1)));
     }
 
@@ -729,7 +746,7 @@ mod tests {
         events.push(Event::new(5, EventBody::ParamChange { id: 0, value: 0.5 }));
         events.push(Event::new(50, EventBody::ParamChange { id: 0, value: 0.6 }));
         // min_offset = 32: first event (offset 5) coalesces, second (50) splits.
-        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 32);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0, 32);
         assert_eq!(next, Some((50, 1)));
     }
 
@@ -745,7 +762,7 @@ mod tests {
                 value: 0.1,
             },
         ));
-        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0, 0);
         assert_eq!(next, None);
     }
 
@@ -825,7 +842,7 @@ mod tests {
             100,
             EventBody::Transport(TransportInfo::default()),
         ));
-        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0);
+        let next = find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0, 0);
         assert_eq!(next, Some((100, 0)));
     }
 
@@ -847,12 +864,12 @@ mod tests {
         ));
         // Unclamped (0): the offset-0 event splits at 0 - the hang.
         assert_eq!(
-            find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0),
+            find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0, 0),
             Some((0, 0))
         );
         // Clamped (>= 1): coalesced, no split at the block start.
         assert_eq!(
-            find_next_split(&events, &|id| is_chunked(id, &infos), 0, 1),
+            find_next_split(&events, &|id| is_chunked(id, &infos), 0, 0, 1),
             None
         );
     }

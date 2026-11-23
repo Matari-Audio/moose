@@ -405,7 +405,8 @@ pub(crate) unsafe extern "C" fn cb_param_ids<P: PluginExport>(
             return 0;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        catalog::control_snapshot(ctx, &inst.exposed).write_ids(out_ids, cap)
+        catalog::control_snapshot(ctx, &inst.exposed, inst.params_arc.as_ref())
+            .write_ids(out_ids, cap)
     })
 }
 
@@ -420,7 +421,8 @@ pub(crate) unsafe extern "C" fn cb_param_info_by_id<P: PluginExport>(
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut local = AuParamInfoOut::default();
-        let found = catalog::control_snapshot(ctx, &inst.exposed).fill_info(id, &mut local);
+        let found = catalog::control_snapshot(ctx, &inst.exposed, inst.params_arc.as_ref())
+            .fill_info(id, &mut local);
         if found {
             out.write(local);
         }
@@ -439,7 +441,8 @@ pub(crate) unsafe extern "C" fn cb_param_clump_name<P: PluginExport>(
             return 0;
         }
         let inst = &*ctx.cast::<AuInstance<P>>();
-        catalog::control_snapshot(ctx, &inst.exposed).write_clump_name(clump_id, out, out_len)
+        catalog::control_snapshot(ctx, &inst.exposed, inst.params_arc.as_ref())
+            .write_clump_name(clump_id, out, out_len)
     })
 }
 
@@ -810,7 +813,7 @@ fn emit_ramp_segment(
     clipped_end: u32,
     seg_start_val: f64,
     seg_end_val: f64,
-    remaining_inputs: u32,
+    reserved_after: u32,
     overridden_at_end: bool,
 ) {
     let seg_len = clipped_end - clipped_start;
@@ -835,17 +838,13 @@ fn emit_ramp_segment(
             let free_slots = len_u32(events.capacity().saturating_sub(events.len()));
             let terminal_slots = u32::from(!overridden_at_end);
             let max_pts = free_slots
-                .saturating_sub(
-                    remaining_inputs
-                        .saturating_sub(1)
-                        .saturating_add(terminal_slots),
-                )
+                .saturating_sub(reserved_after.saturating_add(terminal_slots))
                 .clamp(u32::from(overridden_at_end), 16);
             let stride = base_stride.max(seg_len.div_ceil(max_pts.max(1)));
             let mut offset = clipped_start;
             while max_pts != 0 && offset < clipped_end {
                 let frac = f64::from(offset - clipped_start) / f64::from(seg_len);
-                events.push(Event::new(
+                events.push_at_boundary(Event::new(
                     offset,
                     EventBody::ParamChange {
                         id: param_id,
@@ -855,7 +854,7 @@ fn emit_ramp_segment(
                 offset = offset.saturating_add(stride);
             }
             if !overridden_at_end {
-                events.push(Event::new(
+                events.push_at_boundary(Event::new(
                     clipped_end,
                     EventBody::ParamChange {
                         id: param_id,
@@ -947,6 +946,12 @@ pub(crate) fn push_param_events_v2(
     // Step A: continue any retained multi-slice AUv3 ramps into this slice.
     let mut keep = 0usize;
     let total_active = active_ramps.len();
+    let mut input_slots = len_u32(input.len()).saturating_add(len_u32(
+        input
+            .iter()
+            .filter(|event| event.duration_frames > 0)
+            .count(),
+    ));
     for i in 0..total_active {
         let mut ramp = active_ramps[i];
         if ramp.remaining_frames == 0 {
@@ -1011,8 +1016,10 @@ pub(crate) fn push_param_events_v2(
                     end_val: seg_end_val,
                 },
             );
-            // The emitter subtracts the segment being emitted from this count.
-            let remaining_budget = len_u32(total_active - i + input.len());
+            // Leave room for starts and endpoints of later ramps.
+            let remaining_budget = len_u32(total_active - i - 1)
+                .saturating_mul(2)
+                .saturating_add(input_slots);
             emit_ramp_segment(
                 events,
                 automation,
@@ -1036,6 +1043,7 @@ pub(crate) fn push_param_events_v2(
 
     // Step B: process explicit parameter events delivered for this slice.
     for (idx, ev) in input.iter().enumerate() {
+        input_slots = input_slots.saturating_sub(1 + u32::from(ev.duration_frames > 0));
         let has_start = ev.flags & AU_PARAM_EVENT_HAS_START_VALUE != 0;
         if params.parameter_affects_presentation(ev.param_id) {
             presentation_affected = true;
@@ -1045,14 +1053,24 @@ pub(crate) fn push_param_events_v2(
             #[allow(clippy::cast_sign_loss)]
             let offset = ev.start_offset as u32;
             let value = f64::from(ev.end_value);
-            events.push(Event {
+            let step = Event {
                 sample_offset: offset,
                 port: 0,
                 body: EventBody::ParamChange {
                     id: ev.param_id,
                     value,
                 },
-            });
+            };
+            // A same-parameter replacement carries the boundary of the
+            // truncated ramp (its own terminal event was suppressed).
+            let ends_ramp = tracker
+                .iter()
+                .any(|r| r.id == ev.param_id && r.start_offset < offset && r.end_offset == offset);
+            if ev.flags & AU_PARAM_EVENT_EXACT_OFFSET != 0 || ends_ramp {
+                events.push_at_boundary(step);
+            } else {
+                events.push(step);
+            }
             remove_active_ramp(active_ramps, ev.param_id);
             record_track(
                 tracker,
@@ -1189,7 +1207,7 @@ pub(crate) fn push_param_events_v2(
             effective_end,
             seg_start_val,
             seg_end_val,
-            len_u32(input.len() - idx),
+            input_slots,
             next_override.is_some(),
         );
     }
@@ -1550,7 +1568,6 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         let mut presentation_affected = false;
         let mut staged_v2_ramps = false;
         let mut exact_ramp_boundaries = false;
-        let mut exact_step_boundaries = false;
         match param_input {
             AuParamInput::V1 {
                 events: param_events,
@@ -1607,9 +1624,6 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
                     };
                     exact_ramp_boundaries = !scr.active_ramps.is_empty()
                         || pe_slice.iter().any(|event| event.duration_frames != 0);
-                    exact_step_boundaries = pe_slice.iter().any(|event| {
-                        event.start_offset > 0 && event.flags & AU_PARAM_EVENT_EXACT_OFFSET != 0
-                    });
                     // Stage ramp mutations into `active_ramps_scratch` and commit
                     // only after input staging succeeds so a rejected slice never
                     // loses in-flight multi-slice AUv3 ramps.
@@ -1753,15 +1767,7 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
                 sample_rate: scr.sample_rate,
                 process_mode: moose_core::c_abi_driver::load_render_mode(&inst.render_mode),
                 catalog: &scr.catalog,
-                automation: if (exact_ramp_boundaries || exact_step_boundaries)
-                    && matches!(inst.automation, Automation::BlockSplit { .. })
-                {
-                    // Preserve scheduled AUv2 steps and the boundaries emitted
-                    // by the ramp generator, which spaces intermediate points itself.
-                    Automation::BlockSplit { min: 1 }
-                } else {
-                    inst.automation
-                },
+                automation: inst.automation,
                 bus_routing,
             },
         );
@@ -1860,7 +1866,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
 pub(crate) unsafe extern "C" fn cb_param_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        len_u32(catalog::control_snapshot(ctx, &inst.exposed).len())
+        len_u32(catalog::control_snapshot(ctx, &inst.exposed, inst.params_arc.as_ref()).len())
     }
 }
 
@@ -1901,7 +1907,8 @@ pub(crate) unsafe extern "C" fn cb_param_format_value<P: PluginExport>(
 ) -> u32 {
     run_extern_callback_with::<P, u32>("au", "format_value", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
-        if let Some(snapshot) = catalog::scoped_snapshot(ctx, &inst.exposed)
+        if let Some(snapshot) =
+            catalog::scoped_snapshot(ctx, &inst.exposed, inst.params_arc.as_ref())
             && let Some(label) = snapshot.choice_label(id, value)
         {
             if out.is_null() || out_len == 0 {

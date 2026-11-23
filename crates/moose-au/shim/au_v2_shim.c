@@ -31,6 +31,8 @@
 #define AU_PARAM_EVENT_CAP 512
 
 // The low bits gate one render dispatch and identify an enabled slot.
+static _Thread_local unsigned au_notify_depth;
+
 #define AU_RN_ACTIVE UINT64_C(1)
 #define AU_RN_CALLING UINT64_C(2)
 #define AU_RN_FLAGS (AU_RN_ACTIVE | AU_RN_CALLING)
@@ -2627,7 +2629,23 @@ static OSStatus au_v2_remove_render_notify(void *self_, AURenderCallback proc, v
         uint64_t state = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
         if (!(state & AU_RN_FLAGS) || slot->proc != proc || slot->userData != userData)
             continue;
-        state = __atomic_fetch_and(&slot->state, ~AU_RN_ACTIVE, __ATOMIC_ACQ_REL);
+        // A callback cannot wait for another dispatch thread: it may be
+        // waiting on us. Fail without retiring its registration; retry off
+        // the callback stack before releasing the refcon.
+        if (au_notify_depth && au_current_tid() !=
+            __atomic_load_n(&inst->renderNotifyThreadId, __ATOMIC_ACQUIRE)) {
+            for (;;) {
+                if (state & AU_RN_CALLING) {
+                    os_unfair_lock_unlock(&inst->renderNotifyLock);
+                    return kAudioUnitErr_CannotDoInCurrentContext;
+                }
+                if (__atomic_compare_exchange_n(&slot->state, &state, state & ~AU_RN_ACTIVE,
+                                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                    break;
+            }
+        } else {
+            state = __atomic_fetch_and(&slot->state, ~AU_RN_ACTIVE, __ATOMIC_ACQ_REL);
+        }
         if ((state & AU_RN_CALLING) &&
             au_current_tid() != __atomic_load_n(&inst->renderNotifyThreadId, __ATOMIC_ACQUIRE)) {
             inFlight = slot;
@@ -2677,7 +2695,9 @@ static void au_v2_fire_render_notifies(MooseAUv2 *inst,
                                          false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
             continue;
         AudioUnitRenderActionFlags f = (ioFlags ? *ioFlags : 0) | action;
+        ++au_notify_depth;
         slot->proc(slot->userData, &f, ts, bus, frames, ioData);
+        --au_notify_depth;
         __atomic_fetch_and(&slot->state, ~AU_RN_CALLING, __ATOMIC_RELEASE);
     }
     __atomic_store_n(&inst->renderNotifyThreadId, 0u, __ATOMIC_RELEASE);

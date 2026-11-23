@@ -1291,9 +1291,9 @@ class MooseAUAudioUnit: AUAudioUnit {
         // AUAudioUnitBus.isEnabled is the format's connection/activation
         // contract. Snapshot it while the host builds the render graph; the
         // realtime block must not query Objective-C state.
-        let mainInputEnabled = !_inputBusArray.isEmpty && _inputBusArray[0].isEnabled
+        let mainInputEnabled = _inputBusArray.count > 0 && _inputBusArray[0].isEnabled
         let sidechainEnabled = _inputBusArray.count > 1 && _inputBusArray[1].isEnabled
-        let mainOutputEnabled = !_outputBusArray.isEmpty && _outputBusArray[0].isEnabled
+        let mainOutputEnabled = _outputBusArray.count > 0 && _outputBusArray[0].isEnabled
         // Size to the authoritative max captured in allocateRenderResources
         // (`_maxFrames`), not `maximumFramesToRender` sampled now: the host
         // may have finalized the max after a smaller default, and this

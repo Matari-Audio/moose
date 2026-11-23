@@ -106,6 +106,7 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     /// Lock-free editor factory, cached at creation. Building the editor
     /// through this never touches the plugin (`--shell` builds rebuild
     /// from the reloaded dylib, so GUI edits hot-reload).
+    pub(crate) has_editor: bool,
     pub(crate) editor_builder: EditorBuilder<P::Params>,
     /// The latency and tail reported to the host: published at `activate`
     /// only, because CLAP forbids a latency change while active.

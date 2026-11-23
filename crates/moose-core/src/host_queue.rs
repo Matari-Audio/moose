@@ -278,7 +278,11 @@ impl HostQueue {
     /// Call the wake unless one is already pending. Callers have just
     /// published a signal bit or a message.
     fn wake_once(&self) {
-        if self.defer_wake.as_ref().is_some_and(|defer| defer()) {
+        if self
+            .defer_wake
+            .as_ref()
+            .is_some_and(|defer| self.with_open(defer) != Some(false))
+        {
             return;
         }
         // Pairs with the RMW in `disarm` (see the type docs).
@@ -678,6 +682,14 @@ mod tests {
         queue.signal(HostSignal::RESTART);
         assert_eq!(wakes.load(Ordering::Relaxed), 0);
         assert_eq!(queue.drain(&main()).signals, HostSignal::RESTART);
+    }
+
+    #[test]
+    fn closed_queue_does_not_call_the_deferral_hook() {
+        let queue =
+            HostQueue::with_deferred_wake(|| panic!("immediate wake"), || panic!("deferred wake"));
+        queue.close();
+        queue.signal(HostSignal::LATENCY);
     }
 
     #[test]

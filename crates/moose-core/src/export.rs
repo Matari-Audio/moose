@@ -186,7 +186,7 @@ pub trait PluginExport: PluginRuntime + Sized {
     #[must_use]
     fn has_editor_static() -> bool {
         let plugin = Self::create();
-        plugin.editor_builder()(plugin.params_arc()).is_some()
+        plugin.editor_builder()(plugin.params_arc()).is_some_and(|editor| editor.has_ui())
     }
 }
 

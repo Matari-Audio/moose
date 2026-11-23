@@ -1037,7 +1037,8 @@ fn ensure_editor<P: PluginExport>(inst: &AaxInstance<P>, gui: &mut AaxGui) -> bo
     if gui.editor.is_some() {
         return true;
     }
-    gui.editor = (inst.editor_builder)(Arc::clone(&inst.params_arc));
+    gui.editor =
+        (inst.editor_builder)(Arc::clone(&inst.params_arc)).filter(|editor| editor.has_ui());
     gui.editor.is_some()
 }
 
