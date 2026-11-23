@@ -64,7 +64,7 @@ if(NOT DEFINED MOOSE_PLUGIN_VERSION)
 endif()
 
 include(AAXSDK.cmake)
-moose_aax_sdk_archive(archive)
+moose_aax_sdk_archive(archive adapter_sdk)
 add_library(AAXLibrary STATIC IMPORTED)
 set_target_properties(AAXLibrary PROPERTIES IMPORTED_LOCATION "${archive}")
 
@@ -72,15 +72,15 @@ add_library(MooseAAXPlugin MODULE
     src/MooseAAX_Describe.cpp
     src/MooseAAX_Parameters.cpp
     src/MooseAAX_GUI.cpp
-    ${AAX_SDK_PATH}/Extensions/Topology/AAX_CMonolithicParameters.cpp
-    ${AAX_SDK_PATH}/Interfaces/AAX_Exports.cpp
+    ${adapter_sdk}/Extensions/Topology/AAX_CMonolithicParameters.cpp
+    ${adapter_sdk}/Interfaces/AAX_Exports.cpp
 )
 
 target_include_directories(MooseAAXPlugin PRIVATE
-    ${AAX_SDK_PATH}/Interfaces
-    ${AAX_SDK_PATH}/Interfaces/ACF
-    ${AAX_SDK_PATH}/Extensions/Topology
-    ${AAX_SDK_PATH}/Extensions/GUI
+    ${adapter_sdk}/Interfaces
+    ${adapter_sdk}/Interfaces/ACF
+    ${adapter_sdk}/Extensions/Topology
+    ${adapter_sdk}/Extensions/GUI
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 

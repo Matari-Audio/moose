@@ -16,32 +16,46 @@ function(moose_aax_validate_archive archive external result)
             return()
         endif()
         if(external)
-            execute_process(
-                COMMAND xcrun otool -arch all -l "${archive}"
-                RESULT_VARIABLE status OUTPUT_VARIABLE metadata ERROR_QUIET)
-            if(NOT status EQUAL 0 OR
-               metadata MATCHES "LC_VERSION_MIN_(IPHONEOS|TVOS|WATCHOS)" OR
-               (NOT metadata MATCHES "LC_BUILD_VERSION" AND
-                NOT metadata MATCHES "LC_VERSION_MIN_MACOSX"))
+            if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
                 return()
             endif()
-            string(REGEX MATCHALL "\n[ \t]+platform[ \t]+[^\n]+" platforms "${metadata}")
-            foreach(platform IN LISTS platforms)
-                if(NOT platform MATCHES "[ \t](macos|MACOS|1)[ \t]*$")
+            foreach(arch IN LISTS CMAKE_OSX_ARCHITECTURES)
+                execute_process(
+                    COMMAND xcrun otool -arch "${arch}" -l "${archive}"
+                    RESULT_VARIABLE status OUTPUT_VARIABLE metadata ERROR_QUIET)
+                if(NOT status STREQUAL "0")
                     return()
                 endif()
-            endforeach()
-            # LC_BUILD_VERSION has a minos field and the older command has
-            # version. Restrict the latter to the LC_VERSION_MIN_MACOSX command.
-            string(REGEX MATCHALL "(minos[ \t]+|LC_VERSION_MIN_MACOSX\n[^\n]*\n[ \t]*version[ \t]+)[0-9]+(\\.[0-9]+)*" versions "${metadata}")
-            if(NOT versions OR NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-                return()
-            endif()
-            foreach(version IN LISTS versions)
-                string(REGEX MATCH "[0-9]+(\\.[0-9]+)*$" minimum "${version}")
-                if(minimum VERSION_GREATER CMAKE_OSX_DEPLOYMENT_TARGET)
+                # Each archive member has an unindented archive(member): header.
+                # Split there before checking its own load commands.
+                string(REGEX REPLACE "(^|\n)[^ \t\n][^\n]*\\([^\n]*\\)[ \t]*:[ \t]*\n"
+                    ";" objects "${metadata}")
+                list(POP_FRONT objects)
+                if(NOT objects)
                     return()
                 endif()
+                foreach(object IN LISTS objects)
+                    if(object MATCHES "LC_VERSION_MIN_(IPHONEOS|TVOS|WATCHOS)")
+                        return()
+                    endif()
+                    string(REGEX MATCHALL "\n[ \t]+cmd (LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX)\n"
+                        version_commands "${object}")
+                    list(LENGTH version_commands version_count)
+                    if(NOT version_count EQUAL 1)
+                        return()
+                    endif()
+                    if(NOT object MATCHES "\n[ \t]+cmd LC_BUILD_VERSION\n[^\n]*\n[ \t]+platform[ \t]+(macos|MACOS|1)[ \t]*\n[ \t]+minos[ \t]+([0-9]+(\\.[0-9]+)*)[ \t]*\n")
+                        if(NOT object MATCHES "\n[ \t]+cmd LC_VERSION_MIN_MACOSX\n[^\n]*\n[ \t]+version[ \t]+([0-9]+(\\.[0-9]+)*)[ \t]*\n")
+                            return()
+                        endif()
+                        set(minimum "${CMAKE_MATCH_1}")
+                    else()
+                        set(minimum "${CMAKE_MATCH_2}")
+                    endif()
+                    if(minimum VERSION_GREATER CMAKE_OSX_DEPLOYMENT_TARGET)
+                        return()
+                    endif()
+                endforeach()
             endforeach()
         endif()
     elseif(MSVC)
@@ -92,12 +106,22 @@ function(moose_aax_validate_archive archive external result)
 endfunction()
 
 function(moose_aax_sdk_identity sdk result snapshot)
-    file(GLOB_RECURSE inputs LIST_DIRECTORIES FALSE RELATIVE "${sdk}"
+    file(GLOB_RECURSE inputs FOLLOW_SYMLINKS LIST_DIRECTORIES FALSE RELATIVE "${sdk}"
         "${sdk}/Libs/AAXLibrary/*" "${sdk}/Interfaces/*" "${sdk}/Extensions/*")
     set(identity "")
     foreach(input IN LISTS inputs)
         if(snapshot)
-            configure_file("${sdk}/${input}" "${snapshot}/${input}" COPYONLY)
+            # Do not register live SDK files as configure dependencies: the
+            # adapter must keep using this snapshot until explicitly configured.
+            get_filename_component(destination "${snapshot}/${input}" DIRECTORY)
+            if(IS_SYMLINK "${sdk}/${input}")
+                file(MAKE_DIRECTORY "${destination}")
+                execute_process(COMMAND "${CMAKE_COMMAND}" -E copy
+                    "${sdk}/${input}" "${snapshot}/${input}"
+                    COMMAND_ERROR_IS_FATAL ANY)
+            else()
+                file(COPY "${sdk}/${input}" DESTINATION "${destination}")
+            endif()
             file(SHA256 "${snapshot}/${input}" digest)
         else()
             file(SHA256 "${sdk}/${input}" digest)
@@ -107,7 +131,7 @@ function(moose_aax_sdk_identity sdk result snapshot)
     set(${result} "${identity}" PARENT_SCOPE)
 endfunction()
 
-function(moose_aax_sdk_archive result)
+function(moose_aax_sdk_archive result sdk_result)
     if(APPLE)
         set(archive_name libAAXLibrary.a)
     else()
@@ -119,6 +143,7 @@ function(moose_aax_sdk_archive result)
     moose_aax_validate_archive("${AAX_LIB_PATH}" TRUE usable)
     if(usable)
         set(${result} "${AAX_LIB_PATH}" PARENT_SCOPE)
+        set(${sdk_result} "${AAX_SDK_PATH}" PARENT_SCOPE)
         return()
     elseif(EXISTS "${AAX_LIB_PATH}")
         message(STATUS "AAX archive does not match this build: ${AAX_LIB_PATH}")
@@ -127,7 +152,7 @@ function(moose_aax_sdk_archive result)
     get_filename_component(sdk "${AAX_SDK_PATH}" REALPATH)
     moose_aax_sdk_identity("${sdk}" sdk_identity "")
     # Exclude archives created before successful builds were published atomically.
-    set(identity "atomic-archive-v1|${sdk}|${sdk_identity}")
+    set(identity "atomic-archive-and-sdk-v2|${sdk}|${sdk_identity}")
     file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" template_hash)
     string(APPEND identity "| ${template_hash}")
     if(CMAKE_TOOLCHAIN_FILE AND EXISTS "${CMAKE_TOOLCHAIN_FILE}")
@@ -135,7 +160,7 @@ function(moose_aax_sdk_archive result)
         string(APPEND identity "| ${toolchain_hash}")
     endif()
     set(config Release)
-    set(toolchain_vars CMAKE_CXX_COMPILER CMAKE_CXX_COMPILER_TARGET CMAKE_CXX_FLAGS
+    set(toolchain_vars CMAKE_CXX_COMPILER CMAKE_CXX_COMPILER_ARG1 CMAKE_CXX_COMPILER_TARGET CMAKE_CXX_FLAGS
         CMAKE_CXX_FLAGS_RELEASE CMAKE_SYSTEM_PROCESSOR CMAKE_TOOLCHAIN_FILE
         CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_OSX_SYSROOT
         CMAKE_MSVC_RUNTIME_LIBRARY MOOSE_MSVC_CRT MOOSE_AAX_WINDOWS_ARCH)
@@ -143,12 +168,17 @@ function(moose_aax_sdk_archive result)
         " | ${CMAKE_GENERATOR_PLATFORM} | ${CMAKE_GENERATOR_TOOLSET} | ${config}"
         " | ${CMAKE_CXX_COMPILER_ID} | ${CMAKE_CXX_COMPILER_VERSION}"
         " | ${CMAKE_LINKER} | ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    if(MSVC)
+        string(SHA256 cl_flags "$ENV{CL}")
+        string(SHA256 trailing_cl_flags "$ENV{_CL_}")
+        string(APPEND identity "| CL=${cl_flags} | _CL_=${trailing_cl_flags}")
+    endif()
     if(WIN32 AND NOT CMAKE_GENERATOR MATCHES "^Visual Studio")
         string(APPEND identity "| WindowsSDK=$ENV{WindowsSdkDir}|$ENV{WindowsSDKVersion}")
     endif()
     if(APPLE)
         list(APPEND toolchain_vars
-            CMAKE_OBJCXX_COMPILER CMAKE_OBJCXX_COMPILER_TARGET
+            CMAKE_OBJCXX_COMPILER CMAKE_OBJCXX_COMPILER_ARG1 CMAKE_OBJCXX_COMPILER_TARGET
             CMAKE_OBJCXX_FLAGS CMAKE_OBJCXX_FLAGS_RELEASE)
         execute_process(COMMAND xcrun --show-sdk-build-version
             OUTPUT_VARIABLE apple_sdk_build ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -167,24 +197,26 @@ function(moose_aax_sdk_archive result)
     # A custom toolchain is executable CMake and may read arbitrary included
     # files. Build privately from a clean configure when its inputs are unknown.
     if(CMAKE_TOOLCHAIN_FILE)
-        set(entry "${CMAKE_CURRENT_BINARY_DIR}/sdk-toolchain/${key}")
+        string(RANDOM LENGTH 24 ALPHABET 0123456789abcdef private_id)
+        set(entry "${CMAKE_CURRENT_BINARY_DIR}/sdk-toolchain/${key}-${private_id}")
     endif()
-    set(archive "${entry}/archive/${archive_name}")
+    set(published "${entry}/result")
+    set(archive "${published}/${archive_name}")
     file(MAKE_DIRECTORY "${entry}")
     file(LOCK "${entry}/build.lock" GUARD FUNCTION TIMEOUT 300)
-    if(CMAKE_TOOLCHAIN_FILE)
+    if(NOT IS_DIRECTORY "${published}/sdk")
         set(usable FALSE)
     else()
         moose_aax_validate_archive("${archive}" FALSE usable)
     endif()
     if(NOT usable)
-        file(REMOVE "${archive}")
+        file(REMOVE_RECURSE "${published}")
         # An interrupted configure can leave its child build running after the
         # lock is released. Give each attempt its own build and output paths.
         string(RANDOM LENGTH 24 ALPHABET 0123456789abcdef attempt_id)
         set(attempt "${entry}/attempt-${attempt_id}")
-        set(snapshot "${attempt}/sdk")
-        set(built_archive "${attempt}/archive/${archive_name}")
+        set(snapshot "${attempt}/result/sdk")
+        set(built_archive "${attempt}/result/${archive_name}")
         moose_aax_sdk_identity("${sdk}" copied_identity "${snapshot}")
         if(NOT copied_identity STREQUAL sdk_identity)
             file(REMOVE_RECURSE "${attempt}")
@@ -212,7 +244,7 @@ function(moose_aax_sdk_archive result)
                 ${generator} ${settings}
                 "-DAAX_SDK_PATH=${snapshot}" "-DCMAKE_BUILD_TYPE=${config}"
                 -DMOOSE_AAX_SDK_ONLY=ON "-DMOOSE_AAX_CONFIG=${config}"
-                "-DMOOSE_AAX_ARCHIVE_DIR=${attempt}/archive"
+                "-DMOOSE_AAX_ARCHIVE_DIR=${attempt}/result"
             RESULT_VARIABLE status)
         if(NOT status STREQUAL "0")
             file(REMOVE_RECURSE "${attempt}")
@@ -229,9 +261,9 @@ function(moose_aax_sdk_archive result)
             file(REMOVE_RECURSE "${attempt}")
             message(FATAL_ERROR "AAX SDK build did not produce a valid archive at ${built_archive}")
         endif()
-        file(MAKE_DIRECTORY "${entry}/archive")
-        file(RENAME "${built_archive}" "${archive}")
+        file(RENAME "${attempt}/result" "${published}")
         file(REMOVE_RECURSE "${attempt}")
     endif()
     set(${result} "${archive}" PARENT_SCOPE)
+    set(${sdk_result} "${published}/sdk" PARENT_SCOPE)
 endfunction()
