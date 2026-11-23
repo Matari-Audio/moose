@@ -381,10 +381,10 @@ impl<P: PluginExport> HostSink for AuSink<'_, P> {
         // notifications so synchronous host re-reads immediately see the new
         // value. Commit only the latency lane so a latency-only drain can
         // never silently publish a racing tail observation.
-        if self.inst.delay.commit_latency() {
-            // SAFETY: main thread, live instance.
-            unsafe { self.inst.host_sink.latency_changed() };
-        }
+        // Preparation can publish both slots before this queued obligation runs.
+        let _ = self.inst.delay.commit_latency();
+        // SAFETY: main thread, live instance.
+        unsafe { self.inst.host_sink.latency_changed() };
     }
 
     fn mark_dirty(&mut self) {
@@ -410,10 +410,9 @@ impl<P: PluginExport> HostSink for AuSink<'_, P> {
         if self.inst.host_queue.is_closed() {
             return;
         }
-        if self.inst.delay.commit_tail() {
-            // SAFETY: main thread, live instance.
-            unsafe { self.inst.host_sink.tail_changed() };
-        }
+        let _ = self.inst.delay.commit_tail();
+        // SAFETY: main thread, live instance.
+        unsafe { self.inst.host_sink.tail_changed() };
     }
 
     fn param_values_changed(&mut self) {
@@ -430,34 +429,35 @@ impl<P: PluginExport> HostSink for AuSink<'_, P> {
             return;
         }
         if self.sync_catalog {
-            let (catalog_values, presentation_changed, new_catalog) = {
-                let mut exposed = self
-                    .inst
-                    .exposed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                exposed.sync(self.inst.params_arc.as_ref())
-            };
-            if let Some(catalog) = new_catalog {
+            let exposed = crate::catalog::current_snapshot(&self.inst.exposed);
+            let (catalog_values, fresh, retry) = exposed.sync(self.inst.params_arc.as_ref());
+            let presentation_changed = fresh.is_some();
+            if retry && !self.inst.host_queue.is_closed() {
+                // Keep the last verified snapshot and retry once presentation
+                // updates settle instead of publishing an incoherent snapshot.
+                self.inst
+                    .host_queue
+                    .signal(moose_core::host_queue::HostSignal::PRESENTATION);
+            }
+            if let Some(fresh) = fresh {
+                let catalog = fresh.render_catalog();
                 self.inst.param_edit_seqs.extend_catalog(&catalog);
                 let _guard = self
                     .inst
                     .lifecycle_lock
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
+                *self
+                    .inst
+                    .exposed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = fresh;
+                self.inst.render_catalog.publish(catalog);
                 if self.inst.is_known_inactive() {
-                    self.inst.audio.enter().catalog = catalog;
-                    *self
-                        .inst
-                        .pending_audio_catalog
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = None;
-                } else {
-                    *self
-                        .inst
-                        .pending_audio_catalog
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Some(catalog);
+                    let mut audio = self.inst.audio.enter();
+                    self.inst.render_catalog.reclaim();
+                    self.inst.render_catalog.install(&mut audio.catalog);
+                    self.inst.render_catalog.reclaim();
                 }
             }
             if presentation_changed && !self.inst.host_queue.is_closed() {
@@ -480,6 +480,32 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
     main: &MainThread,
 ) {
     let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
+
+    inst.render_catalog.reclaim();
+    if let Some(mut hooks) = inst.main_thread.try_borrow_mut(main) {
+        let info = inst
+            .pending_context_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(info) = info {
+            // Keep draining the armed host queue even if the plugin hook panics.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hooks.track_info_changed(main, &info);
+            }));
+        }
+    } else if inst
+        .pending_context_name
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some()
+        && let Some(dispatch) = &inst.host_dispatch
+    {
+        dispatch.trigger_now();
+    }
+    if inst.host_queue.is_closed() {
+        return;
+    }
 
     // 1. Deliver any off-UI-thread editor gestures and deferred resizes on
     //    the main/UI thread before host feedback.

@@ -1,13 +1,89 @@
-//! Event-driven main-queue drain and `MooseAuHostSink` vtable wrapper for AU.
+//! Main-queue drains and the AU host sink.
 //!
-//! Every host-bound event (parameter edits/feedback, `LATENCY`, `TAIL`,
-//! `PERSIST`, `PRESENTATION`, `PARAM_RESCAN`, `MARK_DIRTY`, `RESTART`,
-//! `HostNotice`) wakes a per-instance `DISPATCH_SOURCE_TYPE_DATA_OR` on
-//! `_dispatch_main_q` (`#[cfg(target_vendor = "apple")]`: macOS `AUv2`, macOS
-//! `AUv3`, iOS `AUv3`). Zero polling timers, zero frame-rate caps; `HostQueue` and
-//! `dispatch_source_merge_data` coalesce bursts into a single main-queue turn.
+//! Control producers wake a per-instance `DATA_OR` source. Render producers
+//! publish atomically and a timer shared by the framework image wakes the
+//! dirty instances at approximately 30 Hz.
 
 use crate::ffi::MooseAuHostSink;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_vendor = "apple")]
+use std::{ffi::c_void, sync::atomic::AtomicPtr};
+
+static IMAGE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(target_vendor = "apple"))]
+thread_local! {
+    static IN_RENDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_vendor = "apple")]
+fn current_thread() -> *mut c_void {
+    unsafe extern "C" {
+        fn pthread_self() -> *mut c_void;
+    }
+
+    // SAFETY: pthread_self reads the calling thread's initialized pthread token.
+    unsafe { pthread_self() }
+}
+
+/// Signals routed from this instance's exclusive audio owner to the image timer.
+#[derive(Default)]
+pub(crate) struct RenderSignals {
+    dirty: AtomicBool,
+    #[cfg(target_vendor = "apple")]
+    thread: AtomicPtr<c_void>,
+}
+
+impl RenderSignals {
+    pub(crate) fn enter(&self) -> RenderSignalGuard<'_> {
+        #[cfg(target_vendor = "apple")]
+        self.thread.store(current_thread(), Ordering::Release);
+        #[cfg(not(target_vendor = "apple"))]
+        let previous = IN_RENDER.with(|render| render.replace(true));
+        RenderSignalGuard {
+            signals: self,
+            #[cfg(not(target_vendor = "apple"))]
+            previous,
+        }
+    }
+
+    pub(crate) fn defer(&self) -> bool {
+        #[cfg(target_vendor = "apple")]
+        let render = self.thread.load(Ordering::Acquire) == current_thread();
+        #[cfg(not(target_vendor = "apple"))]
+        let render = IN_RENDER.with(std::cell::Cell::get);
+        if render {
+            self.mark();
+        }
+        render
+    }
+
+    pub(crate) fn mark(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+        IMAGE_DIRTY.store(true, Ordering::SeqCst);
+    }
+}
+
+pub(crate) struct RenderSignalGuard<'a> {
+    signals: &'a RenderSignals,
+    #[cfg(not(target_vendor = "apple"))]
+    previous: bool,
+}
+
+impl Drop for RenderSignalGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(target_vendor = "apple")]
+        self.signals
+            .thread
+            .store(std::ptr::null_mut(), Ordering::Release);
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = self.signals;
+            IN_RENDER.with(|render| render.set(self.previous));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HostSink: value-copied vtable wrapper with single-run release on Drop
@@ -19,7 +95,7 @@ use crate::ffi::MooseAuHostSink;
 pub(crate) struct HostSink(MooseAuHostSink);
 
 impl HostSink {
-    /// No-op sink used by `create(void)` callers and null pointers.
+    /// No-op sink used when the caller passes a null or undersized prefix.
     pub(crate) fn empty() -> Self {
         Self(MooseAuHostSink::default())
     }
@@ -29,13 +105,15 @@ impl HostSink {
     /// remaining forward-compatible with larger future vtable revisions).
     ///
     /// # Safety
-    /// `raw` is either null or points to a readable `MooseAuHostSink` prefix of
-    /// at least `(*raw).size` bytes (or `size_of::<MooseAuHostSink>()` bytes).
+    /// `raw` is null or aligned with a readable size word and the first
+    /// `min(size, size_of::<MooseAuHostSink>())` bytes initialized.
     pub(crate) unsafe fn from_raw(raw: *const MooseAuHostSink) -> Self {
         if raw.is_null() {
             return Self::empty();
         }
-        let declared = unsafe { (*raw).size as usize };
+        // SAFETY: the caller guarantees the size word is readable even for
+        // an undersized prefix.
+        let declared = unsafe { raw.cast::<u32>().read() as usize };
         if declared < std::mem::size_of::<u32>() * 2 {
             return Self::empty();
         }
@@ -198,13 +276,14 @@ impl Drop for HostSink {
 
 #[cfg(target_vendor = "apple")]
 mod apple {
+    use super::{IMAGE_DIRTY, RenderSignals};
     use crate::instance::AuCtx;
     use moose_core::export::PluginExport;
     use moose_core::host_queue::HostQueue;
     use moose_core::wrapper::run_extern_callback_with;
     use std::ffi::c_void;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     /// Owned `dispatch_source_t` handle safe to wake from any thread via
     /// `dispatch_source_merge_data` until `Dispatcher::drop` cancels and
@@ -227,6 +306,7 @@ mod apple {
 
     unsafe extern "C" {
         static _dispatch_source_type_data_or: c_void;
+        static _dispatch_source_type_timer: c_void;
         static _dispatch_main_q: c_void;
         fn dispatch_source_create(
             kind: *const c_void,
@@ -243,10 +323,85 @@ mod apple {
             source: *mut c_void,
             callback: unsafe extern "C" fn(*mut c_void),
         );
+        fn dispatch_source_set_timer(source: *mut c_void, start: u64, interval: u64, leeway: u64);
         fn dispatch_resume(source: *mut c_void);
         fn dispatch_source_merge_data(source: *mut c_void, data: usize);
         fn dispatch_source_cancel(source: *mut c_void);
         fn dispatch_release(source: *mut c_void);
+    }
+
+    static TIMER: Mutex<RenderTimer> = Mutex::new(RenderTimer {
+        source: None,
+        reservations: 0,
+        active: Vec::new(),
+    });
+
+    struct RenderTimer {
+        source: Option<DispatchSource>,
+        reservations: usize,
+        active: Vec<(DispatchSource, Arc<RenderSignals>)>,
+    }
+
+    // Reserve a working source during fallible instantiation; the v14
+    // activation callback has no way to report a timer allocation failure.
+    struct TimerReservation;
+
+    impl TimerReservation {
+        fn new() -> Option<Self> {
+            let mut timer = TIMER.lock().unwrap_or_else(PoisonError::into_inner);
+            if timer.source.is_none() {
+                // SAFETY: both the source type and queue are libdispatch globals.
+                let raw = unsafe {
+                    dispatch_source_create(
+                        &raw const _dispatch_source_type_timer,
+                        0,
+                        0,
+                        (&raw const _dispatch_main_q).cast_mut(),
+                    )
+                };
+                if raw.is_null() {
+                    return None;
+                }
+                // SAFETY: initialize and resume the newly created timer once.
+                unsafe {
+                    dispatch_source_set_event_handler_f(raw, timer_tick);
+                    dispatch_source_set_timer(raw, u64::MAX, 0, 0);
+                    dispatch_resume(raw);
+                }
+                timer.source = Some(DispatchSource(raw));
+            }
+            timer.reservations += 1;
+            Some(Self)
+        }
+    }
+
+    impl Drop for TimerReservation {
+        fn drop(&mut self) {
+            let mut timer = TIMER.lock().unwrap_or_else(PoisonError::into_inner);
+            timer.reservations -= 1;
+            if timer.reservations == 0
+                && let Some(source) = timer.source.take()
+            {
+                // The last dispatcher has already removed its registration.
+                unsafe {
+                    dispatch_source_cancel(source.0);
+                    dispatch_release(source.0);
+                }
+            }
+        }
+    }
+
+    unsafe extern "C" fn timer_tick(_: *mut c_void) {
+        if !IMAGE_DIRTY.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let timer = TIMER.lock().unwrap_or_else(PoisonError::into_inner);
+        for (source, signals) in &timer.active {
+            if signals.dirty.swap(false, Ordering::SeqCst) {
+                // SAFETY: registrations keep the source live under TIMER.
+                unsafe { dispatch_source_merge_data(source.0, 1) };
+            }
+        }
     }
 
     struct DrainContext {
@@ -257,12 +412,14 @@ mod apple {
     pub(crate) struct Dispatcher {
         source: DispatchSource,
         activated: AtomicBool,
+        _timer: TimerReservation,
     }
 
     impl Dispatcher {
-        /// Create a suspended main-queue `DATA_OR` dispatch source and its
-        /// thread-safe, allocation-free wake closure.
+        /// Reserve the render timer and create a suspended main-queue
+        /// `DATA_OR` source with a thread-safe, allocation-free wake closure.
         pub(crate) unsafe fn new() -> Option<(Self, impl Fn() + Send + Sync + 'static)> {
+            let timer = TimerReservation::new()?;
             unsafe {
                 let raw = dispatch_source_create(
                     &raw const _dispatch_source_type_data_or,
@@ -281,6 +438,7 @@ mod apple {
                     Self {
                         source,
                         activated: AtomicBool::new(false),
+                        _timer: timer,
                     },
                     wake,
                 ))
@@ -307,6 +465,31 @@ mod apple {
             self.activated.store(true, Ordering::Release);
         }
 
+        pub(crate) fn start_render_polling(&self, signals: &Arc<RenderSignals>) {
+            let mut timer = TIMER.lock().unwrap_or_else(PoisonError::into_inner);
+            if timer.active.is_empty()
+                && let Some(source) = timer.source
+            {
+                // The dispatcher's reservation keeps the resumed timer live.
+                unsafe { dispatch_source_set_timer(source.0, 0, 33_333_333, 3_000_000) };
+            }
+            timer.active.push((self.source, Arc::clone(signals)));
+            if signals.dirty.load(Ordering::SeqCst) {
+                IMAGE_DIRTY.store(true, Ordering::SeqCst);
+            }
+        }
+
+        pub(crate) fn stop_render_polling(&self) {
+            let mut timer = TIMER.lock().unwrap_or_else(PoisonError::into_inner);
+            timer.active.retain(|(source, _)| source.0 != self.source.0);
+            if timer.active.is_empty()
+                && let Some(source) = timer.source
+            {
+                // DISPATCH_TIME_FOREVER keeps the reserved source idle.
+                unsafe { dispatch_source_set_timer(source.0, u64::MAX, 0, 0) };
+            }
+        }
+
         /// Coalesced event-driven wake of the main-queue drain (safe from any
         /// thread, allocation-free).
         pub(crate) fn trigger_now(&self) {
@@ -320,6 +503,7 @@ mod apple {
 
     impl Drop for Dispatcher {
         fn drop(&mut self) {
+            self.stop_render_polling();
             let raw = self.source.0;
             unsafe {
                 dispatch_source_cancel(raw);
@@ -349,6 +533,7 @@ mod apple {
 
 #[cfg(not(target_vendor = "apple"))]
 mod non_apple {
+    use super::RenderSignals;
     use moose_core::export::PluginExport;
     use moose_core::host_queue::HostQueue;
     use std::ffi::c_void;
@@ -376,6 +561,12 @@ mod non_apple {
 
         #[allow(clippy::unused_self)]
         pub(crate) fn trigger_now(&self) {}
+
+        #[allow(clippy::unused_self)]
+        pub(crate) fn start_render_polling(&self, _signals: &Arc<RenderSignals>) {}
+
+        #[allow(clippy::unused_self)]
+        pub(crate) fn stop_render_polling(&self) {}
     }
 }
 

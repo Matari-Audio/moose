@@ -50,8 +50,27 @@ fn main() {
     // `au_shim_common.c`) against `fake_audiotoolbox.h` so `au_shim_harness`
     // exercises the shipping C shim without a Mac.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
-        let au_shim = manifest_dir.join("../moose-au/shim");
+        let aax_template = manifest_dir.join("../cargo-moose/templates/aax");
+        let aax_test = manifest_dir.join("test-support/aax_latency.cpp");
         let shim_include = manifest_dir.join("../moose-shim-types/include");
+        println!("cargo:rerun-if-changed={}", aax_test.display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            aax_template.join("MooseAAX_Bridge.h").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            shim_include.join("aax_shim_types.h").display()
+        );
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .file(aax_test)
+            .include(aax_template)
+            .include(&shim_include)
+            .compile("aax_latency_harness");
+
+        let au_shim = manifest_dir.join("../moose-au/shim");
         for f in [
             "au_shim_common.c",
             "au_v2_shim.c",

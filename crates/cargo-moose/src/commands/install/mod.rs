@@ -322,7 +322,7 @@ pub(crate) fn cmd_install(args: &[String]) -> Res {
             fs_ctx::create_dir_all(&bundles_dir)?;
             for p in &plugins {
                 if !no_build {
-                    let _ = aax::emit_aax_bundle(&root, p, &config, &bundles_dir, None)?;
+                    let _ = aax::emit_aax_bundle(&root, p, &config, &bundles_dir, None, &[])?;
                 }
                 aax::install_aax(&root, p, &config)?;
             }

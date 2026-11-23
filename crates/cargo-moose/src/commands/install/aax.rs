@@ -60,6 +60,7 @@ pub(crate) fn emit_aax_bundle(
     config: &Config,
     stage_dir: &Path,
     target: Option<&str>,
+    mac_slices: &[&str],
 ) -> Result<bool, crate::CargoMooseError> {
     use crate::templates::aax;
     use crate::util::fs_ctx;
@@ -85,15 +86,40 @@ pub(crate) fn emit_aax_bundle(
         .into());
     }
 
+    let sdk_path = sdk_path.canonicalize()?;
+    #[cfg(target_os = "macos")]
+    let arch = if mac_slices.is_empty() {
+        match target.unwrap_or_else(|| moose_build::host_triple()) {
+            "aarch64-apple-darwin" => "arm64".to_owned(),
+            "x86_64-apple-darwin" => "x86_64".to_owned(),
+            other => return Err(format!("unsupported macOS AAX target {other}").into()),
+        }
+    } else {
+        mac_slices.join(";")
+    };
+    #[cfg(target_os = "windows")]
+    let (arch, cmake_arch) = {
+        let _ = mac_slices;
+        match target.unwrap_or_else(|| moose_build::host_triple()) {
+            "x86_64-pc-windows-msvc" => ("x64", "x64"),
+            "aarch64-pc-windows-msvc" => ("arm64", "ARM64"),
+            other => return Err(format!("unsupported Windows AAX target {other}").into()),
+        }
+    };
+    let dynamic_crt = cfg!(target_os = "windows") && crate::util::msvc_dynamic_crt();
+    let crt = if dynamic_crt { "MD" } else { "MT" };
+
     let target_dir = moose_build::target_dir(root);
     let proj_dir = target_dir.join("aax-cmake").join(&p.crate_name);
     let src_dir = proj_dir.join("src");
-    let build_dir = proj_dir.join("build");
+    let build_dir = proj_dir.join(format!("build-{arch}-{crt}"));
     fs_ctx::create_dir_all(&build_dir)?;
 
-    let cmake_lists = proj_dir.join("CMakeLists.txt");
-    if std::fs::read_to_string(&cmake_lists).ok().as_deref() != Some(aax::CMAKE_LISTS) {
-        fs_ctx::write(&cmake_lists, aax::CMAKE_LISTS)?;
+    for (name, source) in [
+        ("CMakeLists.txt", aax::CMAKE_LISTS),
+        ("AAXSDK.cmake", aax::SDK_CMAKE),
+    ] {
+        fs_ctx::write_if_changed(proj_dir.join(name), source)?;
     }
     write_aax_template_sources(&src_dir)?;
 
@@ -109,10 +135,35 @@ pub(crate) fn emit_aax_bundle(
         .arg(&build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Release")
         .arg(format!("-DAAX_SDK_PATH={}", sdk_path.display()))
+        .arg(format!(
+            "-DMOOSE_AAX_SDK_CACHE={}",
+            target_dir.join("aax-sdk-cache").display()
+        ))
         .arg(format!("-DMOOSE_RUST_STATICLIB={}", staticlib.display()))
         .arg(format!("-DMOOSE_PLUGIN_STEM={file_stem}"))
         .arg(format!("-DMOOSE_BUNDLE_ID={bundle_id}"))
         .arg(format!("-DMOOSE_PLUGIN_VERSION={version}"));
+    if let Some(archive) = crate::read_build_env("AAX_LIB_PATH") {
+        configure.arg(format!("-DAAX_LIB_PATH={archive}"));
+    } else {
+        configure.arg("-UAAX_LIB_PATH");
+    }
+    #[cfg(target_os = "macos")]
+    configure
+        .arg(format!("-DCMAKE_OSX_ARCHITECTURES={arch}"))
+        .arg(format!(
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET={}",
+            crate::deployment_target()
+        ));
+    #[cfg(target_os = "windows")]
+    {
+        configure
+            .arg(format!("-DMOOSE_AAX_WINDOWS_ARCH={arch}"))
+            .arg(format!("-DMOOSE_MSVC_CRT={crt}"));
+        if std::env::var("CMAKE_GENERATOR").map_or(true, |name| name.starts_with("Visual Studio")) {
+            configure.args(["-A", cmake_arch]);
+        }
+    }
     let status = configure
         .status()
         .map_err(|e| format!("running `cmake` to configure AAX bundle: {e}"))?;
@@ -136,14 +187,13 @@ pub(crate) fn emit_aax_bundle(
 
     #[cfg(target_os = "macos")]
     {
-        let built_bundle = build_dir.join(&bundle_name);
-        if !built_bundle.exists() {
-            return Err(format!(
-                "AAX build did not produce expected bundle at {}",
-                built_bundle.display()
-            )
-            .into());
-        }
+        let built_bundle = [
+            build_dir.join("Release").join(&bundle_name),
+            build_dir.join(&bundle_name),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .ok_or_else(|| format!("AAX build did not produce {bundle_name}"))?;
         crate::util::copy_dir_recursive(&built_bundle, &dst_bundle)?;
         crate::codesign_bundle(
             dst_bundle.to_str().unwrap_or_default(),
@@ -161,9 +211,9 @@ pub(crate) fn emit_aax_bundle(
         .into_iter()
         .find(|cand| cand.exists())
         .ok_or_else(|| format!("AAX build did not produce {bundle_name}"))?;
-        let x64_dir = dst_bundle.join("Contents").join("x64");
-        fs_ctx::create_dir_all(&x64_dir)?;
-        fs_ctx::copy(&built_dll, x64_dir.join(&bundle_name))?;
+        let arch_dir = dst_bundle.join("Contents").join(arch);
+        fs_ctx::create_dir_all(&arch_dir)?;
+        fs_ctx::copy(&built_dll, arch_dir.join(&bundle_name))?;
     }
 
     Ok(true)

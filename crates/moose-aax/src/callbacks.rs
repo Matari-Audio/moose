@@ -526,10 +526,10 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
             catalog: catalog.as_ref(),
             automation: inst.automation,
             bus_routing,
-            delay: &inst.delay,
-            host_queue: &inst.host_queue,
         };
         unsafe { run_c_abi_audio_block(&mut block) };
+        inst.delay
+            .observe_and_signal_no_wake(plugin.latency(), plugin.tail(), &inst.host_queue);
 
         if audio.output_events.overflow().is_some() {
             audio.staging_status = MOOSE_AAX_EVENT_QUEUE_FULL;

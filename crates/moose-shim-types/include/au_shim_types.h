@@ -32,8 +32,8 @@
 // names predate 2.0, so cross-binary skew is caught only by this
 // word at runtime.)
 //
-// Bump the low byte whenever a field is appended - or an unreleased
-// tail callback changes signature - and mirror it in
+// v14 is frozen. Readers must check the complete version word before
+// reading the rest of AuCallbacks. Mirror the version in
 // `moose_au::ffi::MOOSE_AU_ABI_VERSION` (a lockstep test guards it).
 // v2: `output_ump_count` / `output_ump_at` gained the `protocol`
 // argument; an appex must not drain a v1 binary through them.
@@ -226,6 +226,8 @@ typedef struct {
  * carries only the target `value` and `rampDurationSampleFrames`; Rust derives
  * the starting value from the parameter's current value). */
 #define AU_PARAM_EVENT_HAS_START_VALUE (1u << 0)
+/* AUv2 scheduled steps keep their host offset in block-split mode. */
+#define AU_PARAM_EVENT_EXACT_OFFSET    (1u << 1)
 
 typedef struct {
     int32_t start_offset;
@@ -547,6 +549,11 @@ typedef struct {
 } AuCallbacks;
 
 // Globals shared between v2 and v3 shims.
+// Pair on the same control thread to pin one exposed catalog across the
+// v14 enumeration and formatting callbacks for ctx. Calls may nest.
+void moose_au_param_snapshot_begin(const void *ctx);
+void moose_au_param_snapshot_end(void);
+
 // Populated by moose_au_register_v3() (called from the constructor).
 extern const AuPluginDescriptor *g_descriptor;
 extern const AuCallbacks *g_callbacks;

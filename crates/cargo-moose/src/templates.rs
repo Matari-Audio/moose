@@ -14,6 +14,7 @@ pub mod aax {
     pub const INFO_PLIST_IN: &str = include_str!("../templates/aax/Info.plist.in");
     pub const BRIDGE_H: &str = include_str!("../templates/aax/MooseAAX_Bridge.h");
     pub const DESCRIBE_CPP: &str = include_str!("../templates/aax/MooseAAX_Describe.cpp");
+    pub const SDK_CMAKE: &str = include_str!("../templates/aax/AAXSDK.cmake");
     pub const PARAMETERS_H: &str = include_str!("../templates/aax/MooseAAX_Parameters.h");
     pub const PARAMETERS_CPP: &str = include_str!("../templates/aax/MooseAAX_Parameters.cpp");
     pub const GUI_H: &str = include_str!("../templates/aax/MooseAAX_GUI.h");

@@ -636,6 +636,7 @@ fn stage_aax(
         config,
         &aax_dir,
         Some(arch.triple()),
+        &[],
     )? {
         return Err(
             "AAX packaging requested, but AAX_SDK_PATH is not set to a valid Avid AAX SDK directory."
@@ -645,7 +646,7 @@ fn stage_aax(
     Ok(aax_dir
         .join(format!("{}.aaxplugin", p.file_stem()))
         .join("Contents")
-        .join("x64")
+        .join(arch.tag())
         .join(format!("{}.aaxplugin", p.file_stem())))
 }
 

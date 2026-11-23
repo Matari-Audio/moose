@@ -1018,6 +1018,7 @@ pub(crate) unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(
         }
 
         let epoch = audio.feedback_epoch;
+        let _render_signals = inst.render_signals.enter();
         let mut emitted = false;
         for event in audio.output_events.lossless_iter() {
             let LosslessEventRef::Typed(Event {
@@ -1041,14 +1042,15 @@ pub(crate) unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(
                 .push((*id, f32::from_f64(*value), epoch))
                 .is_err()
             {
+                if emitted {
+                    inst.render_signals.mark();
+                }
                 return AU_OUTPUT_QUEUE_FULL;
             }
             emitted = true;
         }
         if emitted {
-            if let Some(dispatch) = &inst.host_dispatch {
-                dispatch.trigger_now();
-            }
+            inst.render_signals.mark();
             AU_OUTPUT_EMITTED
         } else {
             AU_OUTPUT_END

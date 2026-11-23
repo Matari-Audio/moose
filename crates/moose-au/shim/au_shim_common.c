@@ -25,11 +25,24 @@ void moose_au_register_v3(
     const AuPluginDescriptor *descriptor,
     const AuCallbacks *callbacks
 ) {
-    if (g_registered) return;
+    if (g_registered || !descriptor || !callbacks ||
+        callbacks->abi_version != MOOSE_AU_ABI_VERSION)
+        return;
 
     g_descriptor = descriptor;
     g_callbacks = callbacks;
     g_registered = 1;
+}
+
+extern void moose_au_rust_param_snapshot_begin(const void *ctx);
+extern void moose_au_rust_param_snapshot_end(void);
+
+__attribute__((visibility("default"))) void moose_au_param_snapshot_begin(const void *ctx) {
+    moose_au_rust_param_snapshot_begin(ctx);
+}
+
+__attribute__((visibility("default"))) void moose_au_param_snapshot_end(void) {
+    moose_au_rust_param_snapshot_end();
 }
 
 #ifdef MOOSE_AU_FAKE_AUDIOTOOLBOX

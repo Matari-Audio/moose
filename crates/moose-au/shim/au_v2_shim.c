@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sched.h>
 #include <math.h>
 
 #include "au_shim_types.h"
@@ -29,6 +30,18 @@
 // under dense per-block automation.
 #define AU_PARAM_EVENT_CAP 512
 
+// The low bits gate one render dispatch and identify an enabled slot.
+#define AU_RN_ACTIVE UINT64_C(1)
+#define AU_RN_CALLING UINT64_C(2)
+#define AU_RN_FLAGS (AU_RN_ACTIVE | AU_RN_CALLING)
+
+typedef struct {
+    uint64_t state;
+    AURenderCallback proc;
+    void *userData;
+} AuRenderNotify;
+
+static uint64_t au_current_tid(void);
 static uint32_t au_ump_word_count(uint32_t word0);
 static int au_ump_protocol_accepts(MIDIProtocolID protocol,
                                    uint32_t messageType);
@@ -66,6 +79,7 @@ typedef struct {
     // kAudioUnitProperty_ContextName: host track/channel name, retained
     // until replaced or closed. Forwarded to Rust via `set_context_name`.
     CFStringRef contextName;
+    os_unfair_lock contextNameLock;
 
     // kAudioUnitProperty_FactoryPresets table, built lazily from the
     // Rust factory_preset_* callbacks. Entry names stay retained until
@@ -128,6 +142,8 @@ typedef struct {
     // audio thread and so may touch paramEvents. Read/written relaxed:
     // a stale read only ever skips one enqueue, never corrupts state.
     uint64_t audioThreadId;
+    uint64_t controlThreadId;
+    uint64_t renderScopeThreadId;
 
     // Plugin → host MIDI output callback (set via
     // kAudioUnitProperty_MIDIOutputCallback). Hosts that want to
@@ -185,18 +201,12 @@ typedef struct {
     // Render-notify callbacks (kAudioUnitAddRenderNotify). Invoked with
     // kAudioUnitRenderAction_PreRender before processing and _PostRender
     // after, which AUGraph metering / offline harnesses depend on.
-    // Writers serialize on `renderNotifyLock` (never taken on the audio
-    // thread) and mutate atomic `uintptr_t` slots inside a seqlock bracket
-    // (`renderNotifySeq`), while the audio thread reads every slot atomically
-    // (C11 data-race-free Boehm seqlock — zero RT locks, zero RT allocs).
+    // Each slot pins its refcon for the duration of a call. Writers
+    // serialize with each other. Render reserves a slot using a single CAS.
     os_unfair_lock renderNotifyLock;
-    struct {
-        uintptr_t proc;
-        uintptr_t userData;
-    } renderNotifies[32];
-    uint32_t renderNotifyCount;
-    // Seqlock sequence: even = stable, odd = a writer is mid-update.
-    uint32_t renderNotifySeq;
+    AuRenderNotify renderNotifies[32];
+    uint64_t nextRenderNotifyId;
+    uint64_t renderNotifyThreadId;
 } MooseAUv2;
 
 // ---------------------------------------------------------------------------
@@ -482,10 +492,13 @@ static OSStatus au_v2_open(void *self_, AudioComponentInstance instance) {
     MooseAUv2 *inst = (MooseAUv2 *)self_;
     inst->componentInstance = instance;
     inst->listenerLock = OS_UNFAIR_LOCK_INIT;
+    inst->contextNameLock = OS_UNFAIR_LOCK_INIT;
+    inst->controlThreadId = au_current_tid();
     inst->midiOffThreadLock = OS_UNFAIR_LOCK_INIT;
     inst->renderNotifyLock = OS_UNFAIR_LOCK_INIT;
 
-    if (!g_callbacks) return kAudioUnitErr_FailedInitialization;
+    if (!g_callbacks || g_callbacks->abi_version != MOOSE_AU_ABI_VERSION)
+        return kAudioUnitErr_FailedInitialization;
     MooseAuHostSink sink;
     memset(&sink, 0, sizeof(sink));
     sink.size = (uint32_t)sizeof(MooseAuHostSink);
@@ -601,10 +614,11 @@ static OSStatus au_v2_initialize(void *self_) {
 
 static OSStatus au_v2_uninitialize(void *self_) {
     MooseAUv2 *inst = (MooseAUv2 *)self_;
-    if (inst->initialized && g_callbacks && g_callbacks->set_active && inst->rustCtx)
-        g_callbacks->set_active(inst->rustCtx, 0);
+    const bool wasInitialized = inst->initialized;
     inst->initialized = false;
     __atomic_store_n(&inst->audioThreadId, 0, __ATOMIC_RELAXED);
+    if (wasInitialized && g_callbacks && g_callbacks->set_active && inst->rustCtx)
+        g_callbacks->set_active(inst->rustCtx, 0);
     return noErr;
 }
 
@@ -650,7 +664,7 @@ static uint32_t count_midi_mapped_params(MooseAUv2 *inst) {
     return n;
 }
 
-static OSStatus au_v2_get_property_info(void *self_, AudioUnitPropertyID prop,
+static OSStatus au_v2_get_property_info_impl(void *self_, AudioUnitPropertyID prop,
                                          AudioUnitScope scope, AudioUnitElement elem,
                                          UInt32 *outSize, Boolean *outWritable) {
     MooseAUv2 *inst = (MooseAUv2 *)self_;
@@ -813,7 +827,7 @@ static UInt32 au_v2_parameter_unit(const AuParamInfoOut *pi) {
     return kAudioUnitParameterUnit_Generic;
 }
 
-static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
+static OSStatus au_v2_get_property_impl(void *self_, AudioUnitPropertyID prop,
                                     AudioUnitScope scope, AudioUnitElement elem,
                                     void *outData, UInt32 *ioSize) {
     MooseAUv2 *inst = (MooseAUv2 *)self_;
@@ -884,9 +898,11 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
             if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
             if (*ioSize < sizeof(CFStringRef))
                 return kAudioUnitErr_InvalidPropertyValue;
+            os_unfair_lock_lock(&inst->contextNameLock);
             *(CFStringRef *)outData = inst->contextName
                 ? (CFStringRef)CFRetain(inst->contextName)
                 : NULL;
+            os_unfair_lock_unlock(&inst->contextNameLock);
             *ioSize = sizeof(CFStringRef);
             return noErr;
         }
@@ -1215,7 +1231,7 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
 
             // Use dladdr to find our bundle path
             Dl_info dlInfo;
-            if (dladdr((void*)au_v2_get_property, &dlInfo)) {
+            if (dladdr((void*)au_v2_get_property_impl, &dlInfo)) {
                 // Walk up from the binary path to the .component bundle
                 char path[2048];
                 strncpy(path, dlInfo.dli_fname, sizeof(path));
@@ -1390,6 +1406,32 @@ static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
     }
 }
 
+static OSStatus au_v2_get_property_info(void *self_, AudioUnitPropertyID prop,
+                                         AudioUnitScope scope, AudioUnitElement elem,
+                                         UInt32 *outSize, Boolean *outWritable) {
+    MooseAUv2 *inst = (MooseAUv2 *)self_;
+    if (prop != kAudioUnitProperty_AllParameterMIDIMappings)
+        return au_v2_get_property_info_impl(self_, prop, scope, elem, outSize, outWritable);
+    moose_au_param_snapshot_begin(inst->rustCtx);
+    OSStatus status = au_v2_get_property_info_impl(self_, prop, scope, elem, outSize, outWritable);
+    moose_au_param_snapshot_end();
+    return status;
+}
+
+static OSStatus au_v2_get_property(void *self_, AudioUnitPropertyID prop,
+                                    AudioUnitScope scope, AudioUnitElement elem,
+                                    void *outData, UInt32 *ioSize) {
+    MooseAUv2 *inst = (MooseAUv2 *)self_;
+    if (prop != kAudioUnitProperty_ParameterList &&
+        prop != kAudioUnitProperty_ParameterValueStrings &&
+        prop != kAudioUnitProperty_AllParameterMIDIMappings)
+        return au_v2_get_property_impl(self_, prop, scope, elem, outData, ioSize);
+    moose_au_param_snapshot_begin(inst->rustCtx);
+    OSStatus status = au_v2_get_property_impl(self_, prop, scope, elem, outData, ioSize);
+    moose_au_param_snapshot_end();
+    return status;
+}
+
 static OSStatus au_v2_set_property(void *self_, AudioUnitPropertyID prop,
                                     AudioUnitScope scope, AudioUnitElement elem,
                                     const void *inData, UInt32 inSize) {
@@ -1489,15 +1531,14 @@ static OSStatus au_v2_set_property(void *self_, AudioUnitPropertyID prop,
                 }
                 utf8 = dst;
             }
-            if (inst->contextName) {
-                CFRelease(inst->contextName);
-                inst->contextName = NULL;
-            }
-            if (incoming) {
-                inst->contextName = (CFStringRef)CFRetain(incoming);
-            }
+            CFStringRef retained = incoming ? (CFStringRef)CFRetain(incoming) : NULL;
+            os_unfair_lock_lock(&inst->contextNameLock);
+            CFStringRef previous = inst->contextName;
+            inst->contextName = retained;
             if (g_callbacks && g_callbacks->set_context_name && inst->rustCtx)
                 g_callbacks->set_context_name(inst->rustCtx, utf8);
+            os_unfair_lock_unlock(&inst->contextNameLock);
+            if (previous) CFRelease(previous);
             free(heapBuf);
             notify_listeners(inst, kAudioUnitProperty_ContextName,
                              kAudioUnitScope_Global, 0);
@@ -1737,8 +1778,8 @@ static OSStatus au_v2_get_parameter(void *self_, AudioUnitParameterID id,
     return noErr;
 }
 
-/* Current thread's kernel id. AU is macOS-only, so pthread_threadid_np
- * is always available. */
+/* A kernel thread ID avoids confusing a recycled pthread handle with the
+ * most recent render thread after a host replaces its worker. */
 static uint64_t au_current_tid(void) {
     uint64_t tid = 0;
     pthread_threadid_np(pthread_self(), &tid);
@@ -1755,12 +1796,14 @@ static int au_on_audio_thread(const MooseAUv2 *inst) {
 /* Append a host parameter-automation event (immediate or ramped) to the
  * render-block queue. MUST be called on the audio thread. When full, coalesce
  * onto the most recent event for the same parameter so dense automation stays
- * responsive rather than dropping the newest value. */
-static void enqueue_param_event_v2(MooseAUv2 *inst, AudioUnitParameterID id,
-                                   int32_t startOffset, uint32_t durationFrames,
-                                   uint32_t flags, float startValue, float endValue) {
+ * responsive rather than dropping the newest value. Returns 1 if stored or
+ * coalesced, or 0 if full with no matching parameter slot (caller falls back
+ * to `param_set_value` so no write is lost and render still processes all
+ * accepted parameter and MIDI events). */
+static int enqueue_param_event_v2(MooseAUv2 *inst, AudioUnitParameterID id,
+                                  int32_t startOffset, uint32_t durationFrames,
+                                  uint32_t flags, float startValue, float endValue) {
     if (inst->paramEventCount >= AU_PARAM_EVENT_CAP) {
-        inst->paramOverflow = 1;
         for (uint32_t i = inst->paramEventCount; i > 0; i--) {
             if (inst->paramEvents[i - 1].param_id == id) {
                 inst->paramEvents[i - 1].start_offset = startOffset;
@@ -1768,10 +1811,10 @@ static void enqueue_param_event_v2(MooseAUv2 *inst, AudioUnitParameterID id,
                 inst->paramEvents[i - 1].flags = flags;
                 inst->paramEvents[i - 1].start_value = startValue;
                 inst->paramEvents[i - 1].end_value = endValue;
-                return;
+                return 1;
             }
         }
-        return;
+        return 0;
     }
     AuParamEventV2 *ev = &inst->paramEvents[inst->paramEventCount++];
     ev->start_offset = startOffset;
@@ -1780,6 +1823,7 @@ static void enqueue_param_event_v2(MooseAUv2 *inst, AudioUnitParameterID id,
     ev->flags = flags;
     ev->start_value = startValue;
     ev->end_value = endValue;
+    return 1;
 }
 
 static OSStatus au_v2_set_parameter(void *self_, AudioUnitParameterID id,
@@ -1788,10 +1832,18 @@ static OSStatus au_v2_set_parameter(void *self_, AudioUnitParameterID id,
     (void)scope; (void)elem;
     MooseAUv2 *inst = (MooseAUv2 *)self_;
     if (!g_callbacks || !inst->rustCtx) return kAudioUnitErr_Uninitialized;
-    g_callbacks->param_set_value(inst->rustCtx, id, (double)value);
-    if (au_on_audio_thread(inst)) {
-        enqueue_param_event_v2(inst, id, (int32_t)bufferOffset, 0, 0,
-                               (float)value, (float)value);
+    // A host may also render offline on its control thread. Only writes
+    // inside that render invocation belong to its offset queue.
+    uint64_t tid = au_current_tid();
+    if (tid == __atomic_load_n(&inst->renderScopeThreadId, __ATOMIC_RELAXED) ||
+        (bufferOffset != 0 && tid != inst->controlThreadId &&
+         tid == __atomic_load_n(&inst->audioThreadId, __ATOMIC_RELAXED))) {
+        if (!enqueue_param_event_v2(inst, id, (int32_t)bufferOffset, 0, AU_PARAM_EVENT_EXACT_OFFSET,
+                                    (float)value, (float)value)) {
+            g_callbacks->param_set_value(inst->rustCtx, id, (double)value);
+        }
+    } else {
+        g_callbacks->param_set_value(inst->rustCtx, id, (double)value);
     }
     return noErr;
 }
@@ -1809,16 +1861,22 @@ static OSStatus au_v2_schedule_parameters(void *self_,
     for (UInt32 i = 0; i < numEvents; i++) {
         if (events[i].eventType == kParameterEvent_Immediate) {
             float v = (float)events[i].eventValues.immediate.value;
-            enqueue_param_event_v2(inst, events[i].parameter,
-                                   (int32_t)events[i].eventValues.immediate.bufferOffset,
-                                   0, 0, v, v);
+            if (!enqueue_param_event_v2(inst, events[i].parameter,
+                                        (int32_t)events[i].eventValues.immediate.bufferOffset,
+                                        0, AU_PARAM_EVENT_EXACT_OFFSET, v, v)) {
+                g_callbacks->param_set_value(inst->rustCtx, events[i].parameter, (double)v);
+            }
         } else if (events[i].eventType == kParameterEvent_Ramped) {
-            enqueue_param_event_v2(inst, events[i].parameter,
-                                   events[i].eventValues.ramp.startBufferOffset,
-                                   events[i].eventValues.ramp.durationInFrames,
-                                   AU_PARAM_EVENT_HAS_START_VALUE,
-                                   (float)events[i].eventValues.ramp.startValue,
-                                   (float)events[i].eventValues.ramp.endValue);
+            if (!enqueue_param_event_v2(inst, events[i].parameter,
+                                        events[i].eventValues.ramp.startBufferOffset,
+                                        events[i].eventValues.ramp.durationInFrames,
+                                        AU_PARAM_EVENT_HAS_START_VALUE,
+                                        (float)events[i].eventValues.ramp.startValue,
+                                        (float)events[i].eventValues.ramp.endValue)) {
+                g_callbacks->param_set_value(
+                    inst->rustCtx, events[i].parameter,
+                    (double)events[i].eventValues.ramp.endValue);
+            }
         }
     }
     return noErr;
@@ -1903,7 +1961,7 @@ static void au_v2_fire_render_notifies(MooseAUv2 *inst,
                                        const AudioTimeStamp *ts, UInt32 bus,
                                        UInt32 frames, AudioBufferList *ioData);
 
-static OSStatus au_v2_render(void *self_,
+static OSStatus au_v2_render_impl(void *self_,
                               AudioUnitRenderActionFlags *ioFlags,
                               const AudioTimeStamp *inTimeStamp,
                               UInt32 inBusNumber,
@@ -2487,7 +2545,12 @@ static OSStatus au_v2_add_property_listener(void *self_, AudioUnitPropertyID pro
     MooseAUv2 *inst = (MooseAUv2 *)self_;
     if (!proc) return kAudioUnitErr_InvalidParameter;
     os_unfair_lock_lock(&inst->listenerLock);
-    if (!au_v2_is_closing(inst) && inst->listenerCount < 32) {
+    OSStatus result = noErr;
+    if (au_v2_is_closing(inst)) {
+        result = kAudioUnitErr_Uninitialized;
+    } else if (inst->listenerCount == 32) {
+        result = kAudio_MemFullError;
+    } else {
         inst->listeners[inst->listenerCount].id = ++inst->nextListenerId;
         inst->listeners[inst->listenerCount].prop = prop;
         inst->listeners[inst->listenerCount].proc = proc;
@@ -2495,20 +2558,20 @@ static OSStatus au_v2_add_property_listener(void *self_, AudioUnitPropertyID pro
         inst->listenerCount++;
     }
     os_unfair_lock_unlock(&inst->listenerLock);
-    return noErr;
+    return result;
 }
 
-static OSStatus au_v2_remove_property_listener_with_data(void *self_, AudioUnitPropertyID prop,
-                                                          AudioUnitPropertyListenerProc proc,
-                                                          void *userData) {
-    MooseAUv2 *inst = (MooseAUv2 *)self_;
+static OSStatus remove_property_listener(MooseAUv2 *inst, AudioUnitPropertyID prop,
+                                         AudioUnitPropertyListenerProc proc,
+                                         void *userData, bool matchUserData) {
     pthread_mutex_lock(&inst->listenerDispatch);
     os_unfair_lock_lock(&inst->listenerLock);
-    for (uint32_t i = 0; i < inst->listenerCount; i++) {
+    for (uint32_t i = 0; i < inst->listenerCount;) {
         if (inst->listeners[i].prop == prop && inst->listeners[i].proc == proc &&
-            inst->listeners[i].userData == userData) {
+            (!matchUserData || inst->listeners[i].userData == userData)) {
             inst->listeners[i] = inst->listeners[--inst->listenerCount];
-            break;
+        } else {
+            i++;
         }
     }
     os_unfair_lock_unlock(&inst->listenerLock);
@@ -2516,106 +2579,120 @@ static OSStatus au_v2_remove_property_listener_with_data(void *self_, AudioUnitP
     return noErr;
 }
 
-// C11-sound atomic seqlock write-side bracket (Boehm 2012). Callers MUST hold
-// `inst->renderNotifyLock` so writers never race each other. Every payload
-// slot is written and read atomically so there is zero C11 data-race UB.
-static inline void au_v2_rn_write_begin(MooseAUv2 *inst) {
-    uint32_t s = __atomic_load_n(&inst->renderNotifySeq, __ATOMIC_RELAXED);
-    __atomic_store_n(&inst->renderNotifySeq, s + 1u, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+static OSStatus au_v2_remove_property_listener(void *self_, AudioUnitPropertyID prop,
+                                                AudioUnitPropertyListenerProc proc) {
+    return remove_property_listener(self_, prop, proc, NULL, false);
 }
-static inline void au_v2_rn_write_end(MooseAUv2 *inst) {
-    uint32_t s = __atomic_load_n(&inst->renderNotifySeq, __ATOMIC_RELAXED);
-    __atomic_store_n(&inst->renderNotifySeq, s + 1u, __ATOMIC_RELEASE);
+
+static OSStatus au_v2_remove_property_listener_with_data(void *self_, AudioUnitPropertyID prop,
+                                                          AudioUnitPropertyListenerProc proc,
+                                                          void *userData) {
+    return remove_property_listener(self_, prop, proc, userData, true);
 }
 
 static OSStatus au_v2_add_render_notify(void *self_, AURenderCallback proc, void *userData) {
     MooseAUv2 *inst = (MooseAUv2 *)self_;
     if (!proc) return kAudioUnitErr_InvalidParameter;
-    const uintptr_t procBits = (uintptr_t)proc;
-    const uintptr_t udBits = (uintptr_t)userData;
     os_unfair_lock_lock(&inst->renderNotifyLock);
-    uint32_t count = __atomic_load_n(&inst->renderNotifyCount, __ATOMIC_RELAXED);
-    // Ignore an exact duplicate (proc + refcon), matching the SDK.
-    for (uint32_t i = 0; i < count; i++) {
-        if (__atomic_load_n(&inst->renderNotifies[i].proc, __ATOMIC_RELAXED) == procBits &&
-            __atomic_load_n(&inst->renderNotifies[i].userData, __ATOMIC_RELAXED) == udBits) {
+    AuRenderNotify *freeSlot = NULL;
+    for (uint32_t i = 0; i < 32; i++) {
+        AuRenderNotify *slot = &inst->renderNotifies[i];
+        uint64_t state = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
+        if ((state & AU_RN_ACTIVE) && slot->proc == proc && slot->userData == userData) {
             os_unfair_lock_unlock(&inst->renderNotifyLock);
             return noErr;
         }
+        if (!(state & AU_RN_FLAGS) && !freeSlot) freeSlot = slot;
     }
-    if (count >= 32u) {
+    if (!freeSlot) {
         os_unfair_lock_unlock(&inst->renderNotifyLock);
         return kAudio_MemFullError;
     }
-    au_v2_rn_write_begin(inst);
-    __atomic_store_n(&inst->renderNotifies[count].proc, procBits, __ATOMIC_RELAXED);
-    __atomic_store_n(&inst->renderNotifies[count].userData, udBits, __ATOMIC_RELAXED);
-    __atomic_store_n(&inst->renderNotifyCount, count + 1u, __ATOMIC_RELAXED);
-    au_v2_rn_write_end(inst);
+    freeSlot->proc = proc;
+    freeSlot->userData = userData;
+    inst->nextRenderNotifyId += AU_RN_FLAGS + 1u;
+    __atomic_store_n(&freeSlot->state, inst->nextRenderNotifyId | AU_RN_ACTIVE,
+                     __ATOMIC_RELEASE);
     os_unfair_lock_unlock(&inst->renderNotifyLock);
     return noErr;
 }
 
 static OSStatus au_v2_remove_render_notify(void *self_, AURenderCallback proc, void *userData) {
     MooseAUv2 *inst = (MooseAUv2 *)self_;
-    const uintptr_t procBits = (uintptr_t)proc;
-    const uintptr_t udBits = (uintptr_t)userData;
+    AuRenderNotify *inFlight = NULL;
+    uint64_t inFlightId = 0;
     os_unfair_lock_lock(&inst->renderNotifyLock);
-    uint32_t count = __atomic_load_n(&inst->renderNotifyCount, __ATOMIC_RELAXED);
-    for (uint32_t i = 0; i < count; i++) {
-        if (__atomic_load_n(&inst->renderNotifies[i].proc, __ATOMIC_RELAXED) == procBits &&
-            __atomic_load_n(&inst->renderNotifies[i].userData, __ATOMIC_RELAXED) == udBits) {
-            au_v2_rn_write_begin(inst);
-            // Compact the tail down over the removed slot using atomic ops.
-            for (uint32_t j = i + 1u; j < count; j++) {
-                uintptr_t p = __atomic_load_n(&inst->renderNotifies[j].proc, __ATOMIC_RELAXED);
-                uintptr_t u = __atomic_load_n(&inst->renderNotifies[j].userData, __ATOMIC_RELAXED);
-                __atomic_store_n(&inst->renderNotifies[j - 1u].proc, p, __ATOMIC_RELAXED);
-                __atomic_store_n(&inst->renderNotifies[j - 1u].userData, u, __ATOMIC_RELAXED);
-            }
-            __atomic_store_n(&inst->renderNotifyCount, count - 1u, __ATOMIC_RELAXED);
-            au_v2_rn_write_end(inst);
-            break;
+    for (uint32_t i = 0; i < 32; i++) {
+        AuRenderNotify *slot = &inst->renderNotifies[i];
+        uint64_t state = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
+        if (!(state & AU_RN_FLAGS) || slot->proc != proc || slot->userData != userData)
+            continue;
+        state = __atomic_fetch_and(&slot->state, ~AU_RN_ACTIVE, __ATOMIC_ACQ_REL);
+        if ((state & AU_RN_CALLING) &&
+            au_current_tid() != __atomic_load_n(&inst->renderNotifyThreadId, __ATOMIC_ACQUIRE)) {
+            inFlight = slot;
+            inFlightId = state & ~AU_RN_FLAGS;
         }
     }
     os_unfair_lock_unlock(&inst->renderNotifyLock);
+    // Even a second concurrent remove must wait until the old call releases
+    // its refcon. Leave the writer lock free for callbacks that edit the list.
+    while (inFlight &&
+           (__atomic_load_n(&inFlight->state, __ATOMIC_ACQUIRE) & ~AU_RN_ACTIVE) ==
+               (inFlightId | AU_RN_CALLING)) {
+        sched_yield();
+    }
     return noErr;
 }
 
-// Fire every registered render-notify with `action` (PreRender / PostRender)
-// OR'd onto the current flags - the AUGraph metering / offline convention.
-// Reads the list through the atomic seqlock: every slot word is loaded
-// atomically, retrying if a host add/remove straddled the snapshot. Never
-// blocks or allocates on the audio thread.
+// Capture registration order, then pin and recheck each slot before calling.
+// Only one render dispatch at a time can hold a refcon on this instance.
 static void au_v2_fire_render_notifies(MooseAUv2 *inst,
                                        AudioUnitRenderActionFlags action,
                                        AudioUnitRenderActionFlags *ioFlags,
                                        const AudioTimeStamp *ts, UInt32 bus,
                                        UInt32 frames, AudioBufferList *ioData) {
-    struct { AURenderCallback proc; void *userData; } local[32];
+    uint64_t idle = 0;
+    if (!__atomic_compare_exchange_n(&inst->renderNotifyThreadId, &idle, au_current_tid(),
+                                     false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;
+    struct { AuRenderNotify *slot; uint64_t state; } local[32];
     uint32_t count = 0;
-    bool stable = false;
-    for (int attempt = 0; attempt < 4 && !stable; attempt++) {
-        uint32_t s1 = __atomic_load_n(&inst->renderNotifySeq, __ATOMIC_ACQUIRE);
-        if (s1 & 1u) continue; // a writer is mid-update
-        count = __atomic_load_n(&inst->renderNotifyCount, __ATOMIC_RELAXED);
-        if (count > 32u) count = 32u;
-        for (uint32_t i = 0; i < count; i++) {
-            local[i].proc = (AURenderCallback)__atomic_load_n(
-                &inst->renderNotifies[i].proc, __ATOMIC_RELAXED);
-            local[i].userData = (void *)__atomic_load_n(
-                &inst->renderNotifies[i].userData, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < 32; i++) {
+        AuRenderNotify *slot = &inst->renderNotifies[i];
+        uint64_t state = __atomic_load_n(&slot->state, __ATOMIC_RELAXED);
+        if (!(state & AU_RN_ACTIVE)) continue;
+        uint32_t pos = count++;
+        while (pos > 0 && local[pos - 1].state > state) {
+            local[pos] = local[pos - 1];
+            pos--;
         }
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        uint32_t s2 = __atomic_load_n(&inst->renderNotifySeq, __ATOMIC_RELAXED);
-        stable = (s1 == s2);
+        local[pos].slot = slot;
+        local[pos].state = state;
     }
-    if (!stable) return; // couldn't snapshot a stable list; skip this block
     for (uint32_t i = 0; i < count; i++) {
+        AuRenderNotify *slot = local[i].slot;
+        uint64_t state = local[i].state;
+        if (!__atomic_compare_exchange_n(&slot->state, &state, state | AU_RN_CALLING,
+                                         false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            continue;
         AudioUnitRenderActionFlags f = (ioFlags ? *ioFlags : 0) | action;
-        local[i].proc(local[i].userData, &f, ts, bus, frames, ioData);
+        slot->proc(slot->userData, &f, ts, bus, frames, ioData);
+        __atomic_fetch_and(&slot->state, ~AU_RN_CALLING, __ATOMIC_RELEASE);
     }
+    __atomic_store_n(&inst->renderNotifyThreadId, 0u, __ATOMIC_RELEASE);
+}
+
+static OSStatus au_v2_render(void *self_, AudioUnitRenderActionFlags *ioFlags,
+                             const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber,
+                             UInt32 inFrameCount, AudioBufferList *ioData) {
+    MooseAUv2 *inst = (MooseAUv2 *)self_;
+    uint64_t previous = __atomic_exchange_n(&inst->renderScopeThreadId, au_current_tid(),
+                                             __ATOMIC_RELAXED);
+    OSStatus status = au_v2_render_impl(self_, ioFlags, inTimeStamp, inBusNumber,
+                                        inFrameCount, ioData);
+    __atomic_store_n(&inst->renderScopeThreadId, previous, __ATOMIC_RELAXED);
+    return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -2644,6 +2721,8 @@ static AudioComponentMethod au_v2_lookup(SInt16 selector) {
             return (AudioComponentMethod)au_v2_reset;
         case kAudioUnitAddPropertyListenerSelect:
             return (AudioComponentMethod)au_v2_add_property_listener;
+        case kAudioUnitRemovePropertyListenerSelect:
+            return (AudioComponentMethod)au_v2_remove_property_listener;
         case kAudioUnitRemovePropertyListenerWithUserDataSelect:
             return (AudioComponentMethod)au_v2_remove_property_listener_with_data;
         case kAudioUnitScheduleParametersSelect:

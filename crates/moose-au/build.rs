@@ -106,6 +106,8 @@ fn main() {
     // runtime via dynamic symbol lookup.
     println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_g_descriptor");
     println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_g_callbacks");
+    println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_moose_au_param_snapshot_begin");
+    println!("cargo:rustc-link-arg-cdylib=-Wl,-exported_symbol,_moose_au_param_snapshot_end");
 
     if is_macos {
         // AU v2 factory + v2 cocoa-view class-name lookup. Both

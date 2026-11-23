@@ -25,6 +25,8 @@ mod locate;
 #[cfg(target_os = "windows")]
 pub(crate) use build::cargo_rustc_bin;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) use build::msvc_dynamic_crt;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) use build::rustup_has_target;
 #[cfg(target_os = "macos")]
 pub(crate) use build::{
@@ -79,7 +81,7 @@ pub(crate) mod fs_ctx {
     /// no-op, the file's mtime stays put - important for tools like cmake
     /// that rebuild based on mtime comparisons. Only AU v3 staging
     /// (macOS) needs the mtime-preserving variant today.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn write_if_changed(
         path: impl AsRef<Path>,
         contents: impl AsRef<[u8]>,
