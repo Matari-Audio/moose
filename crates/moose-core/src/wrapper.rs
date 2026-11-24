@@ -1392,6 +1392,7 @@ mod state_handshake_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "wall-clock latency bound; Miri is ~100x slower")]
     fn live_audio_thread_handshake_wakes_immediately_without_50ms_wait() {
         let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
         let params = plugin.enter().params_arc();
@@ -1569,6 +1570,7 @@ mod state_handshake_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "wall-clock latency bound; Miri is ~100x slower")]
     fn queued_load_reuses_original_snapshot_ticket_without_extra_block() {
         let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
         let params = plugin.enter().params_arc();
