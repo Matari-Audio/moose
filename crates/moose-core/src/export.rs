@@ -67,6 +67,16 @@ pub trait PluginExport: PluginRuntime + Sized {
         Box::new(())
     }
 
+    /// Static MIDI 2.0 controller-to-parameter assignments advertised via
+    /// VST3 SDK 3.8 `IMidiMapping2`. Combined with any dynamic assignments
+    /// returned by [`MainThreadHooks::midi2_controller_assignments`](crate::main_thread::MainThreadHooks::midi2_controller_assignments).
+    #[must_use]
+    fn midi2_controller_assignments(
+        _direction: crate::main_thread::BusDirection,
+    ) -> Vec<crate::main_thread::Midi2ControllerAssignment> {
+        Vec::new()
+    }
+
     /// Visit the concrete DSP state when this export supports typed access.
     fn with_dsp_state(&mut self, _callback: &mut dyn FnMut(&mut dyn std::any::Any)) -> bool {
         false
@@ -197,11 +207,36 @@ pub trait PluginExport: PluginRuntime + Sized {
 /// the plugin.
 #[must_use]
 pub fn read_custom_state_offthread<P: PluginExport>(plugin: &P) -> Vec<u8> {
-    current_custom_state(plugin).unwrap_or_default()
+    read_custom_state_offthread_with_context(plugin, crate::state::StateContext::Unknown)
 }
 
-pub(crate) fn current_custom_state<P: PluginExport>(plugin: &P) -> Option<Vec<u8>> {
-    plugin.snapshot_slot().read_offthread().or_else(|| {
+/// Context-aware variant of [`read_custom_state_offthread`].
+///
+/// Invokes [`PluginRuntime::save_state_with_context`](crate::plugin::PluginRuntime::save_state_with_context)
+/// first; if it returns `Some(bytes)` (including `Some(Vec::new())`), that
+/// context-specific payload is used directly. When it returns `None`, falls
+/// back to the off-thread snapshot lane, then `snapshot_into`, then
+/// `save_state`.
+#[must_use]
+pub fn read_custom_state_offthread_with_context<P: PluginExport>(
+    plugin: &P,
+    context: crate::state::StateContext,
+) -> Vec<u8> {
+    current_custom_state_with_context(plugin, context).unwrap_or_default()
+}
+
+pub(crate) fn current_custom_state_with_context<P: PluginExport>(
+    plugin: &P,
+    context: crate::state::StateContext,
+) -> Option<Vec<u8>> {
+    if let Some(contextual) = plugin.save_state_with_context(context) {
+        return Some(contextual);
+    }
+    let slot = plugin.snapshot_slot();
+    if let Some(contextual) = slot.read_context_offthread(context) {
+        return Some(contextual);
+    }
+    slot.read_offthread().or_else(|| {
         let mut buf = Vec::new();
         if plugin.snapshot_into(&mut buf) {
             Some(buf)
@@ -210,4 +245,197 @@ pub(crate) fn current_custom_state<P: PluginExport>(plugin: &P) -> Option<Vec<u8
             (!legacy.is_empty()).then_some(legacy)
         }
     })
+}
+
+#[cfg(test)]
+mod context_state_tests {
+    use super::*;
+    use crate::buffer::AudioBuffer;
+    use crate::config::AudioConfig;
+    use crate::events::EventList;
+    use crate::info::{MidiDialect, PluginCategory, PluginInfo};
+    use crate::meters::MeterStore;
+    use crate::plugin::PluginRuntime;
+    use crate::process::{ProcessContext, ProcessStatus};
+    use crate::snapshot::SnapshotSlot;
+    use crate::state::StateContext;
+    use moose_params::DynamicParams;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_info(id: &'static str) -> PluginInfo {
+        PluginInfo {
+            name: id,
+            vendor: "Test",
+            url: "",
+            version: "0.0.1",
+            category: PluginCategory::Effect,
+            description: None,
+            clap_manual_url: None,
+            clap_support_url: None,
+            clap_features: &[],
+            accepts_midi_in: false,
+            emits_midi: false,
+            midi_input_dialect: MidiDialect::Midi1,
+            midi_output_dialect: MidiDialect::Midi1,
+            midi_input_ports: 0,
+            midi_output_ports: 0,
+            bundle_id: id,
+            vst3_id: id,
+            clap_id: id,
+            fourcc: *b"Test",
+            au_type: *b"aufx",
+            au_manufacturer: *b"Test",
+            vst3_subcategory: None,
+            preset_user_dir: None,
+            preset_extension: "preset",
+            vst3_name: None,
+            clap_name: None,
+            au_name: None,
+            au3_name: None,
+            mute_preview_output: false,
+            automation: crate::Automation::DEFAULT,
+            legacy_au_keys: &[],
+            legacy_aax_chunks: &[],
+        }
+    }
+
+    struct SnapshotOnlyPlugin {
+        params: Arc<DynamicParams<0>>,
+        meters: Arc<MeterStore>,
+        snapshot: Arc<SnapshotSlot>,
+    }
+
+    impl PluginRuntime for SnapshotOnlyPlugin {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            test_info("com.test.snap")
+        }
+        fn reset(&mut self, _: &AudioConfig) {}
+        fn process(
+            &mut self,
+            _: &mut AudioBuffer<f32>,
+            _: &EventList,
+            _: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+        fn save_state(&self) -> Vec<u8> {
+            b"stale-legacy".to_vec()
+        }
+    }
+
+    impl PluginExport for SnapshotOnlyPlugin {
+        type Params = DynamicParams<0>;
+        fn create() -> Self {
+            let snapshot = SnapshotSlot::new();
+            snapshot.store_arc(b"live-snapshot".to_vec());
+            Self {
+                params: Arc::new(DynamicParams::new()),
+                meters: MeterStore::new(),
+                snapshot,
+            }
+        }
+        fn params(&self) -> &Self::Params {
+            &self.params
+        }
+        fn params_arc(&self) -> Arc<Self::Params> {
+            Arc::clone(&self.params)
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            Arc::clone(&self.meters)
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            Arc::clone(&self.snapshot)
+        }
+    }
+
+    struct ExplicitContextPlugin {
+        params: Arc<DynamicParams<0>>,
+        meters: Arc<MeterStore>,
+        snapshot: Arc<SnapshotSlot>,
+        calls: AtomicUsize,
+    }
+
+    impl PluginRuntime for ExplicitContextPlugin {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            test_info("com.test.ctx")
+        }
+        fn reset(&mut self, _: &AudioConfig) {}
+        fn process(
+            &mut self,
+            _: &mut AudioBuffer<f32>,
+            _: &EventList,
+            _: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+        fn save_state_with_context(&self, context: StateContext) -> Option<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match context {
+                StateContext::Preset => Some(Vec::new()),
+                StateContext::Project => Some(b"project-blob".to_vec()),
+                _ => None,
+            }
+        }
+    }
+
+    impl PluginExport for ExplicitContextPlugin {
+        type Params = DynamicParams<0>;
+        fn create() -> Self {
+            let snapshot = SnapshotSlot::new();
+            snapshot.store_arc(b"live-snapshot".to_vec());
+            Self {
+                params: Arc::new(DynamicParams::new()),
+                meters: MeterStore::new(),
+                snapshot,
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn params(&self) -> &Self::Params {
+            &self.params
+        }
+        fn params_arc(&self) -> Arc<Self::Params> {
+            Arc::clone(&self.params)
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            Arc::clone(&self.meters)
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            Arc::clone(&self.snapshot)
+        }
+    }
+
+    #[test]
+    fn snapshot_only_plugin_keeps_live_snapshot_under_non_unknown_context() {
+        let plugin = SnapshotOnlyPlugin::create();
+        assert_eq!(
+            current_custom_state_with_context(&plugin, StateContext::Preset),
+            Some(b"live-snapshot".to_vec())
+        );
+    }
+
+    #[test]
+    fn explicit_empty_context_override_suppresses_snapshot_and_runs_once() {
+        let plugin = ExplicitContextPlugin::create();
+        assert_eq!(
+            current_custom_state_with_context(&plugin, StateContext::Preset),
+            Some(Vec::new())
+        );
+        assert_eq!(plugin.calls.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            current_custom_state_with_context(&plugin, StateContext::Project),
+            Some(b"project-blob".to_vec())
+        );
+        assert_eq!(plugin.calls.load(Ordering::Relaxed), 2);
+
+        // Returning None falls through to the live snapshot cleanly.
+        assert_eq!(
+            current_custom_state_with_context(&plugin, StateContext::Duplicate),
+            Some(b"live-snapshot".to_vec())
+        );
+        assert_eq!(plugin.calls.load(Ordering::Relaxed), 3);
+    }
 }

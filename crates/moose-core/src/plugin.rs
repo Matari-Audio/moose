@@ -214,6 +214,24 @@ pub trait PluginRuntime: Send + 'static {
         Vec::new()
     }
 
+    /// Save extra state with host-reported [`StateContext`](crate::state::StateContext).
+    ///
+    /// Called strictly on the host/main thread when the wrapper owns the plugin
+    /// (never on the audio thread). Return `Some(bytes)` to supply a
+    /// context-specific payload (including `Some(Vec::new())` to intentionally
+    /// omit custom state for a context such as `StateContext::Preset`). Default
+    /// returns `None`, falling through to the off-thread contextual snapshot
+    /// lane ([`crate::snapshot::SnapshotPublisher::publish_for_context`]), the
+    /// ordinary snapshot lane, [`Self::snapshot_into`], and [`Self::save_state`].
+    ///
+    /// Plugins that also need context-specific payloads while audio processing
+    /// is actively running should publish them off-thread via
+    /// [`crate::snapshot::SnapshotPublisher::publish_for_context`] so the audio
+    /// thread never allocates or runs state serialization.
+    fn save_state_with_context(&self, _context: crate::state::StateContext) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Serialize the plugin's custom state into `buf` (cleared on entry) -
     /// the real-time path CLAP / VST3 / AU publish to the lock-free slot.
     /// Returns whether the plugin publishes snapshots at all (see
@@ -243,6 +261,25 @@ pub trait PluginRuntime: Send + 'static {
     /// skew between session file and plugin build, etc).
     fn load_state(&mut self, _data: &[u8]) -> Result<(), crate::state::StateLoadError> {
         Ok(())
+    }
+
+    /// Restore extra state with host-reported [`StateContext`](crate::state::StateContext).
+    ///
+    /// Default delegates to [`Self::load_state`] when `data` is non-empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the plugin rejects the state payload.
+    fn load_state_with_context(
+        &mut self,
+        data: &[u8],
+        _context: crate::state::StateContext,
+    ) -> Result<(), crate::state::StateLoadError> {
+        if data.is_empty() {
+            Ok(())
+        } else {
+            self.load_state(data)
+        }
     }
 
     /// Refresh the lock-free snapshot slot from the current state.
@@ -324,6 +361,22 @@ pub trait PluginRuntime: Send + 'static {
         Ok(())
     }
 
+    /// Context-aware variant of [`Self::validate_state`]. Default delegates to
+    /// [`Self::validate_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `data` is invalid for `context`.
+    fn validate_state_with_context(
+        data: &[u8],
+        _context: crate::state::StateContext,
+    ) -> Result<(), crate::state::StateLoadError>
+    where
+        Self: Sized,
+    {
+        Self::validate_state(data)
+    }
+
     /// Decode custom state bytes off the audio thread into a typed,
     /// ready-to-swap [`DecodedState`](crate::state::DecodedState).
     ///
@@ -349,6 +402,22 @@ pub trait PluginRuntime: Send + 'static {
         Ok(None)
     }
 
+    /// Context-aware variant of [`Self::decode_state`]. Default delegates to
+    /// [`Self::decode_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `data` cannot be decoded for `context`.
+    fn decode_state_with_context(
+        data: &[u8],
+        _context: crate::state::StateContext,
+    ) -> Result<Option<crate::state::DecodedState>, crate::state::StateLoadError>
+    where
+        Self: Sized,
+    {
+        Self::decode_state(data)
+    }
+
     /// Swap a state decoded by [`Self::decode_state`] into the live processor.
     ///
     /// Called on the audio thread inside an `RtSection` (or on the host thread
@@ -357,6 +426,16 @@ pub trait PluginRuntime: Send + 'static {
     /// exchange the new state with the current state in place; the old state
     /// stays inside `decoded` and is dropped off the audio thread.
     fn apply_decoded_state(&mut self, _decoded: &mut crate::state::DecodedState) {}
+
+    /// Context-aware variant of [`Self::apply_decoded_state`]. Default
+    /// delegates to [`Self::apply_decoded_state`].
+    fn apply_decoded_state_with_context(
+        &mut self,
+        decoded: &mut crate::state::DecodedState,
+        _context: crate::state::StateContext,
+    ) {
+        self.apply_decoded_state(decoded);
+    }
 
     /// Processing latency in samples. Host uses this for delay compensation.
     /// Return 0 if the plugin adds no latency (default).

@@ -20,7 +20,7 @@ use moose_core::Sample;
 use moose_core::TransportSlot;
 use moose_core::bus_routing::BusRouting;
 use moose_core::delay::ReportedDelay;
-use moose_core::editor::{Editor, EditorBuilder};
+use moose_core::editor::{Editor, EditorBuilder, EditorFeedback};
 use moose_core::events::EventList;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
@@ -95,6 +95,9 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     /// editor's `get_meter` closure reads these atomic slots instead
     /// of the plugin instance.
     pub(crate) meter_store: Arc<MeterStore>,
+    /// Shared reactive UI feedback (host `ParamIndicationState`, RT-safe poly
+    /// modulation ranges, and coalesced 0 Hz editor wakeup hook).
+    pub(crate) feedback: Arc<EditorFeedback>,
     /// Lock-free custom-state slot the audio thread publishes into, read
     /// by `save_state` so a snapshot-capable plugin's save never touches
     /// the plugin. Cached here on the instance, like `params_arc`.

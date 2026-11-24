@@ -85,7 +85,7 @@ pub fn apply_queued_state<P: PluginExport>(
             let _rt = crate::rt::RtSection::enter();
             plugin.params().restore_values(&queued.state.params);
             plugin.params().snap_smoothers();
-            plugin.apply_decoded_state(&mut decoded);
+            plugin.apply_decoded_state_with_context(&mut decoded, queued.context);
             queue.retire_decoded(decoded);
             slot.mark_state_loaded();
             queue.set_accepted_custom(state_ptr);
@@ -95,7 +95,7 @@ pub fn apply_queued_state<P: PluginExport>(
         }
         return Some(Ok(()));
     }
-    let result = crate::state::try_apply_state(plugin, &queued.state);
+    let result = crate::state::try_apply_state_with_context(plugin, &queued.state, queued.context);
     if result.is_err()
         && let Some(backup) = &queued.backup
     {
@@ -144,17 +144,48 @@ pub fn apply_or_queue_state<P: PluginExport>(
     backup: &crate::state::ParamsBackup,
     can_own: bool,
 ) -> Result<(), crate::state::StateLoadError> {
+    apply_or_queue_state_with_context(
+        plugin,
+        params,
+        slot,
+        queue,
+        state,
+        backup,
+        can_own,
+        crate::state::StateContext::Unknown,
+    )
+}
+
+/// Context-aware variant of [`apply_or_queue_state`], passing the host-reported
+/// [`StateContext`](crate::state::StateContext) to `validate_state_with_context`,
+/// `decode_state_with_context`, `apply_decoded_state_with_context`, and
+/// `load_state_with_context`.
+///
+/// # Errors
+///
+/// The plugin's validation, decode, or load error when it ran before returning.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_or_queue_state_with_context<P: PluginExport>(
+    plugin: &PluginCell<P>,
+    params: &P::Params,
+    slot: &crate::snapshot::SnapshotSlot,
+    queue: &crate::state::StateLoadQueue,
+    state: crate::state::DeserializedState,
+    backup: &crate::state::ParamsBackup,
+    can_own: bool,
+    context: crate::state::StateContext,
+) -> Result<(), crate::state::StateLoadError> {
     use moose_params::Params;
 
     // Host thread, before anything is applied or queued: a queued load may
     // answer the host before the audio thread runs, so validation and
     // off-thread decoding both run synchronously here.
     let decoded = if let Some(extra) = &state.extra {
-        if let Err(err) = P::validate_state(extra) {
+        if let Err(err) = P::validate_state_with_context(extra, context) {
             backup.restore(params);
             return Err(err);
         }
-        match P::decode_state(extra) {
+        match P::decode_state_with_context(extra, context) {
             Ok(decoded) => decoded,
             Err(err) => {
                 backup.restore(params);
@@ -177,11 +208,11 @@ pub fn apply_or_queue_state<P: PluginExport>(
         let result = if let Some(mut decoded) = decoded {
             instance.params().restore_values(&state.params);
             instance.params().snap_smoothers();
-            instance.apply_decoded_state(&mut decoded);
+            instance.apply_decoded_state_with_context(&mut decoded, context);
             // `decoded` (holding the swapped-out old state) drops here on the host thread.
             Ok(())
         } else {
-            crate::state::try_apply_state(&mut *instance, &state)
+            crate::state::try_apply_state_with_context(&mut *instance, &state, context)
         };
         if result.is_err() {
             backup.restore(params);
@@ -198,7 +229,8 @@ pub fn apply_or_queue_state<P: PluginExport>(
         }
         return result;
     }
-    let handle = queue.push_with_backup_and_decoded(state, Some(backup.clone()), decoded);
+    let handle =
+        queue.push_with_backup_decoded_and_context(state, Some(backup.clone()), decoded, context);
     let audio_active = plugin.is_held_by_other_thread()
         || queue.is_audio_active_on_other_thread()
         || slot.is_audio_active_on_other_thread();
@@ -246,12 +278,36 @@ pub fn custom_state_for_save<P: PluginExport>(
     queue: &crate::state::StateLoadQueue,
     can_own: bool,
 ) -> Vec<u8> {
+    custom_state_for_save_with_context(
+        plugin,
+        slot,
+        queue,
+        can_own,
+        crate::state::StateContext::Unknown,
+    )
+}
+
+/// Context-aware variant of [`custom_state_for_save`].
+///
+/// When the host thread owns the plugin (`can_own` or audio inactive with no
+/// pending queued load), calls `save_state_with_context(context)` directly on
+/// the host thread. While audio is actively processing, reads any pre-published
+/// off-thread contextual snapshot (`SnapshotPublisher::publish_for_context`)
+/// without touching the audio thread (zero audio-thread locks or allocations),
+/// falling back to the ordinary snapshot lane when none is published.
+pub fn custom_state_for_save_with_context<P: PluginExport>(
+    plugin: &PluginCell<P>,
+    slot: &crate::snapshot::SnapshotSlot,
+    queue: &crate::state::StateLoadQueue,
+    can_own: bool,
+    context: crate::state::StateContext,
+) -> Vec<u8> {
     if can_own && let Some(mut instance) = plugin.try_enter() {
         if apply_queued_state(&mut *instance, queue).is_some() {
             instance.republish_snapshot();
         }
         queue.reclaim_retired();
-        return crate::export::current_custom_state(&*instance)
+        return crate::export::current_custom_state_with_context(&*instance, context)
             .or_else(|| slot.read_current())
             .or_else(|| queue.accepted_extra())
             .unwrap_or_default();
@@ -259,11 +315,36 @@ pub fn custom_state_for_save<P: PluginExport>(
     let audio_active = plugin.is_held_by_other_thread()
         || queue.is_audio_active_on_other_thread()
         || slot.is_audio_active_on_other_thread();
+    // Stopped audio with a free cell: the live hook beats any cached
+    // contextual snapshot, which may predate the current state.
+    if !audio_active
+        && context != crate::state::StateContext::Unknown
+        && queue.unapplied().is_none()
+        && let Some(instance) = plugin.try_enter()
+        && let Some(contextual) = instance.save_state_with_context(context)
+    {
+        return contextual;
+    }
+    if context != crate::state::StateContext::Unknown
+        && queue.unapplied().is_none()
+        && let Some(contextual) = slot.read_context_offthread(context)
+    {
+        return contextual;
+    }
     if !audio_active {
         return custom_state_view(slot, queue);
     }
+    // If an off-thread snapshot is already published for the current load
+    // generation and no queued load is waiting, return it directly without
+    // touching the audio thread.
+    if queue.unapplied().is_none()
+        && let Some(offthread) = slot.read_offthread()
+    {
+        return offthread;
+    }
+    let wait_timeout = slot.handshake_timeout(AUDIO_HANDSHAKE_WAIT);
     let ticket = slot.request_fresh();
-    let _ = slot.wait_served(ticket, AUDIO_HANDSHAKE_WAIT);
+    let _ = slot.wait_served(ticket, wait_timeout);
     custom_state_view(slot, queue)
 }
 
@@ -1218,6 +1299,10 @@ mod state_handshake_tests {
                 self.raw_extra.clone()
             }
         }
+        fn save_state_with_context(&self, context: crate::state::StateContext) -> Option<Vec<u8>> {
+            (context == crate::state::StateContext::Project && !self.raw_extra.is_empty())
+                .then(|| self.raw_extra.clone())
+        }
         fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
             if data == b"BAD!" {
                 return Err(StateLoadError::Malformed("bad decoded state"));
@@ -1294,10 +1379,12 @@ mod state_handshake_tests {
         let elapsed = start.elapsed();
 
         assert_eq!(saved, 42u32.to_le_bytes().to_vec());
-        assert!(
-            elapsed < Duration::from_millis(20),
-            "sleeping host stalled for {elapsed:?} (must not hit 50 ms AUDIO_HANDSHAKE_WAIT)"
-        );
+        if !cfg!(miri) {
+            assert!(
+                elapsed < Duration::from_millis(20),
+                "sleeping host stalled for {elapsed:?} (must not hit 50 ms AUDIO_HANDSHAKE_WAIT)"
+            );
+        }
     }
 
     #[test]
@@ -1323,6 +1410,26 @@ mod state_handshake_tests {
             "failed decode_state restored backup params"
         );
         assert!(queue.unapplied().is_none(), "failed load was not queued");
+    }
+
+    #[test]
+    fn params_rollback_guard_restores_params_on_unwind() {
+        let plugin = PluginCell::new(SwapPlugin::create());
+        let params = plugin.enter().params_arc();
+        let gain_id = params.param_infos()[0].id;
+        params.set_plain(gain_id, 0.25);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let backup = ParamsBackup::capture(&*params);
+            let _rollback = crate::state::ParamsRollbackGuard::new(&backup, &*params);
+            params.set_plain(gain_id, 0.99);
+            panic!("simulated context decoder panic");
+        }));
+        assert!(result.is_err());
+        assert!(
+            (params.get_plain(gain_id).unwrap() - 0.25).abs() < 1e-6,
+            "unwind must restore pre-load parameter values"
+        );
     }
 
     #[test]
@@ -1465,10 +1572,12 @@ mod state_handshake_tests {
             "processor must hold decoded tag immediately after live apply_or_queue_state"
         );
         assert_eq!(saved, expected);
-        assert!(
-            elapsed < Duration::from_millis(35),
-            "live audio handshake should finish quickly via atomic polling, took {elapsed:?}"
-        );
+        if !cfg!(miri) {
+            assert!(
+                elapsed < Duration::from_millis(35),
+                "live audio handshake should finish quickly via atomic polling, took {elapsed:?}"
+            );
+        }
     }
 
     #[test]
@@ -1518,6 +1627,42 @@ mod state_handshake_tests {
         assert!(
             queue.unapplied().is_some(),
             "pending state remains available for the next block after stop"
+        );
+    }
+
+    #[test]
+    fn stopped_contextual_save_prefers_live_hook_over_stale_cache() {
+        use crate::state::StateContext;
+        let plugin = PluginCell::new(SwapPlugin::create());
+        let slot = plugin.enter().snapshot_slot();
+        let queue = StateLoadQueue::new(1);
+
+        // Project=A published, then live state moves to B; audio stopped,
+        // cell free, but the wrapper reports it cannot own (`can_own=false`).
+        crate::snapshot::SnapshotPublisher::new(&slot)
+            .publish_for_context(StateContext::Project, b"A".to_vec());
+        plugin.enter().raw_extra = b"B".to_vec();
+        assert_eq!(
+            super::custom_state_for_save_with_context(
+                &plugin,
+                &slot,
+                &queue,
+                false,
+                StateContext::Project
+            ),
+            b"B".to_vec()
+        );
+        // Hook declines: the contextual cache still answers.
+        plugin.enter().raw_extra.clear();
+        assert_eq!(
+            super::custom_state_for_save_with_context(
+                &plugin,
+                &slot,
+                &queue,
+                false,
+                StateContext::Project
+            ),
+            b"A".to_vec()
         );
     }
 
@@ -1632,10 +1777,12 @@ mod state_handshake_tests {
 
         res.expect("single block applies load and serves its ticket");
         assert_eq!(super::save_extra(&slot), expected);
-        assert!(
-            elapsed < Duration::from_millis(35),
-            "host must reuse load's served ticket N rather than stalling 50ms for N+1, took {elapsed:?}"
-        );
+        if !cfg!(miri) {
+            assert!(
+                elapsed < Duration::from_millis(35),
+                "host must reuse load's served ticket N rather than stalling 50ms for N+1, took {elapsed:?}"
+            );
+        }
     }
 
     #[test]

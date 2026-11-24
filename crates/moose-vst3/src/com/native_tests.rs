@@ -3911,3 +3911,537 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     );
     assert_eq!(json_stream.bytes(), compat_json.as_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// Wave 4A: IMidiMapping2 (12-byte C++ ABI) + IStreamAttributes StateContext
+// ---------------------------------------------------------------------------
+
+mod wave4a {
+    use super::*;
+    use moose_core::main_thread::{
+        BusDirection, Midi2Controller as CoreMidi2, Midi2ControllerAssignment, Midi2ControllerKind,
+    };
+    use moose_core::state::StateContext;
+    use vst3::Steinberg::Vst::IAttributeList_::AttrID;
+
+    #[repr(C, align(4))]
+    struct AlignedBuf([u8; 36]);
+
+    impl AlignedBuf {
+        fn filled(byte: u8) -> Self {
+            Self([byte; 36])
+        }
+
+        fn as_map_ptr(&mut self) -> *mut Midi2ControllerParamIDAssignment {
+            std::ptr::from_mut(self).cast::<Midi2ControllerParamIDAssignment>()
+        }
+    }
+
+    #[derive(Default)]
+    struct Midi2Backend;
+
+    impl Vst3Backend for Midi2Backend {
+        fn midi2_controller_assignments(
+            &self,
+            direction: BusDirection,
+        ) -> Vec<Midi2ControllerAssignment> {
+            match direction {
+                BusDirection::Input => vec![
+                    Midi2ControllerAssignment {
+                        param_id: 100,
+                        bus_index: 1,
+                        channel: 4,
+                        controller: CoreMidi2 {
+                            kind: Midi2ControllerKind::Registered,
+                            bank: 3,
+                            index: 7,
+                        },
+                    },
+                    // Invalid entries must be filtered out of both count and map.
+                    Midi2ControllerAssignment {
+                        param_id: 999,
+                        bus_index: -1,
+                        channel: 0,
+                        controller: CoreMidi2 {
+                            kind: Midi2ControllerKind::Registered,
+                            bank: 0,
+                            index: 0,
+                        },
+                    },
+                    Midi2ControllerAssignment {
+                        param_id: 998,
+                        bus_index: 0,
+                        channel: 16,
+                        controller: CoreMidi2 {
+                            kind: Midi2ControllerKind::Assignable,
+                            bank: 0,
+                            index: 0,
+                        },
+                    },
+                    Midi2ControllerAssignment {
+                        param_id: 997,
+                        bus_index: 0,
+                        channel: 0,
+                        controller: CoreMidi2 {
+                            kind: Midi2ControllerKind::Assignable,
+                            bank: 128,
+                            index: 0,
+                        },
+                    },
+                    Midi2ControllerAssignment {
+                        param_id: 996,
+                        bus_index: 0,
+                        channel: 0,
+                        controller: CoreMidi2 {
+                            kind: Midi2ControllerKind::Assignable,
+                            bank: 0,
+                            index: 128,
+                        },
+                    },
+                    Midi2ControllerAssignment {
+                        param_id: 200,
+                        bus_index: 0,
+                        channel: 15,
+                        controller: CoreMidi2 {
+                            kind: Midi2ControllerKind::Assignable,
+                            bank: 127,
+                            index: 42,
+                        },
+                    },
+                ],
+                BusDirection::Output => vec![Midi2ControllerAssignment {
+                    param_id: 300,
+                    bus_index: 2,
+                    channel: 1,
+                    controller: CoreMidi2 {
+                        kind: Midi2ControllerKind::Registered,
+                        bank: 12,
+                        index: 34,
+                    },
+                }],
+            }
+        }
+    }
+
+    #[test]
+    fn midi2_mapping_writes_exact_12_byte_cpp_abi_and_validates() {
+        let reg = registration::<Midi2Backend>(descriptor(), Vec::new());
+        let com = component(reg);
+        let map2 = com.as_com_ref::<IMidiMapping2>().expect("IMidiMapping2");
+
+        unsafe {
+            assert_eq!(
+                map2.getNumMidi2ControllerAssignments(BusDirections_::kInput as BusDirections),
+                2
+            );
+            assert_eq!(
+                map2.getNumMidi2ControllerAssignments(BusDirections_::kOutput as BusDirections),
+                1
+            );
+            assert_eq!(map2.getNumMidi2ControllerAssignments(99), 0);
+
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kInput as BusDirections,
+                    std::ptr::null()
+                ),
+                kInvalidArgument
+            );
+            let null_map_nonzero = Midi2ControllerParamIDAssignmentList {
+                count: 2,
+                map: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kInput as BusDirections,
+                    &raw const null_map_nonzero
+                ),
+                kInvalidArgument
+            );
+            let null_map_zero = Midi2ControllerParamIDAssignmentList {
+                count: 0,
+                map: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kInput as BusDirections,
+                    &raw const null_map_zero
+                ),
+                kResultOk
+            );
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(99, &raw const null_map_zero),
+                kResultFalse
+            );
+
+            // Exact 12-byte C++ ABI layout (2 records = 24 bytes) + canary tail.
+            let mut raw = AlignedBuf::filled(0xEE);
+            let list = Midi2ControllerParamIDAssignmentList {
+                count: 2,
+                map: raw.as_map_ptr(),
+            };
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kInput as BusDirections,
+                    &raw const list
+                ),
+                kResultOk
+            );
+            assert_eq!(u32::from_ne_bytes(raw.0[0..4].try_into().unwrap()), 100);
+            assert_eq!(i32::from_ne_bytes(raw.0[4..8].try_into().unwrap()), 1);
+            assert_eq!(&raw.0[8..12], &[4, 0x80 | 0x03, 7, 0]);
+            assert_eq!(u32::from_ne_bytes(raw.0[12..16].try_into().unwrap()), 200);
+            assert_eq!(i32::from_ne_bytes(raw.0[16..20].try_into().unwrap()), 0);
+            assert_eq!(&raw.0[20..24], &[15, 127, 42, 0]);
+            assert!(raw.0[24..36].iter().all(|&b| b == 0xEE));
+
+            // Bounded truncation when host allocates count = 1.
+            let mut small = AlignedBuf::filled(0xCC);
+            let small_list = Midi2ControllerParamIDAssignmentList {
+                count: 1,
+                map: small.as_map_ptr(),
+            };
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kInput as BusDirections,
+                    &raw const small_list
+                ),
+                kResultOk
+            );
+            assert_eq!(u32::from_ne_bytes(small.0[0..4].try_into().unwrap()), 100);
+            assert!(small.0[12..36].iter().all(|&b| b == 0xCC));
+
+            // Output direction works independently.
+            let mut out_buf = AlignedBuf::filled(0xDD);
+            let out_list = Midi2ControllerParamIDAssignmentList {
+                count: 1,
+                map: out_buf.as_map_ptr(),
+            };
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kOutput as BusDirections,
+                    &raw const out_list
+                ),
+                kResultOk
+            );
+            assert_eq!(u32::from_ne_bytes(out_buf.0[0..4].try_into().unwrap()), 300);
+            assert_eq!(i32::from_ne_bytes(out_buf.0[4..8].try_into().unwrap()), 2);
+            assert_eq!(&out_buf.0[8..12], &[1, 0x80 | 0x0C, 34, 0]);
+            assert!(out_buf.0[12..36].iter().all(|&b| b == 0xDD));
+
+            // Requesting more records than available returns kResultFalse so
+            // hosts never interpret unwritten tail slots as valid mappings.
+            let mut oversized = AlignedBuf::filled(0xAA);
+            let oversized_list = Midi2ControllerParamIDAssignmentList {
+                count: 3,
+                map: oversized.as_map_ptr(),
+            };
+            assert_eq!(
+                map2.getMidi2ControllerAssignments(
+                    BusDirections_::kInput as BusDirections,
+                    &raw const oversized_list
+                ),
+                kResultFalse
+            );
+            assert_eq!(
+                u32::from_ne_bytes(oversized.0[0..4].try_into().unwrap()),
+                100
+            );
+            assert_eq!(
+                u32::from_ne_bytes(oversized.0[12..16].try_into().unwrap()),
+                200
+            );
+            assert!(oversized.0[24..36].iter().all(|&b| b == 0xAA));
+        }
+    }
+
+    struct StateAttrList {
+        state_type: Option<String>,
+    }
+
+    impl Class for StateAttrList {
+        type Interfaces = (IAttributeList,);
+    }
+
+    impl IAttributeListTrait for StateAttrList {
+        unsafe fn setInt(&self, _: AttrID, _: int64) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getInt(&self, _: AttrID, _: *mut int64) -> tresult {
+            kResultFalse
+        }
+        unsafe fn setFloat(&self, _: AttrID, _: f64) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getFloat(&self, _: AttrID, _: *mut f64) -> tresult {
+            kResultFalse
+        }
+        unsafe fn setString(&self, _: AttrID, _: *const TChar) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getString(
+            &self,
+            id: AttrID,
+            string: *mut TChar,
+            size_in_bytes: uint32,
+        ) -> tresult {
+            if id.is_null() || string.is_null() || size_in_bytes < 2 {
+                return kInvalidArgument;
+            }
+            let key = unsafe { CStr::from_ptr(id) };
+            let want = unsafe { CStr::from_ptr(PresetAttributes::kStateType) };
+            if key != want {
+                return kResultFalse;
+            }
+            let Some(val) = &self.state_type else {
+                return kResultFalse;
+            };
+            let max_chars = (size_in_bytes as usize) / size_of::<TChar>();
+            let slice = unsafe { std::slice::from_raw_parts_mut(string, max_chars) };
+            super::super::utf16_into(slice, val);
+            kResultOk
+        }
+        unsafe fn setBinary(&self, _: AttrID, _: *const c_void, _: uint32) -> tresult {
+            kNotImplemented
+        }
+        unsafe fn getBinary(&self, _: AttrID, _: *mut *const c_void, _: *mut uint32) -> tresult {
+            kResultFalse
+        }
+    }
+
+    struct AttrStream {
+        mem: MemStream,
+        attrs: Option<ComWrapper<StateAttrList>>,
+    }
+
+    impl AttrStream {
+        fn new(bytes: Vec<u8>, state_type: Option<&str>) -> Self {
+            Self {
+                mem: MemStream::new(bytes),
+                attrs: Some(ComWrapper::new(StateAttrList {
+                    state_type: state_type.map(str::to_owned),
+                })),
+            }
+        }
+    }
+
+    impl Class for AttrStream {
+        type Interfaces = (IBStream, IStreamAttributes);
+    }
+
+    impl IBStreamTrait for AttrStream {
+        unsafe fn read(
+            &self,
+            buffer: *mut c_void,
+            num_bytes: int32,
+            num_read: *mut int32,
+        ) -> tresult {
+            unsafe { self.mem.read(buffer, num_bytes, num_read) }
+        }
+        unsafe fn write(
+            &self,
+            buffer: *mut c_void,
+            num_bytes: int32,
+            num_written: *mut int32,
+        ) -> tresult {
+            unsafe { self.mem.write(buffer, num_bytes, num_written) }
+        }
+        unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
+            unsafe { self.mem.seek(pos, mode, result) }
+        }
+        unsafe fn tell(&self, pos: *mut int64) -> tresult {
+            unsafe { self.mem.tell(pos) }
+        }
+    }
+
+    impl IStreamAttributesTrait for AttrStream {
+        unsafe fn getFileName(&self, _: *mut String128) -> tresult {
+            kResultFalse
+        }
+        unsafe fn getAttributes(&self) -> *mut IAttributeList {
+            self.attrs
+                .as_ref()
+                .and_then(ComWrapper::as_com_ref::<IAttributeList>)
+                .map_or(std::ptr::null_mut(), |r| r.as_ptr())
+        }
+    }
+
+    static RECORDED: std::sync::Mutex<Vec<(&'static str, StateContext)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[derive(Default)]
+    struct ContextBackend;
+
+    impl Vst3Backend for ContextBackend {
+        fn state_save_stream_with_context(
+            &self,
+            context: StateContext,
+            write: &mut dyn FnMut(&[u8]) -> i64,
+        ) -> bool {
+            RECORDED.lock().unwrap().push(("save", context));
+            write(b"ok") == 2
+        }
+
+        fn state_load_stream_with_context(
+            &self,
+            context: StateContext,
+            read: &mut dyn FnMut(&mut [u8]) -> i64,
+        ) -> bool {
+            let mut buf = [0u8; 4];
+            let _ = read(&mut buf);
+            RECORDED.lock().unwrap().push(("load", context));
+            true
+        }
+    }
+
+    #[test]
+    fn stream_attributes_map_vst3_state_type_to_state_context() {
+        RECORDED.lock().unwrap().clear();
+        let reg = registration::<ContextBackend>(descriptor(), Vec::new());
+        let com = component(reg);
+
+        let cases: &[(Option<&str>, StateContext)] = &[
+            (Some("Project"), StateContext::Project),
+            (Some("Default"), StateContext::Default),
+            (Some("TrackPreset"), StateContext::Preset),
+            (Some("Preset"), StateContext::Preset),
+            (Some("CustomHostMode"), StateContext::Unknown),
+            (None, StateContext::Unknown),
+        ];
+
+        unsafe {
+            for &(attr, expected) in cases {
+                let save_stream = ComWrapper::new(AttrStream::new(Vec::new(), attr));
+                let save_ptr = save_stream.as_com_ref::<IBStream>().unwrap().as_ptr();
+                assert_eq!(IComponentTrait::getState(&*com, save_ptr), kResultOk);
+                assert_eq!(save_stream.mem.bytes(), b"ok");
+
+                let load_stream = ComWrapper::new(AttrStream::new(b"ok".to_vec(), attr));
+                let load_ptr = load_stream.as_com_ref::<IBStream>().unwrap().as_ptr();
+                assert_eq!(IComponentTrait::setState(&*com, load_ptr), kResultOk);
+
+                let log = RECORDED.lock().unwrap();
+                let n = log.len();
+                assert_eq!(log[n - 2], ("save", expected), "attr={attr:?}");
+                assert_eq!(log[n - 1], ("load", expected), "attr={attr:?}");
+            }
+
+            let plain_save = ComWrapper::new(MemStream::new(Vec::new()));
+            assert_eq!(
+                IComponentTrait::getState(
+                    &*com,
+                    plain_save.as_com_ref::<IBStream>().unwrap().as_ptr()
+                ),
+                kResultOk
+            );
+            let plain_load = ComWrapper::new(MemStream::new(b"ok".to_vec()));
+            assert_eq!(
+                IComponentTrait::setState(
+                    &*com,
+                    plain_load.as_com_ref::<IBStream>().unwrap().as_ptr()
+                ),
+                kResultOk
+            );
+            let log = RECORDED.lock().unwrap();
+            let n = log.len();
+            assert_eq!(log[n - 2], ("save", StateContext::Unknown));
+            assert_eq!(log[n - 1], ("load", StateContext::Unknown));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// set_size_supersedes_deferred_scale_resize
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "macos"))]
+mod deferred_scale_resize {
+    use super::*;
+    use crate::host_value_fixture::TestPlugin;
+    use crate::instance::Vst3Instance;
+    use moose_core::editor::{Editor, PluginContext, RawWindowHandle};
+
+    struct Fixed((u32, u32));
+    impl Editor for Fixed {
+        fn size(&self) -> (u32, u32) {
+            self.0
+        }
+        fn can_resize(&self) -> bool {
+            true
+        }
+        fn set_size(&mut self, w: u32, h: u32) -> bool {
+            self.0 = (w, h);
+            true
+        }
+        fn open(&mut self, _: RawWindowHandle, _: PluginContext) {}
+        fn close(&mut self) {}
+        fn is_open(&self) -> bool {
+            true
+        }
+    }
+
+    /// The real instance; the host reports its scale while the editor is busy,
+    /// so the scale stays pending until the next GUI call.
+    struct B(Vst3Instance<TestPlugin>);
+    impl Vst3Backend for B {
+        fn gui_has_editor(&self) -> bool {
+            true
+        }
+        fn gui_get_size(&self) -> (u32, u32) {
+            self.0.gui_get_size_impl()
+        }
+        fn gui_set_size(&self, w: u32, h: u32) {
+            self.0.gui_set_size_impl(w, h);
+        }
+        fn gui_set_content_scale(&self, scale: f64) {
+            let busy = self.0.gui.enter();
+            self.0.gui_set_content_scale_impl(scale);
+            drop(busy);
+        }
+        unsafe fn bind_host_queue(&self, id: usize, host: Option<*const Host>) {
+            unsafe { self.0.bind_host_queue(id, host) };
+        }
+    }
+
+    fn make() -> Box<dyn Vst3Backend> {
+        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        inst.gui.enter().editor = Some(Box::new(Fixed((400, 300))));
+        Box::new(B(inst))
+    }
+
+    #[test]
+    fn host_set_size_drops_superseded_deferred_scale_resize() {
+        let reg = registration_with(descriptor(), make, no_bus, Vec::new());
+        let com = component(reg);
+        let view = unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("view");
+        let frame = ComWrapper::new(Frame(FrameCore::new(1000, 700)));
+        let fp = frame.as_com_ref::<IPlugFrame>().unwrap().as_ptr();
+        assert_eq!(unsafe { view.setFrame(fp) }, kResultOk);
+        let scale = view
+            .cast::<IPlugViewContentScaleSupport>()
+            .expect("content scale");
+        assert_eq!(unsafe { scale.setContentScaleFactor(2.0) }, kResultOk);
+
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 700,
+        };
+        assert_eq!(unsafe { view.onSize(&raw mut rect) }, kResultOk);
+        assert_eq!(
+            frame.0.resizes.load(SeqCst),
+            0,
+            "the host's onSize supersedes the pending scale resize"
+        );
+        let mut got = ViewRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        assert_eq!(unsafe { view.getSize(&raw mut got) }, kResultOk);
+        assert_eq!((got.right, got.bottom), (1000, 700));
+        assert_eq!(unsafe { view.setFrame(std::ptr::null_mut()) }, kResultOk);
+    }
+}

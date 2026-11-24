@@ -186,6 +186,12 @@ pub(crate) struct PluginDef {
     #[serde(default)]
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) macos_icon: Option<String>,
+    /// Optional extra C symbols to export alongside the format entry points
+    /// in the generated Linux `-Wl,--version-script` file. Empty by default
+    /// (exports only `clap_entry` for CLAP or `GetPluginFactory` /
+    /// `ModuleEntry` / `ModuleExit` for VST3).
+    #[serde(default)]
+    pub(crate) linux_extra_exports: Vec<String>,
 }
 
 impl std::ops::Deref for PluginDef {
@@ -550,6 +556,7 @@ mod suite_tests {
             au_tag: default_au_tag(),
             windows_icon: None,
             macos_icon: None,
+            linux_extra_exports: Vec::new(),
         }
     }
 

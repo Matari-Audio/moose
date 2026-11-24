@@ -403,6 +403,17 @@ struct ViewSlot {
 /// Monotonic, never-reused key for `INSTANCES` registry lookups.
 static NEXT_HOST_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// State for the Windows `wake_persist` fallback retry worker, coordinated
+/// under one mutex so a failed signal arriving while the worker is exiting
+/// either keeps it looping or spawns a replacement.
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct PersistRetryState {
+    handle: Option<std::thread::JoinHandle<()>>,
+    active: bool,
+    retry_needed: bool,
+}
+
 /// Shared lock-free wake hub referenced by `Host` and by background
 /// `PersistChangeSignal` / `CatalogSignal` / `HostQueue` wake callbacks.
 /// Keeping this state behind an `Arc` lets callbacks run without borrowing
@@ -425,7 +436,7 @@ struct HostWakes {
     /// `wake_persist`. Cancelled and joined in [`Self::stop_persist_retry`]
     /// before `MessageWake` drops and frees the DLL module reference.
     #[cfg(target_os = "windows")]
-    persist_retry_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    persist_retry_worker: Mutex<PersistRetryState>,
     #[cfg(target_os = "windows")]
     persist_retry_cv: std::sync::Condvar,
 }
@@ -445,7 +456,7 @@ impl HostWakes {
             #[cfg(target_os = "windows")]
             message_wake: std::sync::OnceLock::new(),
             #[cfg(target_os = "windows")]
-            persist_retry_worker: Mutex::new(None),
+            persist_retry_worker: Mutex::new(PersistRetryState::default()),
             #[cfg(target_os = "windows")]
             persist_retry_cv: std::sync::Condvar::new(),
         })
@@ -456,10 +467,11 @@ impl HostWakes {
     #[cfg(target_os = "windows")]
     fn stop_persist_retry(&self) {
         let handle = {
-            let mut slot = lock(&self.persist_retry_worker);
+            let mut state = lock(&self.persist_retry_worker);
             self.closing.store(true, Ordering::Release);
+            state.retry_needed = false;
             self.persist_retry_cv.notify_all();
-            slot.take()
+            state.handle.take()
         };
         if let Some(handle) = handle {
             let _ = handle.join();
@@ -524,49 +536,75 @@ impl HostWakes {
                 return;
             }
             // Rare fallback when the UI message queue is momentarily full:
-            // spawn one tracked retry worker joined before `MessageWake` drops
-            // (so no detached thread can outlive DLL unload).
-            let mut slot = lock(&self.persist_retry_worker);
+            // coordinate worker lifecycle and new retry requests under one
+            // mutex so a request arriving while the worker is exiting either
+            // keeps it looping or spawns a replacement.
+            let mut state = lock(&self.persist_retry_worker);
             if self.closing.load(Ordering::Acquire) {
                 return;
             }
-            if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            state.retry_needed = true;
+            if state.active {
+                self.persist_retry_cv.notify_one();
                 return;
             }
-            if let Some(old) = slot.take() {
+            if let Some(old) = state.handle.take() {
                 let _ = old.join();
             }
+            state.active = true;
             let wakes = Arc::clone(self);
             match std::thread::Builder::new()
                 .name("moose-vst3-persist-wake-retry".into())
                 .spawn(move || {
                     loop {
                         {
-                            let guard = lock(&wakes.persist_retry_worker);
+                            let state = lock(&wakes.persist_retry_worker);
                             if wakes.closing.load(Ordering::Acquire)
                                 || !wakes.persist_pending.load(Ordering::Acquire)
+                                || !state.retry_needed
                             {
+                                let mut state = state;
+                                state.active = false;
                                 return;
                             }
-                            let _ = wakes
+                            let (mut state, _) = wakes
                                 .persist_retry_cv
-                                .wait_timeout(guard, std::time::Duration::from_millis(10));
+                                .wait_timeout(state, std::time::Duration::from_millis(10))
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if wakes.closing.load(Ordering::Acquire)
+                                || !wakes.persist_pending.load(Ordering::Acquire)
+                                || !state.retry_needed
+                            {
+                                state.active = false;
+                                return;
+                            }
+                            state.retry_needed = false;
                         }
+                        let signaled = wakes.message_wake.get().is_none_or(|w| w.signal());
+                        let mut state = lock(&wakes.persist_retry_worker);
                         if wakes.closing.load(Ordering::Acquire)
                             || !wakes.persist_pending.load(Ordering::Acquire)
-                            || wakes.message_wake.get().is_none_or(|w| w.signal())
                         {
+                            state.active = false;
                             return;
+                        }
+                        if signaled && !state.retry_needed {
+                            state.active = false;
+                            return;
+                        }
+                        if !signaled {
+                            state.retry_needed = true;
                         }
                     }
                 }) {
                 Ok(handle) => {
-                    *slot = Some(handle);
+                    state.handle = Some(handle);
                 }
                 Err(_) => {
-                    // Thread creation failed: leave `slot` empty so a future
+                    // Thread creation failed: clear `active` so a future
                     // signal can retry, and make a bounded inline attempt now.
-                    drop(slot);
+                    state.active = false;
+                    drop(state);
                     for _ in 0..3 {
                         std::thread::yield_now();
                         if w.signal() {
@@ -2453,10 +2491,13 @@ impl IComponentTrait for Component {
         let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
             return kResultFalse;
         };
+        let context = unsafe { stream_state_context(stream) };
         if self
             .host
             .backend()
-            .state_load_stream(&mut |dst| super::read_state_chunk(stream, dst))
+            .state_load_stream_with_context(context, &mut |dst| {
+                super::read_state_chunk(stream, dst)
+            })
         {
             kResultOk
         } else {
@@ -2468,15 +2509,62 @@ impl IComponentTrait for Component {
         let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
             return kResultFalse;
         };
+        let context = unsafe { stream_state_context(stream) };
         if self
             .host
             .backend()
-            .state_save_stream(&mut |src| super::write_state_chunk(stream, src))
+            .state_save_stream_with_context(context, &mut |src| {
+                super::write_state_chunk(stream, src)
+            })
         {
             kResultOk
         } else {
             kResultFalse
         }
+    }
+}
+
+/// Query `IStreamAttributes` on a VST3 `IBStream` and map
+/// `PresetAttributes::kStateType` (`StateType::{kProject,kDefault,kTrackPreset}`)
+/// into [`moose_core::state::StateContext`].
+unsafe fn stream_state_context(stream: ComRef<'_, IBStream>) -> moose_core::state::StateContext {
+    let Some(attrs) = stream.cast::<IStreamAttributes>() else {
+        return moose_core::state::StateContext::Unknown;
+    };
+    // SAFETY: `IStreamAttributes::getAttributes()` returns a borrowed
+    // `*mut IAttributeList` (no extra AddRef) valid while `attrs` is alive.
+    let list_ptr = unsafe { attrs.getAttributes() };
+    let Some(list) = (unsafe { ComRef::from_raw(list_ptr) }) else {
+        return moose_core::state::StateContext::Unknown;
+    };
+    let mut buf = [0 as TChar; 64];
+    let res = unsafe {
+        list.getString(
+            PresetAttributes::kStateType,
+            buf.as_mut_ptr(),
+            size_of_val(&buf) as u32,
+        )
+    };
+    if res != kResultOk {
+        return moose_core::state::StateContext::Unknown;
+    }
+    let state_type = unsafe { utf16_from(buf.as_ptr(), buf.len()) };
+    parse_vst3_state_type(&state_type)
+}
+
+fn parse_vst3_state_type(state_type: &str) -> moose_core::state::StateContext {
+    // SAFETY: `StateType::k*` constants in `vst3` are static NUL-terminated ASCII C strings.
+    let k_project = unsafe { cstr(StateType::kProject) };
+    let k_default = unsafe { cstr(StateType::kDefault) };
+    let k_track_preset = unsafe { cstr(StateType::kTrackPreset) };
+    if state_type == k_project {
+        moose_core::state::StateContext::Project
+    } else if state_type == k_default {
+        moose_core::state::StateContext::Default
+    } else if state_type == k_track_preset || state_type == "Preset" {
+        moose_core::state::StateContext::Preset
+    } else {
+        moose_core::state::StateContext::Unknown
     }
 }
 
@@ -2907,19 +2995,109 @@ impl Component {
     }
 }
 
-/// The SDK 3.8 list form of `IMidiMapping`, input direction only. Moose
-/// has no MIDI 2 controller bindings.
+/// Exact 12-byte C++ VST3 SDK 3.8 ABI layout for
+/// `Steinberg::Vst::Midi2ControllerParamIDAssignment`.
+///
+/// The `vst3 0.3.0` crate expands the bitfields of `Midi2Controller` into
+/// four `u8` fields (`sizeof == 16`), whereas C++ hosts allocate 12-byte
+/// entries (`ParamID` + `BusIndex` + `MidiChannel` + 2-byte bitfield
+/// `Midi2Controller` + 1 pad byte). Writing `AbiMidi2Assignment` records
+/// directly preserves exact C++ ABI fidelity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AbiMidi2Assignment {
+    p_id: ParamID,
+    bus_index: BusIndex,
+    channel: MidiChannel,
+    byte1: u8,
+    byte2: u8,
+    _pad: u8,
+}
+
+const _: () = {
+    assert!(size_of::<AbiMidi2Assignment>() == 12);
+    assert!(align_of::<AbiMidi2Assignment>() == 4);
+};
+
+fn vst3_bus_direction(direction: BusDirections) -> Option<moose_core::main_thread::BusDirection> {
+    if direction == BusDirections_::kInput as BusDirections {
+        Some(moose_core::main_thread::BusDirection::Input)
+    } else if direction == BusDirections_::kOutput as BusDirections {
+        Some(moose_core::main_thread::BusDirection::Output)
+    } else {
+        None
+    }
+}
+
+fn is_valid_midi2_assignment(a: &moose_core::main_thread::Midi2ControllerAssignment) -> bool {
+    a.bus_index >= 0 && a.channel < 16 && a.controller.bank <= 0x7F && a.controller.index <= 0x7F
+}
+
+/// SDK 3.8 list form of `IMidiMapping`: serves both MIDI 2.0 Registered/Assignable
+/// controller assignments and MIDI 1.0 CC assignments.
 impl IMidiMapping2Trait for Component {
-    unsafe fn getNumMidi2ControllerAssignments(&self, _direction: BusDirections) -> uint32 {
-        0
+    unsafe fn getNumMidi2ControllerAssignments(&self, direction: BusDirections) -> uint32 {
+        let Some(dir) = vst3_bus_direction(direction) else {
+            return 0;
+        };
+        let count = self
+            .host
+            .backend()
+            .midi2_controller_assignments(dir)
+            .into_iter()
+            .filter(is_valid_midi2_assignment)
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
     }
 
     unsafe fn getMidi2ControllerAssignments(
         &self,
-        _direction: BusDirections,
-        _list: *const Midi2ControllerParamIDAssignmentList,
+        direction: BusDirections,
+        list: *const Midi2ControllerParamIDAssignmentList,
     ) -> tresult {
-        kResultFalse
+        let Some(list) = (unsafe { list.as_ref() }) else {
+            return kInvalidArgument;
+        };
+        if list.map.is_null() && list.count > 0 {
+            return kInvalidArgument;
+        }
+        let Some(dir) = vst3_bus_direction(direction) else {
+            return kResultFalse;
+        };
+        let assignments = self.host.backend().midi2_controller_assignments(dir);
+        let out = list.map.cast::<AbiMidi2Assignment>();
+        let requested = list.count as usize;
+        let mut written = 0usize;
+        for a in assignments
+            .into_iter()
+            .filter(is_valid_midi2_assignment)
+            .take(requested)
+        {
+            let registered_bit =
+                if a.controller.kind == moose_core::main_thread::Midi2ControllerKind::Registered {
+                    0x80
+                } else {
+                    0
+                };
+            let record = AbiMidi2Assignment {
+                p_id: a.param_id,
+                bus_index: a.bus_index,
+                channel: a.channel,
+                byte1: (a.controller.bank & 0x7F) | registered_bit,
+                byte2: a.controller.index & 0x7F,
+                _pad: 0,
+            };
+            // SAFETY: Host allocated `list.map` for `list.count` C++ 12-byte
+            // `Midi2ControllerParamIDAssignment` records; `.take(requested)`
+            // guarantees `written < requested`. `write_unaligned` avoids UB if
+            // the host supplies a packed or under-aligned buffer.
+            unsafe { out.add(written).write_unaligned(record) };
+            written += 1;
+        }
+        if written < requested {
+            return kResultFalse;
+        }
+        kResultOk
     }
 
     unsafe fn getNumMidi1ControllerAssignments(&self, direction: BusDirections) -> uint32 {

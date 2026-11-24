@@ -30,10 +30,10 @@ use moose_core::denormal::DenormalGuard;
 use moose_core::editor::Editor;
 use moose_core::events::EventList;
 use moose_core::export::CustomClapExtension;
-use moose_core::main_thread::MainThreadHooks;
+use moose_core::main_thread::{BusDirection, MainThreadHooks, Midi2ControllerAssignment};
 use moose_core::plugin::{PreparationConfig, PreparationError};
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::state::{DecodedState, ForeignState, MigratedState, StateLoadError};
+use moose_core::state::{DecodedState, ForeignState, MigratedState, StateContext, StateLoadError};
 use moose_core::tasks::InitContext;
 use moose_params::Params;
 use moose_params::sample::Sample;
@@ -98,6 +98,16 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// Build the main-thread part. Called once per instance, on the host
     /// main thread.
     fn main_thread(shared: &Arc<Self::Shared>) -> Self::MainThread;
+
+    /// Static MIDI 2.0 controller-to-parameter assignments advertised via
+    /// VST3 SDK 3.8 `IMidiMapping2`. Combined with any dynamic assignments
+    /// returned by [`MainThreadHooks::midi2_controller_assignments`].
+    /// Default: empty.
+    #[must_use]
+    fn midi2_controller_assignments(direction: BusDirection) -> Vec<Midi2ControllerAssignment> {
+        let _ = direction;
+        Vec::new()
+    }
 
     /// Build a processor for `config`, on the host main thread. May allocate
     /// and block. This is the only way a processor comes into being.
@@ -184,6 +194,47 @@ pub trait Plugin<S: Sample = f32>: 'static {
         let _ = (processor, shared);
     }
 
+    /// Context-aware variant of [`Self::state_changed`], receiving the
+    /// host-reported [`StateContext`]. Default delegates to [`Self::state_changed`].
+    fn state_changed_with_context(
+        processor: &mut Self::Processor,
+        shared: &Self::Shared,
+        _context: StateContext,
+    ) {
+        Self::state_changed(processor, shared);
+    }
+
+    /// Save optional processor-owned extra state bytes with host-reported
+    /// [`StateContext`], called strictly on the host/main thread (never on the
+    /// audio thread). Return `Some(bytes)` to supply a context-specific payload
+    /// (including `Some(Vec::new())` to intentionally omit extra state for a
+    /// context such as `StateContext::Preset`). For context-specific saves while
+    /// audio is actively processing, publish off-thread via
+    /// `SnapshotPublisher::publish_for_context`. Default returns `None`,
+    /// preserving the snapshot / `save_state` fallback.
+    fn save_state_with_context(
+        processor: &Self::Processor,
+        _context: StateContext,
+    ) -> Option<Vec<u8>> {
+        let _ = processor;
+        None
+    }
+
+    /// Load optional processor-owned extra state bytes with host-reported
+    /// [`StateContext`]. Default returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Return [`StateLoadError`] when the payload cannot be loaded.
+    fn load_state_with_context(
+        processor: &mut Self::Processor,
+        data: &[u8],
+        _context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        let _ = (processor, data);
+        Ok(())
+    }
+
     /// Allow a replacement to activate while its predecessor is still alive.
     /// Opt in only when both processors can hold resources concurrently. By default
     /// teardown runs first: retain settings needed by the replacement in Shared.
@@ -212,6 +263,19 @@ pub trait Plugin<S: Sample = f32>: 'static {
         Ok(())
     }
 
+    /// Context-aware variant of [`Self::validate_state`]. Default delegates
+    /// to [`Self::validate_state`].
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not a state this plugin can load in `context`.
+    fn validate_state_with_context(
+        data: &[u8],
+        _context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        Self::validate_state(data)
+    }
+
     /// Decode custom state bytes off the audio thread into a ready-to-swap
     /// [`DecodedState`].
     ///
@@ -228,6 +292,19 @@ pub trait Plugin<S: Sample = f32>: 'static {
         Ok(None)
     }
 
+    /// Context-aware variant of [`Self::decode_state`]. Default delegates
+    /// to [`Self::decode_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(StateLoadError)` when the bytes cannot be decoded in `context`.
+    fn decode_state_with_context(
+        data: &[u8],
+        _context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError> {
+        Self::decode_state(data)
+    }
+
     /// Swap a state decoded by [`Self::decode_state`] into the active processor.
     ///
     /// Runs inside an `RtSection` on the audio thread: must not allocate,
@@ -239,6 +316,17 @@ pub trait Plugin<S: Sample = f32>: 'static {
         decoded: &mut DecodedState,
     ) {
         let _ = (processor, shared, decoded);
+    }
+
+    /// Context-aware variant of [`Self::apply_decoded_state`]. Default
+    /// delegates to [`Self::apply_decoded_state`].
+    fn apply_decoded_state_with_context(
+        processor: &mut Self::Processor,
+        shared: &Self::Shared,
+        decoded: &mut DecodedState,
+        _context: StateContext,
+    ) {
+        Self::apply_decoded_state(processor, shared, decoded);
     }
 
     /// Translate foreign state (a previous framework's blob or a renamed
@@ -285,11 +373,12 @@ impl<P> std::fmt::Debug for Lifecycle<P> {
 }
 
 /// The DSP state [`Lifecycle`] hands the shell: a processor once
-/// activated, any pre-activation decoded state waiting for the first
+/// activated, any pre-activation decoded or raw state waiting for the first
 /// activation, and the instance's [`InitContext`] for each activation.
 pub struct ProcessorSlot<T> {
     slot: Slot<T>,
-    pending_decoded: Option<DecodedState>,
+    pending_decoded: Option<(DecodedState, StateContext)>,
+    pending_raw: Option<(Vec<u8>, StateContext)>,
     cx: InitContext,
 }
 
@@ -298,6 +387,7 @@ impl<T> Default for ProcessorSlot<T> {
         Self {
             slot: Slot::default(),
             pending_decoded: None,
+            pending_raw: None,
             cx: InitContext::default(),
         }
     }
@@ -406,9 +496,16 @@ fn activate<S: Sample, P: Plugin<S>>(
         P::transfer_state(&mut old, &mut processor, shared);
         deactivate_boxed::<S, P>(old);
     }
-    if let Some(mut pending) = slot.pending_decoded.take() {
-        P::apply_decoded_state(&mut processor, shared, &mut pending);
-        P::state_changed(&mut processor, shared);
+    if let Some((mut pending, context)) = slot.pending_decoded.take() {
+        P::apply_decoded_state_with_context(&mut processor, shared, &mut pending, context);
+        P::state_changed_with_context(&mut processor, shared, context);
+    } else if let Some((pending_bytes, context)) = slot.pending_raw.take() {
+        if P::load_state_with_context(&mut processor, &pending_bytes, context).is_err() {
+            slot.pending_raw = Some((pending_bytes, context));
+            deactivate_boxed::<S, P>(processor);
+            return Err(PreparationError::NotReady);
+        }
+        P::state_changed_with_context(&mut processor, shared, context);
     }
     slot.slot = Slot::Active {
         processor,
@@ -468,12 +565,17 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
         ProcessorSlot {
             slot: Slot::default(),
             pending_decoded: None,
+            pending_raw: None,
             cx: cx.clone(),
         }
     }
 
     fn main_thread(params: &Arc<P::Shared>) -> Box<dyn MainThreadHooks> {
         Box::new(P::main_thread(params))
+    }
+
+    fn midi2_controller_assignments(direction: BusDirection) -> Vec<Midi2ControllerAssignment> {
+        P::midi2_controller_assignments(direction)
     }
 
     fn reset(state: &mut Self::DspState, params: &P::Shared, _config: &AudioConfig) {
@@ -503,9 +605,45 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
         process::<S, P>(state, params, buffer, events, context)
     }
 
+    fn save_state_with_context(state: &Self::DspState, context: StateContext) -> Option<Vec<u8>> {
+        state
+            .processor()
+            .and_then(|p| P::save_state_with_context(p, context))
+    }
+
+    fn load_state_with_context(
+        state: &mut Self::DspState,
+        data: &[u8],
+        context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        if let Some(processor) = state.processor_mut() {
+            P::load_state_with_context(processor, data, context)
+        } else if data.is_empty()
+            && (state.pending_decoded.is_some() || state.pending_raw.is_some())
+        {
+            // Empty bytes mean "no custom state" (parameter-only load): keep
+            // the custom state still waiting for activation.
+            Ok(())
+        } else {
+            state.pending_decoded = None;
+            state.pending_raw = Some((data.to_vec(), context));
+            Ok(())
+        }
+    }
+
     fn state_changed(state: &mut Self::DspState, params: &P::Shared) {
         if let Some(processor) = state.processor_mut() {
             P::state_changed(processor, params);
+        }
+    }
+
+    fn state_changed_with_context(
+        state: &mut Self::DspState,
+        params: &P::Shared,
+        context: StateContext,
+    ) {
+        if let Some(processor) = state.processor_mut() {
+            P::state_changed_with_context(processor, params, context);
         }
     }
 
@@ -513,8 +651,22 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
         P::validate_state(data)
     }
 
+    fn validate_state_with_context(
+        data: &[u8],
+        context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        P::validate_state_with_context(data, context)
+    }
+
     fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
         P::decode_state(data)
+    }
+
+    fn decode_state_with_context(
+        data: &[u8],
+        context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError> {
+        P::decode_state_with_context(data, context)
     }
 
     fn apply_decoded_state(
@@ -522,12 +674,26 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
         params: &P::Shared,
         decoded: &mut DecodedState,
     ) {
+        Self::apply_decoded_state_with_context(state, params, decoded, StateContext::Unknown);
+    }
+
+    fn apply_decoded_state_with_context(
+        state: &mut Self::DspState,
+        params: &P::Shared,
+        decoded: &mut DecodedState,
+        context: StateContext,
+    ) {
         if let Some(processor) = state.processor_mut() {
-            P::apply_decoded_state(processor, params, decoded);
-        } else if let Some(prev) = &mut state.pending_decoded {
-            std::mem::swap(prev, decoded);
+            P::apply_decoded_state_with_context(processor, params, decoded, context);
         } else {
-            state.pending_decoded = Some(std::mem::replace(decoded, DecodedState::empty()));
+            state.pending_raw = None;
+            if let Some((prev, prev_ctx)) = &mut state.pending_decoded {
+                std::mem::swap(prev, decoded);
+                *prev_ctx = context;
+            } else {
+                state.pending_decoded =
+                    Some((std::mem::replace(decoded, DecodedState::empty()), context));
+            }
         }
     }
 
@@ -795,6 +961,337 @@ mod tests {
         assert!(
             std::mem::size_of::<ProcessorSlot<[u8; 65_536]>>() < 1024,
             "ProcessorSlot must box P::Processor so activate() and host/test stacks stay small"
+        );
+    }
+
+    struct ContextPlugin;
+
+    #[derive(Default)]
+    struct ContextProcessor {
+        loaded_context: Option<StateContext>,
+        applied_context: Option<StateContext>,
+        changed_context: Option<StateContext>,
+        tag: u32,
+    }
+
+    impl Plugin for ContextPlugin {
+        type Shared = DynamicParams<0>;
+        type MainThread = ();
+        type Processor = ContextProcessor;
+
+        fn main_thread(_shared: &Arc<Self::Shared>) -> Self::MainThread {}
+
+        fn midi2_controller_assignments(direction: BusDirection) -> Vec<Midi2ControllerAssignment> {
+            use moose_core::main_thread::{Midi2Controller, Midi2ControllerKind};
+            if direction == BusDirection::Input {
+                vec![Midi2ControllerAssignment {
+                    param_id: 7,
+                    bus_index: 0,
+                    channel: 2,
+                    controller: Midi2Controller {
+                        kind: Midi2ControllerKind::Registered,
+                        bank: 1,
+                        index: 5,
+                    },
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn activate(
+            _shared: &Self::Shared,
+            _config: &AudioConfig,
+            _cx: &InitContext,
+        ) -> Result<Self::Processor, PreparationError> {
+            Ok(ContextProcessor::default())
+        }
+
+        fn process(
+            _processor: &mut Self::Processor,
+            _shared: &Self::Shared,
+            _buffer: &mut AudioBuffer<f32>,
+            _events: &EventList,
+            _context: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+
+        fn save_state_with_context(
+            _processor: &Self::Processor,
+            context: StateContext,
+        ) -> Option<Vec<u8>> {
+            Some(match context {
+                StateContext::Project => b"proj".to_vec(),
+                StateContext::Preset => b"pres".to_vec(),
+                _ => b"unk".to_vec(),
+            })
+        }
+
+        fn load_state_with_context(
+            processor: &mut Self::Processor,
+            _data: &[u8],
+            context: StateContext,
+        ) -> Result<(), StateLoadError> {
+            processor.loaded_context = Some(context);
+            Ok(())
+        }
+
+        fn validate_state_with_context(
+            data: &[u8],
+            context: StateContext,
+        ) -> Result<(), StateLoadError> {
+            if context == StateContext::Preset && data == b"bad-preset" {
+                return Err(StateLoadError::Malformed("bad preset"));
+            }
+            Ok(())
+        }
+
+        fn decode_state_with_context(
+            data: &[u8],
+            context: StateContext,
+        ) -> Result<Option<DecodedState>, StateLoadError> {
+            if data.len() == 4 {
+                let base = u32::from_le_bytes(data.try_into().unwrap());
+                let tag = if context == StateContext::Duplicate {
+                    base + 100
+                } else {
+                    base
+                };
+                return Ok(Some(DecodedState::new(tag)));
+            }
+            Ok(None)
+        }
+
+        fn apply_decoded_state_with_context(
+            processor: &mut Self::Processor,
+            _shared: &Self::Shared,
+            decoded: &mut DecodedState,
+            context: StateContext,
+        ) {
+            decoded.swap_with(&mut processor.tag);
+            processor.applied_context = Some(context);
+        }
+
+        fn state_changed_with_context(
+            processor: &mut Self::Processor,
+            _shared: &Self::Shared,
+            context: StateContext,
+        ) {
+            processor.changed_context = Some(context);
+        }
+    }
+
+    #[test]
+    fn lifecycle_forwards_state_context_and_midi2_assignments() {
+        assert_eq!(
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::midi2_controller_assignments(
+                BusDirection::Input
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::midi2_controller_assignments(
+                BusDirection::Output
+            ),
+            Vec::new()
+        );
+
+        assert!(
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::validate_state_with_context(
+                b"bad-preset",
+                StateContext::Preset
+            )
+            .is_err()
+        );
+        assert!(
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::validate_state_with_context(
+                b"bad-preset",
+                StateContext::Project
+            )
+            .is_ok()
+        );
+
+        let shared = DynamicParams::<0>::new();
+        let mut slot =
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::init(&shared, &InitContext::default());
+
+        let mut decoded = <Lifecycle<ContextPlugin> as PluginLogicCore>::decode_state_with_context(
+            &5u32.to_le_bytes(),
+            StateContext::Duplicate,
+        )
+        .unwrap()
+        .unwrap();
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::apply_decoded_state_with_context(
+            &mut slot,
+            &shared,
+            &mut decoded,
+            StateContext::Duplicate,
+        );
+
+        let prep = PreparationConfig::new(
+            AudioConfig::new(48_000.0, 256),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep)
+            .expect("activate");
+        let p = slot.processor().expect("active");
+        assert_eq!(p.tag, 105);
+        assert_eq!(p.applied_context, Some(StateContext::Duplicate));
+        assert_eq!(p.changed_context, Some(StateContext::Duplicate));
+
+        assert_eq!(
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::save_state_with_context(
+                &slot,
+                StateContext::Project
+            ),
+            Some(b"proj".to_vec())
+        );
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::load_state_with_context(
+            &mut slot,
+            b"pres",
+            StateContext::Preset,
+        )
+        .unwrap();
+        assert_eq!(
+            slot.processor().expect("active").loaded_context,
+            Some(StateContext::Preset)
+        );
+    }
+
+    #[test]
+    fn lifecycle_buffers_pre_activation_raw_load_state_with_context() {
+        let shared = DynamicParams::<0>::new();
+        let mut slot =
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::init(&shared, &InitContext::default());
+        assert!(slot.processor().is_none());
+
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::load_state_with_context(
+            &mut slot,
+            b"raw-preset-payload",
+            StateContext::Preset,
+        )
+        .unwrap();
+
+        let prep = PreparationConfig::new(
+            AudioConfig::new(48_000.0, 256),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep)
+            .expect("activate");
+        let p = slot.processor().expect("active");
+        assert_eq!(p.loaded_context, Some(StateContext::Preset));
+        assert_eq!(p.changed_context, Some(StateContext::Preset));
+    }
+
+    #[test]
+    fn lifecycle_parameter_only_load_keeps_pending_custom_state() {
+        let shared = DynamicParams::<0>::new();
+        let mut slot =
+            <Lifecycle<ContextPlugin> as PluginLogicCore>::init(&shared, &InitContext::default());
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::load_state_with_context(
+            &mut slot,
+            b"custom",
+            StateContext::Project,
+        )
+        .unwrap();
+        // A later parameter-only load carries no custom bytes.
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::load_state_with_context(
+            &mut slot,
+            &[],
+            StateContext::Preset,
+        )
+        .unwrap();
+
+        let prep = PreparationConfig::new(
+            AudioConfig::new(48_000.0, 256),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        <Lifecycle<ContextPlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep)
+            .expect("activate");
+        assert_eq!(
+            slot.processor().expect("active").loaded_context,
+            Some(StateContext::Project)
+        );
+    }
+
+    #[test]
+    fn lifecycle_aborts_activation_and_restores_pending_raw_on_deferred_load_error() {
+        static DEACTIVATES: AtomicU32 = AtomicU32::new(0);
+        static FAIL_LOAD: AtomicBool = AtomicBool::new(true);
+
+        struct RejectRawPlugin;
+        #[derive(Default)]
+        struct RejectRawProc {
+            loaded: Option<Vec<u8>>,
+        }
+
+        impl Plugin for RejectRawPlugin {
+            type Shared = DynamicParams<0>;
+            type MainThread = ();
+            type Processor = RejectRawProc;
+            fn main_thread(_shared: &Arc<Self::Shared>) -> Self::MainThread {}
+            fn activate(
+                _shared: &Self::Shared,
+                _config: &AudioConfig,
+                _cx: &InitContext,
+            ) -> Result<Self::Processor, PreparationError> {
+                Ok(RejectRawProc::default())
+            }
+            fn deactivate(_processor: Self::Processor) {
+                DEACTIVATES.fetch_add(1, Ordering::AcqRel);
+            }
+            fn process(
+                _processor: &mut Self::Processor,
+                _shared: &Self::Shared,
+                _buffer: &mut AudioBuffer<f32>,
+                _events: &EventList,
+                _context: &mut ProcessContext,
+            ) -> ProcessStatus {
+                ProcessStatus::Normal
+            }
+            fn load_state_with_context(
+                processor: &mut Self::Processor,
+                data: &[u8],
+                _context: StateContext,
+            ) -> Result<(), StateLoadError> {
+                if FAIL_LOAD.load(Ordering::Acquire) {
+                    return Err(StateLoadError::Malformed("deferred failure"));
+                }
+                processor.loaded = Some(data.to_vec());
+                Ok(())
+            }
+        }
+
+        let shared = DynamicParams::<0>::new();
+        let mut slot =
+            <Lifecycle<RejectRawPlugin> as PluginLogicCore>::init(&shared, &InitContext::default());
+        <Lifecycle<RejectRawPlugin> as PluginLogicCore>::load_state_with_context(
+            &mut slot,
+            b"deferred-bytes",
+            StateContext::Project,
+        )
+        .unwrap();
+
+        let prep = PreparationConfig::new(
+            AudioConfig::new(48_000.0, 256),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        let err =
+            <Lifecycle<RejectRawPlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep)
+                .expect_err("failed deferred load must fail prepare");
+        assert_eq!(err, PreparationError::NotReady);
+        assert!(slot.processor().is_none());
+        assert_eq!(DEACTIVATES.load(Ordering::Acquire), 1);
+
+        // Retrying after clearing the failure replays the restored `pending_raw`.
+        FAIL_LOAD.store(false, Ordering::Release);
+        <Lifecycle<RejectRawPlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep)
+            .expect("retry succeeds");
+        assert_eq!(
+            slot.processor().expect("active").loaded.as_deref(),
+            Some(&b"deferred-bytes"[..])
         );
     }
 }

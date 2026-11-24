@@ -1307,6 +1307,10 @@ unsafe fn data_from_plugin<P: PluginExport>(
 /// Called by the host through the factory. The descriptor must remain valid
 /// for the lifetime of the returned plugin.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "initializes ClapPluginData fields and static CLAP vtable in one place"
+)]
 pub unsafe fn create_plugin_instance<P: PluginExport>(
     descriptor: *const clap_plugin_descriptor,
     host: *const clap_host,
@@ -1349,6 +1353,9 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             params_arc.parameter_presentation(id)
         }));
         let meter_store = instance.meter_store();
+        let feedback = Arc::new(moose_core::EditorFeedback::new(
+            param_infos.iter().map(|i| i.id),
+        ));
         let snapshot = instance.snapshot_slot();
         let task_spawner = instance.task_spawner();
         let editor_builder = instance.editor_builder();
@@ -1378,6 +1385,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             plugin: PluginCell::new(instance),
             params_arc,
             meter_store,
+            feedback,
             snapshot,
             task_spawner,
             editor_builder,
@@ -2070,6 +2078,249 @@ mod host_state_tests {
             i64::try_from(buf.len()).unwrap()
         });
         assert_eq!(blob, None);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn state_context_saves_preserve_context_while_audio_processing_is_active() {
+        use super::*;
+        use clap_sys::audio_buffer::clap_audio_buffer;
+        use clap_sys::events::{clap_event_header, clap_output_events};
+        use clap_sys::ext::state_context::{
+            CLAP_STATE_CONTEXT_FOR_PRESET, CLAP_STATE_CONTEXT_FOR_PROJECT,
+            clap_plugin_state_context_type,
+        };
+        use clap_sys::process::clap_process;
+        use moose_core::buffer::AudioBuffer;
+        use moose_core::config::AudioConfig;
+        use moose_core::events::EventList;
+        use moose_core::info::PluginInfo;
+        use moose_core::meters::MeterStore;
+        use moose_core::plugin::PluginRuntime;
+        use moose_core::process::{ProcessContext, ProcessStatus};
+        use moose_core::snapshot::SnapshotSlot;
+        use moose_core::state::{self, StateContext};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        struct ContextActivePlugin {
+            params: Arc<moose_params::DynamicParams<0>>,
+            meters: Arc<MeterStore>,
+            snapshot: Arc<SnapshotSlot>,
+        }
+
+        impl PluginRuntime for ContextActivePlugin {
+            type Sample = f32;
+            fn info() -> PluginInfo {
+                large_state_fixture::LargePlugin::<1>::info()
+            }
+            fn reset(&mut self, _: &AudioConfig) {}
+            fn process(
+                &mut self,
+                _: &mut AudioBuffer<f32>,
+                _: &EventList,
+                _: &mut ProcessContext,
+            ) -> ProcessStatus {
+                ProcessStatus::Normal
+            }
+            fn save_state_with_context(&self, context: StateContext) -> Option<Vec<u8>> {
+                match context {
+                    StateContext::Project => Some(b"project-only".to_vec()),
+                    StateContext::Preset => Some(Vec::new()),
+                    _ => None,
+                }
+            }
+        }
+
+        impl PluginExport for ContextActivePlugin {
+            type Params = moose_params::DynamicParams<0>;
+            fn create() -> Self {
+                let snapshot = SnapshotSlot::new();
+                let publisher = moose_core::snapshot::SnapshotPublisher::new(&snapshot);
+                publisher.publish(b"ordinary-live".to_vec());
+                publisher.publish_for_context(StateContext::Project, b"project-only".to_vec());
+                publisher.publish_for_context(StateContext::Preset, Vec::new());
+                Self {
+                    params: Arc::new(moose_params::DynamicParams::new()),
+                    meters: MeterStore::new(),
+                    snapshot,
+                }
+            }
+            fn params(&self) -> &Self::Params {
+                &self.params
+            }
+            fn params_arc(&self) -> Arc<Self::Params> {
+                Arc::clone(&self.params)
+            }
+            fn meter_store(&self) -> Arc<MeterStore> {
+                Arc::clone(&self.meters)
+            }
+            fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+                Arc::clone(&self.snapshot)
+            }
+        }
+
+        unsafe extern "C" fn write_vec(
+            s: *const clap_ostream,
+            bytes: *const c_void,
+            size: u64,
+        ) -> i64 {
+            let out = unsafe { &mut *((*s).ctx.cast::<Vec<u8>>()) };
+            let n = usize::try_from(size).expect("size fits usize");
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), n) });
+            i64::try_from(n).expect("n fits i64")
+        }
+
+        unsafe extern "C" fn no_push(
+            _list: *const clap_output_events,
+            _event: *const clap_event_header,
+        ) -> bool {
+            true
+        }
+
+        #[derive(Clone, Copy)]
+        struct SendPlugin(*const clap_plugin);
+        // SAFETY: CLAP allows `process` on the audio thread concurrently with
+        // `state_context.save` / `state.save` on the main thread; the test joins
+        // the audio thread before calling `stop_processing`/`destroy`.
+        unsafe impl Send for SendPlugin {}
+
+        struct WorkerGuard {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for WorkerGuard {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Release);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+
+        unsafe {
+            let mut host: clap_host = std::mem::zeroed();
+            host.clap_version = CLAP_VERSION;
+            let descriptor = DescriptorHolder::new(&ContextActivePlugin::info());
+            let plugin = create_plugin_instance::<ContextActivePlugin>(
+                &raw const descriptor.descriptor,
+                &raw const host,
+            );
+            assert!(clap_plugin_init::<ContextActivePlugin>(plugin));
+            assert!(clap_plugin_activate::<ContextActivePlugin>(
+                plugin, 48_000.0, 1, 64
+            ));
+            assert!(clap_plugin_start_processing::<ContextActivePlugin>(plugin));
+            let hash = data_from_plugin::<ContextActivePlugin>(plugin).plugin_id_hash;
+
+            let (tx_started, rx_started) = std::sync::mpsc::sync_channel::<()>(1);
+            let stop = Arc::new(AtomicBool::new(false));
+            let send_plugin = SendPlugin(plugin);
+            let audio = {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let plugin = send_plugin;
+                    let mut in_l = [0.25f32; 64];
+                    let mut in_r = [0.25f32; 64];
+                    let mut out_l = [0.0f32; 64];
+                    let mut out_r = [0.0f32; 64];
+                    let mut in_ptrs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+                    let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+                    let input_bus = clap_audio_buffer {
+                        data32: in_ptrs.as_mut_ptr(),
+                        data64: std::ptr::null_mut(),
+                        channel_count: 2,
+                        latency: 0,
+                        constant_mask: 0,
+                    };
+                    let mut output_bus = clap_audio_buffer {
+                        data32: out_ptrs.as_mut_ptr(),
+                        data64: std::ptr::null_mut(),
+                        channel_count: 2,
+                        latency: 0,
+                        constant_mask: 0,
+                    };
+                    let sink = clap_output_events {
+                        ctx: std::ptr::null_mut(),
+                        try_push: Some(no_push),
+                    };
+                    let process = clap_process {
+                        steady_time: 0,
+                        frames_count: 64,
+                        transport: std::ptr::null(),
+                        audio_inputs: &raw const input_bus,
+                        audio_outputs: &raw mut output_bus,
+                        audio_inputs_count: 1,
+                        audio_outputs_count: 1,
+                        in_events: std::ptr::null(),
+                        out_events: &raw const sink,
+                    };
+                    let mut notified = false;
+                    while !stop.load(Ordering::Acquire) {
+                        let _ = clap_plugin_process::<ContextActivePlugin>(
+                            plugin.0,
+                            &raw const process,
+                        );
+                        if !notified {
+                            let _ = tx_started.try_send(());
+                            notified = true;
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                })
+            };
+            let mut worker = WorkerGuard {
+                stop,
+                handle: Some(audio),
+            };
+
+            rx_started
+                .recv_timeout(Duration::from_secs(5))
+                .expect("audio worker failed to start or exited before first block");
+
+            let save_ctx = |ctx: Option<clap_plugin_state_context_type>| -> Option<Vec<u8>> {
+                let mut bytes = Vec::new();
+                let out = clap_ostream {
+                    ctx: (&raw mut bytes).cast(),
+                    write: Some(write_vec),
+                };
+                let ok = match ctx {
+                    Some(c) => state_ext::state_context_save::<ContextActivePlugin>(
+                        plugin,
+                        &raw const out,
+                        c,
+                    ),
+                    None => state_save::<ContextActivePlugin>(plugin, &raw const out),
+                };
+                assert!(ok);
+                state::deserialize_state(&bytes, hash)
+                    .expect("valid envelope")
+                    .extra
+            };
+
+            let project_active = save_ctx(Some(CLAP_STATE_CONTEXT_FOR_PROJECT));
+            let preset_active = save_ctx(Some(CLAP_STATE_CONTEXT_FOR_PRESET));
+            let plain_active = save_ctx(None);
+
+            worker.stop.store(true, Ordering::Release);
+            worker.handle.take().unwrap().join().unwrap();
+
+            assert_eq!(project_active.as_deref(), Some(&b"project-only"[..]));
+            assert_eq!(preset_active, None);
+            assert_eq!(plain_active.as_deref(), Some(&b"ordinary-live"[..]));
+
+            clap_plugin_stop_processing::<ContextActivePlugin>(plugin);
+            assert_eq!(
+                save_ctx(Some(CLAP_STATE_CONTEXT_FOR_PROJECT)).as_deref(),
+                Some(&b"project-only"[..])
+            );
+            assert_eq!(save_ctx(Some(CLAP_STATE_CONTEXT_FOR_PRESET)), None);
+            assert_eq!(save_ctx(None).as_deref(), Some(&b"ordinary-live"[..]));
+
+            clap_plugin_deactivate::<ContextActivePlugin>(plugin);
+            clap_plugin_destroy::<ContextActivePlugin>(plugin);
+        }
     }
 }
 

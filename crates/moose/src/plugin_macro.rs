@@ -451,6 +451,13 @@ macro_rules! __plugin_hot_reload {
                 self.inner.save_state()
             }
 
+            fn save_state_with_context(
+                &self,
+                context: $crate::core::state::StateContext,
+            ) -> Option<Vec<u8>> {
+                self.inner.save_state_with_context(context)
+            }
+
             fn snapshot_into(&self, buf: &mut Vec<u8>) -> bool {
                 self.inner.snapshot_into(buf)
             }
@@ -460,6 +467,57 @@ macro_rules! __plugin_hot_reload {
                 data: &[u8],
             ) -> Result<(), $crate::core::state::StateLoadError> {
                 self.inner.load_state(data)
+            }
+
+            fn load_state_with_context(
+                &mut self,
+                data: &[u8],
+                context: $crate::core::state::StateContext,
+            ) -> Result<(), $crate::core::state::StateLoadError> {
+                self.inner.load_state_with_context(data, context)
+            }
+
+            fn validate_state(
+                data: &[u8],
+            ) -> Result<(), $crate::core::state::StateLoadError>
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::validate_state(data)
+            }
+
+            fn validate_state_with_context(
+                data: &[u8],
+                context: $crate::core::state::StateContext,
+            ) -> Result<(), $crate::core::state::StateLoadError>
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::validate_state_with_context(data, context)
+            }
+
+            fn decode_state_with_context(
+                data: &[u8],
+                context: $crate::core::state::StateContext,
+            ) -> Result<
+                Option<$crate::core::state::DecodedState>,
+                $crate::core::state::StateLoadError,
+            >
+            where
+                Self: Sized,
+            {
+                // Hot-reload shells bridge state across the dylib boundary as
+                // raw bytes via `load_state_with_context`, so typed off-thread
+                // decoding stays on `HotShell`'s default (`Ok(None)`).
+                <$crate::__reexport::HotShell<$params> as $crate::core::plugin::PluginRuntime>::decode_state_with_context(data, context)
+            }
+
+            fn apply_decoded_state_with_context(
+                &mut self,
+                decoded: &mut $crate::core::state::DecodedState,
+                context: $crate::core::state::StateContext,
+            ) {
+                self.inner.apply_decoded_state_with_context(decoded, context);
             }
 
             fn republish_snapshot(&mut self) {
@@ -523,6 +581,14 @@ macro_rules! __plugin_hot_reload {
                 // The shell's baked-in logic: main-thread hooks don't hot-reload.
                 <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::main_thread(
                     &self.inner.params,
+                )
+            }
+
+            fn midi2_controller_assignments(
+                direction: $crate::core::main_thread::BusDirection,
+            ) -> Vec<$crate::core::main_thread::Midi2ControllerAssignment> {
+                <$logic as $crate::__reexport::moose_plugin::PluginLogicCore<Sample>>::midi2_controller_assignments(
+                    direction,
                 )
             }
 

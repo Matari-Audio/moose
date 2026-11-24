@@ -9,11 +9,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use clap_sys::plugin::clap_plugin;
-use moose_core::editor::{EditorBridge, EditorNotificationDelivery, HostContext, PluginContext};
+use moose_core::editor::{
+    EditorBridge, EditorFeedback, EditorNotificationDelivery, HostContext, ParamModulation,
+    PluginContext,
+};
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
-use moose_core::main_thread::{HostNotice, MenuTarget};
+use moose_core::main_thread::{HostNotice, MenuTarget, ParamIndicationState};
 use moose_core::meters::MeterStore;
 use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
@@ -58,6 +61,7 @@ pub(crate) struct ClapHost<P: PluginExport> {
     pending_state: Arc<StateLoadQueue>,
     snapshot: Arc<SnapshotSlot>,
     meter_store: Arc<MeterStore>,
+    feedback: Arc<EditorFeedback>,
     transport: Arc<TransportSlot>,
     queue: Arc<HostQueue>,
     _plugin: PhantomData<fn() -> P>,
@@ -85,6 +89,7 @@ impl<P: PluginExport> ClapHost<P> {
                 pending_state: Arc::clone(&data.pending_state),
                 snapshot: Arc::clone(&data.snapshot),
                 meter_store: Arc::clone(&data.meter_store),
+                feedback: Arc::clone(&data.feedback),
                 transport: Arc::clone(&data.transport_slot),
                 queue: Arc::clone(&data.host_queue),
                 _plugin: PhantomData,
@@ -325,6 +330,22 @@ impl<P: PluginExport> HostContext for ClapHost<P> {
                 pressed,
             })
             .is_ok()
+    }
+
+    fn param_indication(&self, id: u32) -> ParamIndicationState {
+        self.feedback.indication(id)
+    }
+
+    fn param_indication_revision(&self) -> u64 {
+        self.feedback.indication_revision()
+    }
+
+    fn param_modulation(&self, id: u32) -> ParamModulation {
+        self.feedback.modulation(id, self.params.get_modulation(id))
+    }
+
+    fn set_editor_waker(&self, waker: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.feedback.set_waker(waker);
     }
 }
 

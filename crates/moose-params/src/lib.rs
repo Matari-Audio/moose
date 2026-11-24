@@ -525,6 +525,15 @@ pub trait Params: __private::Sealed + Send + Sync + 'static {
     /// Default: no-op (`#[derive(Params)]` implements it).
     fn set_modulation(&self, _id: u32, _amount: f64) {}
 
+    /// Read the current mono modulation offset of `id` in plain units (`0.0`
+    /// when unmodulated, unknown, or non-modulatable). Lock-free atomic read;
+    /// safe from audio and editor threads. Default: `0.0` (`#[derive(Params)]`
+    /// and [`DynamicParams`] override it).
+    #[must_use]
+    fn get_modulation(&self, _id: u32) -> f64 {
+        0.0
+    }
+
     /// Zero every modulation offset in this store, including nested
     /// groups. Same real-time contract as [`Self::set_modulation`];
     /// wrappers call it on reset / deactivate, where the host's modulation

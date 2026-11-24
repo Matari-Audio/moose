@@ -7,13 +7,15 @@ use crate::midi_proxy::{MIDI_PROXY_PER_CHANNEL, allocated_midi_proxy_id};
 
 use moose_core::TransportSlot;
 use moose_core::editor::{
-    EditGroup, Editor, EditorBridge, HostContext, PluginContext, RawWindowHandle,
-    clamp_logical_size, fit_logical_size,
+    EditGroup, Editor, EditorBridge, EditorFeedback, HostContext, ParamModulation, PluginContext,
+    RawWindowHandle, clamp_logical_size, fit_logical_size,
 };
 use moose_core::events::TransportInfo;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostMessage, HostQueue, HostSignal};
-use moose_core::main_thread::{HostNotice, MenuTarget};
+use moose_core::main_thread::{
+    BusDirection, HostNotice, MenuTarget, Midi2ControllerAssignment, ParamIndicationState,
+};
 use moose_core::meters::MeterStore;
 use moose_core::snapshot::SnapshotSlot;
 use moose_core::state;
@@ -33,6 +35,7 @@ pub(crate) struct Vst3Host<P: PluginExport> {
     scale: Arc<EditorScaleState>,
     params: Arc<P::Params>,
     meter_store: Arc<MeterStore>,
+    feedback: Arc<EditorFeedback>,
     snapshot: Arc<SnapshotSlot>,
     pending_state: Arc<StateLoadQueue>,
     transport: Arc<TransportSlot>,
@@ -47,6 +50,7 @@ impl<P: PluginExport> Vst3Host<P> {
             scale: Arc::clone(&inst.scale),
             params: Arc::clone(&inst.params_arc),
             meter_store: Arc::clone(&inst.meter_store),
+            feedback: Arc::clone(&inst.feedback),
             snapshot: Arc::clone(&inst.snapshot),
             pending_state: Arc::clone(&inst.pending_state),
             transport: Arc::clone(&inst.transport_slot),
@@ -79,7 +83,7 @@ impl<P: PluginExport> EditorBridge for Vst3Host<P> {
         if w == 0 || h == 0 {
             return false;
         }
-        let (pw, ph) = logical_to_phys(w, h, self.scale.host_scale());
+        let (pw, ph) = logical_to_phys(w, h, self.scale.view_rect_scale());
         com::request_resize(self.host_id, pw, ph)
     }
 
@@ -159,6 +163,22 @@ impl<P: PluginExport> HostContext for Vst3Host<P> {
                 .store(scale.to_bits(), Ordering::Relaxed);
         }
     }
+
+    fn param_indication(&self, id: u32) -> ParamIndicationState {
+        self.feedback.indication(id)
+    }
+
+    fn param_indication_revision(&self) -> u64 {
+        self.feedback.indication_revision()
+    }
+
+    fn param_modulation(&self, id: u32) -> ParamModulation {
+        self.feedback.modulation(id, self.params.get_modulation(id))
+    }
+
+    fn set_editor_waker(&self, waker: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.feedback.set_waker(waker);
+    }
 }
 
 /// Build the [`PluginContext`] handed to the instance's editor.
@@ -168,18 +188,31 @@ pub(crate) fn editor_context<P: PluginExport>(inst: &Vst3Instance<P>) -> PluginC
         .with_tasks(inst.task_spawner.clone())
 }
 
-/// Compute the physical `ViewRect` dimensions for `editor` on the current platform.
+/// Compute the `ViewRect` dimensions for `editor` on the current platform
+/// (logical points on macOS, physical pixels on Windows/Linux).
 fn editor_phys_size<P: PluginExport>(inst: &Vst3Instance<P>, editor: &dyn Editor) -> (u32, u32) {
     let (ew, eh) = editor.size();
-    #[cfg(target_os = "macos")]
-    {
-        let _ = inst;
-        (ew, eh)
+    logical_to_phys(ew, eh, inst.scale.view_rect_scale())
+}
+
+/// Apply any host content scale reported via `setContentScaleFactor` that has
+/// not yet been forwarded to `editor`. Returns `Some((pw, ph))` when the host
+/// should be notified via `com::request_resize` (caller MUST drop the `gui`
+/// guard before calling `com::request_resize`).
+fn sync_pending_host_scale<P: PluginExport>(
+    inst: &Vst3Instance<P>,
+    editor: &mut dyn Editor,
+) -> Option<(u32, u32)> {
+    let scale = inst.reported_host_scale()?;
+    if inst.scale.applied_host_scale() == Some(scale) {
+        return None;
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        logical_to_phys(ew, eh, inst.host_scale())
-    }
+    editor.set_scale_factor(scale);
+    inst.scale.set_applied_host_scale(scale);
+    let (lw, lh) = editor.size();
+    let (pw, ph) = logical_to_phys(lw, lh, inst.scale.view_rect_scale());
+    inst.store_phys_size(pw, ph);
+    (lw > 0 && lh > 0).then_some((pw, ph))
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +229,7 @@ impl<P: PluginExport> Vst3Instance<P> {
                     (self.reported_host_scale(), gui.editor.as_mut())
                 {
                     editor.set_scale_factor(scale);
+                    self.scale.set_applied_host_scale(scale);
                 }
                 if let Some(ref editor) = gui.editor {
                     let (pw, ph) = editor_phys_size(self, editor.as_ref());
@@ -220,23 +254,28 @@ impl<P: PluginExport> Vst3Instance<P> {
                 return (0, 0);
             };
             let packed = self.pending_resize.swap(0, Ordering::Relaxed);
-            if let Some(editor) = gui.editor.as_deref() {
-                self.note_window_scale(editor);
+            let mut deferred_resize = None;
+            if let Some(editor) = gui.editor.as_mut() {
+                deferred_resize = sync_pending_host_scale(self, editor.as_mut());
+                self.note_window_scale(editor.as_ref());
+                if packed != 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (pw, ph) = ((packed >> 32) as u32, packed as u32);
+                    apply_physical_resize(editor.as_mut(), pw, ph, self.scale.view_rect_scale());
+                }
             }
-            if packed != 0
-                && let Some(editor) = gui.editor.as_mut()
-            {
-                #[allow(clippy::cast_possible_truncation)]
-                let (pw, ph) = ((packed >> 32) as u32, packed as u32);
-                apply_physical_resize(editor.as_mut(), pw, ph, self.host_scale());
-            }
-            if let Some(ref editor) = gui.editor {
+            let out = if let Some(ref editor) = gui.editor {
                 let (pw, ph) = editor_phys_size(self, editor.as_ref());
                 self.store_phys_size(pw, ph);
                 (pw, ph)
             } else {
                 (0, 0)
+            };
+            drop(gui);
+            if let Some((pw, ph)) = deferred_resize {
+                let _ = com::request_resize(self.host_id(), pw, ph);
             }
+            out
         })
     }
 
@@ -266,23 +305,27 @@ impl<P: PluginExport> Vst3Instance<P> {
                 return;
             }
             let scale = scale.clamp(0.25, 8.0);
-            let changed = self.reported_host_scale() != Some(scale);
             self.set_host_scale(scale);
-            let Some(mut gui) = self.gui.try_enter() else {
-                return;
-            };
-            let Some(editor) = gui.editor.as_mut() else {
-                return;
-            };
-            editor.set_scale_factor(scale);
-            let (lw, lh) = editor.size();
-            let (pw, ph) = logical_to_phys(lw, lh, scale);
-            self.store_phys_size(pw, ph);
-            drop(gui);
-            if changed && lw > 0 && lh > 0 {
-                let _ = com::request_resize(self.host_id(), pw, ph);
-            }
+            self.apply_pending_content_scale();
         });
+    }
+
+    pub(crate) fn apply_pending_content_scale(&self) {
+        if self.reported_host_scale() == self.scale.applied_host_scale() {
+            return;
+        }
+        let Some(mut gui) = self.gui.try_enter() else {
+            self.host_queue.signal(HostSignal::EDITOR_WAKE);
+            return;
+        };
+        let Some(editor) = gui.editor.as_mut() else {
+            return;
+        };
+        let resize = sync_pending_host_scale(self, editor.as_mut());
+        drop(gui);
+        if let Some((pw, ph)) = resize {
+            let _ = com::request_resize(self.host_id(), pw, ph);
+        }
     }
 
     pub(crate) fn gui_can_resize_impl(&self) -> bool {
@@ -301,22 +344,28 @@ impl<P: PluginExport> Vst3Instance<P> {
             "gui_check_size_constraint",
             (w, h),
             || {
-                let Some(gui) = self.gui.try_enter() else {
+                let Some(mut gui) = self.gui.try_enter() else {
                     return (w, h);
                 };
-                let Some(ref editor) = gui.editor else {
+                let Some(editor) = gui.editor.as_mut() else {
                     return (w, h);
                 };
+                let deferred_resize = sync_pending_host_scale(self, editor.as_mut());
                 self.note_window_scale(editor.as_ref());
-                let host_scale = self.host_scale();
-                if editor.can_resize() {
-                    let (lw, lh) = phys_to_logical(w, h, host_scale);
+                let view_scale = self.scale.view_rect_scale();
+                let out = if editor.can_resize() {
+                    let (lw, lh) = phys_to_logical(w, h, view_scale);
                     let (fw, fh) = fit_logical_size(lw, lh, editor.as_ref());
-                    logical_to_phys(fw, fh, host_scale)
+                    logical_to_phys(fw, fh, view_scale)
                 } else {
                     let (cw, ch) = editor.size();
-                    logical_to_phys(cw, ch, host_scale)
+                    logical_to_phys(cw, ch, view_scale)
+                };
+                drop(gui);
+                if let Some((pw, ph)) = deferred_resize {
+                    let _ = com::request_resize(self.host_id(), pw, ph);
                 }
+                out
             },
         )
     }
@@ -330,8 +379,11 @@ impl<P: PluginExport> Vst3Instance<P> {
                 Some(mut gui) => {
                     self.pending_resize.store(0, Ordering::Relaxed);
                     if let Some(editor) = gui.editor.as_mut() {
+                        // The host's explicit size supersedes any resize the
+                        // pending scale would request, so none is sent.
+                        let _ = sync_pending_host_scale(self, editor.as_mut());
                         self.note_window_scale(editor.as_ref());
-                        apply_physical_resize(editor.as_mut(), w, h, self.host_scale());
+                        apply_physical_resize(editor.as_mut(), w, h, self.scale.view_rect_scale());
                         let (pw, ph) = editor_phys_size(self, editor.as_ref());
                         self.store_phys_size(pw, ph);
                     }
@@ -368,6 +420,32 @@ impl<P: PluginExport> Vst3Instance<P> {
         None
     }
 
+    pub(crate) fn midi2_controller_assignments_impl(
+        &self,
+        direction: BusDirection,
+    ) -> Vec<Midi2ControllerAssignment> {
+        run_extern_callback_with::<P, Vec<Midi2ControllerAssignment>>(
+            "vst3",
+            "midi2_controller_assignments",
+            Vec::new(),
+            || {
+                let mut assignments = P::midi2_controller_assignments(direction);
+                // SAFETY: `IMidiMapping2` is `[UI-thread & Connected]`.
+                let main = unsafe { moose_core::thread::MainThread::assume() };
+                if let Some(hooks) = self.main_thread.try_borrow_mut(&main) {
+                    assignments.extend(hooks.midi2_controller_assignments(&main, direction));
+                }
+                assignments.retain(|a| {
+                    a.bus_index >= 0
+                        && a.channel < 16
+                        && a.controller.bank <= 127
+                        && a.controller.index <= 127
+                });
+                assignments
+            },
+        )
+    }
+
     pub(crate) fn gui_open_impl(&self, parent: *mut std::ffi::c_void) -> bool {
         #[cfg(target_os = "macos")]
         let handle = RawWindowHandle::AppKit(parent);
@@ -384,13 +462,17 @@ impl<P: PluginExport> Vst3Instance<P> {
             if let Some(ref mut editor) = gui.editor {
                 if let Some(scale) = self.reported_host_scale() {
                     editor.set_scale_factor(scale);
+                    self.scale.set_applied_host_scale(scale);
                 }
                 let (pw, ph) = editor_phys_size(self, editor.as_ref());
                 self.store_phys_size(pw, ph);
                 let context = editor_context(self);
                 editor.open(handle, context);
-                if let Some(scale) = self.reported_host_scale() {
+                if let Some(scale) = self.reported_host_scale()
+                    && self.scale.applied_host_scale() == Some(scale)
+                {
                     editor.set_scale_factor(scale);
+                    self.scale.set_applied_host_scale(scale);
                 }
                 self.note_window_scale(editor.as_ref());
                 let (pw, ph) = editor_phys_size(self, editor.as_ref());
@@ -632,6 +714,38 @@ mod tests {
         assert_eq!(inst.pending_resize.load(Ordering::Relaxed), 0);
 
         assert_eq!(inst.gui_get_size_impl(), (640, 480));
+    }
+
+    #[test]
+    fn scale_reported_while_gui_held_is_applied_after_release() {
+        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let scales = Arc::new(Mutex::new(Vec::new()));
+        inst.gui.enter().editor = Some(Box::new(RecordingEditor {
+            size: (400, 300),
+            open: true,
+            scales: Arc::clone(&scales),
+        }));
+
+        let held = inst.gui.enter();
+        inst.gui_set_content_scale_impl(2.0);
+        assert!(scales.lock().unwrap().is_empty());
+        drop(held);
+
+        inst.drain_host_queue_impl();
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(*scales.lock().unwrap(), vec![2.0]);
+        let size = inst.gui_get_size_impl();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(scales.lock().unwrap().is_empty());
+            assert_eq!(size, (400, 300));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(*scales.lock().unwrap(), vec![2.0]);
+            assert_eq!(inst.scale.applied_host_scale(), Some(2.0));
+            assert_eq!(size, (800, 600));
+        }
     }
 
     #[test]

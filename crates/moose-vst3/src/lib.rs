@@ -636,6 +636,183 @@ mod state_tests {
             );
         }
     }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn context_state_saves_preserve_state_context_while_audio_processing_is_active() {
+        use moose_core::buffer::AudioBuffer;
+        use moose_core::config::AudioConfig;
+        use moose_core::events::EventList;
+        use moose_core::info::PluginInfo;
+        use moose_core::meters::MeterStore;
+        use moose_core::plugin::PluginRuntime;
+        use moose_core::process::{ProcessContext, ProcessStatus};
+        use moose_core::snapshot::SnapshotSlot;
+        use moose_core::state::StateContext;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        struct ContextActivePlugin {
+            params: Arc<moose_params::DynamicParams<0>>,
+            meters: Arc<MeterStore>,
+            snapshot: Arc<SnapshotSlot>,
+        }
+
+        impl PluginRuntime for ContextActivePlugin {
+            type Sample = f32;
+            fn info() -> PluginInfo {
+                TestPlugin::info()
+            }
+            fn reset(&mut self, _: &AudioConfig) {}
+            fn process(
+                &mut self,
+                _: &mut AudioBuffer<f32>,
+                _: &EventList,
+                _: &mut ProcessContext,
+            ) -> ProcessStatus {
+                ProcessStatus::Normal
+            }
+            fn save_state_with_context(&self, context: StateContext) -> Option<Vec<u8>> {
+                match context {
+                    StateContext::Project => Some(b"project-only".to_vec()),
+                    StateContext::Preset => Some(Vec::new()),
+                    _ => None,
+                }
+            }
+        }
+
+        impl PluginExport for ContextActivePlugin {
+            type Params = moose_params::DynamicParams<0>;
+            fn create() -> Self {
+                let snapshot = SnapshotSlot::new();
+                let publisher = moose_core::snapshot::SnapshotPublisher::new(&snapshot);
+                publisher.publish(b"ordinary-live".to_vec());
+                publisher.publish_for_context(StateContext::Project, b"project-only".to_vec());
+                publisher.publish_for_context(StateContext::Preset, Vec::new());
+                Self {
+                    params: Arc::new(moose_params::DynamicParams::new()),
+                    meters: MeterStore::new(),
+                    snapshot,
+                }
+            }
+            fn params(&self) -> &Self::Params {
+                &self.params
+            }
+            fn params_arc(&self) -> Arc<Self::Params> {
+                Arc::clone(&self.params)
+            }
+            fn meter_store(&self) -> Arc<MeterStore> {
+                Arc::clone(&self.meters)
+            }
+            fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+                Arc::clone(&self.snapshot)
+            }
+        }
+
+        struct WorkerGuard {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for WorkerGuard {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Release);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+
+        let inst = Arc::new(Vst3Instance::<ContextActivePlugin>::create().expect("create"));
+        let hash = inst.plugin_id_hash;
+        assert!(inst.prepare_impl(48_000.0, 64, 0));
+        inst.set_active_impl(true);
+        inst.set_processing_impl(true, 48_000.0, 64, 0);
+
+        let (tx_started, rx_started) = std::sync::mpsc::sync_channel::<()>(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let audio = {
+            let inst = Arc::clone(&inst);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let in_l = [0.25f32; 64];
+                let in_r = [0.25f32; 64];
+                let mut out_l = [0.0f32; 64];
+                let mut out_r = [0.0f32; 64];
+                let in_ptrs = [
+                    in_l.as_ptr().cast::<std::ffi::c_void>(),
+                    in_r.as_ptr().cast::<std::ffi::c_void>(),
+                ];
+                let mut out_ptrs = [
+                    out_l.as_mut_ptr().cast::<std::ffi::c_void>(),
+                    out_r.as_mut_ptr().cast::<std::ffi::c_void>(),
+                ];
+                let bus_channels = [2u32];
+                let mut notified = false;
+                while !stop.load(Ordering::Acquire) {
+                    inst.begin_input_events_impl(64);
+                    let mut args = crate::ProcessArgs {
+                        inputs: &in_ptrs,
+                        outputs: &mut out_ptrs,
+                        in_bus_channels: &bus_channels,
+                        in_bus_active: 1,
+                        out_bus_channels: &bus_channels,
+                        out_bus_active: 1,
+                        num_frames: 64,
+                        transport: None,
+                        process_mode: 0,
+                    };
+                    // SAFETY: `in_ptrs` and `out_ptrs` point to valid 64-sample `f32` buffers.
+                    let _ = unsafe { inst.process_block::<f32>(&mut args) };
+                    if !notified {
+                        let _ = tx_started.try_send(());
+                        notified = true;
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+            })
+        };
+        let mut worker = WorkerGuard {
+            stop,
+            handle: Some(audio),
+        };
+
+        rx_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("audio worker failed to start or exited before first block");
+
+        let save_extra = |ctx: StateContext| -> Option<Vec<u8>> {
+            let mut blob = Vec::new();
+            assert!(inst.state_save_stream_with_context_impl(ctx, &mut |chunk| {
+                blob.extend_from_slice(chunk);
+                i64::try_from(chunk.len()).unwrap_or(-1)
+            }));
+            state::deserialize_state(&blob, hash)
+                .expect("valid envelope")
+                .extra
+        };
+
+        let project_active = save_extra(StateContext::Project);
+        let preset_active = save_extra(StateContext::Preset);
+        let unknown_active = save_extra(StateContext::Unknown);
+
+        worker.stop.store(true, Ordering::Release);
+        worker.handle.take().unwrap().join().unwrap();
+
+        assert_eq!(project_active.as_deref(), Some(&b"project-only"[..]));
+        assert_eq!(preset_active, None);
+        assert_eq!(unknown_active.as_deref(), Some(&b"ordinary-live"[..]));
+
+        inst.set_processing_impl(false, 48_000.0, 64, 0);
+        assert_eq!(
+            save_extra(StateContext::Project).as_deref(),
+            Some(&b"project-only"[..])
+        );
+        assert_eq!(save_extra(StateContext::Preset), None);
+        assert_eq!(
+            save_extra(StateContext::Unknown).as_deref(),
+            Some(&b"ordinary-live"[..])
+        );
+    }
 }
 
 #[cfg(test)]

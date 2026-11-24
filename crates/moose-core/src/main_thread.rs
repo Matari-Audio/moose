@@ -105,6 +105,24 @@ pub struct Midi2Controller {
     pub index: u8,
 }
 
+/// One MIDI 2.0 controller-to-parameter assignment advertised to a host
+/// (VST3 SDK 3.8 `IMidiMapping2::getMidi2ControllerAssignments`).
+///
+/// `bus_index` must be non-negative, `channel` must be `0..=15`, and
+/// `controller.bank` / `controller.index` must be 7-bit (`0..=127`); entries
+/// outside those ranges are ignored by the wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Midi2ControllerAssignment {
+    /// Target parameter ID.
+    pub param_id: u32,
+    /// Event bus index (`0` for the primary MIDI bus).
+    pub bus_index: i32,
+    /// MIDI channel (`0..=15`).
+    pub channel: u8,
+    /// MIDI 2.0 Registered (RPN) or Assignable (NRPN) controller.
+    pub controller: Midi2Controller,
+}
+
 /// The controller a host reports during MIDI learn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -206,6 +224,44 @@ pub enum ParamIndication {
         state: AutomationState,
         color: Option<HostColor>,
     },
+}
+
+/// Combined host indication snapshot for one parameter: its current automation
+/// state/colour plus any mapped host controller (`clap.param-indication/4`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamIndicationState {
+    /// Current automation lane state (`None`, `Present`, `Playing`, `Recording`, `Overriding`).
+    pub automation: AutomationState,
+    /// Host-supplied automation lane colour, if any.
+    pub automation_color: Option<HostColor>,
+    /// Active host controller/macro mapping, if any.
+    pub mapping: Option<HostMapping>,
+}
+
+impl ParamIndicationState {
+    /// Apply one incremental [`ParamIndication`] update from the host.
+    /// Returns `true` when the state actually changed.
+    pub fn apply(&mut self, indication: &ParamIndication) -> bool {
+        match indication {
+            ParamIndication::Mapping(mapping) => {
+                if &self.mapping == mapping {
+                    false
+                } else {
+                    self.mapping.clone_from(mapping);
+                    true
+                }
+            }
+            ParamIndication::Automation { state, color } => {
+                if self.automation == *state && self.automation_color == *color {
+                    false
+                } else {
+                    self.automation = *state;
+                    self.automation_color = *color;
+                    true
+                }
+            }
+        }
+    }
 }
 
 /// What a context menu is for.
@@ -347,6 +403,16 @@ pub trait MainThreadHooks: Send + 'static {
         _source: LearnSource,
     ) -> bool {
         false
+    }
+
+    /// MIDI 2.0 controller-to-parameter assignments for `direction` (VST3 SDK
+    /// 3.8 `IMidiMapping2`). Default: empty (no dynamic MIDI 2.0 assignments).
+    fn midi2_controller_assignments(
+        &self,
+        _cx: &MainThread,
+        _direction: BusDirection,
+    ) -> Vec<Midi2ControllerAssignment> {
+        Vec::new()
     }
 
     /// The host's mapping or automation indication for parameter `id`.

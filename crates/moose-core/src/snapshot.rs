@@ -19,11 +19,11 @@
 //! there is no priority inversion on the audio side.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::state::{AudioHeartbeat, WAIT_POLL_INTERVAL};
+use crate::state::{AudioHeartbeat, StateContext, WAIT_POLL_INTERVAL};
 
 /// Capacity the inline publish buffer is pre-warmed to by
 /// [`SnapshotSlot::new`], off the audio thread, so the first per-block
@@ -34,6 +34,8 @@ use crate::state::{AudioHeartbeat, WAIT_POLL_INTERVAL};
 /// the off-thread lane ([`SnapshotPublisher`]) instead, which never
 /// touches this buffer.
 pub const SNAPSHOT_PREALLOC: usize = 256;
+
+type TaggedSnapshot = Option<(u64, Arc<Vec<u8>>)>;
 
 /// Shared handle to the published custom-state bytes. Held by the shell
 /// (producer, audio thread) and the format wrapper (consumer, host /
@@ -49,7 +51,14 @@ pub struct SnapshotSlot {
     /// when its generation matches the current `load_gen`, so a state load
     /// never gets overridden by an older background snapshot. The audio thread
     /// never touches this lock.
-    swapped: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+    swapped: Mutex<TaggedSnapshot>,
+    /// Off-thread per-context lane: pre-serialized payloads published for
+    /// specific [`StateContext`] values (indexed by `StateContext::to_u8()`),
+    /// tagged with `load_gen`. Used during active audio saves so contextual
+    /// saves (`Project`, `Preset`, etc.) run strictly on the host/background
+    /// thread with zero audio-thread locks or allocations. Never touched on
+    /// the audio thread.
+    contextual: Mutex<[TaggedSnapshot; StateContext::COUNT]>,
     /// Accepted custom state bytes retained for host-owned pre-activation
     /// decoded loads whose live serializer returns empty (e.g. an unactivated
     /// `Lifecycle` processor). Tagged with `load_gen` so any later state load
@@ -97,6 +106,7 @@ impl SnapshotSlot {
             slot_id: NEXT_SLOT.fetch_add(1, Ordering::Relaxed),
             bytes: Mutex::new((None, Vec::with_capacity(cap))),
             swapped: Mutex::new(None),
+            contextual: Mutex::new([const { None }; StateContext::COUNT]),
             pending_extra: Mutex::new(None),
             load_gen: AtomicU64::new(0),
             supported: AtomicBool::new(false),
@@ -113,6 +123,11 @@ impl SnapshotSlot {
         // construction instead.
         drop(slot.bytes.lock().unwrap_or_else(PoisonError::into_inner));
         drop(slot.swapped.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(
+            slot.contextual
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         drop(
             slot.pending_extra
                 .lock()
@@ -135,17 +150,18 @@ impl SnapshotSlot {
     /// publish was skipped, so the caller should not advance its
     /// last-published generation - the block must be retried.
     pub fn publish(&self, write: impl FnOnce(&mut Vec<u8>) -> bool) -> bool {
-        if let Ok(mut guard) = self.bytes.try_lock() {
-            guard.1.clear();
-            guard.0 = None;
-            if write(&mut guard.1) {
-                guard.0 = Some(self.load_gen.load(Ordering::Acquire));
-                self.supported.store(true, Ordering::Release);
-            }
-            true
-        } else {
-            false
+        let mut guard = match self.bytes.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        guard.1.clear();
+        guard.0 = None;
+        if write(&mut guard.1) {
+            guard.0 = Some(self.load_gen.load(Ordering::Acquire));
+            self.supported.store(true, Ordering::Release);
         }
+        true
     }
 
     /// Host thread: replace the inline snapshot, waiting for the lock.
@@ -260,6 +276,14 @@ impl SnapshotSlot {
         }
     }
 
+    /// Host thread: bounded wait timeout scaled to the negotiated audio block
+    /// interval (at least `floor`) so large blocks (e.g. 8,192 frames at
+    /// 44.1 kHz) do not time out before one block completes.
+    #[must_use]
+    pub(crate) fn handshake_timeout(&self, floor: Duration) -> Duration {
+        self.heartbeat.handshake_timeout(floor)
+    }
+
     /// Host thread: wait up to `timeout` for the audio thread to serve
     /// `ticket`. `false` means no block ran in time (or audio stopped); the
     /// caller falls back to the last published snapshot.
@@ -343,6 +367,63 @@ impl SnapshotSlot {
         *guard = Some((generation.0, Arc::new(bytes)));
         self.supported.store(true, Ordering::Release);
         true
+    }
+
+    /// Off-thread contextual lane: publish `bytes` for a specific
+    /// [`StateContext`] (never called on the audio thread). Passing
+    /// `StateContext::Unknown` delegates to [`Self::store_arc`]. Publishing
+    /// `Vec::new()` explicitly suppresses custom state for `context` (for
+    /// example `StateContext::Preset`).
+    pub fn store_context_arc(&self, context: StateContext, bytes: Vec<u8>) {
+        let generation = self.generation();
+        let _ = self.store_context_arc_for_generation(context, bytes, generation);
+    }
+
+    /// Off-thread contextual lane: publish `bytes` for `context` bound to
+    /// `generation`. Rejected if a newer state load superseded `generation`.
+    pub fn store_context_arc_for_generation(
+        &self,
+        context: StateContext,
+        bytes: Vec<u8>,
+        generation: SnapshotGeneration,
+    ) -> bool {
+        if context == StateContext::Unknown {
+            return self.store_arc_for_generation(bytes, generation);
+        }
+        let idx = usize::from(context.to_u8());
+        let mut guard = self
+            .contextual
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current = self.load_gen.load(Ordering::Acquire);
+        if generation.1 != self.slot_id
+            || generation.0 != current
+            || guard[idx]
+                .as_ref()
+                .is_some_and(|(stored_gen, _)| *stored_gen > generation.0)
+        {
+            return false;
+        }
+        guard[idx] = Some((generation.0, Arc::new(bytes)));
+        self.supported.store(true, Ordering::Release);
+        true
+    }
+
+    /// Host / GUI thread: read the off-thread contextual payload published for
+    /// `context` at the current state-load generation, if any. Never touches
+    /// the audio thread.
+    #[must_use]
+    pub fn read_context_offthread(&self, context: StateContext) -> Option<Vec<u8>> {
+        if context == StateContext::Unknown {
+            return None;
+        }
+        let idx = usize::from(context.to_u8());
+        self.contextual
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[idx]
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.load_gen.load(Ordering::Acquire))
+            .map(|(_, arc)| (**arc).clone())
     }
 
     /// Whether the plugin has ever published a snapshot on either lane.
@@ -443,6 +524,13 @@ impl SnapshotPublisher {
 
     /// Publish a freshly serialized snapshot. Call from a background
     /// thread (never the audio thread) after your custom state changes.
+    ///
+    /// **Concurrency with host state loads:** `publish` tags `bytes` with the
+    /// current `load_gen` at publish time. Producers reading mutable state that
+    /// can race with concurrent host state loads **must** capture
+    /// [`Self::generation`] *before* reading the source state and call
+    /// [`Self::publish_for_generation`] instead so an intervening load is never
+    /// overwritten by a stale background snapshot.
     pub fn publish(&self, bytes: Vec<u8>) {
         self.slot.store_arc(bytes);
     }
@@ -455,6 +543,28 @@ impl SnapshotPublisher {
     #[must_use]
     pub fn publish_for_generation(&self, generation: SnapshotGeneration, bytes: Vec<u8>) -> bool {
         self.slot.store_arc_for_generation(bytes, generation)
+    }
+
+    /// Publish a context-specific snapshot (e.g. `StateContext::Project` vs.
+    /// `StateContext::Preset`) off the audio thread so host saves while audio
+    /// is active return exact context-specific bytes with zero audio-thread
+    /// locks or allocations. Passing `Vec::new()` intentionally suppresses
+    /// custom state for `context`.
+    pub fn publish_for_context(&self, context: StateContext, bytes: Vec<u8>) {
+        self.slot.store_context_arc(context, bytes);
+    }
+
+    /// Generation-checked variant of [`Self::publish_for_context`]. Returns
+    /// `false` if a newer host state load superseded `generation`.
+    #[must_use]
+    pub fn publish_for_context_for_generation(
+        &self,
+        context: StateContext,
+        generation: SnapshotGeneration,
+        bytes: Vec<u8>,
+    ) -> bool {
+        self.slot
+            .store_context_arc_for_generation(context, bytes, generation)
     }
 }
 
@@ -673,5 +783,73 @@ mod tests {
         assert!(!publisher.publish_for_generation(gen1, b"STALE_B".to_vec()));
         assert_eq!(slot.read(), Some(b"INLINE_C".to_vec()));
         assert!(slot.read_offthread().is_none());
+    }
+
+    #[test]
+    fn contextual_offthread_lane_respects_load_gen_and_scales_timeout_for_large_blocks() {
+        use crate::state::StateContext;
+        use std::time::Duration;
+
+        let slot = SnapshotSlot::new();
+        slot.set_block_interval(44_100.0, 8_192);
+        let timeout = slot.handshake_timeout(Duration::from_millis(50));
+        assert!(
+            timeout >= Duration::from_millis(200),
+            "8192 frames @ 44.1 kHz needs > 186 ms + margin, got {timeout:?}"
+        );
+
+        let publisher = SnapshotPublisher::new(&slot);
+        let gen0 = publisher.generation();
+        publisher.publish_for_context(StateContext::Project, b"state-a".to_vec());
+        publisher.publish_for_context(StateContext::Preset, Vec::new());
+        assert_eq!(
+            slot.read_context_offthread(StateContext::Project),
+            Some(b"state-a".to_vec())
+        );
+        assert_eq!(
+            slot.read_context_offthread(StateContext::Preset),
+            Some(Vec::new())
+        );
+        assert_eq!(slot.read_context_offthread(StateContext::Duplicate), None);
+
+        // Simulating Project B landing invalidates pre-load contextual snapshots.
+        slot.mark_state_loaded();
+        assert_eq!(slot.read_context_offthread(StateContext::Project), None);
+        assert_eq!(slot.read_context_offthread(StateContext::Preset), None);
+        assert!(!publisher.publish_for_context_for_generation(
+            StateContext::Project,
+            gen0,
+            b"stale".to_vec()
+        ));
+
+        let gen1 = publisher.generation();
+        assert!(publisher.publish_for_context_for_generation(
+            StateContext::Project,
+            gen1,
+            b"state-b".to_vec()
+        ));
+        assert_eq!(
+            slot.read_context_offthread(StateContext::Project),
+            Some(b"state-b".to_vec())
+        );
+    }
+
+    #[test]
+    fn publish_recovers_after_mutex_poison() {
+        let slot = SnapshotSlot::new();
+        let poisoner = std::sync::Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.bytes.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(slot.bytes.is_poisoned());
+
+        let landed = slot.publish(|buf| {
+            buf.extend_from_slice(b"recovered");
+            true
+        });
+        assert!(landed, "publish must recover from a poisoned inline mutex");
+        assert_eq!(slot.read(), Some(b"recovered".to_vec()));
     }
 }
