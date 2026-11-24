@@ -11,11 +11,8 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 moose-core = { workspace = true }
-# `moose-gui-types` carries the lightweight layout / interaction /
-# render / theme types the prelude exports. `moose-plugin` carries
-# the `Plugin` traits. Neither pulls a renderer — enable `moose`'s
-# `mui` feature for `moose::mui::MuiEditor`.
-moose-gui-types = { workspace = true }
+# `moose-plugin` carries the `Plugin` trait. Neither pulls a renderer —
+# enable `moose`'s `mui` feature for `moose::mui::MuiEditor`.
 moose-plugin = { workspace = true }
 moose-params = { workspace = true }
 moose-loader = { workspace = true }

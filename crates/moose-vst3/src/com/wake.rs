@@ -488,7 +488,12 @@ pub(super) mod windows {
             })
         }
 
-        pub fn signal(&self) {
+        /// Post a coalesced `WM_MOOSE_WAKE` to the UI thread.
+        ///
+        /// Returns `true` when `PostMessageW` succeeded or a wake is already in
+        /// flight, and `false` if `PostMessageW` failed (e.g. a momentarily
+        /// full thread message queue).
+        pub fn signal(&self) -> bool {
             loop {
                 match self.state.load(Ordering::Acquire) {
                     WAKE_IDLE => {
@@ -508,14 +513,14 @@ pub(super) mod windows {
                         if posted {
                             // The UI may already have cleared this attempt and started
                             // another. Only the UI may clear a successful post.
-                            return;
+                            return true;
                         }
                         // `PostMessageW` failed (queue full / closing): restore
                         // `WAKE_IDLE` so future signals can retry instead of
                         // wedging on `pending=true`.
                         let prev = self.state.swap(WAKE_IDLE, Ordering::AcqRel);
                         if prev != WAKE_RETRY {
-                            return;
+                            return false;
                         }
                     }
                     WAKE_POSTING => {
@@ -531,9 +536,9 @@ pub(super) mod windows {
                         {
                             continue;
                         }
-                        return;
+                        return true;
                     }
-                    _ => return,
+                    _ => return true,
                 }
             }
         }

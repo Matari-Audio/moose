@@ -2627,6 +2627,167 @@ fn allocation_counter_detects_heap_operations() {
     assert!(ops >= 2);
 }
 
+/// Opt-in off-thread decode + RT swap (`decode_state` / `apply_decoded_state`)
+/// performs ZERO heap allocations and ZERO deallocations on the audio thread
+/// when swapping a heap-owning state table during live processing.
+#[test]
+fn zero_audio_thread_allocations_during_off_thread_decoded_state_swap() {
+    use std::sync::Arc;
+
+    use moose_core::buffer::AudioBuffer;
+    use moose_core::config::AudioConfig;
+    use moose_core::events::EventList;
+    use moose_core::export::PluginExport;
+    use moose_core::info::PluginInfo;
+    use moose_core::meters::MeterStore;
+    use moose_core::plugin::PluginRuntime;
+    use moose_core::process::{ProcessContext, ProcessStatus};
+    use moose_core::snapshot::SnapshotSlot;
+    use moose_core::state::{
+        DecodedState, DeserializedState, ParamsBackup, StateLoadError, StateLoadQueue,
+    };
+    use moose_core::wrapper::{PluginCell, apply_or_queue_state, apply_queued_state};
+
+    struct HeapTable {
+        version: u32,
+        samples: Vec<f32>,
+    }
+
+    struct RtSwapPlugin {
+        params: Arc<moose_params::DynamicParams<1>>,
+        meters: Arc<MeterStore>,
+        snapshot: Arc<SnapshotSlot>,
+        active: HeapTable,
+    }
+
+    impl PluginRuntime for RtSwapPlugin {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            fixture::Contract::info()
+        }
+        fn reset(&mut self, _config: &AudioConfig) {}
+        fn process(
+            &mut self,
+            _buffer: &mut AudioBuffer<f32>,
+            _events: &EventList,
+            _context: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+        fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+            let version = u32::from_le_bytes(
+                data.try_into()
+                    .map_err(|_| StateLoadError::Malformed("expected u32"))?,
+            );
+            // Heavy off-thread allocation: builds a fresh 4096-sample table on the host thread.
+            Ok(Some(DecodedState::new(HeapTable {
+                version,
+                samples: vec![version as f32; 4096],
+            })))
+        }
+        fn apply_decoded_state(&mut self, decoded: &mut DecodedState) {
+            assert!(decoded.swap_with(&mut self.active));
+        }
+    }
+
+    impl PluginExport for RtSwapPlugin {
+        type Params = moose_params::DynamicParams<1>;
+        fn create() -> Self {
+            Self {
+                params: Arc::new(moose_params::DynamicParams::new()),
+                meters: MeterStore::new(),
+                snapshot: SnapshotSlot::new(),
+                active: HeapTable {
+                    version: 1,
+                    samples: vec![1.0; 4096],
+                },
+            }
+        }
+        fn params(&self) -> &moose_params::DynamicParams<1> {
+            &self.params
+        }
+        fn params_arc(&self) -> Arc<moose_params::DynamicParams<1>> {
+            Arc::clone(&self.params)
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            Arc::clone(&self.meters)
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            Arc::clone(&self.snapshot)
+        }
+    }
+
+    let plugin = PluginCell::new(RtSwapPlugin::create());
+    let params = plugin.enter().params_arc();
+    let slot = plugin.enter().snapshot_slot();
+    let queue = StateLoadQueue::new(1);
+    let backup = ParamsBackup::capture(&*params);
+
+    // Host thread decodes & queues version 2 (allocates off audio thread, 0 ms wait).
+    apply_or_queue_state(
+        &plugin,
+        &*params,
+        &slot,
+        &queue,
+        DeserializedState {
+            extra: Some(2u32.to_le_bytes().to_vec()),
+            ..Default::default()
+        },
+        &backup,
+        false,
+    )
+    .expect("off-thread decode + queue succeeds");
+
+    // Audio thread swaps live state inside RtSection with ZERO heap allocations OR deallocations!
+    let (swapped_version, ops) = heap_ops(|| {
+        let mut guard = plugin.try_enter().expect("audio owns plugin");
+        queue.record_audio_block();
+        let res = apply_queued_state(&mut *guard, &queue);
+        assert!(matches!(res, Some(Ok(()))));
+        (guard.active.version, guard.active.samples[0])
+    });
+    assert_eq!(swapped_version, (2, 2.0));
+    assert_eq!(
+        ops, 0,
+        "live off-thread-decoded state swap must perform ZERO audio-thread allocations/deallocations"
+    );
+
+    // Reclaiming on the host thread actually frees the retired old HeapTable (non-vacuous).
+    let ((), host_free_ops) = heap_ops(|| queue.reclaim_retired());
+    assert!(
+        host_free_ops >= 1,
+        "retired old HeapTable must be freed on the host thread"
+    );
+}
+
+fn sleeping_host_load_and_save_do_not_stall_50ms<H: Harness>() {
+    let mut h = H::create();
+    h.start(48_000.0);
+    // Deliberately do NOT pump any audio blocks (models an active plugin on a
+    // sleeping/idle track in Logic, Reaper, or Live).
+    let saved_before = h.save();
+    assert!(!saved_before.is_empty(), "{}: initial save", H::NAME);
+
+    let start = std::time::Instant::now();
+    assert!(
+        h.load(&saved_before),
+        "{}: load while active without audio blocks succeeds",
+        H::NAME
+    );
+    let saved_after = h.save();
+    let elapsed = start.elapsed();
+
+    assert!(!saved_after.is_empty(), "{}: save after load", H::NAME);
+    assert!(
+        elapsed < std::time::Duration::from_millis(35),
+        "{}: sleeping-host load+save stalled for {:?} (expected < 35 ms)",
+        H::NAME,
+        elapsed
+    );
+    h.stop();
+}
+for_each_format!(sleeping_host_load_and_save_do_not_stall_50ms);
+
 fn render_mode_reaches_process_context<H: Harness>() {
     let mut h = H::create();
     h.set_offline(true);

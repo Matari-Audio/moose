@@ -1,8 +1,8 @@
 //! Driver-free regressions against the COM objects, with fake host
-//! objects and a fake callback table per test (ported from the C++ shim
+//! objects and a fake `Vst3Backend` per test (ported from the C++ shim
 //! fixtures).
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, c_char, c_void};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::SeqCst};
@@ -14,306 +14,74 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 use super::component::{Component, Host};
 use super::{Registration, build_units};
-use crate::ffi::{
-    ProcessFn, Vst3Callbacks, Vst3LearnSource, Vst3NativeEvent, Vst3ParamDescriptor,
-    Vst3PluginDescriptor, Vst3TrackInfo, Vst3Transport,
+use crate::backend::{
+    ParamDescriptor, ParamPresentation, PluginDescriptor, ProcessArgs, Vst3Backend,
+    Vst3FactoryBackend, Vst3LearnSource, Vst3NativeEvent, Vst3TrackInfo, WakerFn,
 };
 
 // ---------------------------------------------------------------------------
-// Fake callback table
+// Fake backends
 // ---------------------------------------------------------------------------
 
-/// A distinct, never-freed ctx per instance, so the instance registry never
-/// confuses two of them (tests run in parallel).
-unsafe extern "C" fn fresh_ctx() -> *mut c_void {
-    Box::into_raw(Box::new(0u8)).cast()
-}
-unsafe extern "C" fn nop_ctx(_: *mut c_void) {}
-unsafe extern "C" fn nop_lifecycle(_: *mut c_void, _: f64, _: u32, _: i32) {}
-unsafe extern "C" fn ok_prepare(_: *mut c_void, _: f64, _: u32, _: i32) -> i32 {
-    1
-}
-unsafe extern "C" fn ok_process(
-    _: *mut c_void,
-    _: *const *const c_void,
-    _: *mut *mut c_void,
-    _: u32,
-    _: u32,
-    _: *const u32,
-    _: u32,
-    _: u32,
-    _: *const u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: *const Vst3Transport,
-    _: i32,
-) -> u32 {
-    1
-}
-unsafe extern "C" fn push_param(_: *mut c_void, _: u32, _: i32, _: f64, _: i32, _: f64) -> i32 {
-    1
-}
-unsafe extern "C" fn zero_u32(_: *mut c_void) -> u32 {
-    0
-}
-unsafe extern "C" fn zero_i32(_: *mut c_void) -> i32 {
-    0
-}
-unsafe extern "C" fn param_value(_: *mut c_void, _: u32) -> f64 {
-    0.0
-}
-unsafe extern "C" fn param_set(_: *mut c_void, _: u32, _: f64) {}
-unsafe extern "C" fn identity(_: *mut c_void, _: u32, v: f64) -> f64 {
-    v
-}
-unsafe extern "C" fn no_format(_: *mut c_void, _: u32, _: f64, _: *mut c_char, _: u32) -> u32 {
-    0
-}
-unsafe extern "C" fn no_parse(_: *mut c_void, _: u32, _: *const c_char, _: *mut f64) -> i32 {
-    0
-}
-unsafe extern "C" fn no_save(_: *mut c_void, _: *mut *mut u8, _: *mut u32) {}
-unsafe extern "C" fn no_load(_: *mut c_void, _: *const u8, _: u32) -> i32 {
-    0
-}
-unsafe extern "C" fn no_load_stream(
-    _: *mut c_void,
-    _: *mut c_void,
-    _: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i64,
-) -> i32 {
-    0
-}
-unsafe extern "C" fn no_save_stream(
-    _: *mut c_void,
-    _: *mut c_void,
-    _: unsafe extern "C" fn(*mut c_void, *const u8, u32) -> i64,
-) -> i32 {
-    0
-}
-unsafe extern "C" fn no_free(_: *mut u8, _: u32) {}
-unsafe extern "C" fn begin_input(_: *mut c_void, _: u32) {}
-unsafe extern "C" fn push_input(_: *mut c_void, _: *const Vst3NativeEvent) -> u32 {
-    0
-}
-unsafe extern "C" fn next_output(_: *mut c_void, _: *mut Vst3NativeEvent) -> u32 {
-    0
-}
-unsafe extern "C" fn finish_output(_: *mut c_void, _: u32) {}
-unsafe extern "C" fn get_size(_: *mut c_void, _: *mut u32, _: *mut u32) {}
-unsafe extern "C" fn gui_open(_: *mut c_void, _: *mut c_void) -> i32 {
-    1
-}
-unsafe extern "C" fn set_scale(_: *mut c_void, _: f64) {}
-unsafe extern "C" fn set_size(_: *mut c_void, _: u32, _: u32) {}
-unsafe extern "C" fn no_midi_map(_: *mut c_void, _: i32, _: i16, _: i16, _: *mut u32) -> i32 {
-    0
-}
-unsafe extern "C" fn no_output_param(
-    _: *mut c_void,
-    _: u32,
-    _: *mut u32,
-    _: *mut i32,
-    _: *mut f64,
-) {
-}
-unsafe extern "C" fn set_active(_: *mut c_void, _: i32) {}
-unsafe extern "C" fn match_layout(_: u32, _: u32) -> i32 {
-    0
-}
-unsafe extern "C" fn no_bus_channels(_: u32, _: i32, _: u32) -> u32 {
-    0
-}
-unsafe extern "C" fn match_perbus(_: *const u32, _: u32, _: *const u32, _: u32) -> i32 {
-    0
-}
-unsafe extern "C" fn not_chunked(_: *mut c_void, _: u32) -> i32 {
-    0
-}
-unsafe extern "C" fn no_presentation(_: *mut c_void, _: u32, _: *mut c_char, _: u32) -> i32 {
-    -1
-}
-unsafe extern "C" fn revision(_: *mut c_void) -> u64 {
-    0
-}
-unsafe extern "C" fn no_persist(_: *mut c_void) -> bool {
-    false
-}
-unsafe extern "C" fn no_waker(
-    _: *mut c_void,
-    _: Option<unsafe extern "C" fn(*mut c_void)>,
-    _: *mut c_void,
-) {
-}
-unsafe extern "C" fn no_take(_: *mut c_void, _: *mut u32, _: *mut f64) -> bool {
-    false
-}
-unsafe extern "C" fn no_processing(_: *mut c_void, _: i32, _: f64, _: u32, _: i32) {}
-unsafe extern "C" fn never(_: *mut c_void, _: u32) -> bool {
-    false
-}
-unsafe extern "C" fn no_function(_: *mut c_void, _: u32) -> *const c_char {
-    std::ptr::null()
-}
-unsafe extern "C" fn no_changes(_: *mut c_void) -> u8 {
-    0
-}
-unsafe extern "C" fn no_track(_: *mut c_void, _: *const Vst3TrackInfo) {}
-unsafe extern "C" fn no_learn(_: *mut c_void, _: u32, _: u8, _: Vst3LearnSource) -> i32 {
-    0
-}
-unsafe extern "C" fn no_remap(_: *mut c_void, _: *const u8, _: u32, _: *mut u32) -> i32 {
-    0
-}
-unsafe extern "C" fn no_open_wayland(_: *mut c_void, _: *mut c_void, _: *mut c_void) -> i32 {
-    0
-}
-unsafe extern "C" fn no_fd(_: *mut c_void) -> i32 {
-    -1
-}
-unsafe fn no_menu(_: *mut c_void, _: moose_core::main_thread::MenuTarget, _: u32) -> i32 {
-    0
+/// A backend with every trait default.
+#[derive(Default)]
+struct Fake;
+
+impl Vst3Backend for Fake {}
+
+type MakeFn = fn() -> Box<dyn Vst3Backend>;
+type BusFn = fn(u32, bool, u32) -> u32;
+
+/// Builds one backend per instance; `bus` answers `layout_bus_channels`.
+struct Factory {
+    make: MakeFn,
+    bus: BusFn,
 }
 
-fn callbacks() -> Vst3Callbacks {
-    let process: ProcessFn = ok_process;
-    Vst3Callbacks {
-        create: fresh_ctx,
-        destroy: nop_ctx,
-        reset: nop_lifecycle,
-        prepare: ok_prepare,
-        process,
-        process_f64: process,
-        push_param_change: push_param,
-        param_count: zero_u32,
-        param_get_value: param_value,
-        param_set_value: param_set,
-        param_normalize: identity,
-        param_denormalize: identity,
-        param_format: no_format,
-        param_parse: no_parse,
-        state_save: no_save,
-        state_load: no_load,
-        state_load_stream: no_load_stream,
-        state_save_stream: no_save_stream,
-        state_free: no_free,
-        get_latency: zero_u32,
-        get_tail: zero_u32,
-        begin_input_events: begin_input,
-        push_input_event: push_input,
-        begin_output_events: nop_ctx,
-        next_output_event: next_output,
-        commit_output_event: nop_ctx,
-        finish_output_events: finish_output,
-        gui_has_editor: zero_i32,
-        gui_get_size: get_size,
-        gui_open,
-        gui_close: nop_ctx,
-        gui_set_content_scale: set_scale,
-        gui_can_resize: zero_i32,
-        gui_check_size_constraint: get_size,
-        gui_set_size: set_size,
-        midi_mapping_get_param_id: no_midi_map,
-        get_output_param_count: zero_u32,
-        get_output_param: no_output_param,
-        set_active,
-        match_bus_layout: match_layout,
-        layout_bus_channels: no_bus_channels,
-        match_bus_layout_perbus: match_perbus,
-        param_is_chunked: not_chunked,
-        param_presentation: no_presentation,
-        param_presentation_revision: revision,
-        wants_persist_notifications: no_persist,
-        set_persist_waker: no_waker,
-        take_persist_change: no_take,
-        param_affects_presentation: never,
-        param_function_name: no_function,
-        set_catalog_waker: no_waker,
-        take_catalog_changes: no_changes,
-        track_info_changed: no_track,
-        midi_learn: no_learn,
-        remap_param_id: no_remap,
-        set_processing: no_processing,
-        gui_supports_wayland: zero_i32,
-        gui_open_wayland: no_open_wayland,
-        gui_event_fd: no_fd,
-        gui_on_fd: nop_ctx,
-        gui_on_timer: nop_ctx,
-        gui_wayland_set_sync: {
-            unsafe extern "C" fn nop_sync(_: *mut c_void, _: i32) {}
-            nop_sync
-        },
-        bind_host_queue: {
-            unsafe extern "C" fn nop_bind(_: *mut c_void, _: *mut c_void) {}
-            nop_bind
-        },
-        drain_host_queue: nop_ctx,
-        perform_menu: no_menu,
-        gui_param_at: {
-            unsafe extern "C" fn no_param_at(_: *mut c_void, _: i32, _: i32, _: *mut u32) -> i32 {
-                0
-            }
-            no_param_at
-        },
-        set_audio_presentation_latency: {
-            unsafe extern "C" fn no_pres_lat(_: *mut c_void, _: i32, _: u32, _: u32) {}
-            no_pres_lat
-        },
-        param_step_count: {
-            unsafe extern "C" fn static_step_count(_: *mut c_void, _: u32, _: *mut f64) -> i32 {
-                -1
-            }
-            static_step_count
-        },
-        keyswitches: {
-            unsafe fn no_keyswitches(
-                _: *mut c_void,
-                _: u32,
-                _: u8,
-            ) -> Vec<moose_core::main_thread::Keyswitch> {
-                Vec::new()
-            }
-            no_keyswitches
-        },
-        program_list: {
-            unsafe fn no_programs(_: *mut c_void) -> Vec<moose_core::main_thread::ProgramPreset> {
-                Vec::new()
-            }
-            no_programs
-        },
-        set_program_data: {
-            unsafe fn reject_program_data(
-                _: *mut c_void,
-                _: usize,
-                _: *const u8,
-                _: usize,
-            ) -> bool {
-                false
-            }
-            reject_program_data
-        },
+impl Vst3FactoryBackend for Factory {
+    fn create(&self) -> Option<Box<dyn Vst3Backend>> {
+        Some((self.make)())
+    }
+
+    fn layout_bus_channels(&self, layout: u32, is_output: bool, bus: u32) -> u32 {
+        (self.bus)(layout, is_output, bus)
     }
 }
 
-fn descriptor() -> Vst3PluginDescriptor {
-    // SAFETY: integers, a byte array and nullable C pointers.
-    unsafe { std::mem::zeroed() }
+fn boxed<B: Vst3Backend + Default>() -> Box<dyn Vst3Backend> {
+    Box::new(B::default())
 }
 
-fn registration(
-    desc: Vst3PluginDescriptor,
-    cb: Vst3Callbacks,
-    params: Vec<Vst3ParamDescriptor>,
+fn no_bus(_: u32, _: bool, _: u32) -> u32 {
+    0
+}
+
+fn descriptor() -> PluginDescriptor {
+    PluginDescriptor::default()
+}
+
+fn registration_with(
+    desc: PluginDescriptor,
+    make: MakeFn,
+    bus: BusFn,
+    params: Vec<ParamDescriptor>,
 ) -> &'static Registration {
-    let params: &'static [Vst3ParamDescriptor] = Box::leak(params.into_boxed_slice());
-    let (units, param_unit) = build_units(params);
+    let (units, param_unit) = build_units(&params);
     Box::leak(Box::new(Registration {
-        desc: Box::leak(Box::new(desc)),
-        cb: Box::leak(Box::new(cb)),
+        desc,
+        factory: Box::new(Factory { make, bus }),
         params,
         units,
         param_unit,
     }))
+}
+
+/// A registration whose instances are `B::default()`.
+fn registration<B: Vst3Backend + Default>(
+    desc: PluginDescriptor,
+    params: Vec<ParamDescriptor>,
+) -> &'static Registration {
+    registration_with(desc, boxed::<B>, no_bus, params)
 }
 
 fn component(reg: &'static Registration) -> ComWrapper<Component> {
@@ -325,18 +93,17 @@ fn component(reg: &'static Registration) -> ComWrapper<Component> {
 /// A component the test owns only through one raw `IComponent` reference,
 /// as a host does.
 fn raw_component(reg: &'static Registration) -> *mut IComponent {
-    raw_component_ctx(reg).0
+    raw_component_id(reg).0
 }
 
-/// [`raw_component`] plus its plugin ctx.
-fn raw_component_ctx(reg: &'static Registration) -> (*mut IComponent, *mut c_void) {
+/// [`raw_component`] plus its host instance id.
+fn raw_component_id(reg: &'static Registration) -> (*mut IComponent, usize) {
     let com = component(reg);
     (
         com.to_com_ptr::<IComponent>().unwrap().into_raw(),
-        com.host.ctx,
+        com.host.id,
     )
 }
-
 fn create_view(com: *mut IComponent) -> *mut IPlugView {
     let controller = unsafe { ComRef::from_raw(com) }
         .unwrap()
@@ -525,41 +292,31 @@ mod lifecycle {
     static BAD: AtomicBool = AtomicBool::new(false);
     static PROCESSING_CALLS: AtomicU32 = AtomicU32::new(0);
 
-    unsafe extern "C" fn reset(_: *mut c_void, rate: f64, frames: u32, mode: i32) {
-        if (rate - 44100.0).abs() > f64::EPSILON || frames != 1024 || mode != 0 {
-            BAD.store(true, SeqCst);
+    #[derive(Default)]
+    struct B;
+
+    impl Vst3Backend for B {
+        fn reset(&self, rate: f64, frames: u32, mode: i32) {
+            if (rate - 44100.0).abs() > f64::EPSILON || frames != 1024 || mode != 0 {
+                BAD.store(true, SeqCst);
+            }
+            RESETS.fetch_add(1, SeqCst);
         }
-        RESETS.fetch_add(1, SeqCst);
-    }
-    unsafe extern "C" fn prepare(ctx: *mut c_void, rate: f64, frames: u32, mode: i32) -> i32 {
-        unsafe { reset(ctx, rate, frames, mode) };
-        1
-    }
-    unsafe extern "C" fn set_processing(
-        ctx: *mut c_void,
-        on: i32,
-        rate: f64,
-        frames: u32,
-        mode: i32,
-    ) {
-        PROCESSING_CALLS.fetch_add(1, SeqCst);
-        if on == 0 {
-            unsafe { reset(ctx, rate, frames, mode) };
+        fn prepare(&self, rate: f64, frames: u32, mode: i32) -> bool {
+            self.reset(rate, frames, mode);
+            true
+        }
+        fn set_processing(&self, on: bool, rate: f64, frames: u32, mode: i32) {
+            PROCESSING_CALLS.fetch_add(1, SeqCst);
+            if !on {
+                self.reset(rate, frames, mode);
+            }
         }
     }
 
     #[test]
     fn lifecycle_resets() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                reset,
-                prepare,
-                set_processing,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<B>(descriptor(), Vec::new());
         for processing in [false, true] {
             RESETS.store(0, SeqCst);
             PROCESSING_CALLS.store(0, SeqCst);
@@ -590,7 +347,6 @@ mod lifecycle {
 mod editor_attach {
     use super::*;
 
-    static TOKEN: u8 = 0;
     static OPENS: AtomicU32 = AtomicU32::new(0);
     static CLOSES: AtomicU32 = AtomicU32::new(0);
     static RESTORES: AtomicU32 = AtomicU32::new(0);
@@ -598,57 +354,48 @@ mod editor_attach {
     static PARENT: AtomicUsize = AtomicUsize::new(0);
     static WIDTH: AtomicU32 = AtomicU32::new(1180);
     static HEIGHT: AtomicU32 = AtomicU32::new(760);
-    static BAD: AtomicBool = AtomicBool::new(false);
     static FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 
-    unsafe extern "C" fn create() -> *mut c_void {
-        (&raw const TOKEN).cast_mut().cast()
-    }
-    unsafe extern "C" fn open(ctx: *mut c_void, parent: *mut c_void) -> i32 {
-        if FAIL_OPEN.load(SeqCst) {
-            return 0;
+    #[derive(Default)]
+    struct B;
+
+    impl Vst3Backend for B {
+        unsafe fn gui_open(&self, parent: *mut c_void) -> bool {
+            if FAIL_OPEN.load(SeqCst) {
+                return false;
+            }
+            OPENS.fetch_add(1, SeqCst);
+            PARENT.store(parent as usize, SeqCst);
+            true
         }
-        if ctx != unsafe { create() } {
-            BAD.store(true, SeqCst);
+        fn gui_close(&self) {
+            CLOSES.fetch_add(1, SeqCst);
         }
-        OPENS.fetch_add(1, SeqCst);
-        PARENT.store(parent as usize, SeqCst);
-        1
-    }
-    unsafe extern "C" fn close(_: *mut c_void) {
-        CLOSES.fetch_add(1, SeqCst);
-    }
-    unsafe extern "C" fn size(_: *mut c_void, w: *mut u32, h: *mut u32) {
-        unsafe {
-            *w = WIDTH.load(SeqCst);
-            *h = HEIGHT.load(SeqCst);
+        fn gui_get_size(&self) -> (u32, u32) {
+            (WIDTH.load(SeqCst), HEIGHT.load(SeqCst))
         }
-    }
-    unsafe extern "C" fn resize(_: *mut c_void, w: u32, h: u32) {
-        WIDTH.store(w, SeqCst);
-        HEIGHT.store(h, SeqCst);
-    }
-    unsafe extern "C" fn load(
-        _: *mut c_void,
-        stream: *mut c_void,
-        read: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i64,
-    ) -> i32 {
-        let mut byte = 0u8;
-        if unsafe { read(stream, &raw mut byte, 1) != 1 || read(stream, &raw mut byte, 1) != 0 } {
-            return 0;
+        fn gui_set_size(&self, w: u32, h: u32) {
+            WIDTH.store(w, SeqCst);
+            HEIGHT.store(h, SeqCst);
         }
-        RESTORES.fetch_add(1, SeqCst);
-        1
-    }
-    unsafe extern "C" fn reset(_: *mut c_void, _: f64, _: u32, _: i32) {
-        RESETS.fetch_add(1, SeqCst);
-    }
-    unsafe extern "C" fn prepare(ctx: *mut c_void, rate: f64, frames: u32, mode: i32) -> i32 {
-        unsafe { reset(ctx, rate, frames, mode) };
-        1
-    }
-    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
-        1
+        fn state_load_stream(&self, read: &mut dyn FnMut(&mut [u8]) -> i64) -> bool {
+            let mut byte = [0u8; 1];
+            if read(&mut byte) != 1 || read(&mut byte) != 0 {
+                return false;
+            }
+            RESTORES.fetch_add(1, SeqCst);
+            true
+        }
+        fn reset(&self, _: f64, _: u32, _: i32) {
+            RESETS.fetch_add(1, SeqCst);
+        }
+        fn prepare(&self, rate: f64, frames: u32, mode: i32) -> bool {
+            self.reset(rate, frames, mode);
+            true
+        }
+        fn gui_has_editor(&self) -> bool {
+            true
+        }
     }
 
     /// One state byte, then end of stream.
@@ -682,22 +429,7 @@ mod editor_attach {
 
     #[test]
     fn editor_attachment() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                create,
-                gui_has_editor: has_editor,
-                gui_open: open,
-                gui_close: close,
-                gui_get_size: size,
-                gui_set_size: resize,
-                state_load_stream: load,
-                reset,
-                prepare,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<B>(descriptor(), Vec::new());
         let com = component(reg);
         let view = unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("view");
         let mut parent_token = 0u8;
@@ -768,7 +500,6 @@ mod editor_attach {
             assert_eq!(view.removed(), kResultOk);
             assert_eq!(CLOSES.load(SeqCst), 2);
         }
-        assert!(!BAD.load(SeqCst));
     }
 }
 
@@ -794,38 +525,52 @@ mod editor_lifetime {
     fn alive() -> bool {
         CONTEXT_ALIVE.load(SeqCst)
     }
-    unsafe extern "C" fn create() -> *mut c_void {
+    static HOST: AtomicUsize = AtomicUsize::new(0);
+
+    /// The one live instance's backend.
+    struct B;
+
+    fn make() -> Box<dyn Vst3Backend> {
         require(!CONTEXT_ALIVE.swap(true, SeqCst));
-        (&raw const CONTEXT_ALIVE).cast_mut().cast()
+        Box::new(B)
     }
-    unsafe extern "C" fn destroy(_: *mut c_void) {
-        require(CONTEXT_ALIVE.swap(false, SeqCst));
-        DESTROYS.fetch_add(1, SeqCst);
-    }
-    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
-        require(alive());
-        1
-    }
-    unsafe extern "C" fn open(_: *mut c_void, _: *mut c_void) -> i32 {
-        require(alive());
-        EDITOR_OPEN.store(true, SeqCst);
-        OPENS.fetch_add(1, SeqCst);
-        1
-    }
-    unsafe extern "C" fn close(_: *mut c_void) {
-        require(alive() && EDITOR_OPEN.swap(false, SeqCst));
-        CLOSES.fetch_add(1, SeqCst);
-    }
-    unsafe extern "C" fn size(_: *mut c_void, w: *mut u32, h: *mut u32) {
-        require(alive());
-        unsafe {
-            *w = 1180;
-            *h = 760;
+
+    impl Drop for B {
+        fn drop(&mut self) {
+            require(CONTEXT_ALIVE.swap(false, SeqCst));
+            DESTROYS.fetch_add(1, SeqCst);
         }
     }
 
-    fn ctx() -> *mut c_void {
-        (&raw const CONTEXT_ALIVE).cast_mut().cast()
+    impl Vst3Backend for B {
+        fn gui_has_editor(&self) -> bool {
+            require(alive());
+            true
+        }
+        unsafe fn gui_open(&self, _: *mut c_void) -> bool {
+            require(alive());
+            EDITOR_OPEN.store(true, SeqCst);
+            OPENS.fetch_add(1, SeqCst);
+            true
+        }
+        fn gui_close(&self) {
+            require(alive() && EDITOR_OPEN.swap(false, SeqCst));
+            CLOSES.fetch_add(1, SeqCst);
+        }
+        fn gui_get_size(&self) -> (u32, u32) {
+            require(alive());
+            (1180, 760)
+        }
+        unsafe fn bind_host_queue(&self, id: usize, host: Option<*const Host>) {
+            if host.is_some() {
+                HOST.store(id, SeqCst);
+            }
+        }
+    }
+
+    /// The live instance's host id.
+    fn ctx() -> usize {
+        HOST.load(SeqCst)
     }
 
     fn view_call<R>(view: *mut IPlugView, f: impl FnOnce(&ComRef<'_, IPlugView>) -> R) -> R {
@@ -835,19 +580,7 @@ mod editor_lifetime {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn editor_ownership() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                create,
-                destroy,
-                gui_has_editor: has_editor,
-                gui_open: open,
-                gui_close: close,
-                gui_get_size: size,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration_with(descriptor(), make, no_bus, Vec::new());
         let mut parent_token = 0u8;
         let parent: *mut c_void = (&raw mut parent_token).cast();
         let attach = |v| view_call(v, |v| unsafe { v.attached(parent, PLATFORM.as_ptr()) });
@@ -913,7 +646,7 @@ mod editor_lifetime {
         let view = create_view(com);
         assert!(set_frame(view, fp(0)) == kResultOk && refs(fp(0)) > base);
         assert!(set_frame(view, fp(0)) == kResultOk && refs(fp(0)) > base);
-        assert_eq!(super::super::request_resize(ctx(), 1180, 760), 1);
+        assert!(super::super::request_resize(ctx(), 1180, 760));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(frames[0].0.resizes.load(SeqCst), 1);
         #[cfg(target_os = "macos")]
@@ -924,7 +657,7 @@ mod editor_lifetime {
         assert!(set_frame(view, fp(1)) == kResultOk && refs(fp(0)) == base && refs(fp(1)) > base);
         assert!(set_frame(view, std::ptr::null_mut()) == kResultOk && refs(fp(1)) == base);
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(super::super::request_resize(ctx(), 1180, 760), 0);
+        assert!(!super::super::request_resize(ctx(), 1180, 760));
         assert!(set_frame(view, fp(2)) == kResultOk && refs(fp(2)) > base);
         assert!(release(view) == 0 && refs(fp(2)) == base && alive());
         assert!(release(com) == 0 && !alive() && DESTROYS.load(SeqCst) == 102);
@@ -1019,21 +752,12 @@ fn parameter_units() {
     groups.push(format!("{long_prefix}A/Leaf"));
     groups.push(format!("{long_prefix}B/Leaf"));
     groups.push(String::new());
-    let groups: &'static [CString] = Box::leak(
-        groups
-            .into_iter()
-            .map(|g| CString::new(g).unwrap())
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    );
-    let params: Vec<Vst3ParamDescriptor> = (0..5004)
-        .map(|index: usize| Vst3ParamDescriptor {
+    let params: Vec<ParamDescriptor> = (0..5004)
+        .map(|index: usize| ParamDescriptor {
             id: 0x0100_0000 + index as u32,
-            name: c"Voices".as_ptr(),
-            short_name: c"Voices".as_ptr(),
-            units: c"".as_ptr(),
-            min: 1.0,
-            max: 64.0,
+            name: "Voices".into(),
+            short_name: "Voices".into(),
+            units: String::new(),
             default_normalized: 0.0,
             step_count: 63,
             flags: 1,
@@ -1042,11 +766,11 @@ fn parameter_units() {
             } else {
                 96 + (index - 5001)
             }]
-            .as_ptr(),
+            .clone(),
         })
         .collect();
     let ids: Vec<u32> = params.iter().map(|p| p.id).collect();
-    let reg = registration(descriptor(), callbacks(), params);
+    let reg = registration::<Fake>(descriptor(), params);
     let com = component(reg);
     let zero_info = || -> ParameterInfo { unsafe { std::mem::zeroed() } };
     let zero_unit = || -> UnitInfo { unsafe { std::mem::zeroed() } };
@@ -1098,34 +822,31 @@ mod output_silence {
         const ZERO: Self = 0.0;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C" fn synthesize<S: Sample>(
-        _: *mut c_void,
-        _: *const *const c_void,
-        outputs: *mut *mut c_void,
-        _: u32,
-        num_out: u32,
-        _: *const u32,
-        _: u32,
-        _: u32,
-        _: *const u32,
-        _: u32,
-        _: u32,
-        frames: u32,
-        _: *const Vst3Transport,
-        _: i32,
-    ) -> u32 {
-        for ch in 0..num_out as usize {
-            let out = unsafe { *outputs.add(ch) }.cast::<S>();
-            for i in 0..frames as usize {
+    /// Writes a quarter into every output channel.
+    unsafe fn synthesize<S: Sample>(args: &ProcessArgs<'_>) -> bool {
+        for &out in args.outputs.iter() {
+            let out = out.cast::<S>();
+            for i in 0..args.num_frames as usize {
                 unsafe { *out.add(i) = S::QUARTER };
             }
         }
-        1
+        true
     }
 
-    unsafe extern "C" fn bus_channels(_: u32, output: i32, bus: u32) -> u32 {
-        if output != 0 && bus == 0 { 2 } else { 0 }
+    #[derive(Default)]
+    struct B;
+
+    impl Vst3Backend for B {
+        unsafe fn process_f32(&self, args: &mut ProcessArgs<'_>) -> bool {
+            unsafe { synthesize::<f32>(args) }
+        }
+        unsafe fn process_f64(&self, args: &mut ProcessArgs<'_>) -> bool {
+            unsafe { synthesize::<f64>(args) }
+        }
+    }
+
+    fn bus_channels(_: u32, output: bool, bus: u32) -> u32 {
+        if output && bus == 0 { 2 } else { 0 }
     }
 
     fn audible_block<S: Sample>(com: &Component, sample_size: i32) -> bool {
@@ -1172,25 +893,14 @@ mod output_silence {
 
     #[test]
     fn generated_audio_reaches_hosts_that_honor_silence_flags() {
-        static MAIN: [u8; 1] = [0];
-        let desc = Vst3PluginDescriptor {
+        let desc = PluginDescriptor {
             num_outputs: 2,
             max_outputs: 2,
-            num_output_buses: 1,
-            output_bus_kinds: MAIN.as_ptr(),
-            supports_f64: 1,
+            output_bus_kinds: vec![0],
+            supports_f64: true,
             ..descriptor()
         };
-        let reg = registration(
-            desc,
-            Vst3Callbacks {
-                layout_bus_channels: bus_channels,
-                process: synthesize::<f32>,
-                process_f64: synthesize::<f64>,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration_with(desc, boxed::<B>, bus_channels, Vec::new());
         let com = component(reg);
         assert!(
             audible_block::<f32>(&com, SymbolicSampleSizes_::kSample32 as i32),
@@ -1208,19 +918,24 @@ mod output_events {
 
     static NEXT: AtomicU32 = AtomicU32::new(0);
     static RESULT: AtomicU32 = AtomicU32::new(99);
-    unsafe extern "C" fn count(_: *mut c_void) -> u32 {
-        1
-    }
-    unsafe extern "C" fn next(_: *mut c_void, event: *mut Vst3NativeEvent) -> u32 {
-        if NEXT.fetch_add(1, SeqCst) == 0 {
-            unsafe { (*event).kind = Event_::EventTypes_::kNoteOnEvent as u32 };
+    #[derive(Default)]
+    struct B;
+
+    impl Vst3Backend for B {
+        fn output_param_count(&self) -> u32 {
             1
-        } else {
-            0
         }
-    }
-    unsafe extern "C" fn finish(_: *mut c_void, result: u32) {
-        RESULT.store(result, SeqCst);
+        fn next_output_event(&self, event: &mut Vst3NativeEvent) -> u32 {
+            if NEXT.fetch_add(1, SeqCst) == 0 {
+                event.kind = Event_::EventTypes_::kNoteOnEvent as u32;
+                1
+            } else {
+                0
+            }
+        }
+        fn finish_output_events(&self, result: u32) {
+            RESULT.store(result, SeqCst);
+        }
     }
     struct Events(AtomicU32);
     impl Class for Events {
@@ -1246,16 +961,7 @@ mod output_events {
     fn note_is_delivered_without_parameter_output_queue() {
         NEXT.store(0, SeqCst);
         RESULT.store(99, SeqCst);
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                get_output_param_count: count,
-                next_output_event: next,
-                finish_output_events: finish,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<B>(descriptor(), Vec::new());
         let com = component(reg);
         let events = ComWrapper::new(Events(AtomicU32::new(0)));
         let mut data: ProcessData = unsafe { std::mem::zeroed() };
@@ -1269,22 +975,20 @@ mod output_events {
 
 mod arrangements {
     use super::*;
-    unsafe extern "C" fn channels(_: u32, _: i32, _: u32) -> u32 {
+    fn channels(_: u32, _: bool, _: u32) -> u32 {
         8
     }
     #[test]
     fn rejects_noncanonical_mask_without_changing_current_layout() {
-        let reg = registration(
-            Vst3PluginDescriptor {
-                num_output_buses: 1,
+        let reg = registration_with(
+            PluginDescriptor {
+                output_bus_kinds: vec![0],
                 num_outputs: 8,
                 max_outputs: 8,
                 ..descriptor()
             },
-            Vst3Callbacks {
-                layout_bus_channels: channels,
-                ..callbacks()
-            },
+            boxed::<Fake>,
+            channels,
             Vec::new(),
         );
         let com = component(reg);
@@ -1405,7 +1109,7 @@ mod threads {
             });
             if self.st.worker_on_begin.swap(false, SeqCst) {
                 let ctx = self.st.ctx.load(SeqCst);
-                off_ui(move || end_edit(ctx as *mut c_void, 7));
+                off_ui(move || end_edit(ctx, 7));
             }
             kResultOk
         }
@@ -1431,7 +1135,7 @@ mod threads {
                     self.st.burst.fetch_sub(1, SeqCst);
                 }
                 let ctx = self.st.ctx.load(SeqCst);
-                off_ui(move || perform_edit(ctx as *mut c_void, 7, 0.5));
+                off_ui(move || perform_edit(ctx, 7, 0.5));
             }
             kResultOk
         }
@@ -1457,21 +1161,37 @@ mod threads {
     static TEARDOWN_STAGE: AtomicI32 = AtomicI32::new(0);
     static BAD: AtomicBool = AtomicBool::new(false);
 
-    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
-        1
+    /// Records its host id, as `Vst3Instance` does from `bind_host_queue`.
+    #[derive(Default)]
+    struct B {
+        host: AtomicUsize,
     }
-    unsafe extern "C" fn set_size(ctx: *mut c_void, _: u32, _: u32) {
-        if WORKER_ON_RESIZE.load(SeqCst) {
-            let ctx = ctx as usize;
-            off_ui(move || end_edit(ctx as *mut c_void, 7));
-        } else {
-            begin_edit(ctx, 8);
-            end_edit(ctx, 8);
+
+    impl Drop for B {
+        fn drop(&mut self) {
+            if self.host.load(SeqCst) == WATCH.load(SeqCst) {
+                DESTROYED.store(true, SeqCst);
+            }
         }
     }
-    unsafe extern "C" fn destroy(ctx: *mut c_void) {
-        if ctx as usize == WATCH.load(SeqCst) {
-            DESTROYED.store(true, SeqCst);
+
+    impl Vst3Backend for B {
+        fn gui_has_editor(&self) -> bool {
+            true
+        }
+        fn gui_set_size(&self, _: u32, _: u32) {
+            let ctx = self.host.load(SeqCst);
+            if WORKER_ON_RESIZE.load(SeqCst) {
+                off_ui(move || end_edit(ctx, 7));
+            } else {
+                begin_edit(ctx, 8);
+                end_edit(ctx, 8);
+            }
+        }
+        unsafe fn bind_host_queue(&self, id: usize, host: Option<*const Host>) {
+            if host.is_some() {
+                self.host.store(id, SeqCst);
+            }
         }
     }
 
@@ -1498,16 +1218,7 @@ mod threads {
             worker_on_begin: AtomicBool::new(false),
             emit_on_resize: AtomicBool::new(false),
         });
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                gui_has_editor: has_editor,
-                gui_set_size: set_size,
-                destroy,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<B>(descriptor(), Vec::new());
         let normal = handler(&st, Kind::Normal);
         let next = handler(&st, Kind::Replacement);
         let frame = ComWrapper::new(LoopFrame::new(FrameCore {
@@ -1518,13 +1229,13 @@ mod threads {
 
         let com = component(reg);
         let c: &Component = &com;
-        let ctx = com.host.ctx;
-        st.ctx.store(ctx as usize, SeqCst);
-        let ctx_u = ctx as usize;
+        let ctx = com.host.id;
+        st.ctx.store(ctx, SeqCst);
+        let ctx_u = ctx;
         let set_handler = |h: *mut IComponentHandler| unsafe { c.setComponentHandler(h) };
         set_handler(hp(&normal));
         // No wake yet: worker edits wait for the next UI-thread operation.
-        off_ui(move || begin_edit(ctx_u as *mut c_void, 7));
+        off_ui(move || begin_edit(ctx_u, 7));
         assert_eq!(st.calls(), "");
         unsafe { c.getParamNormalized(7) };
         assert_eq!(st.calls(), "b");
@@ -1551,11 +1262,11 @@ mod threads {
 
         // A gesture and a resize from the editor's own thread wait for the loop.
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             begin_edit(ctx, 7);
             perform_edit(ctx, 7, 0.5);
             end_edit(ctx, 7);
-            assert_eq!(request_resize(ctx, 640, 480), 1);
+            assert!(request_resize(ctx, 640, 480));
         });
         assert!(st.calls().is_empty() && resizes() == 0 && readable(fd()));
         frame.pump();
@@ -1563,7 +1274,7 @@ mod threads {
 
         // A call on the UI thread goes first through whatever is queued.
         st.clear();
-        off_ui(move || begin_edit(ctx_u as *mut c_void, 7));
+        off_ui(move || begin_edit(ctx_u, 7));
         end_edit(ctx, 7);
         assert_eq!(st.calls(), "be");
 
@@ -1572,7 +1283,7 @@ mod threads {
         st.clear();
         st.emit_on_resize.store(true, SeqCst);
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             begin_edit(ctx, 7);
             request_resize(ctx, 640, 480);
             perform_edit(ctx, 7, 0.5);
@@ -1585,7 +1296,7 @@ mod threads {
         // one wake makes a bounded number of calls, then asks for another.
         st.clear();
         flood(true);
-        off_ui(move || perform_edit(ctx_u as *mut c_void, 7, 0.5));
+        off_ui(move || perform_edit(ctx_u, 7, 0.5));
         frame.pump();
         assert!(st.calls() == p(DRAIN_EDITS) && readable(fd()));
         flood(false);
@@ -1595,7 +1306,7 @@ mod threads {
         // A large backlog is delivered DRAIN_EDITS at a time, in order.
         st.clear();
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             for _ in 0..3 * DRAIN_EDITS {
                 perform_edit(ctx, 7, 0.5);
             }
@@ -1616,7 +1327,7 @@ mod threads {
         st.clear();
         let big = 4 * TRANSITION_EDITS;
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             begin_edit(ctx, 7);
             begin_edit(ctx, 9);
             for _ in 0..big {
@@ -1642,12 +1353,12 @@ mod threads {
         for op in ['b', 'p', 'e', 'r'] {
             st.clear();
             flood(true);
-            off_ui(move || perform_edit(ctx_u as *mut c_void, 7, 0.5));
+            off_ui(move || perform_edit(ctx_u, 7, 0.5));
             match op {
                 'b' => begin_edit(ctx, 7),
                 'p' => perform_edit(ctx, 7, 0.5),
                 'e' => end_edit(ctx, 7),
-                _ => assert_eq!(request_resize(ctx, 640, 480), 1),
+                _ => assert!(request_resize(ctx, 640, 480)),
             }
             assert!(st.calls() == p(DRAIN_EDITS) && readable(fd()), "{op}");
             flood(false);
@@ -1660,13 +1371,13 @@ mod threads {
         // the UI thread, and nothing is left queued.
         st.clear();
         st.burst.store(20, SeqCst);
-        off_ui(move || perform_edit(ctx_u as *mut c_void, 7, 0.5));
+        off_ui(move || perform_edit(ctx_u, 7, 0.5));
         set_handler(hp(&next));
         assert!(st.calls() == p(21) && edits().0 == 0);
         set_handler(hp(&normal));
         st.clear();
         st.burst.store(20, SeqCst);
-        off_ui(move || perform_edit(ctx_u as *mut c_void, 7, 0.5));
+        off_ui(move || perform_edit(ctx_u, 7, 0.5));
         assert_eq!(set_frame(std::ptr::null_mut()), kResultOk);
         assert!(st.calls() == p(21) && edits().0 == 0);
         assert_eq!(set_frame(fp), kResultOk);
@@ -1677,7 +1388,7 @@ mod threads {
         st.clear();
         flood(true);
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             begin_edit(ctx, 7);
             perform_edit(ctx, 7, 0.5);
         });
@@ -1698,7 +1409,7 @@ mod threads {
         // A detach under the same flood leaves the rest for the next call.
         st.clear();
         flood(true);
-        off_ui(move || perform_edit(ctx_u as *mut c_void, 7, 0.5));
+        off_ui(move || perform_edit(ctx_u, 7, 0.5));
         assert_eq!(set_frame(std::ptr::null_mut()), kResultOk);
         assert!(st.calls() == p(TRANSITION_EDITS) && edits().0 != 0);
         flood(false);
@@ -1711,9 +1422,8 @@ mod threads {
         // worker, drops the edit and makes no host call there.
         {
             DESTROYED.store(false, SeqCst);
-            let (other, other_ctx) = raw_component_ctx(reg);
+            let (other, other_ctx) = raw_component_id(reg);
             let other_host = pin(other_ctx).unwrap();
-            let other_ctx = other_ctx as usize;
             WATCH.store(other_ctx, SeqCst);
             let controller = unsafe { ComRef::from_raw(other) }
                 .unwrap()
@@ -1731,7 +1441,7 @@ mod threads {
             let worker = {
                 let step = step.clone();
                 std::thread::spawn(move || {
-                    let host = pin(other_ctx as *mut c_void).unwrap();
+                    let host = pin(other_ctx).unwrap();
                     host.submit(EditOp::Perform(7, 0.5));
                     step.store(1, SeqCst);
                     while step.load(SeqCst) != 2 {
@@ -1756,7 +1466,7 @@ mod threads {
             st.emit_on_resize.store(true, SeqCst);
             WORKER_ON_RESIZE.store(true, SeqCst);
             off_ui(move || {
-                let ctx = ctx_u as *mut c_void;
+                let ctx = ctx_u;
                 begin_edit(ctx, 7);
                 request_resize(ctx, 640, 480);
                 perform_edit(ctx, 7, 0.5);
@@ -1777,7 +1487,7 @@ mod threads {
         st.clear();
         st.worker_on_begin.store(true, SeqCst);
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             begin_edit(ctx, 7);
             perform_edit(ctx, 7, 0.5);
         });
@@ -1788,7 +1498,7 @@ mod threads {
         // Detaching delivers the rest: the host never stays mid-gesture.
         st.clear();
         off_ui(move || {
-            let ctx = ctx_u as *mut c_void;
+            let ctx = ctx_u;
             begin_edit(ctx, 7);
             end_edit(ctx, 7);
         });
@@ -1807,8 +1517,8 @@ mod threads {
             DESTROYED.store(false, SeqCst);
             TEARDOWN_STAGE.store(0, SeqCst);
             let slow = handler(&st, Kind::Slow);
-            let (other, other_ctx) = raw_component_ctx(reg);
-            WATCH.store(other_ctx as usize, SeqCst);
+            let (other, other_ctx) = raw_component_id(reg);
+            WATCH.store(other_ctx, SeqCst);
             let controller = unsafe { ComRef::from_raw(other) }
                 .unwrap()
                 .cast::<IEditController>()
@@ -1836,8 +1546,8 @@ mod threads {
         {
             DESTROYED.store(false, SeqCst);
             let dropper = handler(&st, Kind::Drop);
-            let (victim, victim_ctx) = raw_component_ctx(reg);
-            WATCH.store(victim_ctx as usize, SeqCst);
+            let (victim, victim_ctx) = raw_component_id(reg);
+            WATCH.store(victim_ctx, SeqCst);
             dropper.victim.store(victim as usize, SeqCst);
             let controller = unsafe { ComRef::from_raw(victim) }
                 .unwrap()
@@ -1864,14 +1574,14 @@ mod threads {
         });
         let frame = ComWrapper::new(LoopFrame::new(FrameCore::new(640, 480)));
         let run_loop = frame.as_com_ref::<Linux::IRunLoop>().unwrap().to_com_ptr();
-        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let reg = registration::<Fake>(descriptor(), Vec::new());
         let com = ComWrapper::new(Component {
             host: Host::new(reg, Some(run_loop)).unwrap(),
         });
         let handler = handler(&st, Kind::Normal);
         assert_eq!(unsafe { com.setComponentHandler(hp(&handler)) }, kResultOk);
-        let ctx = com.host.ctx as usize;
-        off_ui(move || crate::com::mark_restart(ctx as *mut c_void, 4));
+        let ctx = com.host.id;
+        off_ui(move || crate::com::mark_restart(ctx, 4));
         assert_eq!(st.calls(), "");
         frame.pump();
         assert_eq!(st.calls(), "x");
@@ -1897,7 +1607,6 @@ mod host_features {
 
     use super::super::component::DynamicSupport;
     use super::*;
-    use crate::ffi::{PRESENTATION_HIDDEN, PRESENTATION_UNAVAILABLE};
 
     /// A component handler that logs every call it gets.
     #[derive(Default)]
@@ -1954,18 +1663,13 @@ mod host_features {
         recorder
     }
 
-    fn param(id: u32) -> Vst3ParamDescriptor {
-        Vst3ParamDescriptor {
+    fn param(id: u32) -> ParamDescriptor {
+        ParamDescriptor {
             id,
-            name: c"Param".as_ptr(),
-            short_name: c"Param".as_ptr(),
-            units: c"".as_ptr(),
-            min: 0.0,
-            max: 1.0,
-            default_normalized: 0.0,
-            step_count: 0,
+            name: "Param".into(),
+            short_name: "Param".into(),
             flags: ParameterInfo_::ParameterFlags_::kCanAutomate as i32,
-            group: c"".as_ptr(),
+            ..ParamDescriptor::default()
         }
     }
 
@@ -2005,7 +1709,7 @@ mod host_features {
         );
         assert_eq!(DynamicSupport::for_host("Nuendo"), DynamicSupport::Reload);
         assert_eq!(DynamicSupport::for_host("REAPER"), DynamicSupport::SlotPool);
-        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let reg = registration::<Fake>(descriptor(), Vec::new());
         let com = component(reg);
         assert_eq!(
             com.host.dynamic_support(),
@@ -2018,43 +1722,33 @@ mod host_features {
 
     // --- catalog wake ---------------------------------------------------------
 
-    type Wake = (unsafe extern "C" fn(*mut c_void), usize);
-    static WAKE: Mutex<Option<Wake>> = Mutex::new(None);
+    static WAKE: Mutex<Option<std::sync::Arc<WakerFn>>> = Mutex::new(None);
     static CHANGES: AtomicU8 = AtomicU8::new(0);
 
-    unsafe extern "C" fn store_waker(
-        _: *mut c_void,
-        wake: Option<unsafe extern "C" fn(*mut c_void)>,
-        ctx: *mut c_void,
-    ) {
-        *WAKE.lock().unwrap() = wake.map(|w| (w, ctx as usize));
-    }
-    unsafe extern "C" fn take_changes(_: *mut c_void) -> u8 {
-        CHANGES.swap(0, SeqCst)
+    #[derive(Default)]
+    struct Catalog;
+
+    impl Vst3Backend for Catalog {
+        fn set_catalog_waker(&self, wake: Option<WakerFn>) {
+            *WAKE.lock().unwrap() = wake.map(std::sync::Arc::new);
+        }
+        fn take_catalog_changes(&self) -> u8 {
+            CHANGES.swap(0, SeqCst)
+        }
     }
 
     /// What a committed `DynamicParams` edit does: set its pending bits and
     /// notify the signal, from a worker thread.
     fn commit(change: CatalogChange) {
         CHANGES.fetch_or(change.bits(), SeqCst);
-        let (wake, ctx) = WAKE.lock().unwrap().expect("catalog waker bound");
-        std::thread::spawn(move || unsafe { wake(ctx as *mut c_void) })
-            .join()
-            .unwrap();
+        let wake = WAKE.lock().unwrap().clone().expect("catalog waker bound");
+        std::thread::spawn(move || wake()).join().unwrap();
     }
 
     #[test]
     fn catalog_wake_sends_restart_flags() {
         use RestartFlags_::*;
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                set_catalog_waker: store_waker,
-                take_catalog_changes: take_changes,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<Catalog>(descriptor(), Vec::new());
         let com = component(reg);
         let recorder = attach(&com);
         let restart = |flags: u32| vec![format!("restart {flags}")];
@@ -2099,24 +1793,23 @@ mod host_features {
     static BOUND: AtomicBool = AtomicBool::new(false);
     static REVISION: AtomicU64 = AtomicU64::new(0);
 
-    unsafe extern "C" fn slot_presentation(
-        _: *mut c_void,
-        id: u32,
-        name: *mut c_char,
-        capacity: u32,
-    ) -> i32 {
-        if id != 11 || BOUND.load(SeqCst) {
-            return -1;
+    #[derive(Default)]
+    struct Slots;
+
+    impl Vst3Backend for Slots {
+        fn param_presentation(&self, id: u32) -> Option<ParamPresentation> {
+            (id == 11 && !BOUND.load(SeqCst)).then(|| ParamPresentation {
+                name: "Slot 2".into(),
+                hidden: true,
+                unavailable: true,
+            })
         }
-        let dst = unsafe { std::slice::from_raw_parts_mut(name, capacity as usize) };
-        super::super::c8_into(dst, "Slot 2");
-        PRESENTATION_HIDDEN | PRESENTATION_UNAVAILABLE
-    }
-    unsafe extern "C" fn slot_revision(_: *mut c_void) -> u64 {
-        REVISION.load(SeqCst)
-    }
-    unsafe extern "C" fn binder_param(_: *mut c_void, id: u32) -> bool {
-        id == 10
+        fn param_presentation_revision(&self) -> u64 {
+            REVISION.load(SeqCst)
+        }
+        fn param_affects_presentation(&self, id: u32) -> bool {
+            id == 10
+        }
     }
 
     fn listed(com: &Component) -> Vec<(u32, i32)> {
@@ -2133,16 +1826,7 @@ mod host_features {
     fn slot_pool_hides_and_reload_omits_free_slots() {
         use ParameterInfo_::ParameterFlags_::*;
         use RestartFlags_::*;
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                param_presentation: slot_presentation,
-                param_presentation_revision: slot_revision,
-                param_affects_presentation: binder_param,
-                ..callbacks()
-            },
-            vec![param(10), param(11), param(12)],
-        );
+        let reg = registration::<Slots>(descriptor(), vec![param(10), param(11), param(12)]);
         let automate = kCanAutomate as i32;
         let hidden = (kIsHidden | kIsReadOnly) as i32;
 
@@ -2186,24 +1870,18 @@ mod host_features {
 
     // --- function names ---------------------------------------------------------
 
-    unsafe extern "C" fn mix_is_11(_: *mut c_void, id: u32) -> *const c_char {
-        if id == 11 {
-            FunctionNameType::kDryWetMix
-        } else {
-            std::ptr::null()
+    #[derive(Default)]
+    struct Mix;
+
+    impl Vst3Backend for Mix {
+        fn param_function_name(&self, id: u32) -> Option<&'static CStr> {
+            (id == 11).then(|| unsafe { CStr::from_ptr(FunctionNameType::kDryWetMix) })
         }
     }
 
     #[test]
     fn function_names_find_their_parameter() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                param_function_name: mix_is_11,
-                ..callbacks()
-            },
-            vec![param(10), param(11)],
-        );
+        let reg = registration::<Mix>(descriptor(), vec![param(10), param(11)]);
         let com = component(reg);
         let finder = com
             .as_com_ref::<IParameterFunctionName>()
@@ -2237,29 +1915,15 @@ mod host_features {
 
     #[test]
     fn remap_param_id_forwards_old_cid_and_handles_nulls() {
-        unsafe extern "C" fn remap_cb(
-            _: *mut c_void,
-            plugin_cid: *const u8,
-            old_id: u32,
-            out_new: *mut u32,
-        ) -> i32 {
-            let mut cid = [0u8; 16];
-            unsafe { std::ptr::copy_nonoverlapping(plugin_cid, cid.as_mut_ptr(), 16) };
-            if cid == [0xAB; 16] && old_id == 7 {
-                unsafe { *out_new = 42 };
-                1
-            } else {
-                0
+        #[derive(Default)]
+        struct Remap;
+
+        impl Vst3Backend for Remap {
+            fn remap_param_id(&self, cid: [u8; 16], old_id: u32) -> Option<u32> {
+                (cid == [0xAB; 16] && old_id == 7).then_some(42)
             }
         }
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                remap_param_id: remap_cb,
-                ..callbacks()
-            },
-            vec![param(42)],
-        );
+        let reg = registration::<Remap>(descriptor(), vec![param(42)]);
         let com = component(reg);
         let remap = com.as_com_ref::<IRemapParamID>().expect("IRemapParamID");
         let cid_match: TUID = [0xABu8 as std::ffi::c_char; 16];
@@ -2351,27 +2015,20 @@ mod host_features {
         }
     }
 
-    static TRACK: Mutex<Option<(String, u32, bool)>> = Mutex::new(None);
+    static TRACK: Mutex<Option<(Option<String>, Option<u32>)>> = Mutex::new(None);
 
-    unsafe extern "C" fn record_track(_: *mut c_void, info: *const Vst3TrackInfo) {
-        let info = unsafe { &*info };
-        let name = unsafe { CStr::from_ptr(info.name) }
-            .to_str()
-            .unwrap()
-            .to_owned();
-        *TRACK.lock().unwrap() = Some((name, info.color_argb, info.has_color));
+    #[derive(Default)]
+    struct Track;
+
+    impl Vst3Backend for Track {
+        fn track_info_changed(&self, info: &Vst3TrackInfo) {
+            *TRACK.lock().unwrap() = Some((info.name.clone(), info.color_argb));
+        }
     }
 
     #[test]
     fn info_listener_passes_name_and_colour() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                track_info_changed: record_track,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<Track>(descriptor(), Vec::new());
         let com = component(reg);
         let listener = com.as_com_ref::<IInfoListener>().expect("IInfoListener");
         let channel = ComWrapper::new(Channel);
@@ -2382,7 +2039,7 @@ mod host_features {
         );
         assert_eq!(
             *TRACK.lock().unwrap(),
-            Some(("Lead \u{b5}".to_owned(), 0x80FF_2010, true))
+            Some((Some("Lead \u{b5}".to_owned()), Some(0x80FF_2010)))
         );
         assert_eq!(
             unsafe { listener.setChannelContextInfos(std::ptr::null_mut()) },
@@ -2394,14 +2051,14 @@ mod host_features {
 
     static LEARNED: Mutex<Vec<(u32, u8, Vst3LearnSource)>> = Mutex::new(Vec::new());
 
-    unsafe extern "C" fn learn_cc(
-        _: *mut c_void,
-        bus: u32,
-        channel: u8,
-        source: Vst3LearnSource,
-    ) -> i32 {
-        LEARNED.lock().unwrap().push((bus, channel, source));
-        i32::from(!matches!(source, Vst3LearnSource::Midi1(129)))
+    #[derive(Default)]
+    struct Learn;
+
+    impl Vst3Backend for Learn {
+        fn midi_learn(&self, bus: u32, channel: u8, source: Vst3LearnSource) -> bool {
+            LEARNED.lock().unwrap().push((bus, channel, source));
+            !matches!(source, Vst3LearnSource::Midi1(129))
+        }
     }
 
     /// A `Midi2Controller` as a host passes it: the SDK's two bytes land in
@@ -2417,14 +2074,7 @@ mod host_features {
 
     #[test]
     fn midi_learn_reaches_the_plugin() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                midi_learn: learn_cc,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration::<Learn>(descriptor(), Vec::new());
         let com = component(reg);
         let learn = com.as_com_ref::<IMidiLearn>().expect("IMidiLearn");
         let learn2 = com.as_com_ref::<IMidiLearn2>().expect("IMidiLearn2");
@@ -2487,10 +2137,10 @@ mod host_features {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn group_edits_bracket_the_edits_in_order() {
-        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let reg = registration::<Fake>(descriptor(), Vec::new());
         let com = component(reg);
         let recorder = attach(&com);
-        let ctx = com.host.ctx;
+        let ctx = com.host.id;
         crate::com::group_edit(ctx, EditGroup::Begin);
         for id in [1, 2] {
             crate::com::begin_edit(ctx, id);
@@ -2517,10 +2167,10 @@ mod host_features {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn handler_swap_moves_an_open_group_to_the_new_handler() {
-        let reg = registration(descriptor(), callbacks(), Vec::new());
+        let reg = registration::<Fake>(descriptor(), Vec::new());
         let com = component(reg);
         let old = attach(&com);
-        let ctx = com.host.ctx;
+        let ctx = com.host.id;
         crate::com::group_edit(ctx, EditGroup::Begin);
         crate::com::begin_edit(ctx, 1);
         let new = attach(&com);
@@ -2584,34 +2234,67 @@ mod wayland_embed {
         (&raw const DISPLAY_TOKEN).cast_mut().cast()
     }
 
-    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
-        1
+    /// The fake Wayland editor. `reentrant` resizes the view from inside
+    /// `gui_open_wayland`; `sync` logs `gui_wayland_set_sync`.
+    struct B {
+        reentrant: bool,
+        sync: bool,
     }
-    unsafe extern "C" fn supports(_: *mut c_void) -> i32 {
-        i32::from(SUPPORTS.load(SeqCst))
+
+    fn make(reentrant: bool, sync: bool) -> Box<dyn Vst3Backend> {
+        Box::new(B { reentrant, sync })
     }
-    unsafe extern "C" fn native_open(_: *mut c_void, _: *mut c_void) -> i32 {
-        log("native open");
-        1
-    }
-    unsafe extern "C" fn open(_: *mut c_void, display: *mut c_void, surface: *mut c_void) -> i32 {
-        log(format!("open {display:p} {surface:p}"));
-        1
-    }
-    unsafe extern "C" fn event_fd(_: *mut c_void) -> i32 {
-        EDITOR_FD
-    }
-    unsafe extern "C" fn close(_: *mut c_void) {
-        log("editor close");
-    }
-    unsafe extern "C" fn on_fd(_: *mut c_void) {
-        log("on_fd");
-    }
-    unsafe extern "C" fn on_timer(_: *mut c_void) {
-        log("on_timer");
-    }
-    unsafe extern "C" fn set_size(_: *mut c_void, w: u32, h: u32) {
-        *SIZE.lock().unwrap() = (w, h);
+
+    static REENTRANT_VIEW: AtomicUsize = AtomicUsize::new(0);
+
+    impl Vst3Backend for B {
+        fn gui_has_editor(&self) -> bool {
+            true
+        }
+        fn gui_supports_wayland(&self) -> bool {
+            SUPPORTS.load(SeqCst)
+        }
+        unsafe fn gui_open(&self, _: *mut c_void) -> bool {
+            log("native open");
+            true
+        }
+        unsafe fn gui_open_wayland(&self, display: *mut c_void, surface: *mut c_void) -> bool {
+            if self.reentrant {
+                let ptr = REENTRANT_VIEW.load(SeqCst) as *mut IPlugView;
+                if !ptr.is_null() {
+                    let mut rect = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: 512,
+                        bottom: 384,
+                    };
+                    unsafe { ((*(*ptr).vtbl).onSize)(ptr, &raw mut rect) };
+                }
+            } else {
+                log(format!("open {display:p} {surface:p}"));
+            }
+            true
+        }
+        fn gui_event_fd(&self) -> Option<i32> {
+            Some(EDITOR_FD)
+        }
+        fn gui_close(&self) {
+            log("editor close");
+        }
+        fn gui_on_fd(&self) {
+            log("on_fd");
+        }
+        fn gui_on_timer(&self) {
+            log("on_timer");
+        }
+        fn gui_set_size(&self, w: u32, h: u32) {
+            *SIZE.lock().unwrap() = (w, h);
+        }
+        fn gui_wayland_set_sync(&self, sync: bool) {
+            if self.sync {
+                log(format!("sync {}", i32::from(sync)));
+            }
+        }
     }
 
     struct WaylandHost;
@@ -2785,30 +2468,10 @@ mod wayland_embed {
             .collect()
     }
 
-    unsafe extern "C" fn set_sync(_: *mut c_void, sync: i32) {
-        log(format!("sync {sync}"));
-    }
-
     #[test]
     #[allow(clippy::too_many_lines)]
     fn wayland_surface_embedding() {
-        let reg = registration(
-            descriptor(),
-            Vst3Callbacks {
-                gui_has_editor: has_editor,
-                gui_open: native_open,
-                gui_close: close,
-                gui_set_size: set_size,
-                gui_supports_wayland: supports,
-                gui_open_wayland: open,
-                gui_event_fd: event_fd,
-                gui_on_fd: on_fd,
-                gui_on_timer: on_timer,
-                gui_wayland_set_sync: set_sync,
-                ..callbacks()
-            },
-            Vec::new(),
-        );
+        let reg = registration_with(descriptor(), || make(false, true), no_bus, Vec::new());
         let com = component(reg);
         let app = ComWrapper::new(App);
         let context = app.as_com_ref::<FUnknown>().unwrap().as_ptr();
@@ -2915,20 +2578,10 @@ mod wayland_embed {
         let wframe_ptr = wframe.as_com_ref::<IPlugFrame>().unwrap().as_ptr();
         let opened_from_frame = format!("open {:p} {frame_surface:p}", display());
 
-        let com2 = component(registration(
+        let com2 = component(registration_with(
             descriptor(),
-            Vst3Callbacks {
-                gui_has_editor: has_editor,
-                gui_open: native_open,
-                gui_close: close,
-                gui_set_size: set_size,
-                gui_supports_wayland: supports,
-                gui_open_wayland: open,
-                gui_event_fd: event_fd,
-                gui_on_fd: on_fd,
-                gui_on_timer: on_timer,
-                ..callbacks()
-            },
+            || make(false, false),
+            no_bus,
             Vec::new(),
         ));
         assert_eq!(unsafe { com2.initialize(context) }, kResultOk);
@@ -2985,39 +2638,10 @@ mod wayland_embed {
         // Synchronous `onSize` during `gui_open_wayland` (permitted by VST3 `attached`)
         // must not deadlock on `View::wayland` and still brackets Wayland sync.
         {
-            static REENTRANT_VIEW: AtomicUsize = AtomicUsize::new(0);
-            unsafe extern "C" fn open_with_reentrant_resize(
-                _ctx: *mut c_void,
-                _d: *mut c_void,
-                _s: *mut c_void,
-            ) -> i32 {
-                let ptr = REENTRANT_VIEW.load(SeqCst) as *mut IPlugView;
-                if !ptr.is_null() {
-                    let mut rect = ViewRect {
-                        left: 0,
-                        top: 0,
-                        right: 512,
-                        bottom: 384,
-                    };
-                    unsafe { ((*(*ptr).vtbl).onSize)(ptr, &raw mut rect) };
-                }
-                1
-            }
-            let com3 = component(registration(
+            let com3 = component(registration_with(
                 descriptor(),
-                Vst3Callbacks {
-                    gui_has_editor: has_editor,
-                    gui_open: native_open,
-                    gui_close: close,
-                    gui_set_size: set_size,
-                    gui_supports_wayland: supports,
-                    gui_open_wayland: open_with_reentrant_resize,
-                    gui_event_fd: event_fd,
-                    gui_on_fd: on_fd,
-                    gui_on_timer: on_timer,
-                    gui_wayland_set_sync: set_sync,
-                    ..callbacks()
-                },
+                || make(true, true),
+                no_bus,
                 Vec::new(),
             ));
             assert_eq!(unsafe { com3.initialize(context) }, kResultOk);
@@ -3044,12 +2668,8 @@ mod wayland_embed {
 
 mod input_merge {
     use super::*;
-    use crate::input_events::{
-        cb_begin_input_events, cb_push_input_event, cb_push_param_change, input_event_typed_limit,
-    };
+    use crate::input_events::input_event_typed_limit;
     use crate::instance::Vst3Instance;
-    use crate::lifecycle::{cb_create, cb_destroy, cb_prepare};
-    use crate::params::{cb_param_denormalize, cb_param_get_value, cb_param_set_value};
     use moose_core::buffer::AudioBuffer;
     use moose_core::config::AudioConfig;
     use moose_core::events::{EventBody, EventList, PushError};
@@ -3180,88 +2800,80 @@ mod input_merge {
         });
     }
 
-    /// Records the ingested list without allocating (the snapshot vector is
+    /// The real `Vst3Instance` input path, with a `process` that records
+    /// the ingested list without allocating (the snapshot vector is
     /// preallocated), so the heap counter sees only the adapter's work.
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C" fn snapshot_process(
-        ctx: *mut c_void,
-        inputs: *const *const c_void,
-        outputs: *mut *mut c_void,
-        num_inputs: u32,
-        num_outputs: u32,
-        input_channels: *const u32,
-        input_buses: u32,
-        input_active: u32,
-        output_channels: *const u32,
-        output_buses: u32,
-        output_active: u32,
-        frames: u32,
-        transport: *const Vst3Transport,
-        mode: i32,
-    ) -> u32 {
-        let inst = unsafe { &*ctx.cast::<Vst3Instance<Probe>>() };
-        let audio = inst.audio.enter();
-        let list = &audio.event_list;
-        SNAPSHOT.with(|s| {
-            let mut s = s.borrow_mut();
-            s.sorted = list.is_sorted_by_offset();
-            s.overflow = list.overflow();
-            s.capacity = list.capacity();
-            s.exact_offsets.clear();
-            s.exact_offsets.extend(
-                list.exact_iter()
-                    .map(moose_core::ExactEventRef::sample_offset),
-            );
-            s.events.clear();
-            for event in list.iter() {
-                s.events.push(match event.body {
-                    EventBody::NoteOn { note, .. } => Seen::Note(event.sample_offset, note),
-                    EventBody::ParamChange { id, .. } => Seen::Param(event.sample_offset, id),
-                    ref other => panic!("unexpected event {other:?}"),
-                });
-            }
-        });
-        drop(audio);
-        unsafe {
-            crate::process::cb_process::<Probe>(
-                ctx,
-                inputs,
-                outputs,
-                num_inputs,
-                num_outputs,
-                input_channels,
-                input_buses,
-                input_active,
-                output_channels,
-                output_buses,
-                output_active,
-                frames,
-                transport,
-                mode,
-            )
+    struct SnapshotBackend(Vst3Instance<Probe>);
+
+    impl Vst3Backend for SnapshotBackend {
+        fn prepare(&self, rate: f64, frames: u32, mode: i32) -> bool {
+            self.0.prepare(rate, frames, mode)
+        }
+        fn begin_input_events(&self, frames: u32) {
+            self.0.begin_input_events(frames);
+        }
+        fn push_input_event(&self, event: &Vst3NativeEvent, data: Option<&[u8]>) -> u32 {
+            self.0.push_input_event(event, data)
+        }
+        fn push_param_change(
+            &self,
+            id: u32,
+            offset: i32,
+            plain: f64,
+            from_offset: i32,
+            from_plain: f64,
+        ) -> bool {
+            self.0
+                .push_param_change(id, offset, plain, from_offset, from_plain)
+        }
+        fn param_get_value(&self, id: u32) -> f64 {
+            self.0.param_get_value(id)
+        }
+        fn param_set_value(&self, id: u32, value: f64) {
+            self.0.param_set_value(id, value);
+        }
+        fn param_denormalize(&self, id: u32, normalized: f64) -> f64 {
+            self.0.param_denormalize(id, normalized)
+        }
+        unsafe fn process_f32(&self, args: &mut ProcessArgs<'_>) -> bool {
+            let audio = self.0.audio.enter();
+            let list = &audio.event_list;
+            SNAPSHOT.with(|s| {
+                let mut s = s.borrow_mut();
+                s.sorted = list.is_sorted_by_offset();
+                s.overflow = list.overflow();
+                s.capacity = list.capacity();
+                s.exact_offsets.clear();
+                s.exact_offsets.extend(
+                    list.exact_iter()
+                        .map(moose_core::ExactEventRef::sample_offset),
+                );
+                s.events.clear();
+                for event in list.iter() {
+                    s.events.push(match event.body {
+                        EventBody::NoteOn { note, .. } => Seen::Note(event.sample_offset, note),
+                        EventBody::ParamChange { id, .. } => Seen::Param(event.sample_offset, id),
+                        ref other => panic!("unexpected event {other:?}"),
+                    });
+                }
+            });
+            drop(audio);
+            unsafe { self.0.process_f32(args) }
         }
     }
 
+    fn make() -> Box<dyn Vst3Backend> {
+        Box::new(SnapshotBackend(
+            Vst3Instance::<Probe>::create().expect("create"),
+        ))
+    }
+
     fn plugin_registration() -> &'static Registration {
-        let mut desc = descriptor();
-        desc.midi_input_ports = 1;
-        registration(
-            desc,
-            Vst3Callbacks {
-                create: cb_create::<Probe>,
-                destroy: cb_destroy::<Probe>,
-                prepare: cb_prepare::<Probe>,
-                process: snapshot_process,
-                begin_input_events: cb_begin_input_events::<Probe>,
-                push_input_event: cb_push_input_event::<Probe>,
-                push_param_change: cb_push_param_change::<Probe>,
-                param_get_value: cb_param_get_value::<Probe>,
-                param_set_value: cb_param_set_value::<Probe>,
-                param_denormalize: cb_param_denormalize::<Probe>,
-                ..callbacks()
-            },
-            Vec::new(),
-        )
+        let desc = PluginDescriptor {
+            midi_input_ports: 1,
+            ..descriptor()
+        };
+        registration_with(desc, make, no_bus, Vec::new())
     }
 
     // -- Fake host objects.
@@ -3553,9 +3165,9 @@ fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() 
     use std::sync::atomic::{AtomicPtr, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
-    struct Ctx {
+    struct QueueBackend {
         queue: Arc<HostQueue>,
-        target: Arc<AtomicPtr<c_void>>,
+        target: Arc<AtomicPtr<Host>>,
     }
 
     static ACTIVE_QUEUE: Mutex<Option<Arc<HostQueue>>> = Mutex::new(None);
@@ -3563,8 +3175,8 @@ fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() 
     static DESTROY_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
     static WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    unsafe extern "C" fn create_ctx() -> *mut c_void {
-        let target = Arc::new(AtomicPtr::<c_void>::new(std::ptr::null_mut()));
+    fn make() -> Box<dyn Vst3Backend> {
+        let target = Arc::new(AtomicPtr::<Host>::new(std::ptr::null_mut()));
         let target_wake = Arc::clone(&target);
         let queue = Arc::new(HostQueue::new(move || {
             let host = target_wake.load(Ordering::Acquire);
@@ -3575,28 +3187,32 @@ fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() 
                     // Hold the wake open briefly while the main thread drops `Host`.
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                // SAFETY: `bind_host_queue(ctx, null)` closes the queue before
+                // SAFETY: `bind_host_queue(0, None)` closes the queue before
                 // `Host::drop` frees `host`.
-                unsafe { crate::ffi::moose_vst3_wake_host_queue(host) };
+                unsafe { crate::com::wake_host_queue(host) };
             }
         }));
         *ACTIVE_QUEUE.lock().unwrap() = Some(Arc::clone(&queue));
-        Box::into_raw(Box::new(Ctx { queue, target })).cast()
+        Box::new(QueueBackend { queue, target })
     }
 
-    unsafe extern "C" fn bind_ctx(ctx: *mut c_void, host: *mut c_void) {
-        let state = unsafe { &*ctx.cast::<Ctx>() };
-        state.target.store(host, Ordering::Release);
-        if host.is_null() {
-            state.queue.close();
+    impl Vst3Backend for QueueBackend {
+        unsafe fn bind_host_queue(&self, _: usize, host: Option<*const Host>) {
+            self.target.store(
+                host.unwrap_or(std::ptr::null()).cast_mut(),
+                Ordering::Release,
+            );
+            if host.is_none() {
+                self.queue.close();
+            }
         }
     }
 
-    unsafe extern "C" fn destroy_ctx(ctx: *mut c_void) {
-        *DESTROY_THREAD.lock().unwrap() = Some(std::thread::current().id());
-        let state = unsafe { Box::from_raw(ctx.cast::<Ctx>()) };
-        state.queue.close();
-        drop(state);
+    impl Drop for QueueBackend {
+        fn drop(&mut self) {
+            *DESTROY_THREAD.lock().unwrap() = Some(std::thread::current().id());
+            self.queue.close();
+        }
     }
 
     let barrier = Arc::new(Barrier::new(2));
@@ -3604,11 +3220,7 @@ fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() 
     *DESTROY_THREAD.lock().unwrap() = None;
     WAKE_COUNT.store(0, Ordering::Release);
 
-    let mut cb = callbacks();
-    cb.create = create_ctx;
-    cb.bind_host_queue = bind_ctx;
-    cb.destroy = destroy_ctx;
-    let reg = registration(descriptor(), cb, Vec::new());
+    let reg = registration_with(descriptor(), make, no_bus, Vec::new());
     let host = Host::new(reg, None).expect("host");
     let queue = ACTIVE_QUEUE
         .lock()
@@ -3638,7 +3250,7 @@ fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() 
     assert_eq!(
         *DESTROY_THREAD.lock().unwrap(),
         Some(main_id),
-        "cb_destroy must run on the dropping thread, never inside the worker wake"
+        "the backend must drop on the dropping thread, never inside the worker wake"
     );
 }
 
@@ -3693,16 +3305,25 @@ fn construction_time_mark_dirty_delivers_on_set_component_handler() {
     }
 
     static EMITTED: AtomicBool = AtomicBool::new(false);
-    unsafe extern "C" fn drain_marking_dirty(ctx: *mut c_void) {
-        if !EMITTED.swap(true, Ordering::AcqRel) {
-            crate::ffi::moose_vst3_mark_dirty(ctx);
+
+    #[derive(Default)]
+    struct DrainMarkingDirty {
+        host: AtomicUsize,
+    }
+
+    impl Vst3Backend for DrainMarkingDirty {
+        unsafe fn bind_host_queue(&self, id: usize, _: Option<*const Host>) {
+            self.host.store(id, Ordering::Release);
+        }
+        fn drain_host_queue(&self) {
+            if !EMITTED.swap(true, Ordering::AcqRel) {
+                crate::com::mark_dirty(self.host.load(Ordering::Acquire));
+            }
         }
     }
 
     EMITTED.store(false, Ordering::Release);
-    let mut cb = callbacks();
-    cb.drain_host_queue = drain_marking_dirty;
-    let reg = registration(descriptor(), cb, Vec::new());
+    let reg = registration::<DrainMarkingDirty>(descriptor(), Vec::new());
     let com = component(reg);
     let c: &Component = &com;
 
@@ -3733,38 +3354,31 @@ fn parameter_finder_and_audio_presentation_latency_interfaces() {
 
     static LATENCY_CALLS: Mutex<Vec<(i32, u32, u32)>> = Mutex::new(Vec::new());
 
-    unsafe extern "C" fn has_editor(_: *mut c_void) -> i32 {
-        1
-    }
-    unsafe extern "C" fn fake_param_at(_: *mut c_void, x: i32, y: i32, out_id: *mut u32) -> i32 {
-        if x == 120 && y == 80 {
-            unsafe { *out_id = 42 };
-            1
-        } else {
-            0
+    #[derive(Default)]
+    struct B;
+
+    impl Vst3Backend for B {
+        fn gui_has_editor(&self) -> bool {
+            true
         }
-    }
-    unsafe extern "C" fn record_pres_latency(
-        _: *mut c_void,
-        is_input: i32,
-        bus_index: u32,
-        latency: u32,
-    ) {
-        LATENCY_CALLS
-            .lock()
-            .unwrap()
-            .push((is_input, bus_index, latency));
+        fn gui_param_at(&self, x: i32, y: i32) -> Option<u32> {
+            (x == 120 && y == 80).then_some(42)
+        }
+        fn set_audio_presentation_latency(&self, is_input: bool, bus_index: u32, latency: u32) {
+            LATENCY_CALLS
+                .lock()
+                .unwrap()
+                .push((i32::from(is_input), bus_index, latency));
+        }
     }
 
     LATENCY_CALLS.lock().unwrap().clear();
-    let mut cb = callbacks();
-    cb.gui_has_editor = has_editor;
-    cb.gui_param_at = fake_param_at;
-    cb.set_audio_presentation_latency = record_pres_latency;
-    let mut desc = descriptor();
-    desc.num_input_buses = 2;
-    desc.num_output_buses = 1;
-    let reg = registration(desc, cb, Vec::new());
+    let desc = PluginDescriptor {
+        input_bus_kinds: vec![0, 0],
+        output_bus_kinds: vec![0],
+        ..descriptor()
+    };
+    let reg = registration::<B>(desc, Vec::new());
     let host = Host::new(reg, None).expect("host");
 
     // IAudioPresentationLatency on Component
@@ -3827,50 +3441,35 @@ fn get_parameter_info_prefers_live_step_count_when_present() {
 
     static LIVE_STEPS: AtomicI32 = AtomicI32::new(-1);
 
-    unsafe extern "C" fn live_step(_: *mut c_void, id: u32, out_default_norm: *mut f64) -> i32 {
-        if id == 7 {
+    #[derive(Default)]
+    struct LiveStep;
+
+    impl Vst3Backend for LiveStep {
+        fn param_step_count(&self, id: u32) -> Option<(i32, Option<f64>)> {
             let steps = LIVE_STEPS.load(Ordering::Acquire);
-            if steps > 0
-                && let Some(out) = unsafe { out_default_norm.as_mut() }
-            {
-                *out = 1.0 / f64::from(steps);
-            }
-            steps
-        } else {
-            -1
+            (id == 7 && steps > 0).then(|| (steps, Some(1.0 / f64::from(steps))))
         }
     }
 
     LIVE_STEPS.store(-1, Ordering::Release);
-    let mut cb = callbacks();
-    cb.param_step_count = live_step;
     let params = vec![
-        Vst3ParamDescriptor {
+        ParamDescriptor {
             id: 7,
-            name: c"Bank".as_ptr(),
-            short_name: c"Bank".as_ptr(),
-            units: c"".as_ptr(),
-            min: 0.0,
-            max: 2.0,
+            name: "Bank".into(),
+            short_name: "Bank".into(),
             default_normalized: 0.5,
             step_count: 2,
-            flags: 0,
-            group: c"".as_ptr(),
+            ..ParamDescriptor::default()
         },
-        Vst3ParamDescriptor {
+        ParamDescriptor {
             id: 8,
-            name: c"Gain".as_ptr(),
-            short_name: c"Gain".as_ptr(),
-            units: c"".as_ptr(),
-            min: 0.0,
-            max: 1.0,
+            name: "Gain".into(),
+            short_name: "Gain".into(),
             default_normalized: 0.5,
-            step_count: 0,
-            flags: 0,
-            group: c"".as_ptr(),
+            ..ParamDescriptor::default()
         },
     ];
-    let reg = registration(descriptor(), cb, params);
+    let reg = registration::<LiveStep>(descriptor(), params);
     let host = Host::new(reg, None).expect("host");
     let comp = ComWrapper::new(Component { host });
     let ctrl = comp.to_com_ptr::<IEditController>().expect("controller");
@@ -3982,78 +3581,77 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     static BANK: std::sync::Mutex<Vec<moose_core::main_thread::ProgramPreset>> =
         std::sync::Mutex::new(Vec::new());
 
-    unsafe fn test_keyswitches(
-        _: *mut c_void,
-        bus: u32,
-        channel: u8,
-    ) -> Vec<moose_core::main_thread::Keyswitch> {
-        if bus == 0 && channel == 0 {
-            vec![
-                moose_core::main_thread::Keyswitch {
-                    kind: moose_core::main_thread::KeyswitchKind::NoteOn,
-                    title: "Legato".into(),
-                    short_title: "Leg".into(),
-                    min_key: 24,
-                    max_key: 24,
-                    remapped_key: -1,
-                    unit_id: 0,
-                },
-                moose_core::main_thread::Keyswitch {
-                    kind: moose_core::main_thread::KeyswitchKind::KeyRange,
-                    title: "Staccato".into(),
-                    short_title: "Stac".into(),
-                    min_key: 25,
-                    max_key: 27,
-                    remapped_key: 36,
-                    unit_id: 0,
-                },
-            ]
-        } else {
-            Vec::new()
-        }
-    }
-
-    unsafe fn test_programs(_: *mut c_void) -> Vec<moose_core::main_thread::ProgramPreset> {
+    fn test_programs() -> Vec<moose_core::main_thread::ProgramPreset> {
         BANK.lock().unwrap().clone()
     }
 
-    unsafe fn test_set_program_data(
-        _: *mut c_void,
-        index: usize,
-        data: *const u8,
-        len: usize,
-    ) -> bool {
-        let mut bank = BANK.lock().unwrap();
-        let Some(slot) = bank.get_mut(index) else {
-            return false;
-        };
-        slot.state = if data.is_null() || len == 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
-        };
-        true
+    #[derive(Default)]
+    struct Full;
+
+    impl Vst3Backend for Full {
+        fn keyswitches(&self, bus: u32, channel: u8) -> Vec<moose_core::main_thread::Keyswitch> {
+            if bus == 0 && channel == 0 {
+                vec![
+                    moose_core::main_thread::Keyswitch {
+                        kind: moose_core::main_thread::KeyswitchKind::NoteOn,
+                        title: "Legato".into(),
+                        short_title: "Leg".into(),
+                        min_key: 24,
+                        max_key: 24,
+                        remapped_key: -1,
+                        unit_id: 0,
+                    },
+                    moose_core::main_thread::Keyswitch {
+                        kind: moose_core::main_thread::KeyswitchKind::KeyRange,
+                        title: "Staccato".into(),
+                        short_title: "Stac".into(),
+                        min_key: 25,
+                        max_key: 27,
+                        remapped_key: 36,
+                        unit_id: 0,
+                    },
+                ]
+            } else {
+                Vec::new()
+            }
+        }
+        fn program_list(&self) -> Vec<moose_core::main_thread::ProgramPreset> {
+            test_programs()
+        }
+        fn set_program_data(&self, index: usize, data: &[u8]) -> bool {
+            let mut bank = BANK.lock().unwrap();
+            let Some(slot) = bank.get_mut(index) else {
+                return false;
+            };
+            slot.state = data.to_vec();
+            true
+        }
+        fn state_load_stream(&self, read: &mut dyn FnMut(&mut [u8]) -> i64) -> bool {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = read(&mut buf);
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            if out == b"MOOSE_STATE_A" {
+                return false;
+            }
+            *LOADED_PROGRAM.lock().unwrap() = out;
+            true
+        }
     }
 
-    unsafe extern "C" fn capture_load_stream(
-        _: *mut c_void,
-        stream: *mut c_void,
-        read: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> i64,
-    ) -> i32 {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 64];
-        loop {
-            let n = unsafe { read(stream, buf.as_mut_ptr(), buf.len() as u32) };
-            if n <= 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n as usize]);
+    /// An immutable bank: default `set_program_data`.
+    #[derive(Default)]
+    struct ReadOnly;
+
+    impl Vst3Backend for ReadOnly {
+        fn program_list(&self) -> Vec<moose_core::main_thread::ProgramPreset> {
+            test_programs()
         }
-        if out == b"MOOSE_STATE_A" {
-            return 0;
-        }
-        *LOADED_PROGRAM.lock().unwrap() = out;
-        1
     }
 
     *BANK.lock().unwrap() = vec![
@@ -4070,28 +3668,20 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     ];
     LOADED_PROGRAM.lock().unwrap().clear();
 
-    let compat_json = c"{\"New\":[{\"ClassID\":\"00112233445566778899AABBCCDDEEFF\"}]}";
-    let mut desc = descriptor();
-    desc.name = c"ParityTest".as_ptr();
-    desc.vendor = c"Matari".as_ptr();
-    desc.category = c"Audio Module Class".as_ptr();
-    desc.subcategories = c"Instrument|Synth".as_ptr();
-    desc.version = c"1.0.0".as_ptr();
-    desc.cid = [1; 16];
-    desc.midi_input_ports = 1;
-    desc.compatibility_json = compat_json.as_ptr();
+    let compat_json = "{\"New\":[{\"ClassID\":\"00112233445566778899AABBCCDDEEFF\"}]}";
+    let desc = PluginDescriptor {
+        name: "ParityTest".into(),
+        vendor: "Matari".into(),
+        category: "Audio Module Class".into(),
+        subcategories: "Instrument|Synth".into(),
+        version: "1.0.0".into(),
+        cid: [1; 16],
+        midi_input_ports: 1,
+        compatibility_json: Some(compat_json.into()),
+        ..descriptor()
+    };
 
-    let reg = registration(
-        desc,
-        Vst3Callbacks {
-            keyswitches: test_keyswitches,
-            program_list: test_programs,
-            set_program_data: test_set_program_data,
-            state_load_stream: capture_load_stream,
-            ..callbacks()
-        },
-        vec![],
-    );
+    let reg = registration::<Full>(desc, vec![]);
 
     let comp = component(reg);
     let comp_unk = comp.to_com_ptr::<IComponent>().expect("IComponent");
@@ -4266,17 +3856,12 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     assert_eq!(updated_stream.bytes(), b"MOOSE_STATE_B_UPDATED");
 
     // Immutable banks (default `set_program_data` returning false) reject writes.
-    let mut ro_desc = descriptor();
-    ro_desc.name = c"ParityTest".as_ptr();
-    ro_desc.cid = [2; 16];
-    let ro_reg = registration(
-        ro_desc,
-        Vst3Callbacks {
-            program_list: test_programs,
-            ..callbacks()
-        },
-        vec![],
-    );
+    let ro_desc = PluginDescriptor {
+        name: "ParityTest".into(),
+        cid: [2; 16],
+        ..descriptor()
+    };
+    let ro_reg = registration::<ReadOnly>(ro_desc, vec![]);
     let ro_comp = component(ro_reg);
     let ro_pdata = ro_comp
         .to_com_ptr::<IProgramListData>()
@@ -4324,5 +3909,5 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
         unsafe { compat.getCompatibilityJSON(json_ptr.as_ptr()) },
         kResultOk
     );
-    assert_eq!(json_stream.bytes(), compat_json.to_bytes());
+    assert_eq!(json_stream.bytes(), compat_json.as_bytes());
 }

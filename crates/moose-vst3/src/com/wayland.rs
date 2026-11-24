@@ -236,14 +236,11 @@ impl ITimerHandlerTrait for Hook {
 }
 
 fn on_fd(host: &Host) {
-    // SAFETY: `ctx` is the live plugin instance; run loops call on the UI
-    // thread.
-    unsafe { (host.reg.cb.gui_on_fd)(host.ctx) };
+    host.backend().gui_on_fd();
 }
 
 fn on_timer(host: &Host) {
-    // SAFETY: as in `on_fd`.
-    unsafe { (host.reg.cb.gui_on_timer)(host.ctx) };
+    host.backend().gui_on_timer();
 }
 
 /// The editor's fd handler (when it has an fd) and timer on a run loop,

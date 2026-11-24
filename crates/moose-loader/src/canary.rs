@@ -12,13 +12,6 @@ use std::ptr;
 use moose_core::buffer::AudioBuffer;
 use moose_core::events::{Event, EventBody, TransportInfo as Transport};
 use moose_core::process::{ProcessContext, ProcessStatus};
-// Source canary types from `moose-gui-types` (the lightweight types
-// crate) so the canary - which every shell needs - stays available even
-// when `builtin-gui` is off and the heavy `moose-gui` renderer crate is
-// out of the dep graph.
-use moose_gui_types::interaction::WidgetRegion;
-use moose_gui_types::layout::GridLayout;
-use moose_gui_types::theme::{Color, Theme};
 
 /// Hand-bumped ABI epoch. Sizes and alignments can't see every
 /// layout change: `Event::port` landed in former padding, so
@@ -70,7 +63,9 @@ use moose_gui_types::theme::{Color, Theme};
 /// `#[persist]` or `SnapshotPublisher`).
 /// Epoch 11: adds `Editor::has_ui` to the editor vtable returned by
 /// `moose_build_editor`. Shell and logic must be rebuilt together.
-pub const ABI_EPOCH: u32 = 11;
+/// Epoch 12: removed retired `moose-gui-types` size fields from `AbiCanary`
+/// (paired with `moose_abi_canary_v3` symbol bump).
+pub const ABI_EPOCH: u32 = 12;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///
@@ -87,10 +82,6 @@ pub struct AbiCanary {
     pub event_size: usize,
     pub event_body_size: usize,
     pub transport_size: usize,
-    pub widget_region_size: usize,
-    pub theme_size: usize,
-    pub plugin_layout_size: usize,
-    pub color_size: usize,
     pub vec_u8_size: usize,
     pub option_usize_size: usize,
     pub audio_buffer_align: usize,
@@ -113,7 +104,7 @@ pub struct AbiCanary {
 impl AbiCanary {
     /// Build the canary for a specific sample precision `S`. The
     /// shell calls this with its own `S`; the dylib's
-    /// `moose_abi_canary_v2` export does the same with its own (from the
+    /// `moose_abi_canary_v3` export does the same with its own (from the
     /// prelude alias). The two are compared at load time.
     #[must_use]
     pub fn current<S: moose_params::sample::Sample>() -> Self {
@@ -129,10 +120,6 @@ impl AbiCanary {
             event_size: size_of::<Event>(),
             event_body_size: size_of::<EventBody>(),
             transport_size: size_of::<Transport>(),
-            widget_region_size: size_of::<WidgetRegion>(),
-            theme_size: size_of::<Theme>(),
-            plugin_layout_size: size_of::<GridLayout>(),
-            color_size: size_of::<Color>(),
             vec_u8_size: size_of::<Vec<u8>>(),
             option_usize_size: size_of::<Option<usize>>(),
             audio_buffer_align: align_of::<AudioBuffer<S>>(),
@@ -184,10 +171,6 @@ impl AbiCanary {
         check!(event_size);
         check!(event_body_size);
         check!(transport_size);
-        check!(widget_region_size);
-        check!(theme_size);
-        check!(plugin_layout_size);
-        check!(color_size);
         check!(vec_u8_size);
         check!(option_usize_size);
         check!(audio_buffer_align);

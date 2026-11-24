@@ -45,7 +45,7 @@ static or hot-reload wrapper based on the `shell` Cargo feature.
   mode.
 - **`export_plugin!`** -- emits the `#[no_mangle]` C ABI symbols
   for shell mode (`moose_init_state`, `moose_process`,
-  `moose_build_editor`, `moose_abi_canary_v2`, ...). Each one
+  `moose_build_editor`, `moose_abi_canary_v3`, ...). Each one
   carries the plugin's chosen precision (via the prelude's
   `Sample` alias).
 

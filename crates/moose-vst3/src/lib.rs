@@ -1,9 +1,10 @@
 //! VST3 format wrapper for moose.
 //!
 //! The COM objects (`com/`) are built on the official SDK interfaces from
-//! the `vst3` crate. This file holds the plugin side: a callback table,
-//! generic over the plugin type, that the COM layer calls.
+//! the `vst3` crate and call directly into [`backend::Vst3Backend`]
+//! implemented on [`instance::Vst3Instance`].
 
+mod backend;
 mod com;
 pub mod ffi;
 mod gui;
@@ -20,18 +21,13 @@ mod registration;
 pub use process::rt_paranoid_smoke;
 pub use registration::register_vst3;
 
-// The inline test modules below `use super::*` and reach every split module.
 #[cfg(test)]
 use crate::{
-    host_state::*, input_events::*, instance::*, lifecycle::*, midi_proxy::*, output_events::*,
-    params::*, process::*, registration::*,
+    backend::*, input_events::*, instance::*, lifecycle::*, midi_proxy::*, output_events::*,
+    params::*, registration::*,
 };
 #[cfg(test)]
-use ffi::Vst3NativeEvent;
-#[cfg(test)]
 use moose_core::config::AudioConfig;
-#[cfg(test)]
-use moose_core::events::Event;
 #[cfg(test)]
 use moose_core::events::EventList;
 #[cfg(test)]
@@ -39,11 +35,7 @@ use moose_core::export::PluginExport;
 #[cfg(test)]
 use moose_core::info::PluginInfo;
 #[cfg(test)]
-use moose_core::main_thread::LearnSource;
-#[cfg(test)]
-use moose_core::main_thread::MainThreadHooks;
-#[cfg(test)]
-use moose_core::main_thread::TrackInfo;
+use moose_core::main_thread::{LearnSource, MainThreadHooks, TrackInfo};
 #[cfg(test)]
 use moose_core::meters::MeterStore;
 #[cfg(test)]
@@ -52,20 +44,10 @@ use moose_core::plugin::PluginRuntime;
 use moose_core::snapshot::SnapshotSlot;
 #[cfg(test)]
 use moose_core::thread::MainThread;
-#[cfg(test)]
-use moose_params::MidiSource;
-#[cfg(test)]
-use moose_params::ParamFunction;
-#[cfg(test)]
-use moose_params::ParamInfo;
-#[cfg(test)]
-use moose_params::ParamRange;
 #[cfg(all(test, target_os = "linux"))]
 use moose_params::Params;
 #[cfg(test)]
-use std::ffi::CStr;
-#[cfg(test)]
-use std::slice;
+use moose_params::{MidiSource, ParamFunction, ParamInfo, ParamRange};
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -82,17 +64,11 @@ macro_rules! export_vst3 {
             use super::*;
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn moose_vst3_init() {
-                ::moose_vst3::register_vst3::<$plugin_type>();
-            }
-
-            #[unsafe(no_mangle)]
             #[allow(non_snake_case)]
             pub unsafe extern "C" fn GetPluginFactory() -> *mut ::std::ffi::c_void {
-                // Lazy init: register on first call
                 static INIT: ::std::sync::Once = ::std::sync::Once::new();
                 INIT.call_once(|| {
-                    moose_vst3_init();
+                    ::moose_vst3::register_vst3::<$plugin_type>();
                 });
                 ::moose_vst3::ffi::moose_vst3_get_factory()
             }
@@ -164,9 +140,6 @@ mod midi_proxy_tests {
 
     #[test]
     fn id_round_trips_across_the_banks() {
-        // Every (port, channel, controller) triple survives the trip -
-        // multi-timbral hosts rely on the port dimension to keep each
-        // bus's controllers separate.
         for port in [0u8, 1, 3, 255] {
             for channel in 0u8..16 {
                 for controller in 0..MIDI_PROXY_PER_CHANNEL {
@@ -179,20 +152,15 @@ mod midi_proxy_tests {
 
     #[test]
     fn ports_get_distinct_ids() {
-        // The whole point of per-port banks: the same (channel, cc)
-        // on two buses must be two parameter queues host-side.
         assert_ne!(midi_proxy_id(0, 4, 74), midi_proxy_id(1, 4, 74));
     }
 
     #[test]
     fn real_param_ids_never_decode() {
-        // Hash ids live below METER_ID_BASE, meters just above it -
-        // both far under the proxy base.
         const _: () = assert!(MIDI_PROXY_ID_BASE > moose_params::METER_ID_BASE);
         assert_eq!(midi_proxy_decode(0), None);
         assert_eq!(midi_proxy_decode(moose_params::METER_ID_BASE), None);
         assert_eq!(midi_proxy_decode(MIDI_PROXY_ID_BASE - 1), None);
-        // One past the last bank is out again.
         assert_eq!(
             midi_proxy_decode(midi_proxy_id(255, 15, MIDI_PROXY_PER_CHANNEL - 1) + 1),
             None
@@ -246,8 +214,6 @@ mod channel_limit_tests {
     use super::{max_layout_channels, vst3_bus_widths_supported, vst3_topology_consistent};
     use moose_core::bus::{BusLayout, ChannelConfig};
 
-    /// Layouts differing only in channel *width* (the point of multi-layout)
-    /// share one bus topology and are accepted.
     #[test]
     fn topology_consistent_when_only_widths_vary() {
         let layouts = [
@@ -257,9 +223,6 @@ mod channel_limit_tests {
         assert!(vst3_topology_consistent(&layouts));
     }
 
-    /// A layout with a different input bus *count* (the report's case: a
-    /// mono main with no sidechain alongside a main+sidechain layout) can
-    /// never be matched, so it's rejected at registration.
     #[test]
     fn topology_inconsistent_when_bus_count_differs() {
         let layouts = [
@@ -283,7 +246,6 @@ mod channel_limit_tests {
 
     #[test]
     fn sums_channels_across_buses() {
-        // Main stereo + stereo sidechain = 4 input channels, 2 output.
         let layouts =
             [BusLayout::stereo().with_sidechain_input("Sidechain", ChannelConfig::Stereo)];
         assert_eq!(max_layout_channels(&layouts), (4, 2));
@@ -291,8 +253,6 @@ mod channel_limit_tests {
 
     #[test]
     fn wide_layouts_are_measured_not_capped() {
-        // 17 stereo buses = 34 channels: past the old 32-channel shim cap,
-        // now just the width the process pointer arrays are sized for.
         let mut layout = BusLayout::new()
             .with_input("Main", ChannelConfig::Stereo)
             .with_output("Main", ChannelConfig::Stereo);
@@ -320,7 +280,10 @@ mod channel_limit_tests {
 mod tests {
     use super::*;
     use moose_core::events::EventBody;
-    use std::ffi::c_void;
+    use moose_params::{MidiSource, ParamFlags, ParamUnit, ParamValueKind};
+    use std::cell::Cell;
+    use vst3::Steinberg::{IBStream, IBStreamTrait, int32, int64, kResultOk, tresult};
+    use vst3::{Class, ComWrapper};
 
     #[test]
     fn midi_proxy_text_parses_the_fallback_display() {
@@ -331,85 +294,74 @@ mod tests {
         assert_eq!(parse_midi_proxy_text("loud"), None);
     }
 
-    use crate::com::{
-        read_state_chunk as moose_vst3_read_state_chunk,
-        write_state_stream as moose_vst3_write_state_stream,
-    };
-
-    /// A fake `IBStream`: the vtable pointer first, then a script of
-    /// `(tresult, byte count)` replies the shim sees per read/write.
-    #[repr(C)]
-    struct FakeStream {
-        vtbl: *const FakeVtbl,
-        replies: Vec<(i32, i32)>,
-        calls: usize,
+    struct ScriptedStream {
+        replies: Vec<(tresult, i32)>,
+        calls: Cell<usize>,
     }
 
-    unsafe extern "C" fn fake_io(s: *mut c_void, _buf: *mut c_void, n: i32, out: *mut i32) -> i32 {
-        let s = unsafe { &mut *s.cast::<FakeStream>() };
-        let (r, count) = s.replies.get(s.calls).copied().unwrap_or((0, 0));
-        s.calls += 1;
-        unsafe { *out = if count == i32::MAX { n } else { count } };
-        r
+    impl Class for ScriptedStream {
+        type Interfaces = (IBStream,);
     }
 
-    type IoFn = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, *mut i32) -> i32;
+    impl IBStreamTrait for ScriptedStream {
+        unsafe fn read(
+            &self,
+            _buffer: *mut std::ffi::c_void,
+            num_bytes: int32,
+            num_bytes_read: *mut int32,
+        ) -> tresult {
+            let i = self.calls.get();
+            self.calls.set(i + 1);
+            let (rc, count) = self.replies.get(i).copied().unwrap_or((kResultOk, 0));
+            unsafe {
+                *num_bytes_read = if count == i32::MAX { num_bytes } else { count };
+            }
+            rc
+        }
 
-    /// `IBStream` vtable layout: 3 `FUnknown` slots, read, write, seek, tell.
-    #[repr(C)]
-    struct FakeVtbl {
-        _unknown: [usize; 3],
-        read: IoFn,
-        write: IoFn,
-        _seek_tell: [usize; 2],
-    }
+        unsafe fn write(
+            &self,
+            buffer: *mut std::ffi::c_void,
+            num_bytes: int32,
+            num_bytes_written: *mut int32,
+        ) -> tresult {
+            unsafe { self.read(buffer, num_bytes, num_bytes_written) }
+        }
 
-    static FAKE_VTBL: FakeVtbl = FakeVtbl {
-        _unknown: [0; 3],
-        read: fake_io,
-        write: fake_io,
-        _seek_tell: [0; 2],
-    };
+        unsafe fn seek(&self, _pos: int64, _mode: int32, _result: *mut int64) -> tresult {
+            kResultOk
+        }
 
-    fn fake(replies: &[(i32, i32)]) -> FakeStream {
-        FakeStream {
-            vtbl: &raw const FAKE_VTBL,
-            replies: replies.to_vec(),
-            calls: 0,
+        unsafe fn tell(&self, _pos: *mut int64) -> tresult {
+            kResultOk
         }
     }
 
     #[test]
     fn state_read_chunk_preserves_short_reads_and_rejects_bad_counts() {
-        let mut s = fake(&[(0, 317), (1, 17), (0, 0), (0, -1), (0, 8193)]);
+        let stream = ComWrapper::new(ScriptedStream {
+            replies: vec![(0, 317), (1, 17), (0, 0), (0, -1), (0, 8193)],
+            calls: Cell::new(0),
+        });
+        let com_ref = stream.as_com_ref::<IBStream>().unwrap();
         let mut buf = [0_u8; 8192];
         for expected in [317, 17, 0, -1, -1] {
-            let count = unsafe {
-                moose_vst3_read_state_chunk(
-                    (&raw mut s).cast(),
-                    buf.as_mut_ptr(),
-                    u32::try_from(buf.len()).expect("buffer length fits u32"),
-                )
-            };
-            assert_eq!(count, expected);
+            assert_eq!(crate::com::read_state_chunk(com_ref, &mut buf), expected);
         }
     }
 
     #[test]
-    fn state_write_loops_over_partial_writes() {
+    fn state_write_chunk_rejects_zero_progress_and_overruns() {
+        let stream = ComWrapper::new(ScriptedStream {
+            replies: vec![(0, 60), (0, 0), (0, 101)],
+            calls: Cell::new(0),
+        });
+        let com_ref = stream.as_com_ref::<IBStream>().unwrap();
         let blob = [7u8; 100];
-        let write = |replies: &[(i32, i32)]| {
-            let mut s = fake(replies);
-            let ok =
-                unsafe { moose_vst3_write_state_stream((&raw mut s).cast(), blob.as_ptr(), 100) };
-            (ok, s.calls)
-        };
-        assert_eq!(write(&[(0, 60), (0, 40)]), (1, 2));
-        // No progress, or a count past the request, fails the save.
-        assert_eq!(write(&[(0, 60), (0, 0)]).0, 0);
-        assert_eq!(write(&[(0, 101)]).0, 0);
+        assert_eq!(crate::com::write_state_chunk(com_ref, &blob), 60);
+        assert_eq!(crate::com::write_state_chunk(com_ref, &blob), -1);
+        assert_eq!(crate::com::write_state_chunk(com_ref, &blob), -1);
     }
-    use moose_params::{MidiSource, ParamFlags, ParamUnit, ParamValueKind};
 
     fn info(range: ParamRange, midi_map: Option<MidiSource>) -> ParamInfo {
         ParamInfo {
@@ -427,8 +379,6 @@ mod tests {
         }
     }
 
-    /// Bridge a param change the way `process_block` does: only a param
-    /// with a `midi_map` produces an event.
     fn bridge(info: &ParamInfo, plain: f64) -> Option<EventBody> {
         MidiMap::from_param(info).map(|m| midi_event_from_map(&m, plain))
     }
@@ -441,9 +391,6 @@ mod tests {
 
     #[test]
     fn midi_map_cache_holds_only_mapped_ids_and_binary_searches() {
-        // The `process_block` fast path: build the sorted cache the way
-        // `cb_create` does, then look up by id. Unmapped params are
-        // absent, so their ids (and unknown ids) miss.
         let range = ParamRange::Linear {
             min: 0.0,
             max: 127.0,
@@ -464,7 +411,6 @@ mod tests {
         assert_eq!(cache.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [5, 9]);
 
         let find = |id: u32| cache.binary_search_by_key(&id, |(i, _)| *i);
-        // The mapped CC bridges to a ControlChange on its number.
         let idx = find(5).expect("mapped id 5 present");
         assert!(matches!(
             midi_event_from_map(&cache[idx].1, 127.0),
@@ -477,7 +423,6 @@ mod tests {
 
     #[test]
     fn note_expression_maps_per_note_cc_and_bend() {
-        // Volume CC (7) -> VST3 type 0; noteId = (channel<<7)|note.
         let (type_id, note_id, value) = note_expression_of(&EventBody::PerNoteCC {
             group: 0,
             channel: 2,
@@ -491,7 +436,6 @@ mod tests {
         assert_eq!(note_id, vst3_note_id(2, 60));
         assert!((value - 1.0).abs() < 1e-9);
 
-        // Pitch bend -> tuning (type 2), center value ~0.5.
         let (type_id, _, value) = note_expression_of(&EventBody::PerNotePitchBend {
             group: 0,
             channel: 0,
@@ -502,8 +446,6 @@ mod tests {
         assert_eq!(type_id, 2);
         assert!((value - 0.5).abs() < 1e-3);
 
-        // Full-scale wire bend is ±48 st; VST3's tuning norm spans
-        // ±120 st, so it must land at 0.5 + 48/240 = 0.7, not 1.0.
         let (_, _, value) = note_expression_of(&EventBody::PerNotePitchBend {
             group: 0,
             channel: 0,
@@ -513,7 +455,6 @@ mod tests {
         .expect("bend maps");
         assert!((value - 0.7).abs() < 1e-6);
 
-        // A CC with no predefined VST3 note-expression type is skipped.
         assert!(
             note_expression_of(&EventBody::PerNoteCC {
                 group: 0,
@@ -529,8 +470,6 @@ mod tests {
 
     #[test]
     fn assignable_per_note_cc_is_not_an_expression() {
-        // Only registered per-note indices carry the predefined
-        // expression semantics; an assignable index 7 is not volume.
         assert!(
             note_expression_of(&EventBody::PerNoteCC {
                 group: 0,
@@ -547,157 +486,33 @@ mod tests {
     #[test]
     fn note_id_is_deterministic() {
         assert_eq!(vst3_note_id(0, 0), 0);
-        assert_eq!(vst3_note_id(2, 60), 0x013C); // (2 << 7) | 60
-        assert_eq!(vst3_note_id(15, 127), 0x07FF); // (15 << 7) | 127
-    }
-
-    #[test]
-    fn midi_event_layout_matches_shim() {
-        // The C++ shim static_asserts the same shape; a drift on either
-        // side fails its build or this test.
-        assert_eq!(std::mem::size_of::<Vst3MidiEvent>(), 24);
-        assert_eq!(std::mem::align_of::<Vst3MidiEvent>(), 8);
-    }
-
-    #[test]
-    fn note_id_map_scopes_ids_per_port() {
-        let mut map = NoteIdMap::new();
-        // Host counters are arbitrary - nothing like the pitch - and
-        // scoped per event bus: the same id on two buses is two
-        // distinct voices.
-        map.insert(0, 90210, 3, 64);
-        map.insert(1, 90210, 5, 72);
-        assert_eq!(map.lookup(0, 90210), Some((3, 64)));
-        assert_eq!(map.lookup(1, 90210), Some((5, 72)));
-        assert_eq!(map.lookup(2, 90210), None);
-        assert_eq!(map.lookup(0, 64), None); // pitch is not a key
-        // Unassigned ids never enter the map.
-        map.insert(0, -1, 0, 60);
-        assert_eq!(map.lookup(0, -1), None);
-        // A reset drops every correlation.
-        map.clear();
-        assert_eq!(map.lookup(0, 90210), None);
-        assert_eq!(map.lookup(1, 90210), None);
-    }
-
-    #[test]
-    fn note_id_map_overflow_overwrites_oldest() {
-        let mut map = NoteIdMap::new();
-        for i in 0..NoteIdMap::CAPACITY {
-            // Bounded by CAPACITY = 128, fits in both domains.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            map.insert(0, 1000 + i as i32, 0, i as u8);
-        }
-        // Full map: the next insert takes the round-robin slot rather
-        // than being dropped, and the newest entry resolves.
-        map.insert(0, 5000, 1, 72);
-        assert_eq!(map.lookup(0, 5000), Some((1, 72)));
-        // Entries outlive their note-off by design, so a full map of
-        // released voices still can't wedge it: stale ids fall to the
-        // round-robin overwrite.
-        for i in 0..NoteIdMap::CAPACITY {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            map.insert(0, 6000 + i as i32, 2, i as u8);
-        }
-        assert_eq!(map.lookup(0, 1000), None);
+        assert_eq!(vst3_note_id(2, 60), 0x013C);
+        assert_eq!(vst3_note_id(15, 127), 0x07FF);
     }
 
     #[test]
     fn tuning_norm_round_trips_and_saturates() {
-        // Center and mid-range survive the domain re-scale both ways.
         assert_eq!(vst3_tuning_to_wire(0.5), 0x8000_0000);
         assert!((wire_to_vst3_tuning(0x8000_0000) - 0.5).abs() < 1e-9);
-        let wire = vst3_tuning_to_wire(0.55); // +12 st
+        let wire = vst3_tuning_to_wire(0.55);
         assert!((wire_to_vst3_tuning(wire) - 0.55).abs() < 1e-6);
-        // A host bend past the wire's ±48 st saturates.
         assert_eq!(vst3_tuning_to_wire(1.0), u32::MAX);
         assert_eq!(vst3_tuning_to_wire(0.0), 0);
     }
 
     #[test]
-    fn unmapped_per_note_cc_degrades_to_channel_cc() {
-        // No predefined VST3 expression type for cc 20 - it must fall
-        // through to the 1.0 downconvert as a channel CC (matching
-        // CLAP), not vanish.
-        let event = Event::new(
-            0,
-            EventBody::PerNoteCC {
-                group: 0,
-                channel: 3,
-                note: 60,
-                cc: 20,
-                value: u32::MAX,
-                registered: true,
-            },
-        );
-        let packet = try_encode_vst3_midi(&event).expect("degrades to channel CC");
-        assert_eq!(packet.status, 0xB3);
-        assert_eq!(packet.data1, 20);
-        assert_eq!(packet.data2, 127);
-
-        // Mapped per-note events ride note expression instead - the
-        // MIDI encoder must skip them or they'd double-emit.
-        let mapped = Event::new(
-            0,
-            EventBody::PerNoteCC {
-                group: 0,
-                channel: 0,
-                note: 60,
-                cc: 7,
-                value: 0,
-                registered: true,
-            },
-        );
-        assert!(try_encode_vst3_midi(&mapped).is_none());
-        let bend = Event::new(
-            0,
-            EventBody::PerNotePitchBend {
-                group: 0,
-                channel: 0,
-                note: 60,
-                value: 0,
-            },
-        );
-        assert!(try_encode_vst3_midi(&bend).is_none());
-    }
-
-    #[test]
     fn unit_conversion_round_trips_full_precision() {
-        // A centered tuning value must survive the crossing exactly -
-        // the old 7-bit path decoded 0.5 as ~0.496 (about a semitone
-        // flat over the +/-120 st tuning domain).
         let center = unit_to_u32(0.5);
         assert!((u32_to_unit(center) - 0.5).abs() < 1e-9);
         assert_eq!(unit_to_u32(0.0), 0);
         assert_eq!(unit_to_u32(1.0), u32::MAX);
-        // FFI hygiene: out-of-domain hosts get clamped, not wrapped.
         assert_eq!(unit_to_u32(-0.25), 0);
         assert_eq!(unit_to_u32(1.5), u32::MAX);
         assert_eq!(unit_to_u32(f64::NAN), 0);
     }
 
     #[test]
-    fn output_encode_carries_port() {
-        // The plug-in stamps an outbound event's MIDI port; the shim
-        // reads it back off `Vst3MidiEvent::port` to pick the event bus.
-        let event = Event::on_port(
-            5,
-            2,
-            EventBody::NoteOn {
-                group: 0,
-                channel: 0,
-                note: 60,
-                velocity: 100,
-            },
-        );
-        let packet = try_encode_vst3_midi(&event).expect("note-on encodes");
-        assert_eq!(packet.port, 2);
-    }
-
-    #[test]
     fn pitch_bend_maps_wheel_position_to_14bit() {
-        // The synth's binding range: -1..1, where the host's
-        // normalized 0/0.5/1 wheel positions land on plain -1/0/1.
         let i = info(
             ParamRange::Linear {
                 min: -1.0,
@@ -706,12 +521,10 @@ mod tests {
             Some(MidiSource::PitchBend),
         );
 
-        // Center wheel -> 8192.
         assert!(matches!(
             bridge(&i, 0.0),
             Some(EventBody::PitchBend { value: 8192, .. })
         ));
-        // Full down -> 0, full up -> 16383.
         assert!(matches!(
             bridge(&i, -1.0),
             Some(EventBody::PitchBend { value: 0, .. })
@@ -757,7 +570,6 @@ mod tests {
     }
 }
 
-// The derive names `::moose::{core, params}`; test-only `#[derive(Params)]`s resolve here.
 #[cfg(test)]
 extern crate self as moose;
 #[cfg(test)]
@@ -768,94 +580,60 @@ mod state_tests {
     use super::host_value_fixture::TestPlugin;
     use super::*;
 
-    /// Load-then-`getState` in each state where the host thread owns the
-    /// plugin: inactive, active before the first `setProcessing(true)`,
-    /// and after `setProcessing(false)` (audit finding 1). No `process`
-    /// runs in between.
     #[test]
     fn load_then_save_while_not_processing_returns_loaded_custom_state() {
         for phase in ["inactive", "activated", "stopped"] {
-            // SAFETY: serial callback calls on an instance this test owns;
-            // the save buffer is freed with the matching libc allocator.
-            unsafe {
-                let ctx = cb_create::<TestPlugin>();
-                let hash = (&*ctx.cast::<Vst3Instance<TestPlugin>>()).plugin_id_hash;
-                if phase != "inactive" {
-                    assert_eq!(cb_prepare::<TestPlugin>(ctx, 48_000., 512, 0), 1);
-                    cb_set_active::<TestPlugin>(ctx, 1);
-                }
-                if phase == "stopped" {
-                    cb_set_processing::<TestPlugin>(ctx, 1, 48_000., 512, 0);
-                    cb_set_processing::<TestPlugin>(ctx, 0, 48_000., 512, 0);
-                }
-                let blob = state::serialize_state(hash, &[], &[], &[4, 5, 6], &[]);
-                let len = u32::try_from(blob.len()).unwrap();
-                assert_eq!(
-                    cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len),
-                    1,
-                    "{phase}"
-                );
-                let mut data = std::ptr::null_mut();
-                let mut saved_len = 0;
-                cb_state_save::<TestPlugin>(ctx, &raw mut data, &raw mut saved_len);
-                assert!(!data.is_null(), "{phase}");
-                let saved = slice::from_raw_parts(data, saved_len as usize).to_vec();
-                cb_state_free(data, saved_len);
-                let restored = state::deserialize_state(&saved, hash).expect("own envelope");
-                assert_eq!(restored.extra.as_deref(), Some(&[4, 5, 6][..]), "{phase}");
-                cb_destroy::<TestPlugin>(ctx);
+            let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+            let hash = inst.plugin_id_hash;
+            if phase != "inactive" {
+                assert!(inst.prepare_impl(48_000., 512, 0));
+                inst.set_active_impl(true);
             }
+            if phase == "stopped" {
+                inst.set_processing_impl(true, 48_000., 512, 0);
+                inst.set_processing_impl(false, 48_000., 512, 0);
+            }
+            let blob = state::serialize_state(hash, &[], &[], &[4, 5, 6], &[]);
+            assert!(inst.load_state_bytes(&blob), "{phase}");
+            let saved = inst.save_state_bytes();
+            let restored = state::deserialize_state(&saved, hash).expect("own envelope");
+            assert_eq!(restored.extra.as_deref(), Some(&[4, 5, 6][..]), "{phase}");
         }
     }
 
-    /// A state whose custom part `load_state` rejects fails the load
-    /// (kResultFalse) and leaves params and custom state as they were
-    /// (audit finding 4).
     #[test]
     fn rejected_load_fails_and_keeps_the_previous_state() {
         use moose_params::Params;
         for phase in ["inactive", "stopped"] {
-            // SAFETY: serial callback calls on an instance this test owns;
-            // the save buffer is freed with the matching libc allocator.
-            unsafe {
-                let ctx = cb_create::<TestPlugin>();
-                let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
-                let hash = inst.plugin_id_hash;
-                if phase == "stopped" {
-                    assert_eq!(cb_prepare::<TestPlugin>(ctx, 48_000., 512, 0), 1);
-                    cb_set_active::<TestPlugin>(ctx, 1);
-                    cb_set_processing::<TestPlugin>(ctx, 1, 48_000., 512, 0);
-                    cb_set_processing::<TestPlugin>(ctx, 0, 48_000., 512, 0);
-                }
-                let load = |gain: f64, extra: &[u8]| {
-                    let blob = state::serialize_state(hash, &[0], &[gain], extra, &[]);
-                    let len = u32::try_from(blob.len()).unwrap();
-                    cb_state_load::<TestPlugin>(ctx, blob.as_ptr(), len)
-                };
-                assert_eq!(load(-12.0, &[1]), 1, "{phase}");
-                assert_eq!(
-                    load(-30.0, b"bad"),
-                    0,
-                    "{phase}: rejected load reports failure"
-                );
-                assert_eq!(
-                    inst.params_arc.get_plain(0),
-                    Some(-12.0),
-                    "{phase}: params kept"
-                );
-                let mut data = std::ptr::null_mut();
-                let mut saved_len = 0;
-                cb_state_save::<TestPlugin>(ctx, &raw mut data, &raw mut saved_len);
-                let saved = slice::from_raw_parts(data, saved_len as usize).to_vec();
-                cb_state_free(data, saved_len);
-                let restored = state::deserialize_state(&saved, hash).expect("own envelope");
-                assert_eq!(
-                    restored.extra.as_deref(),
-                    Some(&[1][..]),
-                    "{phase}: custom kept"
-                );
-                cb_destroy::<TestPlugin>(ctx);
+            let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+            let hash = inst.plugin_id_hash;
+            if phase == "stopped" {
+                assert!(inst.prepare_impl(48_000., 512, 0));
+                inst.set_active_impl(true);
+                inst.set_processing_impl(true, 48_000., 512, 0);
+                inst.set_processing_impl(false, 48_000., 512, 0);
             }
+            let load = |gain: f64, extra: &[u8]| {
+                let blob = state::serialize_state(hash, &[0], &[gain], extra, &[]);
+                inst.load_state_bytes(&blob)
+            };
+            assert!(load(-12.0, &[1]), "{phase}");
+            assert!(
+                !load(-30.0, b"bad"),
+                "{phase}: rejected load reports failure"
+            );
+            assert_eq!(
+                inst.params_arc.get_plain(0),
+                Some(-12.0),
+                "{phase}: params kept"
+            );
+            let saved = inst.save_state_bytes();
+            let restored = state::deserialize_state(&saved, hash).expect("own envelope");
+            assert_eq!(
+                restored.extra.as_deref(),
+                Some(&[1][..]),
+                "{phase}: custom kept"
+            );
         }
     }
 }
@@ -866,7 +644,6 @@ mod main_thread_tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Hooks that keep what the host told them.
     #[derive(Clone, Default)]
     struct Seen(Arc<Mutex<Vec<String>>>);
 
@@ -894,44 +671,36 @@ mod main_thread_tests {
 
     #[test]
     fn host_info_and_midi_learn_reach_the_hooks() {
-        // SAFETY: the test thread stands in for the host UI thread and owns
-        // the instance for every callback.
-        unsafe {
-            let ctx = cb_create::<TestPlugin>();
-            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
-            let seen = Seen::default();
-            *inst.main_thread.borrow_mut(&MainThread::assume()) = Box::new(seen.clone());
-            let info = ffi::Vst3TrackInfo {
-                name: c"Bass".as_ptr(),
-                color_argb: 0x80FF_2010,
-                has_color: true,
-            };
-            cb_track_info_changed::<TestPlugin>(ctx, &raw const info);
-            let midi1 = ffi::Vst3LearnSource::Midi1;
-            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 1, 2, midi1(74)), 1);
-            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 0, 0, midi1(129)), 0);
-            assert_eq!(
-                cb_midi_learn::<TestPlugin>(ctx, 0, 0, midi1(131)),
-                0,
-                "not a controller"
-            );
-            let nrpn = ffi::Vst3LearnSource::Midi2 {
-                registered: false,
-                bank: 5,
-                index: 9,
-            };
-            assert_eq!(cb_midi_learn::<TestPlugin>(ctx, 0, 3, nrpn), 1);
-            assert_eq!(
-                *seen.0.lock().unwrap(),
-                [
-                    r#"Some("Bass") Some(HostColor { r: 255, g: 32, b: 16, a: 128 })"#,
-                    "1 2 Midi1(Cc(74))",
-                    "0 0 Midi1(PitchBend)",
-                    "0 3 Midi2(Midi2Controller { kind: Assignable, bank: 5, index: 9 })",
-                ]
-            );
-            cb_destroy::<TestPlugin>(ctx);
-        }
+        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let seen = Seen::default();
+        // SAFETY: test thread acts as host UI thread.
+        *inst
+            .main_thread
+            .borrow_mut(&unsafe { MainThread::assume() }) = Box::new(seen.clone());
+        let info = Vst3TrackInfo {
+            name: Some(String::from("Bass")),
+            color_argb: Some(0x80FF_2010),
+        };
+        inst.track_info_changed_impl(&info);
+        let midi1 = Vst3LearnSource::Midi1;
+        assert!(inst.midi_learn_impl(1, 2, midi1(74)));
+        assert!(!inst.midi_learn_impl(0, 0, midi1(129)));
+        assert!(!inst.midi_learn_impl(0, 0, midi1(131)), "not a controller");
+        let nrpn = Vst3LearnSource::Midi2 {
+            registered: false,
+            bank: 5,
+            index: 9,
+        };
+        assert!(inst.midi_learn_impl(0, 3, nrpn));
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            [
+                r#"Some("Bass") Some(HostColor { r: 255, g: 32, b: 16, a: 128 })"#,
+                "1 2 Midi1(Cc(74))",
+                "0 0 Midi1(PitchBend)",
+                "0 3 Midi2(Midi2Controller { kind: Assignable, bank: 5, index: 9 })",
+            ]
+        );
     }
 
     #[test]
@@ -951,58 +720,51 @@ mod main_thread_tests {
                 c"Comp:ResetGainReductionMax",
             ),
         ] {
-            // SAFETY: the SDK constants are static NUL-terminated strings.
-            assert_eq!(unsafe { CStr::from_ptr(function_name(function)) }, name);
+            assert_eq!(function_name(function), Some(name));
         }
     }
 
     #[test]
     fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
-        unsafe {
-            let ctx = cb_create::<TestPlugin>();
-            assert!(!ctx.is_null());
-            assert_eq!(cb_prepare::<TestPlugin>(ctx, 48_000.0, 64, 0), 1);
+        let inst = Arc::new(Vst3Instance::<TestPlugin>::create().expect("create"));
+        assert!(inst.prepare_impl(48_000.0, 64, 0));
 
-            let inst = &*ctx.cast::<Vst3Instance<TestPlugin>>();
-            let ctx_addr = ctx as usize;
-            let held = inst.plugin.enter();
+        let held = inst.plugin.enter();
+        let worker_inst = Arc::clone(&inst);
+        let (out_l, out_r) = std::thread::spawn(move || {
+            let in_l = [0.5f32; 16];
+            let in_r = [0.5f32; 16];
+            let mut out_l = [1.0f32; 16];
+            let mut out_r = [1.0f32; 16];
+            let in_ptrs = [
+                in_l.as_ptr().cast::<std::ffi::c_void>(),
+                in_r.as_ptr().cast::<std::ffi::c_void>(),
+            ];
+            let mut out_ptrs = [
+                out_l.as_mut_ptr().cast::<std::ffi::c_void>(),
+                out_r.as_mut_ptr().cast::<std::ffi::c_void>(),
+            ];
+            let bus_channels = [2u32];
+            let mut args = ProcessArgs {
+                inputs: &in_ptrs,
+                outputs: &mut out_ptrs,
+                in_bus_channels: &bus_channels,
+                in_bus_active: 1,
+                out_bus_channels: &bus_channels,
+                out_bus_active: 1,
+                num_frames: 16,
+                transport: None,
+                process_mode: 0,
+            };
+            unsafe { worker_inst.process_block::<f32>(&mut args) };
+            (out_l, out_r)
+        })
+        .join()
+        .expect("VST3 audio thread must not park on overlap");
 
-            let (out_l, out_r) = std::thread::spawn(move || {
-                let ctx = ctx_addr as *mut std::ffi::c_void;
-                let in_l = [0.5f32; 16];
-                let in_r = [0.5f32; 16];
-                let mut out_l = [1.0f32; 16];
-                let mut out_r = [1.0f32; 16];
-                let in_ptrs = [in_l.as_ptr(), in_r.as_ptr()];
-                let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
-                let bus_channels = [2u32];
-                crate::process::process_block::<TestPlugin, f32>(
-                    ctx,
-                    in_ptrs.as_ptr(),
-                    out_ptrs.as_mut_ptr(),
-                    2,
-                    2,
-                    bus_channels.as_ptr(),
-                    1,
-                    1,
-                    bus_channels.as_ptr(),
-                    1,
-                    1,
-                    16,
-                    std::ptr::null(),
-                    0,
-                );
-                (out_l, out_r)
-            })
-            .join()
-            .expect("VST3 audio thread must not park on overlap");
-
-            assert!(out_l.iter().all(|&s| s == 0.0));
-            assert!(out_r.iter().all(|&s| s == 0.0));
-
-            drop(held);
-            cb_destroy::<TestPlugin>(ctx);
-        }
+        assert!(out_l.iter().all(|&s| s == 0.0));
+        assert!(out_r.iter().all(|&s| s == 0.0));
+        drop(held);
     }
 }
 
@@ -1019,51 +781,27 @@ mod host_value_tests {
         reason = "unchanged storage values must compare exactly"
     )]
     fn ffi_text_hooks_preserve_static_plain_and_normalized_storage() {
-        // SAFETY: own the instance and bounded buffers for all callback calls.
-        unsafe {
-            let ctx = cb_create::<TestPlugin>();
-            assert!(!ctx.is_null());
-            let params = (&*ctx.cast::<Vst3Instance<TestPlugin>>())
-                .params_arc
-                .clone();
-            let normalized = 49. / 96.;
-            let plain = cb_param_denormalize::<TestPlugin>(ctx, 1, normalized);
-            assert_eq!(plain, normalized);
-            let mut buffer = [0_i8; 128];
-            assert!(cb_param_format::<TestPlugin>(ctx, 1, plain, buffer.as_mut_ptr(), 128) > 0);
-            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "+1 st");
-            let mut parsed = -999.;
-            assert_eq!(
-                cb_param_parse::<TestPlugin>(ctx, 1, c"+1 st".as_ptr(), &raw mut parsed),
-                1
-            );
-            assert_eq!(cb_param_normalize::<TestPlugin>(ctx, 1, parsed), normalized);
-            cb_param_set_value::<TestPlugin>(ctx, 1, parsed);
-            assert_eq!(params.get_plain(1), Some(normalized));
-            for invalid in [c"0.5", c"nan"] {
-                assert_eq!(
-                    cb_param_parse::<TestPlugin>(ctx, 1, invalid.as_ptr(), &raw mut parsed),
-                    0
-                );
-            }
-            assert_eq!(
-                cb_param_parse::<TestPlugin>(ctx, 0, c"-6 dB".as_ptr(), &raw mut parsed),
-                1
-            );
-            assert_eq!(parsed, -6.);
-            params.rebound.store(true, Ordering::Relaxed);
-            assert!(
-                cb_param_format::<TestPlugin>(ctx, 1, normalized, buffer.as_mut_ptr(), 128) > 0
-            );
-            assert_eq!(CStr::from_ptr(buffer.as_ptr()).to_str().unwrap(), "51%");
-            assert_eq!(
-                cb_param_parse::<TestPlugin>(ctx, 1, c"25%".as_ptr(), &raw mut parsed),
-                1
-            );
-            assert_eq!(parsed, 0.25);
-            assert_eq!(params.get_plain(1), Some(normalized));
-            cb_destroy::<TestPlugin>(ctx);
+        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let params = inst.params_arc.clone();
+        let normalized = 49. / 96.;
+        let plain = inst.param_denormalize_impl(1, normalized);
+        assert_eq!(plain, normalized);
+        assert_eq!(inst.param_format_impl(1, plain).as_deref(), Some("+1 st"));
+        let parsed = inst.param_parse_impl(1, "+1 st").expect("parsed");
+        assert_eq!(inst.param_normalize_impl(1, parsed), normalized);
+        inst.param_set_value_impl(1, parsed);
+        assert_eq!(params.get_plain(1), Some(normalized));
+        for invalid in ["0.5", "nan"] {
+            assert_eq!(inst.param_parse_impl(1, invalid), None);
         }
+        assert_eq!(inst.param_parse_impl(0, "-6 dB"), Some(-6.));
+        params.rebound.store(true, Ordering::Relaxed);
+        assert_eq!(
+            inst.param_format_impl(1, normalized).as_deref(),
+            Some("51%")
+        );
+        assert_eq!(inst.param_parse_impl(1, "25%"), Some(0.25));
+        assert_eq!(params.get_plain(1), Some(normalized));
     }
 }
 
@@ -1074,47 +812,32 @@ mod large_state_tests {
     use super::large_state_fixture::{LargePlugin, payload};
     use super::*;
     type Large = LargePlugin<{ 64 * 1024 * 1024 }>;
-    struct Input {
-        bytes: Vec<u8>,
-        offset: usize,
-    }
-    unsafe extern "C" fn read(ctx: *mut std::ffi::c_void, dst: *mut u8, size: u32) -> i64 {
-        let input = unsafe { &mut *ctx.cast::<Input>() };
-        let n = (size as usize)
-            .min(317)
-            .min(input.bytes.len() - input.offset);
-        unsafe { std::ptr::copy_nonoverlapping(input.bytes.as_ptr().add(input.offset), dst, n) };
-        input.offset += n;
-        i64::try_from(n).expect("test read size fits i64")
-    }
+
     #[test]
     fn large_host_state_roundtrips_through_stream_callback() {
-        unsafe {
-            let ctx = cb_create::<Large>();
-            assert!(!ctx.is_null());
-            let inst = &*ctx.cast::<Vst3Instance<Large>>();
-            *inst.params_arc.payload.lock().unwrap() = payload();
-            let mut ptr = std::ptr::null_mut();
-            let mut len = 0;
-            cb_state_save::<Large>(ctx, &raw mut ptr, &raw mut len);
-            assert!(len > 32 * 1024 * 1024);
-            let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
-            cb_state_free(ptr, len);
-            inst.params_arc.payload.lock().unwrap().clear();
-            let mut input = Input { bytes, offset: 0 };
-            assert_eq!(
-                cb_state_load_stream::<Large>(ctx, (&raw mut input).cast(), read),
-                1
-            );
-            assert_eq!(*inst.params_arc.payload.lock().unwrap(), payload());
-            input.bytes.pop();
-            input.offset = 0;
-            assert_eq!(
-                cb_state_load_stream::<Large>(ctx, (&raw mut input).cast(), read),
-                0
-            );
-            cb_destroy::<Large>(ctx);
-        }
+        let inst = Vst3Instance::<Large>::create().expect("create");
+        *inst.params_arc.payload.lock().unwrap() = payload();
+        let bytes = inst.save_state_bytes();
+        assert!(bytes.len() > 32 * 1024 * 1024);
+        inst.params_arc.payload.lock().unwrap().clear();
+
+        let mut offset = 0usize;
+        assert!(inst.state_load_stream_impl(&mut |dst| {
+            let n = dst.len().min(317).min(bytes.len() - offset);
+            dst[..n].copy_from_slice(&bytes[offset..offset + n]);
+            offset += n;
+            i64::try_from(n).expect("test read size fits i64")
+        }));
+        assert_eq!(*inst.params_arc.payload.lock().unwrap(), payload());
+
+        let truncated = &bytes[..bytes.len() - 1];
+        let mut offset = 0usize;
+        assert!(!inst.state_load_stream_impl(&mut |dst| {
+            let n = dst.len().min(317).min(truncated.len() - offset);
+            dst[..n].copy_from_slice(&truncated[offset..offset + n]);
+            offset += n;
+            i64::try_from(n).expect("test read size fits i64")
+        }));
     }
 }
 
@@ -1133,10 +856,7 @@ mod param_point_tests {
     #[test]
     fn per_sample_gets_the_segment_as_a_linear_ramp() {
         let event = param_point_event(Automation::PerSample, 7, 300, 0.75, Some((100, 0.25)));
-        assert_eq!(
-            event.sample_offset, 100,
-            "the ramp starts at the previous point"
-        );
+        assert_eq!(event.sample_offset, 100);
         assert_eq!(
             event.body,
             EventBody::ParamRamp {

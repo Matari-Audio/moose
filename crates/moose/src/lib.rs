@@ -8,7 +8,6 @@ pub use moose_core::rt;
 pub use moose_derive::{ParamEnum, Params, State};
 // `moose` is renderer-agnostic. Plugins that want a GUI enable `moose`'s
 // `mui` feature (`moose::mui`) or implement `moose_core::Editor` directly.
-// The prelude below sources legacy layout/theme types from `moose-gui-types`.
 pub use moose_params as params;
 pub use moose_plugin::{Lifecycle, Plugin, ProcessorSlot};
 
@@ -100,8 +99,8 @@ mod prelude_impl {
     pub use moose_core::plugin::PreparationError;
     pub use moose_core::sample::{Float, Sample as SampleTrait};
     pub use moose_core::state::{
-        ForeignState, MigratedState, PluginFormat, StateLoadError, StateMigrationChain,
-        StateMigrationStep,
+        DecodedState, ForeignState, MigratedState, PluginFormat, StateLoadError,
+        StateMigrationChain, StateMigrationStep,
     };
     pub use std::f64::consts::TAU;
     pub use std::sync::Arc;
@@ -131,9 +130,6 @@ mod prelude_impl {
         TransportInfo,
     };
     pub use moose_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
-    pub use moose_gui_types::interaction::WidgetRegion;
-    pub use moose_gui_types::render::RenderBackend;
-    pub use moose_gui_types::theme::{Color, Theme};
     pub use moose_params::{
         BoolParam, DynamicParams, EnumParam, FloatParam, IntParam, MeterSlot, ParamEnum,
         ParamFlags, ParamFunction, ParamInfo, ParamRange, ParamSmoother, ParamUnit, Params,

@@ -9,7 +9,6 @@ description = "User-facing PluginLogic traits for moose - the plugin author's en
 
 [dependencies]
 moose-core = { workspace = true }
-moose-gui-types = { workspace = true }
 moose-params = { workspace = true }
 
 [lints]

@@ -324,6 +324,40 @@ pub trait PluginRuntime: Send + 'static {
         Ok(())
     }
 
+    /// Decode custom state bytes off the audio thread into a typed,
+    /// ready-to-swap [`DecodedState`](crate::state::DecodedState).
+    ///
+    /// Opt-in zero-allocation RT swap hook. When this returns `Ok(Some(decoded))`,
+    /// the wrapper skips [`Self::load_state`] and instead hands `&mut decoded` to
+    /// [`Self::apply_decoded_state`] inside an `RtSection` on the audio thread
+    /// (retiring whatever old state was swapped into `decoded` back to the host
+    /// thread to drop). Returning `Ok(None)` (the default) preserves the
+    /// backwards-compatible [`Self::load_state`] path.
+    ///
+    /// Runs synchronously on the host thread, so returning `Err` rejects the
+    /// load and rolls back parameters immediately even while audio is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `data` cannot be decoded into valid plugin state.
+    fn decode_state(
+        _data: &[u8],
+    ) -> Result<Option<crate::state::DecodedState>, crate::state::StateLoadError>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// Swap a state decoded by [`Self::decode_state`] into the live processor.
+    ///
+    /// Called on the audio thread inside an `RtSection` (or on the host thread
+    /// while stopped): **must not allocate, deallocate, lock, or block**. Use
+    /// [`DecodedState::swap_with`](crate::state::DecodedState::swap_with) to
+    /// exchange the new state with the current state in place; the old state
+    /// stays inside `decoded` and is dropped off the audio thread.
+    fn apply_decoded_state(&mut self, _decoded: &mut crate::state::DecodedState) {}
+
     /// Processing latency in samples. Host uses this for delay compensation.
     /// Return 0 if the plugin adds no latency (default).
     fn latency(&self) -> u32 {

@@ -33,14 +33,13 @@
 
 #![cfg(all(target_os = "macos", feature = "gui"))]
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use objc::declare::ClassDecl;
-use objc::runtime::{BOOL, Class, NO, Object, Sel, YES};
-use objc::{class, msg_send, sel, sel_impl};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
+use objc2::{class, msg_send, sel};
 
 use crate::audio::{ChannelRoute, DeviceCache, InputController, OutputController};
 use crate::midi::{MIDI_MENU_MAX_PORTS, MidiChannel, MidiController};
@@ -55,23 +54,23 @@ struct MenuState {
     presets: PresetController,
     /// Mic-toggle item - checkmark refreshed on Plugin-menu open.
     /// Null for instrument plugins (item not added).
-    mic_item: *mut Object,
+    mic_item: *mut AnyObject,
     /// Output mute-toggle item - checkmark refreshed on
     /// Plugin-menu open.
-    output_item: *mut Object,
+    output_item: *mut AnyObject,
     /// QWERTY-keyboard-to-MIDI flag, shared with the key handler and
     /// the Cmd+K shortcut. The toggle action flips it.
     keyboard: Arc<AtomicBool>,
     /// "Computer Keyboard" toggle item - checkmark refreshed on open.
-    keyboard_item: *mut Object,
+    keyboard_item: *mut AnyObject,
     /// Input device submenu - repopulated on open from cpal.
     /// Null for instrument plugins (submenu not added).
-    input_device_menu: *mut Object,
+    input_device_menu: *mut AnyObject,
     /// Output device submenu - repopulated on open from cpal.
-    output_device_menu: *mut Object,
+    output_device_menu: *mut AnyObject,
     /// Pointer to the action-target object itself, for re-targeting
     /// the device items repopulated each open.
-    target: *mut Object,
+    target: *mut AnyObject,
     /// Background-refreshed device-name cache. Read on menu open
     /// (instant) instead of enumerating cpal synchronously on the
     /// GUI thread.
@@ -82,16 +81,16 @@ struct MenuState {
     /// One MIDI-input device submenu per plugin MIDI input port,
     /// indexed by port. Each is repopulated on open. Empty when the
     /// MIDI menu isn't built.
-    midi_input_menus: Vec<*mut Object>,
+    midi_input_menus: Vec<*mut AnyObject>,
     /// The Presets menu - identified on open to refresh its children.
-    presets_menu: *mut Object,
+    presets_menu: *mut AnyObject,
     /// Presets > Load submenu - re-enumerated on each open so saves
     /// appear without a relaunch.
-    preset_load_menu: *mut Object,
+    preset_load_menu: *mut AnyObject,
     /// The "Save Preset" item - on open its title shows the file
     /// Save will write, and it's grayed out unless an editable
     /// preset is loaded to overwrite.
-    preset_save_item: *mut Object,
+    preset_save_item: *mut AnyObject,
 }
 
 /// Install the native menu bar.
@@ -112,7 +111,7 @@ pub fn install(
     bus_layouts: &[(u16, u16)],
 ) {
     unsafe {
-        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
 
         // App menu - "About <App>" / "Hide <App>" / "Quit <App>".
         let app_menu_item = make_menu_item(app_name);
@@ -156,7 +155,7 @@ pub fn install(
         let _: () = msg_send![plugin_menu, addItem: keyboard_item];
 
         // Separator before device pickers.
-        let sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![plugin_menu, addItem: sep];
 
         // Input device submenu - only useful for effects (instrument
@@ -198,7 +197,7 @@ pub fn install(
         // Parent items need a target for the same anti-graying reason
         // as the device submenus above.
         if channels >= 2 {
-            let sep2: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+            let sep2: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
             let _: () = msg_send![plugin_menu, addItem: sep2];
 
             if is_effect {
@@ -236,7 +235,7 @@ pub fn install(
         // checkmark; the layout is otherwise session-stable like the
         // channel menus above.
         if bus_layouts.len() > 1 {
-            let sep3: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+            let sep3: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
             let _: () = msg_send![plugin_menu, addItem: sep3];
             let bus_item = make_menu_item("Bus Layout");
             let _: () = msg_send![bus_item, setTarget: target];
@@ -258,7 +257,7 @@ pub fn install(
         // plugin (any can receive MIDI CC; instruments need note
         // input). The input submenu is repopulated on open; the channel
         // submenu is static and its checkmark is moved by the action.
-        let midi_sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let midi_sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![plugin_menu, addItem: midi_sep];
 
         // One device submenu per plugin MIDI input port, capped at
@@ -275,7 +274,7 @@ pub fn install(
                  route the rest with --midi-input"
             );
         }
-        let mut midi_input_menus: Vec<*mut Object> = Vec::with_capacity(menu_ports);
+        let mut midi_input_menus: Vec<*mut AnyObject> = Vec::with_capacity(menu_ports);
         for port in 0..menu_ports {
             let label = if menu_ports == 1 {
                 "MIDI Input".to_string()
@@ -335,7 +334,7 @@ pub fn install(
         // enabled state ourselves (autoenable would re-enable Save
         // since the target responds to its action).
         let _: () = msg_send![presets_menu, setDelegate: target];
-        let _: () = msg_send![presets_menu, setAutoenablesItems: NO];
+        let _: () = msg_send![presets_menu, setAutoenablesItems: Bool::NO];
 
         let load_item = make_menu_item("Load");
         let _: () = msg_send![load_item, setTarget: target];
@@ -344,14 +343,14 @@ pub fn install(
         let _: () = msg_send![load_item, setSubmenu: load_menu];
         let _: () = msg_send![presets_menu, addItem: load_item];
 
-        let nav_sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let nav_sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![presets_menu, addItem: nav_sep];
         let prev_item = make_toggle_item("Previous Preset", "[", sel!(prevPresetAction:), target);
         let _: () = msg_send![presets_menu, addItem: prev_item];
         let next_item = make_toggle_item("Next Preset", "]", sel!(nextPresetAction:), target);
         let _: () = msg_send![presets_menu, addItem: next_item];
 
-        let save_sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let save_sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![presets_menu, addItem: save_sep];
         // No key equivalents: Cmd-S / Cmd-Shift-S are handled by the
         // window's own key handler; a menu item with the same
@@ -374,24 +373,24 @@ pub fn install(
     }
 }
 
-unsafe fn make_menu(title: &str) -> *mut Object {
+unsafe fn make_menu(title: &str) -> *mut AnyObject {
     unsafe {
         let title = ns_string(title);
-        let menu: *mut Object = msg_send![class!(NSMenu), alloc];
-        let menu: *mut Object = msg_send![menu, initWithTitle: title];
+        let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let menu: *mut AnyObject = msg_send![menu, initWithTitle: title];
         menu
     }
 }
 
-unsafe fn make_menu_item(title: &str) -> *mut Object {
+unsafe fn make_menu_item(title: &str) -> *mut AnyObject {
     unsafe {
         let title = ns_string(title);
         let empty = ns_string("");
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
             item,
-            initWithTitle: title
-            action: sel!(noopAction:)
+            initWithTitle: title,
+            action: sel!(noopAction:),
             keyEquivalent: empty
         ];
         item
@@ -402,16 +401,16 @@ unsafe fn make_toggle_item(
     title: &str,
     key_equiv: &str,
     action: Sel,
-    target: *mut Object,
-) -> *mut Object {
+    target: *mut AnyObject,
+) -> *mut AnyObject {
     unsafe {
         let title = ns_string(title);
         let key = ns_string(key_equiv);
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
             item,
-            initWithTitle: title
-            action: action
+            initWithTitle: title,
+            action: action,
             keyEquivalent: key
         ];
         let _: () = msg_send![item, setTarget: target];
@@ -421,15 +420,15 @@ unsafe fn make_toggle_item(
 
 /// Add the standard App-menu items. macOS does NOT auto-fill the
 /// app name here - we have to spell out `Quit <App>` ourselves.
-unsafe fn add_app_menu_items(menu: *mut Object, app_name: &str) {
+unsafe fn add_app_menu_items(menu: *mut AnyObject, app_name: &str) {
     unsafe {
         let title = ns_string(&format!("Quit {app_name}"));
         let key = ns_string("q");
-        let quit_item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let quit_item: *mut Object = msg_send![
+        let quit_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let quit_item: *mut AnyObject = msg_send![
             quit_item,
-            initWithTitle: title
-            action: sel!(terminate:)
+            initWithTitle: title,
+            action: sel!(terminate:),
             keyEquivalent: key
         ];
         let _: () = msg_send![menu, addItem: quit_item];
@@ -443,77 +442,80 @@ unsafe fn add_app_menu_items(menu: *mut Object, app_name: &str) {
 /// its display label; `loadPresetAction:` dispatches by that title.
 /// Empty libraries get a disabled placeholder.
 unsafe fn populate_preset_load_menu(
-    menu: *mut Object,
-    target: *mut Object,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     entries: &[crate::presets::PresetMenuEntry],
 ) {
-    let empty = unsafe { ns_string("") };
-    if entries.is_empty() {
-        let title = unsafe { ns_string("(no presets)") };
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
-            item,
-            initWithTitle: title
-            action: sel!(noopAction:)
-            keyEquivalent: empty
-        ];
-        let _: () = msg_send![item, setEnabled: NO];
-        let _: () = msg_send![menu, addItem: item];
-        return;
-    }
-    for entry in entries {
-        let title = unsafe { ns_string(&entry.label) };
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
-            item,
-            initWithTitle: title
-            action: sel!(loadPresetAction:)
-            keyEquivalent: empty
-        ];
-        let _: () = msg_send![item, setTarget: target];
-        let _: () = msg_send![menu, addItem: item];
+    unsafe {
+        let empty = ns_string("");
+        if entries.is_empty() {
+            let title = ns_string("(no presets)");
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
+                item,
+                initWithTitle: title,
+                action: sel!(noopAction:),
+                keyEquivalent: empty
+            ];
+            let _: () = msg_send![item, setEnabled: Bool::NO];
+            let _: () = msg_send![menu, addItem: item];
+            return;
+        }
+        for entry in entries {
+            let title = ns_string(&entry.label);
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
+                item,
+                initWithTitle: title,
+                action: sel!(loadPresetAction:),
+                keyEquivalent: empty
+            ];
+            let _: () = msg_send![item, setTarget: target];
+            let _: () = msg_send![menu, addItem: item];
+        }
     }
 }
 
 unsafe fn populate_device_menu(
-    menu: *mut Object,
-    target: *mut Object,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     devices: &[String],
     current: Option<&str>,
     action: Sel,
 ) {
-    let _: () = msg_send![menu, removeAllItems];
+    unsafe {
+        let _: () = msg_send![menu, removeAllItems];
 
-    if devices.is_empty() {
-        let title = unsafe { ns_string("(no devices)") };
-        let empty = unsafe { ns_string("") };
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
-            item,
-            initWithTitle: title
-            action: sel!(noopAction:)
-            keyEquivalent: empty
-        ];
-        let _: () = msg_send![item, setEnabled: NO];
-        let _: () = msg_send![menu, addItem: item];
-        return;
-    }
+        if devices.is_empty() {
+            let title = ns_string("(no devices)");
+            let empty = ns_string("");
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
+                item,
+                initWithTitle: title,
+                action: sel!(noopAction:),
+                keyEquivalent: empty
+            ];
+            let _: () = msg_send![item, setEnabled: Bool::NO];
+            let _: () = msg_send![menu, addItem: item];
+            return;
+        }
 
-    for name in devices {
-        let title = unsafe { ns_string(name) };
-        let empty = unsafe { ns_string("") };
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
-            item,
-            initWithTitle: title
-            action: action
-            keyEquivalent: empty
-        ];
-        let _: () = msg_send![item, setTarget: target];
-        let is_current = current.is_some_and(|c| c == name.as_str());
-        let mark: BOOL = if is_current { YES } else { NO };
-        let _: () = msg_send![item, setState: i64::from(mark)];
-        let _: () = msg_send![menu, addItem: item];
+        for name in devices {
+            let title = ns_string(name);
+            let empty = ns_string("");
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
+                item,
+                initWithTitle: title,
+                action: action,
+                keyEquivalent: empty
+            ];
+            let _: () = msg_send![item, setTarget: target];
+            let is_current = current.is_some_and(|c| c == name.as_str());
+            let _: () = msg_send![item, setState: i64::from(is_current)];
+            let _: () = msg_send![menu, addItem: item];
+        }
     }
 }
 
@@ -522,8 +524,8 @@ unsafe fn populate_device_menu(
 /// [`ChannelRoute`] encoded in the `NSMenuItem` `tag`; the checkmark
 /// lands on the item matching `current`.
 unsafe fn populate_channel_menu(
-    menu: *mut Object,
-    target: *mut Object,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     channels: usize,
     current: ChannelRoute,
     action: Sel,
@@ -544,7 +546,7 @@ unsafe fn populate_channel_menu(
         // Stereo pairs (1 & 2, 3 & 4, ...). Only emit a pair when both
         // of its channels exist.
         if channels >= 2 {
-            let sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+            let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
             let _: () = msg_send![menu, addItem: sep];
             let mut base = 0;
             while base + 1 < channels {
@@ -562,7 +564,7 @@ unsafe fn populate_channel_menu(
         }
 
         // Mono channels (1, 2, 3, ...).
-        let sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: sep];
         for c in 0..channels {
             let label = format!("Channel {} (mono)", c + 1);
@@ -584,8 +586,8 @@ unsafe fn populate_channel_menu(
 /// Each item's tag is its layout index, so two layouts that share a maximum
 /// width still get distinct tags (and checkmarks).
 unsafe fn populate_bus_layout_menu(
-    menu: *mut Object,
-    target: *mut Object,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     layouts: &[(u16, u16)],
     current_index: usize,
     action: Sel,
@@ -608,8 +610,8 @@ fn encoded_tag(route: ChannelRoute) -> i64 {
 /// Add one tagged, targeted menu item, checkmarked when its tag is the
 /// active one.
 unsafe fn add_tagged_item(
-    menu: *mut Object,
-    target: *mut Object,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     action: Sel,
     title: &str,
     tag: i64,
@@ -618,17 +620,16 @@ unsafe fn add_tagged_item(
     unsafe {
         let t = ns_string(title);
         let empty = ns_string("");
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
             item,
-            initWithTitle: t
-            action: action
+            initWithTitle: t,
+            action: action,
             keyEquivalent: empty
         ];
         let _: () = msg_send![item, setTarget: target];
         let _: () = msg_send![item, setTag: tag];
-        let on: BOOL = if tag == current_tag { YES } else { NO };
-        let _: () = msg_send![item, setState: i64::from(on)];
+        let _: () = msg_send![item, setState: i64::from(tag == current_tag)];
         let _: () = msg_send![menu, addItem: item];
     }
 }
@@ -636,24 +637,23 @@ unsafe fn add_tagged_item(
 /// Move the checkmark in a channel submenu to the item whose tag is
 /// `selected_tag`. Skips separators (whose default tag is 0 and would
 /// otherwise collide with the "direct" item).
-unsafe fn update_channel_checkmarks(menu: *mut Object, selected_tag: i64) {
+unsafe fn update_channel_checkmarks(menu: *mut AnyObject, selected_tag: i64) {
     unsafe {
         if menu.is_null() {
             return;
         }
         let count: i64 = msg_send![menu, numberOfItems];
         for i in 0..count {
-            let item: *mut Object = msg_send![menu, itemAtIndex: i];
+            let item: *mut AnyObject = msg_send![menu, itemAtIndex: i];
             if item.is_null() {
                 continue;
             }
-            let is_sep: BOOL = msg_send![item, isSeparatorItem];
-            if is_sep == YES {
+            let is_sep: Bool = msg_send![item, isSeparatorItem];
+            if is_sep.as_bool() {
                 continue;
             }
             let tag: i64 = msg_send![item, tag];
-            let on: BOOL = if tag == selected_tag { YES } else { NO };
-            let _: () = msg_send![item, setState: i64::from(on)];
+            let _: () = msg_send![item, setState: i64::from(tag == selected_tag)];
         }
     }
 }
@@ -683,8 +683,8 @@ fn decode_midi_input_tag(tag: i64) -> (u8, bool) {
 /// "None") is checkmarked. Every item's tag encodes `port` so the
 /// action routes to the right plugin MIDI port.
 unsafe fn populate_midi_input_menu(
-    menu: *mut Object,
-    target: *mut Object,
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
     port: u8,
     devices: &[String],
     current: Option<&str>,
@@ -694,41 +694,36 @@ unsafe fn populate_midi_input_menu(
 
         let none = ns_string("None");
         let empty = ns_string("");
-        let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut Object = msg_send![
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
             item,
-            initWithTitle: none
-            action: sel!(selectMidiInputAction:)
+            initWithTitle: none,
+            action: sel!(selectMidiInputAction:),
             keyEquivalent: empty
         ];
         let _: () = msg_send![item, setTarget: target];
         let _: () = msg_send![item, setTag: midi_input_none_tag(port)];
-        let on: BOOL = if current.is_none() { YES } else { NO };
-        let _: () = msg_send![item, setState: i64::from(on)];
+        let _: () = msg_send![item, setState: i64::from(current.is_none())];
         let _: () = msg_send![menu, addItem: item];
 
         if devices.is_empty() {
             return;
         }
-        let sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: sep];
         for name in devices {
             let title = ns_string(name);
             let empty = ns_string("");
-            let item: *mut Object = msg_send![class!(NSMenuItem), alloc];
-            let item: *mut Object = msg_send![
+            let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let item: *mut AnyObject = msg_send![
                 item,
-                initWithTitle: title
-                action: sel!(selectMidiInputAction:)
+                initWithTitle: title,
+                action: sel!(selectMidiInputAction:),
                 keyEquivalent: empty
             ];
             let _: () = msg_send![item, setTarget: target];
             let _: () = msg_send![item, setTag: midi_input_device_tag(port)];
-            let on: BOOL = if current.is_some_and(|c| c == name.as_str()) {
-                YES
-            } else {
-                NO
-            };
+            let on = current.is_some_and(|c| c == name.as_str());
             let _: () = msg_send![item, setState: i64::from(on)];
             let _: () = msg_send![menu, addItem: item];
         }
@@ -738,7 +733,11 @@ unsafe fn populate_midi_input_menu(
 /// Fill the MIDI-channel submenu: an "Omni" default then channels
 /// 1-16, each tagged with its `MidiChannel::encode()`. Checkmark on
 /// `current`.
-unsafe fn populate_midi_channel_menu(menu: *mut Object, target: *mut Object, current: MidiChannel) {
+unsafe fn populate_midi_channel_menu(
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
+    current: MidiChannel,
+) {
     unsafe {
         let _: () = msg_send![menu, removeAllItems];
         let cur = i64::from(current.encode());
@@ -752,7 +751,7 @@ unsafe fn populate_midi_channel_menu(menu: *mut Object, target: *mut Object, cur
             i64::from(MidiChannel::Omni.encode()),
             cur,
         );
-        let sep: *mut Object = msg_send![class!(NSMenuItem), separatorItem];
+        let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: sep];
         for n in 0..16u8 {
             let label = format!("Channel {}", n + 1);
@@ -768,39 +767,39 @@ unsafe fn populate_midi_channel_menu(menu: *mut Object, target: *mut Object, cur
     }
 }
 
-unsafe fn ns_string(s: &str) -> *mut Object {
-    let bytes = s.as_bytes();
-    let cls = class!(NSString);
-    let nsstr: *mut Object = msg_send![cls, alloc];
-    let nsstr: *mut Object = msg_send![
-        nsstr,
-        initWithBytes: bytes.as_ptr().cast::<c_void>()
-        length: bytes.len()
-        encoding: 4_usize // NSUTF8StringEncoding
-    ];
-    nsstr
+unsafe fn ns_string(s: &str) -> *mut AnyObject {
+    unsafe {
+        let bytes = s.as_bytes();
+        let cls = class!(NSString);
+        let nsstr: *mut AnyObject = msg_send![cls, alloc];
+        let nsstr: *mut AnyObject = msg_send![
+            nsstr,
+            initWithBytes: bytes.as_ptr().cast::<c_void>(),
+            length: bytes.len(),
+            encoding: 4_usize // NSUTF8StringEncoding
+        ];
+        nsstr
+    }
 }
 
 /// Read an `NSMenuItem`'s title back as a Rust String.
-unsafe fn item_title(item: *mut Object) -> Option<String> {
+unsafe fn item_title(item: *mut AnyObject) -> Option<String> {
     if item.is_null() {
         return None;
     }
-    let nsstr: *mut Object = msg_send![item, title];
-    if nsstr.is_null() {
-        return None;
+    unsafe {
+        let nsstr: *mut AnyObject = msg_send![item, title];
+        if nsstr.is_null() {
+            return None;
+        }
+        let cstr: *const std::os::raw::c_char = msg_send![nsstr, UTF8String];
+        if cstr.is_null() {
+            return None;
+        }
+        // SAFETY: `UTF8String` returns a NUL-terminated buffer owned by
+        // the autoreleased NSString - valid for the duration of this call.
+        Some(CStr::from_ptr(cstr).to_string_lossy().into_owned())
     }
-    let cstr: *const std::os::raw::c_char = msg_send![nsstr, UTF8String];
-    if cstr.is_null() {
-        return None;
-    }
-    // SAFETY: `UTF8String` returns a NUL-terminated buffer owned by
-    // the autoreleased NSString - valid for the duration of this call.
-    Some(unsafe {
-        std::ffi::CStr::from_ptr(cstr)
-            .to_string_lossy()
-            .into_owned()
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -809,7 +808,7 @@ unsafe fn item_title(item: *mut Object) -> Option<String> {
 
 static REGISTER_CLASS: Once = Once::new();
 
-const STATE_IVAR: &str = "_moose_menu_state";
+const STATE_IVAR: &CStr = c"_moose_menu_state";
 
 // `extern "C" fn` action callbacks are declared inside `call_once`
 // so they live in scope where `decl.add_method` can take their
@@ -817,16 +816,16 @@ const STATE_IVAR: &str = "_moose_menu_state";
 // `add_method` registration pattern. Hence the function-level
 // `items_after_statements` allow.
 #[allow(clippy::items_after_statements, clippy::too_many_lines)]
-fn ensure_class() -> &'static Class {
+fn ensure_class() -> &'static AnyClass {
     REGISTER_CLASS.call_once(|| unsafe {
         let superclass = class!(NSObject);
-        let mut decl = ClassDecl::new("MooseMenuTarget", superclass)
+        let mut decl = ClassBuilder::new(c"MooseMenuTarget", superclass)
             .expect("MooseMenuTarget already registered (this should be unreachable - Once gate)");
 
         decl.add_ivar::<*mut c_void>(STATE_IVAR);
 
         // Mic toggle.
-        extern "C" fn toggle_input_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn toggle_input_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -837,17 +836,16 @@ fn ensure_class() -> &'static Class {
                     "mic: {} (request, via menu)",
                     if want { "ON" } else { "OFF" }
                 );
-                let new_state: BOOL = if want { YES } else { NO };
-                let _: () = msg_send![sender, setState: i64::from(new_state)];
+                let _: () = msg_send![sender, setState: i64::from(want)];
             }
         }
         decl.add_method(
             sel!(toggleInputAction:),
-            toggle_input_action as extern "C" fn(&Object, Sel, *mut Object),
+            toggle_input_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Output mute toggle.
-        extern "C" fn toggle_output_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn toggle_output_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -858,17 +856,16 @@ fn ensure_class() -> &'static Class {
                     "output: {} (request, via menu)",
                     if want { "ON" } else { "OFF" }
                 );
-                let new_state: BOOL = if want { YES } else { NO };
-                let _: () = msg_send![sender, setState: i64::from(new_state)];
+                let _: () = msg_send![sender, setState: i64::from(want)];
             }
         }
         decl.add_method(
             sel!(toggleOutputAction:),
-            toggle_output_action as extern "C" fn(&Object, Sel, *mut Object),
+            toggle_output_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Computer-keyboard-to-MIDI toggled from the menu (⌘K).
-        extern "C" fn toggle_keyboard_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn toggle_keyboard_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -879,17 +876,20 @@ fn ensure_class() -> &'static Class {
                     "computer keyboard: {} (request, via menu)",
                     if want { "ON" } else { "OFF" }
                 );
-                let new_state: BOOL = if want { YES } else { NO };
-                let _: () = msg_send![sender, setState: i64::from(new_state)];
+                let _: () = msg_send![sender, setState: i64::from(want)];
             }
         }
         decl.add_method(
             sel!(toggleKeyboardAction:),
-            toggle_keyboard_action as extern "C" fn(&Object, Sel, *mut Object),
+            toggle_keyboard_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Input device chosen.
-        extern "C" fn select_input_device_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_input_device_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -902,11 +902,15 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(selectInputDeviceAction:),
-            select_input_device_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_input_device_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Output device chosen.
-        extern "C" fn select_output_device_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_output_device_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -919,11 +923,15 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(selectOutputDeviceAction:),
-            select_output_device_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_output_device_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Input channel routing chosen.
-        extern "C" fn select_input_channels_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_input_channels_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -932,17 +940,21 @@ fn ensure_class() -> &'static Class {
                 let route = ChannelRoute::decode(usize::try_from(tag).unwrap_or(0));
                 vlog!("input channels: {route:?}");
                 state.input.set_channel_route(route);
-                let menu: *mut Object = msg_send![sender, menu];
+                let menu: *mut AnyObject = msg_send![sender, menu];
                 update_channel_checkmarks(menu, tag);
             }
         }
         decl.add_method(
             sel!(selectInputChannelsAction:),
-            select_input_channels_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_input_channels_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Output channel routing chosen.
-        extern "C" fn select_output_channels_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_output_channels_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -951,18 +963,22 @@ fn ensure_class() -> &'static Class {
                 let route = ChannelRoute::decode(usize::try_from(tag).unwrap_or(0));
                 vlog!("output channels: {route:?}");
                 state.output.set_channel_route(route);
-                let menu: *mut Object = msg_send![sender, menu];
+                let menu: *mut AnyObject = msg_send![sender, menu];
                 update_channel_checkmarks(menu, tag);
             }
         }
         decl.add_method(
             sel!(selectOutputChannelsAction:),
-            select_output_channels_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_output_channels_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Bus layout chosen (tag packs `(in << 16) | out`). Rebuilds the
         // plugin at that exact layout and moves the checkmark.
-        extern "C" fn select_bus_layout_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_bus_layout_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -971,19 +987,23 @@ fn ensure_class() -> &'static Class {
                 let idx = usize::try_from(tag).unwrap_or(0);
                 vlog!("bus layout: index {idx}");
                 state.output.set_layout(idx);
-                let menu: *mut Object = msg_send![sender, menu];
+                let menu: *mut AnyObject = msg_send![sender, menu];
                 update_channel_checkmarks(menu, tag);
             }
         }
         decl.add_method(
             sel!(selectBusLayoutAction:),
-            select_bus_layout_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_bus_layout_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // MIDI input device chosen. The item tag encodes the plugin
         // port and whether it's the "None" (disconnect) row; device
         // rows carry the name in their title.
-        extern "C" fn select_midi_input_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_midi_input_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1001,11 +1021,15 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(selectMidiInputAction:),
-            select_midi_input_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_midi_input_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // MIDI channel filter chosen (tag = MidiChannel::encode()).
-        extern "C" fn select_midi_channel_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn select_midi_channel_action(
+            this: *mut AnyObject,
+            _: Sel,
+            sender: *mut AnyObject,
+        ) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1014,20 +1038,20 @@ fn ensure_class() -> &'static Class {
                 let channel = MidiChannel::decode(u8::try_from(tag).unwrap_or(0xFF));
                 vlog!("midi channel: {channel:?}");
                 state.midi.set_channel(channel);
-                let menu: *mut Object = msg_send![sender, menu];
+                let menu: *mut AnyObject = msg_send![sender, menu];
                 update_channel_checkmarks(menu, tag);
             }
         }
         decl.add_method(
             sel!(selectMidiChannelAction:),
-            select_midi_channel_action as extern "C" fn(&Object, Sel, *mut Object),
+            select_midi_channel_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // -(void) menuWillOpen:(NSMenu *)menu - refresh state for
         // the about-to-open menu. Dispatch by pointer comparison so
         // we know whether to refresh the mic checkmark or
         // repopulate a device submenu.
-        extern "C" fn menu_will_open(this: &Object, _: Sel, menu: *mut Object) {
+        extern "C" fn menu_will_open(this: *mut AnyObject, _: Sel, menu: *mut AnyObject) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1095,11 +1119,7 @@ fn ensure_class() -> &'static Class {
                         let _: () = msg_send![state.preset_save_item, setTitle: title];
                         // Gray Save out unless an editable preset is
                         // loaded; Save As stays the way forward.
-                        let enabled: BOOL = if state.presets.save_enabled() {
-                            YES
-                        } else {
-                            NO
-                        };
+                        let enabled = Bool::from(state.presets.save_enabled());
                         let _: () = msg_send![state.preset_save_item, setEnabled: enabled];
                     }
                     return;
@@ -1109,38 +1129,35 @@ fn ensure_class() -> &'static Class {
                 // toggle checkmarks.
                 if !state.mic_item.is_null() {
                     let on = state.input.is_enabled();
-                    let new_state: BOOL = if on { YES } else { NO };
-                    let _: () = msg_send![state.mic_item, setState: i64::from(new_state)];
+                    let _: () = msg_send![state.mic_item, setState: i64::from(on)];
                 }
                 if !state.output_item.is_null() {
                     let on = state.output.is_enabled();
-                    let new_state: BOOL = if on { YES } else { NO };
-                    let _: () = msg_send![state.output_item, setState: i64::from(new_state)];
+                    let _: () = msg_send![state.output_item, setState: i64::from(on)];
                 }
                 if !state.keyboard_item.is_null() {
                     let on = state.keyboard.load(Ordering::Relaxed);
-                    let new_state: BOOL = if on { YES } else { NO };
-                    let _: () = msg_send![state.keyboard_item, setState: i64::from(new_state)];
+                    let _: () = msg_send![state.keyboard_item, setState: i64::from(on)];
                 }
             }
         }
         decl.add_method(
             sel!(menuWillOpen:),
-            menu_will_open as extern "C" fn(&Object, Sel, *mut Object),
+            menu_will_open as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Placeholder selector used by non-action items
         // (separators, disabled "(no devices)" rows).
-        extern "C" fn noop_action(_: &Object, _: Sel, _sender: *mut Object) {}
+        extern "C" fn noop_action(_: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {}
         decl.add_method(
             sel!(noopAction:),
-            noop_action as extern "C" fn(&Object, Sel, *mut Object),
+            noop_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Preset: a Load-submenu item chosen. Dispatch by the item's
         // title (its display label) so re-enumeration can't desync a
         // stale index.
-        extern "C" fn load_preset_action(this: &Object, _: Sel, sender: *mut Object) {
+        extern "C" fn load_preset_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1152,11 +1169,11 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(loadPresetAction:),
-            load_preset_action as extern "C" fn(&Object, Sel, *mut Object),
+            load_preset_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Preset: step to the next entry, wrapping.
-        extern "C" fn next_preset_action(this: &Object, _: Sel, _sender: *mut Object) {
+        extern "C" fn next_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.step(1);
@@ -1165,11 +1182,11 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(nextPresetAction:),
-            next_preset_action as extern "C" fn(&Object, Sel, *mut Object),
+            next_preset_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Preset: step to the previous entry, wrapping.
-        extern "C" fn prev_preset_action(this: &Object, _: Sel, _sender: *mut Object) {
+        extern "C" fn prev_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.step(-1);
@@ -1178,12 +1195,12 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(prevPresetAction:),
-            prev_preset_action as extern "C" fn(&Object, Sel, *mut Object),
+            prev_preset_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Preset: save the current state - overwrites the loaded
         // user preset, or routes to Save As for factory / none.
-        extern "C" fn save_preset_action(this: &Object, _: Sel, _sender: *mut Object) {
+        extern "C" fn save_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.save();
@@ -1192,11 +1209,11 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(savePresetAction:),
-            save_preset_action as extern "C" fn(&Object, Sel, *mut Object),
+            save_preset_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         // Preset: save under a chosen name / location.
-        extern "C" fn save_as_preset_action(this: &Object, _: Sel, _sender: *mut Object) {
+        extern "C" fn save_as_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.save_as();
@@ -1205,17 +1222,22 @@ fn ensure_class() -> &'static Class {
         }
         decl.add_method(
             sel!(saveAsPresetAction:),
-            save_as_preset_action as extern "C" fn(&Object, Sel, *mut Object),
+            save_as_preset_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
         );
 
         decl.register();
     });
-    Class::get("MooseMenuTarget").unwrap()
+    AnyClass::get(c"MooseMenuTarget").unwrap()
 }
 
-unsafe fn state_from<'a>(this: &Object) -> Option<&'a MenuState> {
+unsafe fn state_from<'a>(this: *mut AnyObject) -> Option<&'a MenuState> {
+    if this.is_null() {
+        return None;
+    }
     unsafe {
-        let state_ptr: *mut c_void = *this.get_ivar(STATE_IVAR);
+        let this = &*this;
+        let ivar = this.class().instance_variable(STATE_IVAR)?;
+        let state_ptr: *mut c_void = *ivar.load::<*mut c_void>(this);
         if state_ptr.is_null() {
             None
         } else {
@@ -1230,47 +1252,54 @@ unsafe fn make_menu_target(
     midi: MidiController,
     presets: PresetController,
     keyboard: Arc<AtomicBool>,
-) -> *mut Object {
-    let cls = ensure_class();
-    let target: *mut Object = msg_send![cls, alloc];
-    let target: *mut Object = msg_send![target, init];
-    let state = Box::into_raw(Box::new(MenuState {
-        input,
-        output,
-        presets,
-        mic_item: std::ptr::null_mut(),
-        output_item: std::ptr::null_mut(),
-        keyboard,
-        keyboard_item: std::ptr::null_mut(),
-        input_device_menu: std::ptr::null_mut(),
-        output_device_menu: std::ptr::null_mut(),
-        target: std::ptr::null_mut(),
-        device_cache: DeviceCache::new(),
-        midi,
-        midi_input_menus: Vec::new(),
-        presets_menu: std::ptr::null_mut(),
-        preset_load_menu: std::ptr::null_mut(),
-        preset_save_item: std::ptr::null_mut(),
-    }));
-    // SAFETY: `target` was just `alloc`+`init`'d above; it's a valid
-    // MooseMenuTarget instance whose ivar layout we declared.
-    unsafe { (*target).set_ivar::<*mut c_void>(STATE_IVAR, state.cast::<c_void>()) };
-    target
+) -> *mut AnyObject {
+    unsafe {
+        let cls = ensure_class();
+        let target: *mut AnyObject = msg_send![cls, alloc];
+        let target: *mut AnyObject = msg_send![target, init];
+        let state = Box::into_raw(Box::new(MenuState {
+            input,
+            output,
+            presets,
+            mic_item: std::ptr::null_mut(),
+            output_item: std::ptr::null_mut(),
+            keyboard,
+            keyboard_item: std::ptr::null_mut(),
+            input_device_menu: std::ptr::null_mut(),
+            output_device_menu: std::ptr::null_mut(),
+            target: std::ptr::null_mut(),
+            device_cache: DeviceCache::new(),
+            midi,
+            midi_input_menus: Vec::new(),
+            presets_menu: std::ptr::null_mut(),
+            preset_load_menu: std::ptr::null_mut(),
+            preset_save_item: std::ptr::null_mut(),
+        }));
+        // SAFETY: `target` was just `alloc`+`init`'d above; it's a valid
+        // MooseMenuTarget instance whose ivar layout we declared.
+        if let Some(ivar) = (*target).class().instance_variable(STATE_IVAR) {
+            *ivar.load_ptr::<*mut c_void>(&*target) = state.cast::<c_void>();
+        }
+        target
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn update_menu_state(
-    target: *mut Object,
-    mic_item: *mut Object,
-    output_item: *mut Object,
-    keyboard_item: *mut Object,
-    input_device_menu: *mut Object,
-    output_device_menu: *mut Object,
-    midi_input_menus: Vec<*mut Object>,
-    target_self: *mut Object,
+    target: *mut AnyObject,
+    mic_item: *mut AnyObject,
+    output_item: *mut AnyObject,
+    keyboard_item: *mut AnyObject,
+    input_device_menu: *mut AnyObject,
+    output_device_menu: *mut AnyObject,
+    midi_input_menus: Vec<*mut AnyObject>,
+    target_self: *mut AnyObject,
 ) {
     unsafe {
-        let state_ptr: *mut c_void = *(*target).get_ivar(STATE_IVAR);
+        let Some(ivar) = (*target).class().instance_variable(STATE_IVAR) else {
+            return;
+        };
+        let state_ptr: *mut c_void = *ivar.load::<*mut c_void>(&*target);
         if state_ptr.is_null() {
             return;
         }
@@ -1288,13 +1317,16 @@ unsafe fn update_menu_state(
 /// Record the Presets menu's pointers so `menuWillOpen:` can
 /// re-enumerate the Load submenu and refresh the Save title.
 unsafe fn set_preset_menu(
-    target: *mut Object,
-    presets_menu: *mut Object,
-    preset_load_menu: *mut Object,
-    preset_save_item: *mut Object,
+    target: *mut AnyObject,
+    presets_menu: *mut AnyObject,
+    preset_load_menu: *mut AnyObject,
+    preset_save_item: *mut AnyObject,
 ) {
     unsafe {
-        let state_ptr: *mut c_void = *(*target).get_ivar(STATE_IVAR);
+        let Some(ivar) = (*target).class().instance_variable(STATE_IVAR) else {
+            return;
+        };
+        let state_ptr: *mut c_void = *ivar.load::<*mut c_void>(&*target);
         if state_ptr.is_null() {
             return;
         }

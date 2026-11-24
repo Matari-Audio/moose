@@ -19,7 +19,6 @@ moose = { workspace = true, features = ["mui"] }
 moose-core = { workspace = true }
 moose-derive = { workspace = true }
 moose-font = { workspace = true }
-moose-gui-types = { workspace = true }
 moose-loader = { workspace = true }
 moose-params = { workspace = true }
 # Format wrappers driven in-process by `tests/cross_format_contract.rs`

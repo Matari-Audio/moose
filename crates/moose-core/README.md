@@ -30,6 +30,10 @@ format wrappers or GUI backends.
   traits that route `state.get_param(...)` to the prelude's
   chosen precision (mirror of `FloatParamReadF{32,64}` for the
   audio thread)
+- **`DecodedState` / `StateLoadQueue` / `AudioHeartbeat`** --
+  off-audio-thread state decoding with lock-free RT swap,
+  off-thread retirement of replaced payloads, and a sleeping-host
+  fast path that avoids 50 ms load/save stalls when audio is idle
 
 ## Utilities
 

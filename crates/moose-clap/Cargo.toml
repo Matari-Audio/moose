@@ -29,7 +29,7 @@ crossbeam-queue = "0.3"
 # in the bottom-left of any extra plugin-window space Reaper
 # leaves around it. Pure `msg_send!` against AppKit.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc = "0.2"
+objc2 = "0.6"
 
 [lints]
 workspace = true

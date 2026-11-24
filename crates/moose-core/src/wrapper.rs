@@ -24,6 +24,7 @@ use moose_params::ParamInfo;
 
 use crate::export::PluginExport;
 
+pub(crate) use plugin_cell::thread_token as current_thread_token;
 pub use plugin_cell::{PluginCell, PluginGuard};
 
 /// Take ownership of the plugin for a **non-real-time** lifecycle callback
@@ -51,53 +52,89 @@ pub fn save_extra(snapshot: &crate::snapshot::SnapshotSlot) -> Vec<u8> {
     snapshot.read().unwrap_or_default()
 }
 
-/// How long a host-thread save or load waits for the audio thread to
-/// serve it at the next block boundary before falling back. Long enough
-/// for any real block period; a host that stopped calling `process`
-/// without telling us (a sleeping CLAP plugin) costs this much per call.
-// ponytail: fixed bound, derive from the block period if 50 ms stalls show up.
+/// How long a host-thread save or load waits for an **actively streaming**
+/// audio thread to serve it at the next block boundary before falling back.
+/// Sleeping, bypassed, suspended, or single-threaded hosts do not stall for
+/// this duration (the wrapper checks the audio heartbeat and ownership cell
+/// first and returns immediately when no other thread is pumping blocks).
 pub const AUDIO_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Pop and apply one queued state load on the thread that owns the plugin,
 /// record the result for a waiting host thread, and ask the shell for a
 /// fresh snapshot at the end of the next `process`. `None` when nothing was
-/// queued. Wrappers call this at the top of `process`, outside the
-/// real-time section (`load_state` may allocate).
+/// queued.
+///
+/// When the plugin opted into off-thread decoding
+/// ([`PluginRuntime::decode_state`](crate::plugin::PluginRuntime::decode_state)),
+/// the swap runs inside an [`RtSection`](crate::rt::RtSection) with zero
+/// audio-thread allocations or deallocations: the displaced old state is
+/// pushed into `queue`'s lock-free retirement channel to drop off the audio
+/// thread. Otherwise `load_state` runs outside the real-time section for
+/// backwards compatibility.
 pub fn apply_queued_state<P: PluginExport>(
     plugin: &mut P,
     queue: &crate::state::StateLoadQueue,
 ) -> Option<Result<(), crate::state::StateLoadError>> {
-    let (state, backup) = queue.pop_with_backup()?;
-    let result = crate::state::try_apply_state(plugin, &state);
+    use moose_params::Params;
+
+    let queued = queue.pop_queued()?;
+    let state_ptr = std::sync::Arc::as_ptr(&queued.state) as usize;
+    if let Some(mut decoded) = queued.decoded {
+        let slot = plugin.snapshot_slot();
+        {
+            let _rt = crate::rt::RtSection::enter();
+            plugin.params().restore_values(&queued.state.params);
+            plugin.params().snap_smoothers();
+            plugin.apply_decoded_state(&mut decoded);
+            queue.retire_decoded(decoded);
+            slot.mark_state_loaded();
+            queue.set_accepted_custom(state_ptr);
+            let ticket = slot.request_fresh();
+            slot.record_load_ticket(state_ptr, ticket);
+            queue.mark_applied(&queued.state, true);
+        }
+        return Some(Ok(()));
+    }
+    let result = crate::state::try_apply_state(plugin, &queued.state);
     if result.is_err()
-        && let Some(backup) = backup
+        && let Some(backup) = &queued.backup
     {
         backup.restore(plugin.params());
     }
-    queue.mark_applied(&state, result.is_ok());
-    plugin.snapshot_slot().request_fresh();
+    let slot = plugin.snapshot_slot();
+    if result.is_ok() && queued.state.extra.is_some() {
+        slot.mark_state_loaded();
+        queue.set_accepted_custom(state_ptr);
+    }
+    let ticket = slot.request_fresh();
+    slot.record_load_ticket(state_ptr, ticket);
+    queue.mark_applied(&queued.state, result.is_ok());
     Some(result)
 }
 
 /// Load a host state into the plugin. With `can_own` (the wrapper is not
 /// processing) the host thread takes the plugin and applies it now;
-/// otherwise the state is queued for the audio thread and this waits up to
-/// [`AUDIO_HANDSHAKE_WAIT`] for it to land and for the fresh snapshot, so an
-/// editor notified next reads the new state.
+/// otherwise the state is queued for the audio thread. If another thread is
+/// actively pumping audio blocks (measured via the audio heartbeat and
+/// [`PluginCell::is_held_by_other_thread`]), this waits up to
+/// [`AUDIO_HANDSHAKE_WAIT`] (woken immediately when the block finishes) so an
+/// editor notified next reads the new state. On a sleeping, bypassed,
+/// suspended, or single-threaded host, this returns `Ok(())` immediately
+/// without stalling.
 ///
 /// Params and `#[persist]` must already be applied (`read_and_apply_params`
 /// / `apply_params`); `backup` is what they were before. When the plugin's
-/// `load_state` rejects the state, they are restored from it, so the load
-/// fails as a unit and the error is returned for the host. The plugin's
-/// [`validate_state`](crate::plugin::PluginRuntime::validate_state) runs
-/// first, on this thread, and can reject the state up front. A load still
-/// queued when the wait ends returns `Ok`: its envelope already parsed on
-/// the host thread, and saves until it lands report its custom bytes (see
-/// [`custom_state_view`]).
+/// [`validate_state`](crate::plugin::PluginRuntime::validate_state),
+/// [`decode_state`](crate::plugin::PluginRuntime::decode_state), or
+/// `load_state` rejects the state, they are restored from `backup`, so the
+/// load fails as a unit and the error is returned for the host. A load still
+/// queued when this returns `Ok` reports its custom bytes on saves until it
+/// lands (see [`custom_state_view`]).
 ///
 /// # Errors
 ///
-/// The plugin's `load_state` error, when it ran before this returned.
+/// The plugin's `validate_state`, `decode_state`, or `load_state` error, when
+/// it ran before this returned.
 pub fn apply_or_queue_state<P: PluginExport>(
     plugin: &PluginCell<P>,
     params: &P::Params,
@@ -107,14 +144,26 @@ pub fn apply_or_queue_state<P: PluginExport>(
     backup: &crate::state::ParamsBackup,
     can_own: bool,
 ) -> Result<(), crate::state::StateLoadError> {
+    use moose_params::Params;
+
     // Host thread, before anything is applied or queued: a queued load may
-    // answer the host before `load_state` runs, so this is where it can fail.
-    if let Some(extra) = &state.extra
-        && let Err(err) = P::validate_state(extra)
-    {
-        backup.restore(params);
-        return Err(err);
-    }
+    // answer the host before the audio thread runs, so validation and
+    // off-thread decoding both run synchronously here.
+    let decoded = if let Some(extra) = &state.extra {
+        if let Err(err) = P::validate_state(extra) {
+            backup.restore(params);
+            return Err(err);
+        }
+        match P::decode_state(extra) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                backup.restore(params);
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
     // `try_enter`: a CLAP `reset` may hold the cell on the audio thread
     // while stopped; then queue instead of panicking on an overlap.
     if can_own && let Some(mut instance) = plugin.try_enter() {
@@ -122,23 +171,56 @@ pub fn apply_or_queue_state<P: PluginExport>(
         if let Some(stale) = queue.pop() {
             queue.mark_applied(&stale, true);
         }
-        let result = crate::state::try_apply_state(&mut *instance, &state);
+        queue.reclaim_retired();
+        let has_custom_extra = state.extra.is_some();
+
+        let result = if let Some(mut decoded) = decoded {
+            instance.params().restore_values(&state.params);
+            instance.params().snap_smoothers();
+            instance.apply_decoded_state(&mut decoded);
+            // `decoded` (holding the swapped-out old state) drops here on the host thread.
+            Ok(())
+        } else {
+            crate::state::try_apply_state(&mut *instance, &state)
+        };
         if result.is_err() {
             backup.restore(params);
+        } else if has_custom_extra {
+            slot.mark_state_loaded();
+            queue.set_accepted_custom(0);
         }
         instance.republish_snapshot();
+        if result.is_ok()
+            && let Some(extra) = state.extra
+            && slot.read_current().is_none()
+        {
+            slot.store_pending_extra(extra);
+        }
         return result;
     }
-    let handle = queue.push_with_backup(state, Some(backup.clone()));
+    let handle = queue.push_with_backup_and_decoded(state, Some(backup.clone()), decoded);
+    let audio_active = plugin.is_held_by_other_thread()
+        || queue.is_audio_active_on_other_thread()
+        || slot.is_audio_active_on_other_thread();
+    if !audio_active {
+        return Ok(());
+    }
     match queue.wait_applied(&handle, AUDIO_HANDSHAKE_WAIT) {
-        Some(false) => Err(crate::state::StateLoadError::Other(
-            "plugin load_state rejected the state".into(),
-        )),
+        Some(false) => {
+            queue.reclaim_retired();
+            Err(crate::state::StateLoadError::Other(
+                "plugin load_state rejected the state".into(),
+            ))
+        }
         // Applied: the audio thread requested a fresh snapshot right after
-        // the apply, served at the end of that block. Wait for it so a
-        // `get_state` right after this doesn't read the pre-load snapshot.
+        // the apply and recorded its ticket before marking completion. Wait on
+        // that original ticket so we don't wait for a second block if the
+        // snapshot was already served.
         Some(true) => {
-            let ticket = slot.request_fresh();
+            queue.reclaim_retired();
+            let ticket = slot
+                .ticket_for_load(std::sync::Arc::as_ptr(&handle) as usize)
+                .unwrap_or_else(|| slot.request_fresh());
             // A late snapshot only delays freshness; the load itself landed.
             let _ = slot.wait_served(ticket, AUDIO_HANDSHAKE_WAIT);
             Ok(())
@@ -148,10 +230,11 @@ pub fn apply_or_queue_state<P: PluginExport>(
 }
 
 /// Custom state for a host save. With `can_own` the host thread takes the
-/// plugin, applies any queued load, and serializes live state. Otherwise it
-/// asks the audio thread for a fresh snapshot and waits up to
-/// [`AUDIO_HANDSHAKE_WAIT`]; if no block runs in time it falls back to
-/// [`custom_state_view`].
+/// plugin, applies any queued load, and serializes live state. Otherwise, if
+/// another thread is actively pumping audio blocks, it asks the audio thread
+/// for a fresh snapshot and waits up to [`AUDIO_HANDSHAKE_WAIT`]; if the host
+/// is sleeping/bypassed/single-threaded or no block runs in time, it falls
+/// back immediately to [`custom_state_view`].
 ///
 /// Why a request instead of a lock: the audio thread never waits, and a
 /// running audio thread serves the request within one block, so the host
@@ -167,12 +250,20 @@ pub fn custom_state_for_save<P: PluginExport>(
         if apply_queued_state(&mut *instance, queue).is_some() {
             instance.republish_snapshot();
         }
-        return crate::export::read_custom_state_offthread(&*instance);
+        queue.reclaim_retired();
+        return crate::export::current_custom_state(&*instance)
+            .or_else(|| slot.read_current())
+            .or_else(|| queue.accepted_extra())
+            .unwrap_or_default();
+    }
+    let audio_active = plugin.is_held_by_other_thread()
+        || queue.is_audio_active_on_other_thread()
+        || slot.is_audio_active_on_other_thread();
+    if !audio_active {
+        return custom_state_view(slot, queue);
     }
     let ticket = slot.request_fresh();
-    if slot.wait_served(ticket, AUDIO_HANDSHAKE_WAIT) && queue.unapplied().is_none() {
-        return save_extra(slot);
-    }
+    let _ = slot.wait_served(ticket, AUDIO_HANDSHAKE_WAIT);
     custom_state_view(slot, queue)
 }
 
@@ -186,7 +277,10 @@ pub fn custom_state_view(
 ) -> Vec<u8> {
     match queue.unapplied() {
         Some(state) => state.extra.clone().unwrap_or_default(),
-        None => save_extra(slot),
+        None => slot
+            .read_current()
+            .or_else(|| queue.accepted_extra())
+            .unwrap_or_default(),
     }
 }
 
@@ -232,7 +326,7 @@ mod plugin_cell {
 
     /// A never-zero per-thread token. `0` is reserved for "cell free", so
     /// the counter starts at 1.
-    fn thread_token() -> u64 {
+    pub(crate) fn thread_token() -> u64 {
         // loom runs its model threads on one OS thread, so the token must
         // be per loom thread there or every thread would look like the owner.
         #[cfg(all(test, feature = "loom"))]
@@ -335,6 +429,16 @@ mod plugin_cell {
                 cell: self,
                 _not_send: PhantomData,
             })
+        }
+
+        /// Whether another thread currently holds this cell. Wait-free.
+        #[must_use]
+        pub fn is_held_by_other_thread(&self) -> bool {
+            if !self.held.load(Ordering::Acquire) {
+                return false;
+            }
+            let owner = self.owner.load(Ordering::Relaxed);
+            owner != 0 && owner != thread_token()
         }
 
         /// Wake a thread parked in [`Self::enter`], if any. Never blocks:
@@ -1007,6 +1111,733 @@ mod panic_latch_tests {
         latch.clear_with(|msg| reported.push_str(msg));
         assert!(reported.contains("second panic"), "{reported}");
         assert_eq!(latch.message.lock().unwrap().capacity(), PANIC_MESSAGE_CAP);
+    }
+}
+
+#[cfg(test)]
+mod state_handshake_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{PluginCell, apply_or_queue_state, apply_queued_state, custom_state_for_save};
+    use crate::buffer::AudioBuffer;
+    use crate::config::AudioConfig;
+    use crate::events::EventList;
+    use crate::export::PluginExport;
+    use crate::info::{MidiDialect, PluginCategory, PluginInfo};
+    use crate::meters::MeterStore;
+    use crate::plugin::PluginRuntime;
+    use crate::process::{ProcessContext, ProcessStatus};
+    use crate::snapshot::SnapshotSlot;
+    use crate::state::{
+        DecodedState, DeserializedState, ParamsBackup, StateLoadError, StateLoadQueue,
+    };
+    use moose_params::{DynamicParams, Params, SlotDef, SlotRange};
+
+    struct TrackedTable {
+        tag: u32,
+        _buf: Vec<f32>,
+        drops: Arc<AtomicUsize>,
+        dropped_on_audio: Arc<AtomicBool>,
+        audio_tid: std::thread::ThreadId,
+    }
+
+    impl Drop for TrackedTable {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            if std::thread::current().id() == self.audio_tid {
+                self.dropped_on_audio.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    struct SwapPlugin {
+        params: Arc<DynamicParams<1>>,
+        meters: Arc<MeterStore>,
+        snapshot: Arc<SnapshotSlot>,
+        table: Option<TrackedTable>,
+        tag: Option<u32>,
+        observed_tag: Arc<std::sync::atomic::AtomicU32>,
+        raw_extra: Vec<u8>,
+    }
+
+    impl PluginRuntime for SwapPlugin {
+        type Sample = f32;
+        fn info() -> PluginInfo {
+            PluginInfo {
+                name: "Swap",
+                vendor: "Test",
+                url: "",
+                version: "0.0.1",
+                category: PluginCategory::Effect,
+                description: None,
+                clap_manual_url: None,
+                clap_support_url: None,
+                clap_features: &[],
+                accepts_midi_in: false,
+                emits_midi: false,
+                midi_input_dialect: MidiDialect::Midi1,
+                midi_output_dialect: MidiDialect::Midi1,
+                midi_input_ports: 0,
+                midi_output_ports: 0,
+                bundle_id: "swap",
+                vst3_id: "com.test.swap",
+                clap_id: "com.test.swap",
+                fourcc: *b"Swap",
+                au_type: *b"aufx",
+                au_manufacturer: *b"Test",
+                vst3_subcategory: None,
+                preset_user_dir: None,
+                preset_extension: "preset",
+                vst3_name: None,
+                clap_name: None,
+                au_name: None,
+                au3_name: None,
+                mute_preview_output: false,
+                automation: crate::Automation::DEFAULT,
+                legacy_au_keys: &[],
+                legacy_aax_chunks: &[],
+            }
+        }
+        fn reset(&mut self, _config: &AudioConfig) {}
+        fn process(
+            &mut self,
+            _buffer: &mut AudioBuffer<f32>,
+            _events: &EventList,
+            _context: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+        fn save_state(&self) -> Vec<u8> {
+            if let Some(table) = &self.table {
+                table.tag.to_le_bytes().to_vec()
+            } else if let Some(tag) = self.tag {
+                tag.to_le_bytes().to_vec()
+            } else {
+                self.raw_extra.clone()
+            }
+        }
+        fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+            if data == b"BAD!" {
+                return Err(StateLoadError::Malformed("bad decoded state"));
+            }
+            if data.len() == 4 {
+                let tag = u32::from_le_bytes(data.try_into().unwrap());
+                return Ok(Some(DecodedState::new(tag)));
+            }
+            Ok(None)
+        }
+        fn apply_decoded_state(&mut self, decoded: &mut DecodedState) {
+            if let Some(table) = &mut self.table {
+                decoded.swap_with(table);
+                return;
+            }
+            if let Some(&tag) = decoded.downcast_ref::<u32>() {
+                self.tag = Some(tag);
+                self.observed_tag.store(tag, Ordering::Release);
+            }
+        }
+    }
+
+    impl PluginExport for SwapPlugin {
+        type Params = DynamicParams<1>;
+        fn create() -> Self {
+            let params = DynamicParams::<1>::new();
+            let slot0 = params.slot(0).unwrap();
+            params.edit(|e| {
+                e.bind(
+                    slot0,
+                    SlotDef::new("Gain", SlotRange::Linear { min: 0.0, max: 1.0 }),
+                );
+            });
+            Self {
+                params: Arc::new(params),
+                meters: MeterStore::new(),
+                snapshot: SnapshotSlot::new(),
+                table: None,
+                tag: None,
+                observed_tag: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                raw_extra: Vec::new(),
+            }
+        }
+        fn params(&self) -> &DynamicParams<1> {
+            &self.params
+        }
+        fn params_arc(&self) -> Arc<DynamicParams<1>> {
+            Arc::clone(&self.params)
+        }
+        fn meter_store(&self) -> Arc<MeterStore> {
+            Arc::clone(&self.meters)
+        }
+        fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+            Arc::clone(&self.snapshot)
+        }
+    }
+
+    #[test]
+    fn sleeping_host_does_not_stall_50ms_on_load_or_save() {
+        let plugin = PluginCell::new(SwapPlugin::create());
+        let params = plugin.enter().params_arc();
+        let slot = plugin.enter().snapshot_slot();
+        let queue = StateLoadQueue::new(1);
+        let backup = ParamsBackup::capture(&*params);
+
+        let start = Instant::now();
+        let state = DeserializedState {
+            extra: Some(42u32.to_le_bytes().to_vec()),
+            ..Default::default()
+        };
+        apply_or_queue_state(&plugin, &*params, &slot, &queue, state, &backup, false)
+            .expect("queued load succeeds");
+        let saved = custom_state_for_save(&plugin, &slot, &queue, false);
+        let elapsed = start.elapsed();
+
+        assert_eq!(saved, 42u32.to_le_bytes().to_vec());
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "sleeping host stalled for {elapsed:?} (must not hit 50 ms AUDIO_HANDSHAKE_WAIT)"
+        );
+    }
+
+    #[test]
+    fn decode_state_error_rolls_back_params_even_when_processing() {
+        let plugin = PluginCell::new(SwapPlugin::create());
+        let params = plugin.enter().params_arc();
+        let slot = plugin.enter().snapshot_slot();
+        let queue = StateLoadQueue::new(1);
+        let gain_id = params.param_infos()[0].id;
+
+        params.set_plain(gain_id, 0.25);
+        let backup = ParamsBackup::capture(&*params);
+        params.set_plain(gain_id, 0.99);
+
+        let bad = DeserializedState {
+            extra: Some(b"BAD!".to_vec()),
+            ..Default::default()
+        };
+        let err = apply_or_queue_state(&plugin, &*params, &slot, &queue, bad, &backup, false);
+        assert!(err.is_err(), "decode_state failure rejects load up front");
+        assert!(
+            (params.get_plain(gain_id).unwrap() - 0.25).abs() < 1e-6,
+            "failed decode_state restored backup params"
+        );
+        assert!(queue.unapplied().is_none(), "failed load was not queued");
+    }
+
+    #[test]
+    fn off_thread_decoded_state_swaps_on_audio_and_drops_old_state_off_audio() {
+        let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped_on_audio = Arc::new(AtomicBool::new(false));
+
+        let (tx_tid, rx_tid) = std::sync::mpsc::channel();
+        let (tx_go, rx_go) = std::sync::mpsc::channel();
+        let (tx_done, rx_done) = std::sync::mpsc::channel();
+
+        let audio_plugin = Arc::clone(&plugin);
+        let audio_queue = Arc::clone(&queue);
+        let audio = std::thread::spawn(move || {
+            tx_tid.send(std::thread::current().id()).unwrap();
+            rx_go.recv().unwrap();
+            audio_queue.record_audio_block();
+            let mut guard = audio_plugin.try_enter().expect("audio owns plugin");
+            let applied = apply_queued_state(&mut *guard, &audio_queue);
+            assert!(matches!(applied, Some(Ok(()))));
+            assert_eq!(guard.table.as_ref().unwrap().tag, 2);
+            tx_done.send(()).unwrap();
+        });
+
+        let audio_tid = rx_tid.recv().unwrap();
+        plugin.enter().table = Some(TrackedTable {
+            tag: 1,
+            _buf: vec![1.0; 1024],
+            drops: Arc::clone(&drops),
+            dropped_on_audio: Arc::clone(&dropped_on_audio),
+            audio_tid,
+        });
+
+        let new_table = TrackedTable {
+            tag: 2,
+            _buf: vec![2.0; 1024],
+            drops: Arc::clone(&drops),
+            dropped_on_audio: Arc::clone(&dropped_on_audio),
+            audio_tid,
+        };
+        let _handle = queue.push_with_backup_and_decoded(
+            DeserializedState::default(),
+            None,
+            Some(DecodedState::new(new_table)),
+        );
+        tx_go.send(()).unwrap();
+        rx_done.recv().unwrap();
+        audio.join().unwrap();
+
+        assert!(
+            !dropped_on_audio.load(Ordering::Acquire),
+            "old heap state must NEVER drop on the audio thread"
+        );
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "old state waits in retirement queue until host reclaims"
+        );
+        queue.reclaim_retired();
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "old state dropped on host thread after reclaim"
+        );
+    }
+
+    #[test]
+    fn live_audio_thread_handshake_wakes_immediately_without_50ms_wait() {
+        let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
+        let params = plugin.enter().params_arc();
+        let slot = plugin.enter().snapshot_slot();
+        let observed_tag = Arc::clone(&plugin.enter().observed_tag);
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+
+        let audio = {
+            let plugin = Arc::clone(&plugin);
+            let queue = Arc::clone(&queue);
+            let stop = Arc::clone(&stop);
+            let started = Arc::clone(&started);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    {
+                        let mut guard = plugin.enter();
+                        queue.record_audio_block();
+                        let _ = apply_queued_state(&mut *guard, &queue);
+                        if let Some(ticket) = guard.snapshot_slot().pending_request() {
+                            let bytes = guard.save_state();
+                            guard.snapshot_slot().serve(ticket, |buf| {
+                                buf.extend_from_slice(&bytes);
+                            });
+                        }
+                    }
+                    started.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let expected = 42u32.to_le_bytes().to_vec();
+        let backup = ParamsBackup::capture(&*params);
+        let t0 = Instant::now();
+        let load_res = apply_or_queue_state(
+            &plugin,
+            &*params,
+            &slot,
+            &queue,
+            DeserializedState {
+                extra: Some(expected.clone()),
+                ..Default::default()
+            },
+            &backup,
+            false,
+        );
+        let unapplied_after_load = queue.unapplied();
+        let tag_after_load = observed_tag.load(Ordering::Acquire);
+        let saved = custom_state_for_save(&plugin, &slot, &queue, false);
+        let elapsed = t0.elapsed();
+
+        // Stop and join the audio worker BEFORE asserting so a failure cannot
+        // leave the background thread running.
+        stop.store(true, Ordering::Release);
+        audio.join().unwrap();
+
+        load_res.expect("live audio thread applies queued state synchronously");
+        assert!(
+            unapplied_after_load.is_none(),
+            "live audio handshake must apply load before returning"
+        );
+        assert_eq!(
+            tag_after_load, 42,
+            "processor must hold decoded tag immediately after live apply_or_queue_state"
+        );
+        assert_eq!(saved, expected);
+        assert!(
+            elapsed < Duration::from_millis(35),
+            "live audio handshake should finish quickly via atomic polling, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn completed_waits_succeed_after_stop() {
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let slot = SnapshotSlot::new();
+
+        // Already-completed requests keep their result even if audio stops after.
+        let done_handle = queue.push_tracked(DeserializedState::default());
+        queue.mark_applied(&done_handle, true);
+        queue.mark_audio_inactive();
+        assert_eq!(
+            queue.wait_applied(&done_handle, Duration::from_millis(50)),
+            Some(true)
+        );
+        let done_ticket = slot.request_fresh();
+        slot.serve(done_ticket, |buf| buf.extend_from_slice(b"ok"));
+        slot.mark_audio_inactive();
+        assert!(slot.wait_served(done_ticket, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn stop_during_poll_interrupts_each_wait() {
+        let queue = StateLoadQueue::new(1);
+        let slot = SnapshotSlot::new();
+        queue.record_audio_block();
+        let _ = slot.pending_request();
+        let pending = queue.push_tracked(DeserializedState::default());
+        let ticket = slot.request_fresh();
+        let mut queue_polls = 0;
+        assert_eq!(
+            queue.wait_applied_poll(&pending, Duration::from_secs(2), || {
+                queue_polls += 1;
+                assert_eq!(queue_polls, 1);
+                queue.mark_audio_inactive();
+            }),
+            None
+        );
+        assert_eq!(queue_polls, 1);
+        let mut slot_polls = 0;
+        assert!(!slot.wait_served_poll(ticket, Duration::from_secs(2), || {
+            slot_polls += 1;
+            assert_eq!(slot_polls, 1);
+            slot.mark_audio_inactive();
+        }));
+        assert_eq!(slot_polls, 1);
+        assert!(
+            queue.unapplied().is_some(),
+            "pending state remains available for the next block after stop"
+        );
+    }
+
+    #[test]
+    fn param_only_load_preserves_offthread_publisher_snapshot() {
+        let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
+        let params = plugin.enter().params_arc();
+        let slot = plugin.enter().snapshot_slot();
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let backup = ParamsBackup::capture(&*params);
+
+        crate::snapshot::SnapshotPublisher::new(&slot).publish(b"PUB_CUSTOM".to_vec());
+        assert_eq!(super::save_extra(&slot), b"PUB_CUSTOM".to_vec());
+
+        // Host-owned param-only load (`extra: None`) must NOT invalidate publisher bytes.
+        apply_or_queue_state(
+            &plugin,
+            &*params,
+            &slot,
+            &queue,
+            DeserializedState {
+                extra: None,
+                ..Default::default()
+            },
+            &backup,
+            true,
+        )
+        .expect("param-only host-owned load succeeds");
+        assert_eq!(
+            custom_state_for_save(&plugin, &slot, &queue, true),
+            b"PUB_CUSTOM".to_vec()
+        );
+        assert_eq!(slot.read_offthread(), Some(b"PUB_CUSTOM".to_vec()));
+
+        // Queued audio-thread param-only load (`extra: None`) also preserves publisher bytes.
+        let handle = queue.push_tracked(DeserializedState {
+            extra: None,
+            ..Default::default()
+        });
+        {
+            let mut guard = plugin.enter();
+            assert!(matches!(
+                apply_queued_state(&mut *guard, &queue),
+                Some(Ok(()))
+            ));
+        }
+        assert_eq!(queue.wait_applied(&handle, Duration::ZERO), Some(true));
+        assert_eq!(super::save_extra(&slot), b"PUB_CUSTOM".to_vec());
+        assert_eq!(slot.read_offthread(), Some(b"PUB_CUSTOM".to_vec()));
+    }
+
+    #[test]
+    fn queued_load_reuses_original_snapshot_ticket_without_extra_block() {
+        let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
+        let params = plugin.enter().params_arc();
+        let slot = plugin.enter().snapshot_slot();
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let backup = ParamsBackup::capture(&*params);
+
+        let (tx_ready, rx_ready) = std::sync::mpsc::channel();
+        let (tx_run_one, rx_run_one) = std::sync::mpsc::channel();
+        let audio_plugin = Arc::clone(&plugin);
+        let audio_queue = Arc::clone(&queue);
+        let audio = std::thread::spawn(move || {
+            // Stamp active heartbeat, then wait for host to push load and serve
+            // ONLY ONE block (applying load + serving its own ticket N), then stop
+            // producing blocks without marking inactive.
+            audio_queue.record_audio_block();
+            let _ = audio_plugin.enter().snapshot_slot().pending_request();
+            tx_ready.send(()).unwrap();
+            rx_run_one.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut guard = audio_plugin.enter();
+            audio_queue.record_audio_block();
+            let _ = apply_queued_state(&mut *guard, &audio_queue);
+            if let Some(ticket) = guard.snapshot_slot().pending_request() {
+                let bytes = guard.save_state();
+                guard
+                    .snapshot_slot()
+                    .serve(ticket, |buf| buf.extend_from_slice(&bytes));
+            }
+        });
+        rx_ready.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let trigger_queue = Arc::clone(&queue);
+        let trigger = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while trigger_queue.unapplied().is_none() {
+                assert!(Instant::now() < deadline, "load was never queued");
+                std::thread::yield_now();
+            }
+            tx_run_one.send(()).unwrap();
+        });
+
+        let expected = 77u32.to_le_bytes().to_vec();
+        let t0 = Instant::now();
+        let res = apply_or_queue_state(
+            &plugin,
+            &*params,
+            &slot,
+            &queue,
+            DeserializedState {
+                extra: Some(expected.clone()),
+                ..Default::default()
+            },
+            &backup,
+            false,
+        );
+        let elapsed = t0.elapsed();
+        trigger.join().unwrap();
+        audio.join().unwrap();
+
+        res.expect("single block applies load and serves its ticket");
+        assert_eq!(super::save_extra(&slot), expected);
+        assert!(
+            elapsed < Duration::from_millis(35),
+            "host must reuse load's served ticket N rather than stalling 50ms for N+1, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn host_owned_pre_activation_decoded_load_remains_visible_to_save() {
+        // Plugin whose `save_state` returns empty while inactive (like `Lifecycle`).
+        struct InactiveDecodedPlugin {
+            params: Arc<DynamicParams<1>>,
+            meters: Arc<MeterStore>,
+            snapshot: Arc<SnapshotSlot>,
+            pending_tag: Option<u32>,
+            active_tag: Option<u32>,
+        }
+        impl PluginRuntime for InactiveDecodedPlugin {
+            type Sample = f32;
+            fn info() -> PluginInfo {
+                SwapPlugin::info()
+            }
+            fn reset(&mut self, _config: &AudioConfig) {}
+            fn process(
+                &mut self,
+                _buffer: &mut AudioBuffer<f32>,
+                _events: &EventList,
+                _context: &mut ProcessContext,
+            ) -> ProcessStatus {
+                ProcessStatus::Normal
+            }
+            fn save_state(&self) -> Vec<u8> {
+                self.active_tag
+                    .map_or_else(Vec::new, |t| t.to_le_bytes().to_vec())
+            }
+            fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+                if data.len() == 4 {
+                    let tag = u32::from_le_bytes(data.try_into().unwrap());
+                    return Ok(Some(DecodedState::new(tag)));
+                }
+                Ok(None)
+            }
+            fn apply_decoded_state(&mut self, decoded: &mut DecodedState) {
+                if let Some(&tag) = decoded.downcast_ref::<u32>() {
+                    self.pending_tag = Some(tag);
+                }
+            }
+        }
+        impl PluginExport for InactiveDecodedPlugin {
+            type Params = DynamicParams<1>;
+            fn create() -> Self {
+                Self {
+                    params: Arc::new(DynamicParams::<1>::new()),
+                    meters: MeterStore::new(),
+                    snapshot: SnapshotSlot::new(),
+                    pending_tag: None,
+                    active_tag: None,
+                }
+            }
+            fn params(&self) -> &DynamicParams<1> {
+                &self.params
+            }
+            fn params_arc(&self) -> Arc<DynamicParams<1>> {
+                Arc::clone(&self.params)
+            }
+            fn meter_store(&self) -> Arc<MeterStore> {
+                Arc::clone(&self.meters)
+            }
+            fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+                Arc::clone(&self.snapshot)
+            }
+        }
+
+        for can_own in [true, false] {
+            let plugin = PluginCell::new(InactiveDecodedPlugin::create());
+            let params = plugin.enter().params_arc();
+            let slot = plugin.enter().snapshot_slot();
+            let queue = StateLoadQueue::new(1);
+            let backup = ParamsBackup::capture(&*params);
+            let expected = 42u32.to_le_bytes().to_vec();
+
+            // 1. Host-owned pre-activation load (`can_own = true`).
+            apply_or_queue_state(
+                &plugin,
+                &*params,
+                &slot,
+                &queue,
+                DeserializedState {
+                    extra: Some(expected.clone()),
+                    ..Default::default()
+                },
+                &backup,
+                can_own,
+            )
+            .expect("pre-activation load succeeds");
+
+            // 2. Save BEFORE activation (both host-owned and non-owned views) sees `expected`.
+            assert_eq!(
+                custom_state_for_save(&plugin, &slot, &queue, true),
+                expected
+            );
+            assert_eq!(super::custom_state_view(&slot, &queue), expected);
+
+            // 3. Activate consumes pending tag; live save continues returning `expected`.
+            {
+                let mut guard = plugin.enter();
+                assert_eq!(guard.pending_tag.take(), Some(42));
+                guard.active_tag = Some(43);
+            }
+            assert_eq!(
+                custom_state_for_save(&plugin, &slot, &queue, true),
+                43u32.to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn older_publisher_snapshot_does_not_override_decoded_state_load() {
+        let plugin = Arc::new(PluginCell::new(SwapPlugin::create()));
+        let slot = plugin.enter().snapshot_slot();
+        let queue = Arc::new(StateLoadQueue::new(1));
+
+        slot.store_inline(|buf| buf.push(1));
+        // Background publisher publishes A before any load.
+        crate::snapshot::SnapshotPublisher::new(&slot).publish(b"OLD_A".to_vec());
+        assert_eq!(slot.read(), Some(b"OLD_A".to_vec()));
+
+        // Queued decoded load swaps in B (tag = 99) on the audio thread.
+        let expected_b = 99u32.to_le_bytes().to_vec();
+        let handle = queue.push_with_backup_and_decoded(
+            DeserializedState {
+                extra: Some(expected_b.clone()),
+                ..Default::default()
+            },
+            None,
+            Some(DecodedState::new(99u32)),
+        );
+        {
+            let mut guard = plugin.enter();
+            assert!(matches!(
+                apply_queued_state(&mut *guard, &queue),
+                Some(Ok(()))
+            ));
+            assert_eq!(super::custom_state_view(&slot, &queue), expected_b);
+            let ticket = guard
+                .snapshot_slot()
+                .pending_request()
+                .expect("fresh requested");
+            let bytes = guard.save_state();
+            guard
+                .snapshot_slot()
+                .serve(ticket, |buf| buf.extend_from_slice(&bytes));
+        }
+        assert_eq!(queue.wait_applied(&handle, Duration::ZERO), Some(true));
+
+        // Active save and off-thread save must both see B, not pre-load publisher A.
+        assert_eq!(super::save_extra(&slot), expected_b);
+        assert!(slot.read_offthread().is_none());
+        assert_eq!(
+            crate::export::read_custom_state_offthread(&*plugin.enter()),
+            expected_b
+        );
+
+        // A new publisher snapshot C belonging to the current generation wins again.
+        crate::snapshot::SnapshotPublisher::new(&slot).publish(b"NEW_C".to_vec());
+        assert_eq!(super::save_extra(&slot), b"NEW_C".to_vec());
+        assert_eq!(slot.read_offthread(), Some(b"NEW_C".to_vec()));
+        crate::snapshot::SnapshotPublisher::new(&slot).publish(Vec::new());
+        assert_eq!(
+            custom_state_for_save(&plugin, &slot, &queue, true),
+            Vec::<u8>::new()
+        );
+        assert_eq!(super::custom_state_view(&slot, &queue), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn negotiated_block_interval_expands_heartbeat_active_window() {
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let slot = SnapshotSlot::new();
+        // 8,192 frames @ 44.1 kHz ≈ 186 ms (exceeds the 150 ms default window).
+        queue.set_block_interval(44_100.0, 8192);
+        slot.set_block_interval(44_100.0, 8192);
+
+        // Never processed -> still immediately inactive.
+        assert!(!queue.is_audio_active_on_other_thread());
+        assert!(!slot.is_audio_active_on_other_thread());
+
+        let q = Arc::clone(&queue);
+        let s = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            crate::state::with_test_time(1_000, || {
+                q.record_audio_block();
+                let _ = s.pending_request();
+            });
+        })
+        .join()
+        .unwrap();
+
+        // 175 ms later (> 150 ms default, < 186 ms + 50 ms margin): still active!
+        crate::state::with_test_time(176_000, || {
+            assert!(queue.is_audio_active_on_other_thread());
+            assert!(slot.is_audio_active_on_other_thread());
+        });
+
+        // Explicit stop clears activity immediately.
+        queue.mark_audio_inactive();
+        slot.mark_audio_inactive();
+        assert!(!queue.is_audio_active_on_other_thread());
+        assert!(!slot.is_audio_active_on_other_thread());
     }
 }
 

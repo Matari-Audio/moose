@@ -347,6 +347,8 @@ pub(crate) unsafe extern "C" fn cb_set_active<P: PluginExport>(
             inst.render_catalog.install(&mut audio.catalog);
             inst.render_catalog.reclaim();
             let mut plugin = enter_plugin(&inst.plugin);
+            inst.pending_state.mark_audio_inactive();
+            inst.snapshot.mark_audio_inactive();
             if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
                 plugin.republish_snapshot();
             }
@@ -524,6 +526,9 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
                 // Stays unprepared: `cb_process` outputs silence.
                 return;
             }
+            inst.pending_state
+                .set_block_interval(sample_rate, max_frames);
+            inst.snapshot.set_block_interval(sample_rate, max_frames);
             inst.panic_latch.clear();
             // The activation: the only place the reported values change.
             inst.delay.publish(plugin.latency(), plugin.tail());
@@ -1454,6 +1459,7 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         // plugin sees consistent params and extra state for the
         // entire block. See `pending_state` field comment for the
         // queue-overflow policy.
+        inst.pending_state.record_audio_block();
         apply_queued_state(&mut *plugin, &inst.pending_state);
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the

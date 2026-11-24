@@ -314,6 +314,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
         // single-slot queue means a rapid double-recall lands the
         // newest blob and the older one is dropped - preferred to
         // the audio thread chasing stale state across blocks.
+        data.pending_state.record_audio_block();
         let state_loaded = apply_queued_state(&mut *instance, &data.pending_state).is_some();
 
         // Paranoid allocation check (the `rt-paranoid` feature): guard the

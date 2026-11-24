@@ -1,9 +1,13 @@
-//! Lifecycle, host-notice and bus-layout callbacks.
+//! Lifecycle, host-notice, bus-layout, and [`Vst3Backend`] implementation for [`Vst3Instance`].
 
-use crate::ffi;
+use crate::backend::{
+    ParamPresentation, ProcessArgs, Vst3Backend, Vst3LearnSource, Vst3NativeEvent, Vst3TrackInfo,
+    WakerFn,
+};
+use crate::com::{self, Host};
 use crate::input_events::VST3_EVENT_END;
 use crate::instance::{
-    K_IO_CHANGED, K_KEYSWITCH_CHANGED, K_LATENCY_CHANGED, K_PARAM_VALUES_CHANGED,
+    EditorScaleState, K_IO_CHANGED, K_KEYSWITCH_CHANGED, K_LATENCY_CHANGED, K_PARAM_VALUES_CHANGED,
     K_RELOAD_COMPONENT, OutputNoteIds, PendingOutputMutation, Vst3Gui, Vst3Instance, Vst3Scratch,
 };
 use crate::midi_proxy::{
@@ -28,50 +32,24 @@ use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
 use moose_core::state;
 use moose_core::thread::{MainThread, MainThreadCell};
-use moose_core::wrapper::{
-    PluginCell, apply_queued_state, enter_plugin, find_bus_layout, run_extern_callback_with,
-};
+use moose_core::wrapper::{PluginCell, apply_queued_state, enter_plugin, run_extern_callback_with};
 use moose_params::{MidiSource, ParamFunction, ParamRange, Params, PersistChangeSignal};
-use std::ffi::CStr;
-use std::os::raw::c_char;
+use std::ffi::{CStr, c_void};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-// ---------------------------------------------------------------------------
-// C callback implementations
-//
-// SAFETY for all unsafe extern "C" fn below:
-// - `ctx` is a *mut c_void created by Box::into_raw in cb_create().
-//   Valid until cb_destroy() (called exactly once by the C++ shim).
-// - The COM layer (Host) owns the Rust context and guarantees
-//   exclusive access to audio/plugin state: `process()` and
-//   `setProcessing(false)` / `cb_reset` may run on the audio/processing
-//   thread, lifecycle/UI callbacks on the main thread, never concurrent.
-// - Audio buffer pointers come from the VST3 host via ProcessData
-//   and are valid for the declared channel count × numSamples.
-// - Parameter IDs and values come from IParamValueQueue and are
-//   guaranteed valid by the VST3 host.
-// ---------------------------------------------------------------------------
-
-pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c_void {
-    // Author `create` / `init` run here; a panic must not cross the FFI
-    // boundary. A null return tells the host construction failed.
-    run_extern_callback_with::<P, *mut std::ffi::c_void>(
-        "vst3",
-        "create",
-        std::ptr::null_mut(),
-        || {
+impl<P: PluginExport> Vst3Instance<P> {
+    /// Construct a new plugin instance, firewalling any panic in `P::create` / `init`.
+    pub(crate) fn create() -> Option<Self> {
+        run_extern_callback_with::<P, Option<Self>>("vst3", "create", None, || {
             let mut plugin = P::create();
             plugin.init();
             let info = P::info();
             let param_infos = plugin.params().param_catalog();
             let mut param_ranges: Vec<(u32, ParamRange)> =
                 param_infos.iter().map(|i| (i.id, i.range)).collect();
-            // Sort by id so `binary_search_by_key` works in the hot lookups.
             param_ranges.sort_by_key(|(id, _)| *id);
             let param_id_indices = param_infos.sorted_id_indices();
-            // Precompute the MIDI-controller bindings, sorted by id, so the
-            // audio thread bridges mapped controllers without a linear scan.
             let mut midi_maps: Vec<(u32, MidiMap)> = param_infos
                 .iter()
                 .filter_map(|i| MidiMap::from_param(i).map(|m| (i.id, m)))
@@ -79,22 +57,17 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
             midi_maps.sort_by_key(|(id, _)| *id);
             let params_arc = plugin.params_arc();
             let mut hooks = plugin.main_thread();
-            // The queue wake learns the borrowed COM `Host` pointer once
-            // `Host::new` registers it, and `Host::drop` clears it and closes
-            // the queue (joining any in-flight wake) before tearing down `Host`
-            // or its OS wakes. The wake never pins `Arc<Host>`, so it can never
-            // run `Host::drop` -> `close()` and self-deadlock.
-            let host_wake_target =
-                Arc::new(AtomicPtr::<std::ffi::c_void>::new(std::ptr::null_mut()));
+
+            let host_wake_target = Arc::new(AtomicPtr::<Host>::new(std::ptr::null_mut()));
             let host_queue = Arc::new(HostQueue::new({
                 let host_wake_target = Arc::clone(&host_wake_target);
                 move || {
                     let host = host_wake_target.load(Ordering::Acquire);
                     if !host.is_null() {
-                        // SAFETY: `cb_bind_host_queue(ctx, null)` clears
-                        // `host_wake_target` and calls `host_queue.close()`
-                        // before `Host::drop` tears down `Host` or its wakes.
-                        unsafe { ffi::moose_vst3_wake_host_queue(host) };
+                        // SAFETY: `bind_host_queue(0, None)` clears `host_wake_target`
+                        // and calls `host_queue.close()` before `Host::drop` tears down
+                        // `Host` or its wakes.
+                        unsafe { com::wake_host_queue(host) };
                     }
                 }
             }));
@@ -107,19 +80,16 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
             let editor_builder = plugin.editor_builder();
             let delay = moose_core::delay::ReportedDelay::new(plugin.latency(), plugin.tail());
             let midi_proxy_ids = allocate_midi_proxy_ids(&param_infos, midi_proxy_len::<P>());
-            // One point per parameter per block fits next to the note
-            // events; a mapped controller pushes two (event + change).
-            // Points past this are committed as the queue's final value.
             let event_capacity = EVENT_LIST_PREALLOC + 2 * param_infos.len();
             let midi_proxy_values = (0..midi_proxy_ids.len())
                 .map(|i| {
-                    // Bounded by the proxy count.
                     #[allow(clippy::cast_possible_truncation)]
                     let controller = (i as u32) % MIDI_PROXY_PER_CHANNEL;
                     AtomicU64::new(midi_proxy_default(controller).to_bits())
                 })
                 .collect();
-            let instance = Box::new(Vst3Instance::<P> {
+
+            Some(Self {
                 persist_signal: std::sync::Mutex::new(None),
                 catalog_signal: std::sync::Mutex::new(None),
                 main_thread,
@@ -143,8 +113,7 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 delay,
                 midi_proxy_ids,
                 midi_proxy_values,
-                host_scale: AtomicU64::new(0),
-                window_scale: AtomicU64::new(0),
+                scale: Arc::new(EditorScaleState::default()),
                 pending_resize: AtomicU64::new(0),
                 last_phys_size: AtomicU64::new(0),
                 audio: PluginCell::new(Vst3Scratch {
@@ -153,10 +122,6 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                     output_events: EventList::with_capacity(EVENT_LIST_PREALLOC),
                     sub_event_scratch: EventList::with_capacity(event_capacity),
                     sample_rate: 44100.0,
-                    // 8192 covers the largest block sizes mainstream DAWs /
-                    // validators use (Reaper / pluginval <= 4096); a non-zero
-                    // default keeps the process-before-activate path from
-                    // tripping the contract assert.
                     max_block_size: 8192,
                     prepared: false,
                     scratch: RawBufferScratch::default(),
@@ -167,32 +132,196 @@ pub(crate) unsafe extern "C" fn cb_create<P: PluginExport>() -> *mut std::ffi::c
                 }),
                 gui: PluginCell::new(Vst3Gui { editor: None }),
                 host_queue,
+                host_id: AtomicUsize::new(0),
                 host_wake_target,
-            });
-            Box::into_raw(instance).cast::<std::ffi::c_void>()
-        },
-    )
-}
+            })
+        })
+    }
 
-/// Bind (non-null) or unbind and close (null) the instance's [`HostQueue`]
-/// wake target against the COM `Host`.
-pub(crate) unsafe extern "C" fn cb_bind_host_queue<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    host: *mut std::ffi::c_void,
-) {
-    run_extern_callback_with::<P, ()>("vst3", "bind_host_queue", (), || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return;
-        };
-        inst.host_wake_target.store(host, Ordering::Release);
-        if host.is_null() {
-            inst.host_queue.close();
+    pub(crate) fn drain_host_queue_impl(&self) {
+        run_extern_callback_with::<P, ()>("vst3", "drain_host_queue", (), || {
+            // SAFETY: the COM layer calls this only on the host UI thread.
+            let main = unsafe { MainThread::assume() };
+            let drain = self.host_queue.drain(&main);
+            let mut sink = Vst3Sink {
+                host_id: self.host_id(),
+                inst: self,
+                main: &main,
+                restart: 0,
+                presentation: false,
+            };
+            dispatch(drain, &mut sink);
+        });
+    }
+
+    pub(crate) fn prepare_impl(
+        &self,
+        sample_rate: f64,
+        max_frames: u32,
+        process_mode: i32,
+    ) -> bool {
+        run_extern_callback_with::<P, bool>("vst3", "prepare", false, || {
+            let mut audio = self.audio.enter();
+            audio.prepared = false;
+            let max_frames = max_frames as usize;
+            let config = PreparationConfig::new(
+                AudioConfig::new(sample_rate, max_frames)
+                    .with_process_mode(vst3_process_mode(process_mode)),
+                PreparationFrameBound::NegotiatedHost,
+            );
+            if config.validate().is_err() {
+                return false;
+            }
+            audio.sample_rate = sample_rate;
+            audio.max_block_size = max_frames;
+            let (num_in, num_out) = max_layout_channels(&P::bus_layouts());
+            audio
+                .scratch
+                .ensure_capacity(num_in as usize, num_out as usize, max_frames.max(1024));
+            {
+                let mut plugin = enter_plugin(&self.plugin);
+                if plugin.prepare(&config).is_err() {
+                    return false;
+                }
+                self.pending_state
+                    .set_block_interval(sample_rate, max_frames);
+                self.snapshot.set_block_interval(sample_rate, max_frames);
+                self.panic_latch.clear();
+                self.delay.publish(plugin.latency(), plugin.tail());
+            }
+            audio.output_note_ids.clear();
+            audio.pending_output_mutation = PendingOutputMutation::None;
+            audio.prepared = true;
+            true
+        })
+    }
+
+    pub(crate) fn reset_impl(&self, sample_rate: f64, max_frames: u32, process_mode: i32) {
+        run_extern_callback_with::<P, ()>("vst3", "reset", (), || {
+            let Some(mut audio) = self.audio.try_enter() else {
+                return;
+            };
+            if !audio.prepared {
+                return;
+            }
+            let Some(mut plugin) = self.plugin.try_enter() else {
+                return;
+            };
+            {
+                let _rt = RtSection::enter();
+                plugin.reset(
+                    &AudioConfig::new(sample_rate, max_frames as usize)
+                        .with_process_mode(vst3_process_mode(process_mode)),
+                );
+            }
+            audio.output_note_ids.clear();
+            audio.pending_output_mutation = PendingOutputMutation::None;
+        });
+    }
+
+    pub(crate) fn set_processing_impl(
+        &self,
+        processing: bool,
+        sample_rate: f64,
+        max_frames: u32,
+        process_mode: i32,
+    ) {
+        if processing {
+            self.processing.store(true, Ordering::Release);
+        } else {
+            self.reset_impl(sample_rate, max_frames, process_mode);
+            self.processing.store(false, Ordering::Release);
+            self.pending_state.mark_audio_inactive();
+            self.snapshot.mark_audio_inactive();
         }
-    });
+    }
+
+    pub(crate) fn set_active_impl(&self, active: bool) {
+        run_extern_callback_with::<P, ()>("vst3", "set_active", (), || {
+            self.active.store(active, Ordering::Relaxed);
+            self.processing.store(false, Ordering::Release);
+            if !active {
+                self.pending_state.mark_audio_inactive();
+                self.snapshot.mark_audio_inactive();
+                let mut plugin = enter_plugin(&self.plugin);
+                if apply_queued_state(&mut *plugin, &self.pending_state).is_some() {
+                    plugin.republish_snapshot();
+                }
+            }
+        });
+    }
+
+    pub(crate) fn set_persist_waker_impl(&self, wake: Option<WakerFn>) {
+        run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || {
+            if let Some(signal) = rebind_signal(
+                &self.persist_signal,
+                wake,
+                Some((Arc::clone(&self.host_queue), HostSignal::PERSIST)),
+            ) {
+                self.params_arc.set_persist_change_signal(signal);
+            }
+        });
+    }
+
+    pub(crate) fn set_catalog_waker_impl(&self, wake: Option<WakerFn>) {
+        run_extern_callback_with::<P, ()>("vst3", "catalog_bind", (), || {
+            if let Some(signal) = rebind_signal(
+                &self.catalog_signal,
+                wake,
+                Some((Arc::clone(&self.host_queue), HostSignal::PRESENTATION)),
+            ) {
+                self.params_arc.set_catalog_signal(signal);
+            }
+        });
+    }
+
+    pub(crate) fn track_info_changed_impl(&self, info: &Vst3TrackInfo) {
+        run_extern_callback_with::<P, ()>("vst3", "track_info", (), || {
+            let mut track = TrackInfo::new();
+            track.name.clone_from(&info.name);
+            track.color = info.color_argb.map(argb_color);
+            // SAFETY: `IInfoListener::setChannelContextInfos` runs on the UI thread.
+            let main = unsafe { MainThread::assume() };
+            if let Some(mut hooks) = self.main_thread.try_borrow_mut(&main) {
+                hooks.track_info_changed(&main, &track);
+            }
+        });
+    }
+
+    pub(crate) fn midi_learn_impl(&self, bus: u32, channel: u8, source: Vst3LearnSource) -> bool {
+        run_extern_callback_with::<P, bool>("vst3", "midi_learn", false, || {
+            let source = match source {
+                Vst3LearnSource::Midi1(controller) => {
+                    vst3_midi_source(controller).map(LearnSource::Midi1)
+                }
+                Vst3LearnSource::Midi2 {
+                    registered,
+                    bank,
+                    index,
+                } => Some(LearnSource::Midi2(Midi2Controller {
+                    kind: if registered {
+                        Midi2ControllerKind::Registered
+                    } else {
+                        Midi2ControllerKind::Assignable
+                    },
+                    bank,
+                    index,
+                })),
+            };
+            let Some(source) = source else {
+                return false;
+            };
+            // SAFETY: `IMidiLearn` / `IMidiLearn2` run on the UI thread.
+            let main = unsafe { MainThread::assume() };
+            self.main_thread
+                .try_borrow_mut(&main)
+                .is_some_and(|mut hooks| hooks.midi_learn(&main, bus, channel, source))
+        })
+    }
 }
 
 struct Vst3Sink<'a, P: PluginExport> {
-    ctx: *mut std::ffi::c_void,
+    host_id: usize,
     inst: &'a Vst3Instance<P>,
     main: &'a MainThread,
     restart: i32,
@@ -201,7 +330,7 @@ struct Vst3Sink<'a, P: PluginExport> {
 
 impl<P: PluginExport> HostSink for Vst3Sink<'_, P> {
     fn mark_dirty(&mut self) {
-        ffi::moose_vst3_mark_dirty(self.ctx);
+        com::mark_dirty(self.host_id);
     }
 
     fn request_restart(&mut self) {
@@ -225,25 +354,20 @@ impl<P: PluginExport> HostSink for Vst3Sink<'_, P> {
     }
 
     fn latency_changed(&mut self) {
-        // VST3 hosts may re-read `getLatencySamples` immediately inside
-        // `restartComponent(kLatencyChanged)` without calling
-        // `setupProcessing` again. Commit only the latency lane here so a
-        // tail-only drain can never silently publish a racing latency change.
         if self.inst.delay.commit_latency() {
             self.restart |= K_LATENCY_CHANGED;
         }
     }
 
     fn tail_changed(&mut self) {
-        // Commit tail independently without requesting a PDC restart.
         let _ = self.inst.delay.commit_tail();
     }
 
     fn flush_signals(&mut self) {
         if self.restart != 0 {
-            ffi::moose_vst3_mark_restart(self.ctx, self.restart);
+            com::mark_restart(self.host_id, self.restart);
         } else if self.presentation {
-            ffi::moose_vst3_check_presentation(self.ctx);
+            com::check_presentation(self.host_id);
         }
     }
 
@@ -259,122 +383,15 @@ impl<P: PluginExport> HostSink for Vst3Sink<'_, P> {
         let hx = (f64::from(x) * scale).round() as i32;
         #[allow(clippy::cast_possible_truncation)]
         let hy = (f64::from(y) * scale).round() as i32;
-        ffi::moose_vst3_popup_context_menu(self.ctx, target, hx, hy, &items);
+        com::popup_context_menu(self.host_id, target, hx, hy, &items);
     }
 }
 
-/// Drain the instance's [`HostQueue`] on the host UI thread.
-pub(crate) unsafe extern "C" fn cb_drain_host_queue<P: PluginExport>(ctx: *mut std::ffi::c_void) {
-    run_extern_callback_with::<P, ()>("vst3", "drain_host_queue", (), || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return;
-        };
-        // SAFETY: the COM layer calls this only on the host UI thread.
-        let main = MainThread::assume();
-        let drain = inst.host_queue.drain(&main);
-        let mut sink = Vst3Sink {
-            ctx,
-            inst,
-            main: &main,
-            restart: 0,
-            presentation: false,
-        };
-        dispatch(drain, &mut sink);
-    });
-}
-
-pub(crate) unsafe fn cb_perform_menu<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    target: MenuTarget,
-    action: u32,
-) -> i32 {
-    run_extern_callback_with::<P, i32>("vst3", "perform_menu", 0, || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return 0;
-        };
-        // SAFETY: `IContextMenuTarget::executeMenuItem` is a UI-thread call.
-        let main = MainThread::assume();
-        let performed = inst
-            .main_thread
-            .try_borrow_mut(&main)
-            .is_some_and(|mut hooks| hooks.perform_menu(&main, target, action));
-        i32::from(performed)
-    })
-}
-
-pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
-    // Dropping the instance cascades into the editor's `Drop` (wgpu surface
-    // / NSView / baseview / runloop-timer teardown). A panic there would
-    // unwind across this `extern "C"` boundary and abort the host. Hosts
-    // destroy instances routinely mid-session - removing a plugin from a
-    // track, closing a project - not just at quit, so swallowing the panic
-    // keeps a live host alive; the instance is being torn down regardless.
-    run_extern_callback_with::<P, ()>("vst3", "destroy", (), || unsafe {
-        if !ctx.is_null() {
-            let instance = Box::from_raw(ctx.cast::<Vst3Instance<P>>());
-            instance.host_queue.close();
-            rebind_signal(&instance.persist_signal, None, std::ptr::null_mut(), None);
-            rebind_signal(&instance.catalog_signal, None, std::ptr::null_mut(), None);
-            drop(instance);
-        }
-    });
-}
-
-// All three callbacks run on the host thread. Only the installed wake itself
-// may run on a background worker; close() gates it before the shim tears down.
-pub(crate) unsafe extern "C" fn cb_wants_persist_notifications<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) -> bool {
-    run_extern_callback_with::<P, bool>("vst3", "persist_wants", false, || unsafe {
-        (&*ctx.cast::<Vst3Instance<P>>())
-            .params_arc
-            .wants_persist_notifications()
-    })
-}
-pub(crate) unsafe extern "C" fn cb_set_persist_waker<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-    wake_context: *mut std::ffi::c_void,
-) {
-    run_extern_callback_with::<P, ()>("vst3", "persist_bind", (), || unsafe {
-        let instance = &*ctx.cast::<Vst3Instance<P>>();
-        if let Some(signal) = rebind_signal(
-            &instance.persist_signal,
-            wake,
-            wake_context,
-            Some((Arc::clone(&instance.host_queue), HostSignal::PERSIST)),
-        ) {
-            instance.params_arc.set_persist_change_signal(signal);
-        }
-    });
-}
-
-/// Opaque COM-layer context passed back to `wake` in [`rebind_signal`].
-#[derive(Clone, Copy)]
-struct WakeContext(*mut std::ffi::c_void);
-
-impl WakeContext {
-    fn as_ptr(self) -> *mut std::ffi::c_void {
-        self.0
-    }
-}
-
-// SAFETY: the caller keeps `wake_context` alive until the next rebind of
-// `slot`, and `old.close()` in `rebind_signal` joins every in-flight wake
-// before the caller releases it.
-unsafe impl Send for WakeContext {}
-unsafe impl Sync for WakeContext {}
-
-/// Close the signal in `slot` (waiting for a running wake) and, with
-/// `wake`, install one that signals `queue_signal` and calls
-/// `wake(wake_context)`; returns it for the params setter.
-///
-/// # Safety
-/// `wake_context` stays valid for `wake` until the next rebind of `slot`.
-pub(crate) unsafe fn rebind_signal(
+/// Close the signal in `slot` (waiting for any running wake) and, with `wake`,
+/// install one that signals `queue_signal` and invokes `wake`.
+pub(crate) fn rebind_signal(
     slot: &std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
-    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-    wake_context: *mut std::ffi::c_void,
+    wake: Option<WakerFn>,
     queue_signal: Option<(Arc<HostQueue>, HostSignal)>,
 ) -> Option<std::sync::Weak<PersistChangeSignal>> {
     let mut binding = slot
@@ -384,72 +401,24 @@ pub(crate) unsafe fn rebind_signal(
         old.close();
     }
     let wake = wake?;
-    let context = WakeContext(wake_context);
-    // SAFETY: as above; `wake` is the COM layer's wake for that context.
-    let signal = Arc::new(PersistChangeSignal::new(move || unsafe {
+    let signal = Arc::new(PersistChangeSignal::new(move || {
         if let Some((queue, bit)) = &queue_signal {
             queue.signal(*bit);
         }
-        wake(context.as_ptr());
+        wake();
     }));
     let weak = Arc::downgrade(&signal);
     *binding = Some(signal);
     Some(weak)
 }
 
-pub(crate) unsafe extern "C" fn cb_set_catalog_waker<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    wake: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-    wake_context: *mut std::ffi::c_void,
-) {
-    run_extern_callback_with::<P, ()>("vst3", "catalog_bind", (), || unsafe {
-        let instance = &*ctx.cast::<Vst3Instance<P>>();
-        if let Some(signal) = rebind_signal(
-            &instance.catalog_signal,
-            wake,
-            wake_context,
-            Some((Arc::clone(&instance.host_queue), HostSignal::PRESENTATION)),
-        ) {
-            instance.params_arc.set_catalog_signal(signal);
-        }
-    });
-}
-
-pub(crate) unsafe extern "C" fn cb_take_catalog_changes<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) -> u8 {
-    run_extern_callback_with::<P, u8>("vst3", "catalog_changes", 0, || unsafe {
-        (*ctx.cast::<Vst3Instance<P>>())
-            .params_arc
-            .take_catalog_changes()
-            .flags
-            .bits()
-    })
-}
-
-pub(crate) unsafe extern "C" fn cb_param_affects_presentation<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    id: u32,
-) -> bool {
-    run_extern_callback_with::<P, bool>(
-        "vst3",
-        "parameter_affects_presentation",
-        false,
-        || unsafe {
-            (*ctx.cast::<Vst3Instance<P>>())
-                .params_arc
-                .parameter_affects_presentation(id)
-        },
-    )
-}
-
 /// The SDK `FunctionNameType` string for `function`.
-pub(crate) fn function_name(function: ParamFunction) -> *const c_char {
+pub(crate) fn function_name(function: ParamFunction) -> Option<&'static CStr> {
     use vst3::Steinberg::Vst::FunctionNameType::{
         kCompGainReduction, kCompGainReductionMax, kCompGainReductionPeakHold,
         kCompResetGainReductionMax, kDryWetMix, kLowLatencyMode, kRandomize,
     };
-    match function {
+    let ptr = match function {
         ParamFunction::DryWetMix => kDryWetMix,
         ParamFunction::LowLatencyMode => kLowLatencyMode,
         ParamFunction::Randomize => kRandomize,
@@ -457,25 +426,10 @@ pub(crate) fn function_name(function: ParamFunction) -> *const c_char {
         ParamFunction::GainReductionMax => kCompGainReductionMax,
         ParamFunction::GainReductionPeakHold => kCompGainReductionPeakHold,
         ParamFunction::ResetGainReductionMax => kCompResetGainReductionMax,
-        _ => std::ptr::null(),
-    }
-}
-
-pub(crate) unsafe extern "C" fn cb_param_function_name<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    id: u32,
-) -> *const c_char {
-    run_extern_callback_with::<P, *const c_char>(
-        "vst3",
-        "parameter_function",
-        std::ptr::null(),
-        || unsafe {
-            (*ctx.cast::<Vst3Instance<P>>())
-                .params_arc
-                .parameter_function(id)
-                .map_or(std::ptr::null(), function_name)
-        },
-    )
+        _ => return None,
+    };
+    // SAFETY: SDK `FunctionNameType` constants are static NUL-terminated strings.
+    (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) })
 }
 
 /// A VST3 `ColorSpec` (`0xAARRGGBB`).
@@ -484,125 +438,7 @@ pub(crate) fn argb_color(argb: u32) -> HostColor {
     HostColor { r, g, b, a }
 }
 
-pub(crate) unsafe extern "C" fn cb_track_info_changed<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    info: *const ffi::Vst3TrackInfo,
-) {
-    run_extern_callback_with::<P, ()>("vst3", "track_info", (), || unsafe {
-        let (Some(inst), Some(info)) = (ctx.cast::<Vst3Instance<P>>().as_ref(), info.as_ref())
-        else {
-            return;
-        };
-        let mut track = TrackInfo::new();
-        track.name = (!info.name.is_null())
-            .then(|| CStr::from_ptr(info.name).to_string_lossy().into_owned());
-        track.color = info.has_color.then(|| argb_color(info.color_argb));
-        // SAFETY: the COM layer calls this only from
-        // `IInfoListener::setChannelContextInfos`, an edit-controller call
-        // VST3 makes on the UI thread.
-        let main = MainThread::assume();
-        if let Some(mut hooks) = inst.main_thread.try_borrow_mut(&main) {
-            hooks.track_info_changed(&main, &track);
-        }
-    });
-}
-
-pub(crate) unsafe extern "C" fn cb_midi_learn<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    bus: u32,
-    channel: u8,
-    source: ffi::Vst3LearnSource,
-) -> i32 {
-    run_extern_callback_with::<P, i32>("vst3", "midi_learn", 0, || unsafe {
-        let source = match source {
-            ffi::Vst3LearnSource::Midi1(controller) => {
-                vst3_midi_source(controller).map(LearnSource::Midi1)
-            }
-            ffi::Vst3LearnSource::Midi2 {
-                registered,
-                bank,
-                index,
-            } => Some(LearnSource::Midi2(Midi2Controller {
-                kind: if registered {
-                    Midi2ControllerKind::Registered
-                } else {
-                    Midi2ControllerKind::Assignable
-                },
-                bank,
-                index,
-            })),
-        };
-        let (Some(inst), Some(source)) = (ctx.cast::<Vst3Instance<P>>().as_ref(), source) else {
-            return 0;
-        };
-        // SAFETY: the COM layer calls this only from
-        // `IMidiLearn::onLiveMIDIControllerInput` / `IMidiLearn2`, which
-        // VST3 runs on the UI thread.
-        let main = MainThread::assume();
-        let learned = inst
-            .main_thread
-            .try_borrow_mut(&main)
-            .is_some_and(|mut hooks| hooks.midi_learn(&main, bus, channel, source));
-        i32::from(learned)
-    })
-}
-
-pub(crate) unsafe extern "C" fn cb_remap_param_id<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    plugin_cid: *const u8,
-    old_id: u32,
-    out_new_id: *mut u32,
-) -> i32 {
-    run_extern_callback_with::<P, i32>("vst3", "remap_param_id", 0, || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return 0;
-        };
-        if plugin_cid.is_null() || out_new_id.is_null() {
-            return 0;
-        }
-        let mut cid = [0u8; 16];
-        std::ptr::copy_nonoverlapping(plugin_cid, cid.as_mut_ptr(), 16);
-        // SAFETY: `IRemapParamID::getCompatibleParamID` runs on the VST3 UI/main thread.
-        let main = MainThread::assume();
-        let mapped = inst
-            .main_thread
-            .try_borrow_mut(&main)
-            .and_then(|hooks| hooks.remap_param_id(&main, cid, old_id));
-        if let Some(new_id) = mapped {
-            *out_new_id = new_id;
-            1
-        } else {
-            0
-        }
-    })
-}
-
-pub(crate) unsafe extern "C" fn cb_set_audio_presentation_latency<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    is_input: i32,
-    bus_index: u32,
-    latency_samples: u32,
-) {
-    run_extern_callback_with::<P, ()>("vst3", "audio_presentation_latency", (), || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return;
-        };
-        let direction = if is_input != 0 {
-            BusDirection::Input
-        } else {
-            BusDirection::Output
-        };
-        // SAFETY: `IAudioPresentationLatency::setAudioPresentationLatencySamples`
-        // is a component setup call on the host main thread.
-        let main = MainThread::assume();
-        if let Some(mut hooks) = inst.main_thread.try_borrow_mut(&main) {
-            hooks.audio_presentation_latency_changed(&main, direction, bus_index, latency_samples);
-        }
-    });
-}
-
-/// A VST3 `ControllerNumbers` value (`ivstmidicontrollers.h`): 0..=127 are
-/// CCs, then kAfterTouch, kPitchBend, kCtrlProgramChange.
+/// A VST3 `ControllerNumbers` value (`ivstmidicontrollers.h`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn vst3_midi_source(controller: i16) -> Option<MidiSource> {
     match controller {
@@ -613,31 +449,8 @@ pub(crate) fn vst3_midi_source(controller: i16) -> Option<MidiSource> {
         _ => None,
     }
 }
-pub(crate) unsafe extern "C" fn cb_take_persist_change<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    id: *mut u32,
-    value: *mut f64,
-) -> bool {
-    run_extern_callback_with::<P, bool>("vst3", "persist_drain", false, || unsafe {
-        let params = &(&*ctx.cast::<Vst3Instance<P>>()).params_arc;
-        let Some((changed_id, normalized)) = params.take_persist_change() else {
-            return false;
-        };
-        if !normalized.is_finite()
-            || !(0.0..=1.0).contains(&normalized)
-            || params.get_normalized(changed_id).is_none()
-        {
-            return false;
-        }
-        *id = changed_id;
-        *value = params.set_normalized_returning_normalized(changed_id, normalized);
-        true
-    })
-}
 
-/// Map a VST3 `ProcessModes` value (`kRealtime` 0, `kPrefetch` 1,
-/// `kOffline` 2) to a moose [`ProcessMode`]. Unknown values fall back
-/// to `Realtime`.
+/// Map a VST3 `ProcessModes` value (`kRealtime` 0, `kPrefetch` 1, `kOffline` 2).
 pub(crate) fn vst3_process_mode(mode: i32) -> ProcessMode {
     match mode {
         1 => ProcessMode::Buffered,
@@ -646,157 +459,10 @@ pub(crate) fn vst3_process_mode(mode: i32) -> ProcessMode {
     }
 }
 
-pub(crate) unsafe extern "C" fn cb_prepare<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    sample_rate: f64,
-    max_frames: u32,
-    process_mode: i32,
-) -> i32 {
-    // Author `reset` can panic (allocation, DSP prep); firewall it so the
-    // panic can't unwind across the C ABI and abort the host.
-    run_extern_callback_with::<P, i32>("vst3", "prepare", 0, || unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
-        audio.prepared = false;
-        let max_frames = max_frames as usize;
-        let config = PreparationConfig::new(
-            AudioConfig::new(sample_rate, max_frames)
-                .with_process_mode(vst3_process_mode(process_mode)),
-            PreparationFrameBound::NegotiatedHost,
-        );
-        if config.validate().is_err() {
-            return 0;
-        }
-        audio.sample_rate = sample_rate;
-        audio.max_block_size = max_frames;
-        // Grow per-block scratch to cover the *widest* declared layout and
-        // this block size before the first process() call so the audio
-        // thread stays alloc-free. VST3 negotiates layouts at runtime
-        // (setBusArrangements), so a later, wider layout than the default
-        // must not grow the per-channel Vecs on the audio thread - size to
-        // the same structural width the shim gathers, including disabled
-        // optional buses that retain null/silence positions in the flat
-        // array. Active-only totals would leave `build` allocating here on
-        // the audio thread when every declared optional bus is disabled.
-        let (num_in, num_out) = max_layout_channels(&P::bus_layouts());
-        audio
-            .scratch
-            .ensure_capacity(num_in as usize, num_out as usize, max_frames.max(1024));
-        {
-            let mut plugin = enter_plugin(&inst.plugin);
-            if plugin.prepare(&config).is_err() {
-                return 0;
-            }
-            inst.panic_latch.clear();
-            // The activation: the only place the reported values change.
-            inst.delay.publish(plugin.latency(), plugin.tail());
-        }
-        audio.output_note_ids.clear();
-        audio.pending_output_mutation = PendingOutputMutation::None;
-        audio.prepared = true;
-        1
-    })
-}
-
-pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    sample_rate: f64,
-    max_frames: u32,
-    process_mode: i32,
-) {
-    run_extern_callback_with::<P, ()>("vst3", "reset", (), || unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        // Hosts may call `setProcessing(false)` on the audio thread: use
-        // wait-free `try_enter` so an overlapping lifecycle call never parks
-        // the audio thread.
-        let Some(mut audio) = inst.audio.try_enter() else {
-            return;
-        };
-        if !audio.prepared {
-            return;
-        }
-        let Some(mut plugin) = inst.plugin.try_enter() else {
-            return;
-        };
-        {
-            // Hosts may call setProcessing(false) on the audio thread: the
-            // author's `reset` must not allocate (rt-paranoid reports it).
-            let _rt = RtSection::enter();
-            plugin.reset(
-                &AudioConfig::new(sample_rate, max_frames as usize)
-                    .with_process_mode(vst3_process_mode(process_mode)),
-            );
-        }
-        // Latency and tail stay as reported at activation; a change shows
-        // up at the next block, which asks the host to restart.
-        audio.output_note_ids.clear();
-        audio.pending_output_mutation = PendingOutputMutation::None;
-    });
-}
-
-/// `IAudioProcessor::setProcessing`. Tracks whether the audio thread owns
-/// the plugin; stopping also resets it, as the shim did before.
-pub(crate) unsafe extern "C" fn cb_set_processing<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    processing: i32,
-    sample_rate: f64,
-    max_frames: u32,
-    process_mode: i32,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        if processing != 0 {
-            inst.processing.store(true, Ordering::Release);
-        } else {
-            cb_reset::<P>(ctx, sample_rate, max_frames, process_mode);
-            inst.processing.store(false, Ordering::Release);
-        }
-    }
-}
-
-/// `IComponent::setActive`. Tracks activation so `cb_state_load` knows
-/// whether the audio thread will drain the pending-state queue.
-pub(crate) unsafe extern "C" fn cb_set_active<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    active: i32,
-) {
-    // The deactivation drain runs author `load_state` via `apply_state`;
-    // firewall it so a panic can't unwind across the C ABI.
-    run_extern_callback_with::<P, ()>("vst3", "set_active", (), || unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        inst.active.store(active != 0, Ordering::Relaxed);
-        inst.processing.store(false, Ordering::Release);
-        if active == 0 {
-            // Deactivating: the audio thread stops draining `pending_state`,
-            // so a load queued (by the host or the editor) while active would
-            // strand and a following `getState` would re-serialize stale extra
-            // state - silently losing the load. Apply it now under the plugin
-            // lock (uncontended: the host serializes lifecycle calls with
-            // `process`) and refresh the snapshot.
-            let mut plugin = enter_plugin(&inst.plugin);
-            if apply_queued_state(&mut *plugin, &inst.pending_state).is_some() {
-                plugin.republish_snapshot();
-            }
-        }
-    });
-}
-
-/// The `bus_layouts()` index matching `(in_ch, out_ch)`, or `-1`. The
-/// shim's `setBusArrangements` calls this to accept any declared layout.
-/// Static per plugin type - no instance context.
-pub(crate) unsafe extern "C" fn cb_match_bus_layout<P: PluginExport>(
-    in_ch: u32,
-    out_ch: u32,
-) -> i32 {
-    find_bus_layout::<P>(in_ch, out_ch).map_or(-1, |i| i32::try_from(i).unwrap_or(-1))
-}
-
-/// Per-bus channel width of a declared layout, for the shim's per-bus
-/// `getBusInfo` / `getBusArrangement` and its process-time channel gather.
-/// `0` for any out-of-range index.
-pub(crate) unsafe extern "C" fn cb_layout_bus_channels<P: PluginExport>(
+/// Per-bus channel width of a declared layout (`0` when out of range).
+pub(crate) fn layout_bus_channels<P: PluginExport>(
     layout_index: u32,
-    is_output: i32,
+    is_output: bool,
     bus_index: u32,
 ) -> u32 {
     let (Ok(li), Ok(bi)) = (usize::try_from(layout_index), usize::try_from(bus_index)) else {
@@ -806,7 +472,7 @@ pub(crate) unsafe extern "C" fn cb_layout_bus_channels<P: PluginExport>(
     let Some(layout) = layouts.get(li) else {
         return 0;
     };
-    let buses = if is_output != 0 {
+    let buses = if is_output {
         &layout.outputs
     } else {
         &layout.inputs
@@ -814,20 +480,8 @@ pub(crate) unsafe extern "C" fn cb_layout_bus_channels<P: PluginExport>(
     buses.get(bi).map_or(0, |b| b.channels.channel_count())
 }
 
-/// Match a host-proposed per-bus arrangement (arrays of per-bus channel
-/// counts) to a declared `bus_layouts()` index, or `-1`. A layout matches
-/// when its per-bus widths equal the host's, direction by direction - so
-/// a sidechain bus is matched on its own width, not summed into the main.
-pub(crate) unsafe extern "C" fn cb_match_bus_layout_perbus<P: PluginExport>(
-    in_channels: *const u32,
-    num_in: u32,
-    out_channels: *const u32,
-    num_out: u32,
-) -> i32 {
-    // SAFETY: the shim passes arrays of the lengths it declares, or null
-    // with length 0 for a bus-less direction.
-    let ins = unsafe { slice_or_empty(in_channels, num_in) };
-    let outs = unsafe { slice_or_empty(out_channels, num_out) };
+/// Match a host-proposed per-bus arrangement to a declared `bus_layouts()` index.
+pub(crate) fn match_bus_layout_perbus<P: PluginExport>(ins: &[u32], outs: &[u32]) -> Option<u32> {
     let widths_match = |buses: &[BusConfig], want: &[u32]| {
         buses.len() == want.len()
             && buses
@@ -838,44 +492,22 @@ pub(crate) unsafe extern "C" fn cb_match_bus_layout_perbus<P: PluginExport>(
     P::bus_layouts()
         .iter()
         .position(|l| widths_match(&l.inputs, ins) && widths_match(&l.outputs, outs))
-        .map_or(-1, |i| i32::try_from(i).unwrap_or(-1))
+        .and_then(|i| u32::try_from(i).ok())
 }
 
-/// `(num_input_buses, num_output_buses, input_kinds_ptr, output_kinds_ptr)`
-/// for the descriptor, from the plugin's first declared layout. The
-/// kind-byte arrays are leaked to `'static`.
-pub(crate) fn descriptor_buses<P: PluginExport>() -> (u32, u32, *const u8, *const u8) {
+/// Owned per-bus kind bytes (`0` = Main, `1` = Sidechain) from the first declared layout.
+pub(crate) fn descriptor_bus_kinds<P: PluginExport>() -> (Vec<u8>, Vec<u8>) {
     let first = P::bus_layouts().into_iter().next().unwrap_or_default();
-    let ins = leak_bus_kinds(&first.inputs);
-    let outs = leak_bus_kinds(&first.outputs);
-    (
-        u32::try_from(ins.len()).unwrap_or(0),
-        u32::try_from(outs.len()).unwrap_or(0),
-        ins.as_ptr(),
-        outs.as_ptr(),
-    )
-}
-
-/// Leak the per-bus kind bytes of a bus list (`0` = Main, `1` = Sidechain)
-/// to `'static` for the descriptor's raw pointer.
-pub(crate) fn leak_bus_kinds(buses: &[BusConfig]) -> &'static [u8] {
-    Box::leak(
+    let kinds = |buses: &[BusConfig]| {
         buses
             .iter()
             .map(|b| u8::from(b.kind == BusKind::Sidechain))
-            .collect::<Vec<u8>>()
-            .into_boxed_slice(),
-    )
+            .collect()
+    };
+    (kinds(&first.inputs), kinds(&first.outputs))
 }
 
-/// True when every declared layout shares the first layout's bus topology:
-/// the same input and output bus COUNT and the same per-bus KIND (main vs
-/// sidechain) in order. VST3 fixes one bus topology per plugin - only
-/// channel widths are negotiated - so [`descriptor_buses`] takes the bus
-/// count + kinds from layout 0 and [`cb_match_bus_layout_perbus`] requires
-/// the host arrangement to have exactly that many buses. A layout with a
-/// different bus count or kind can therefore never be matched (it's dead),
-/// or, if it leads the list, silently drops a bus the others declare.
+/// True when every declared layout shares the first layout's bus topology.
 pub(crate) fn vst3_topology_consistent(layouts: &[BusLayout]) -> bool {
     let kinds = |buses: &[BusConfig]| buses.iter().map(|b| b.kind).collect::<Vec<BusKind>>();
     let Some(first) = layouts.first() else {
@@ -887,77 +519,360 @@ pub(crate) fn vst3_topology_consistent(layouts: &[BusLayout]) -> bool {
         .all(|l| kinds(&l.inputs) == first_in && kinds(&l.outputs) == first_out)
 }
 
-/// `MainThreadHooks::keyswitches` (`IKeyswitchController`). UI thread.
-pub(crate) unsafe fn cb_keyswitches<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    bus: u32,
-    channel: u8,
-) -> Vec<Keyswitch> {
-    run_extern_callback_with::<P, Vec<Keyswitch>>("vst3", "keyswitches", Vec::new(), || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return Vec::new();
-        };
-        // SAFETY: `IKeyswitchController` callbacks run on the host UI thread.
-        let main = MainThread::assume();
-        inst.main_thread
-            .try_borrow_mut(&main)
-            .map(|hooks| hooks.keyswitches(&main, bus, channel))
-            .unwrap_or_default()
-    })
-}
+// ---------------------------------------------------------------------------
+// Vst3Backend implementation on Vst3Instance<P>
+// ---------------------------------------------------------------------------
 
-/// `MainThreadHooks::program_list` (`IUnitInfo` + `IProgramListData`). UI thread.
-pub(crate) unsafe fn cb_program_list<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) -> Vec<ProgramPreset> {
-    run_extern_callback_with::<P, Vec<ProgramPreset>>(
-        "vst3",
-        "program_list",
-        Vec::new(),
-        || unsafe {
-            let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-                return Vec::new();
-            };
-            // SAFETY: `IUnitInfo` / `IProgramListData` callbacks run on the host UI thread.
-            let main = MainThread::assume();
-            inst.main_thread
+impl<P: PluginExport> Vst3Backend for Vst3Instance<P> {
+    fn prepare(&self, sample_rate: f64, max_frames: u32, process_mode: i32) -> bool {
+        self.prepare_impl(sample_rate, max_frames, process_mode)
+    }
+
+    fn reset(&self, sample_rate: f64, max_frames: u32, process_mode: i32) {
+        self.reset_impl(sample_rate, max_frames, process_mode);
+    }
+
+    fn set_active(&self, active: bool) {
+        self.set_active_impl(active);
+    }
+
+    fn set_processing(
+        &self,
+        processing: bool,
+        sample_rate: f64,
+        max_frames: u32,
+        process_mode: i32,
+    ) {
+        self.set_processing_impl(processing, sample_rate, max_frames, process_mode);
+    }
+
+    fn get_latency(&self) -> u32 {
+        self.delay.latency()
+    }
+
+    fn get_tail(&self) -> u32 {
+        self.delay.tail()
+    }
+
+    fn begin_input_events(&self, num_frames: u32) {
+        self.begin_input_events_impl(num_frames);
+    }
+
+    fn push_input_event(&self, event: &Vst3NativeEvent, data: Option<&[u8]>) -> u32 {
+        self.push_input_event_impl(event, data)
+    }
+
+    fn push_param_change(
+        &self,
+        id: u32,
+        sample_offset: i32,
+        plain: f64,
+        from_offset: i32,
+        from_plain: f64,
+    ) -> bool {
+        self.push_param_change_impl(id, sample_offset, plain, from_offset, from_plain)
+    }
+
+    unsafe fn process_f32(&self, args: &mut ProcessArgs<'_>) -> bool {
+        unsafe { self.process_block::<f32>(args) }
+    }
+
+    unsafe fn process_f64(&self, args: &mut ProcessArgs<'_>) -> bool {
+        unsafe { self.process_block::<f64>(args) }
+    }
+
+    fn begin_output_events(&self) {
+        self.begin_output_events_impl();
+    }
+
+    fn next_output_event(&self, out: &mut Vst3NativeEvent) -> u32 {
+        self.next_output_event_impl(out)
+    }
+
+    fn commit_output_event(&self) {
+        self.commit_output_event_impl();
+    }
+
+    fn finish_output_events(&self, status: u32) {
+        self.finish_output_events_impl(status);
+    }
+
+    fn output_param_count(&self) -> u32 {
+        self.output_param_count_impl()
+    }
+
+    fn output_param(&self, index: u32) -> Option<(u32, i32, f64)> {
+        self.output_param_impl(index)
+    }
+
+    fn param_get_value(&self, id: u32) -> f64 {
+        self.param_get_value_impl(id)
+    }
+
+    fn param_set_value(&self, id: u32, value: f64) {
+        self.param_set_value_impl(id, value);
+    }
+
+    fn param_normalize(&self, id: u32, plain: f64) -> f64 {
+        self.param_normalize_impl(id, plain)
+    }
+
+    fn param_denormalize(&self, id: u32, normalized: f64) -> f64 {
+        self.param_denormalize_impl(id, normalized)
+    }
+
+    fn param_format(&self, id: u32, value: f64) -> Option<String> {
+        self.param_format_impl(id, value)
+    }
+
+    fn param_parse(&self, id: u32, text: &str) -> Option<f64> {
+        self.param_parse_impl(id, text)
+    }
+
+    fn param_is_chunked(&self, id: u32) -> bool {
+        self.param_is_chunked_impl(id)
+    }
+
+    fn param_presentation(&self, id: u32) -> Option<ParamPresentation> {
+        self.param_presentation_impl(id)
+    }
+
+    fn param_presentation_revision(&self) -> u64 {
+        self.param_presentation_revision_impl()
+    }
+
+    fn param_affects_presentation(&self, id: u32) -> bool {
+        run_extern_callback_with::<P, bool>("vst3", "parameter_affects_presentation", false, || {
+            self.params_arc.parameter_affects_presentation(id)
+        })
+    }
+
+    fn param_function_name(&self, id: u32) -> Option<&'static CStr> {
+        run_extern_callback_with::<P, Option<&'static CStr>>(
+            "vst3",
+            "parameter_function",
+            None,
+            || {
+                self.params_arc
+                    .parameter_function(id)
+                    .and_then(function_name)
+            },
+        )
+    }
+
+    fn param_step_count(&self, id: u32) -> Option<(i32, Option<f64>)> {
+        self.param_step_count_impl(id)
+    }
+
+    fn state_load_stream(&self, read: &mut dyn FnMut(&mut [u8]) -> i64) -> bool {
+        self.state_load_stream_impl(read)
+    }
+
+    fn state_save_stream(&self, write: &mut dyn FnMut(&[u8]) -> i64) -> bool {
+        self.state_save_stream_impl(write)
+    }
+
+    fn gui_has_editor(&self) -> bool {
+        self.gui_has_editor_impl()
+    }
+
+    fn gui_get_size(&self) -> (u32, u32) {
+        self.gui_get_size_impl()
+    }
+
+    unsafe fn gui_open(&self, parent: *mut c_void) -> bool {
+        self.gui_open_impl(parent)
+    }
+
+    fn gui_close(&self) {
+        self.gui_close_impl();
+    }
+
+    fn gui_set_content_scale(&self, scale: f64) {
+        self.gui_set_content_scale_impl(scale);
+    }
+
+    fn gui_can_resize(&self) -> bool {
+        self.gui_can_resize_impl()
+    }
+
+    fn gui_check_size_constraint(&self, w: u32, h: u32) -> (u32, u32) {
+        self.gui_check_size_constraint_impl(w, h)
+    }
+
+    fn gui_set_size(&self, w: u32, h: u32) {
+        self.gui_set_size_impl(w, h);
+    }
+
+    fn gui_param_at(&self, x: i32, y: i32) -> Option<u32> {
+        self.gui_param_at_impl(x, y)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gui_supports_wayland(&self) -> bool {
+        self.gui_supports_wayland_impl()
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn gui_open_wayland(&self, display: *mut c_void, surface: *mut c_void) -> bool {
+        self.gui_open_wayland_impl(display, surface)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gui_event_fd(&self) -> Option<i32> {
+        self.gui_event_fd_impl()
+    }
+
+    fn gui_on_fd(&self) {
+        self.gui_on_fd_impl();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gui_on_timer(&self) {
+        self.gui_on_timer_impl();
+    }
+
+    fn gui_wayland_set_sync(&self, sync: bool) {
+        self.gui_wayland_set_sync_impl(sync);
+    }
+
+    fn midi_mapping_get_param_id(
+        &self,
+        bus_index: i32,
+        channel: i16,
+        controller: i16,
+    ) -> Option<u32> {
+        self.midi_mapping_get_param_id_impl(bus_index, channel, controller)
+    }
+
+    fn wants_persist_notifications(&self) -> bool {
+        run_extern_callback_with::<P, bool>("vst3", "persist_wants", false, || {
+            self.params_arc.wants_persist_notifications()
+        })
+    }
+
+    fn set_persist_waker(&self, wake: Option<WakerFn>) {
+        self.set_persist_waker_impl(wake);
+    }
+
+    fn take_persist_change(&self) -> Option<(u32, f64)> {
+        run_extern_callback_with::<P, Option<(u32, f64)>>("vst3", "persist_drain", None, || {
+            let (changed_id, normalized) = self.params_arc.take_persist_change()?;
+            if !normalized.is_finite()
+                || !(0.0..=1.0).contains(&normalized)
+                || self.params_arc.get_normalized(changed_id).is_none()
+            {
+                return None;
+            }
+            let clamped = self
+                .params_arc
+                .set_normalized_returning_normalized(changed_id, normalized);
+            Some((changed_id, clamped))
+        })
+    }
+
+    fn set_catalog_waker(&self, wake: Option<WakerFn>) {
+        self.set_catalog_waker_impl(wake);
+    }
+
+    fn take_catalog_changes(&self) -> u8 {
+        run_extern_callback_with::<P, u8>("vst3", "catalog_changes", 0, || {
+            self.params_arc.take_catalog_changes().flags.bits()
+        })
+    }
+
+    fn track_info_changed(&self, info: &Vst3TrackInfo) {
+        self.track_info_changed_impl(info);
+    }
+
+    fn midi_learn(&self, bus: u32, channel: u8, source: Vst3LearnSource) -> bool {
+        self.midi_learn_impl(bus, channel, source)
+    }
+
+    fn remap_param_id(&self, cid: [u8; 16], param_id: u32) -> Option<u32> {
+        run_extern_callback_with::<P, Option<u32>>("vst3", "remap_param_id", None, || {
+            // SAFETY: `IRemapParamID::getCompatibleParamID` runs on the VST3 UI/main thread.
+            let main = unsafe { MainThread::assume() };
+            self.main_thread
                 .try_borrow_mut(&main)
-                .map(|hooks| hooks.program_list(&main))
+                .and_then(|hooks| hooks.remap_param_id(&main, cid, param_id))
+        })
+    }
+
+    fn set_audio_presentation_latency(&self, is_input: bool, bus_index: u32, samples: u32) {
+        run_extern_callback_with::<P, ()>("vst3", "audio_presentation_latency", (), || {
+            let direction = if is_input {
+                BusDirection::Input
+            } else {
+                BusDirection::Output
+            };
+            // SAFETY: `IAudioPresentationLatency` runs on the host main thread.
+            let main = unsafe { MainThread::assume() };
+            if let Some(mut hooks) = self.main_thread.try_borrow_mut(&main) {
+                hooks.audio_presentation_latency_changed(&main, direction, bus_index, samples);
+            }
+        });
+    }
+
+    unsafe fn bind_host_queue(&self, host_id: usize, host: Option<*const Host>) {
+        run_extern_callback_with::<P, ()>("vst3", "bind_host_queue", (), || {
+            self.host_id.store(host_id, Ordering::Release);
+            let ptr = host.map_or(std::ptr::null_mut(), <*const Host>::cast_mut);
+            self.host_wake_target.store(ptr, Ordering::Release);
+            if ptr.is_null() {
+                self.host_queue.close();
+            }
+        });
+    }
+
+    fn drain_host_queue(&self) {
+        self.drain_host_queue_impl();
+    }
+
+    fn perform_menu(&self, target: MenuTarget, action: u32) -> bool {
+        run_extern_callback_with::<P, bool>("vst3", "perform_menu", false, || {
+            // SAFETY: `IContextMenuTarget::executeMenuItem` is a UI-thread call.
+            let main = unsafe { MainThread::assume() };
+            self.main_thread
+                .try_borrow_mut(&main)
+                .is_some_and(|mut hooks| hooks.perform_menu(&main, target, action))
+        })
+    }
+
+    fn keyswitches(&self, bus: u32, channel: u8) -> Vec<Keyswitch> {
+        run_extern_callback_with::<P, Vec<Keyswitch>>("vst3", "keyswitches", Vec::new(), || {
+            // SAFETY: `IKeyswitchController` callbacks run on the host UI thread.
+            let main = unsafe { MainThread::assume() };
+            self.main_thread
+                .try_borrow_mut(&main)
+                .map(|hooks| hooks.keyswitches(&main, bus, channel))
                 .unwrap_or_default()
-        },
-    )
-}
+        })
+    }
 
-/// `MainThreadHooks::set_program_data` (`IProgramListData::setProgramData` /
-/// `IUnitInfo::setUnitProgramData`). UI thread.
-pub(crate) unsafe fn cb_set_program_data<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    index: usize,
-    data: *const u8,
-    len: usize,
-) -> bool {
-    run_extern_callback_with::<P, bool>("vst3", "set_program_data", false, || unsafe {
-        let Some(inst) = ctx.cast::<Vst3Instance<P>>().as_ref() else {
-            return false;
-        };
-        let bytes = if data.is_null() || len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(data, len)
-        };
-        // SAFETY: `IProgramListData::setProgramData` runs on the host UI thread.
-        let main = MainThread::assume();
-        inst.main_thread
-            .try_borrow_mut(&main)
-            .is_some_and(|mut hooks| hooks.set_program_data(&main, index, bytes))
-    })
-}
+    fn program_list(&self) -> Vec<ProgramPreset> {
+        run_extern_callback_with::<P, Vec<ProgramPreset>>(
+            "vst3",
+            "program_list",
+            Vec::new(),
+            || {
+                // SAFETY: `IUnitInfo` / `IProgramListData` callbacks run on the host UI thread.
+                let main = unsafe { MainThread::assume() };
+                self.main_thread
+                    .try_borrow_mut(&main)
+                    .map(|hooks| hooks.program_list(&main))
+                    .unwrap_or_default()
+            },
+        )
+    }
 
-/// Build a slice from a `(ptr, len)` the C++ shim handed us, or an empty
-/// slice when the pointer is null (a direction with no buses).
-pub(crate) unsafe fn slice_or_empty<'a>(ptr: *const u32, len: u32) -> &'a [u32] {
-    match usize::try_from(len) {
-        Ok(n) if !ptr.is_null() && n > 0 => unsafe { std::slice::from_raw_parts(ptr, n) },
-        _ => &[],
+    fn set_program_data(&self, index: usize, data: &[u8]) -> bool {
+        run_extern_callback_with::<P, bool>("vst3", "set_program_data", false, || {
+            // SAFETY: `IProgramListData::setProgramData` runs on the host UI thread.
+            let main = unsafe { MainThread::assume() };
+            self.main_thread
+                .try_borrow_mut(&main)
+                .is_some_and(|mut hooks| hooks.set_program_data(&main, index, data))
+        })
     }
 }

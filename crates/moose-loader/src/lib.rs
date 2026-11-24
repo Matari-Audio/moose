@@ -36,7 +36,7 @@
 //! pub fn moose_process(state: *mut (), params: *const (), /* ... */) { }
 //!
 //! #[unsafe(no_mangle)]
-//! pub fn moose_abi_canary_v2() -> AbiCanary { AbiCanary::current::<Sample>() }
+//! pub fn moose_abi_canary_v3() -> AbiCanary { AbiCanary::current::<Sample>() }
 //! ```
 
 #[doc(hidden)]
@@ -315,13 +315,13 @@ macro_rules! export_plugin {
             <$logic as $crate::__macro_deps::moose_plugin::PluginEditor<Sample>>::editor(params)
         }
 
-        // `_v2` because `AbiCanary` crosses this boundary *by value*
+        // `_v3` because `AbiCanary` crosses this boundary *by value*
         // (sret): if the two sides disagreed about its size, the call
         // itself would corrupt the caller's stack before any field
         // compare. A canary-layout change therefore renames the symbol,
         // so a mismatched pair fails at `dlsym` - cleanly.
         #[unsafe(no_mangle)]
-        pub fn moose_abi_canary_v2() -> $crate::AbiCanary {
+        pub fn moose_abi_canary_v3() -> $crate::AbiCanary {
             $crate::AbiCanary::current::<Sample>()
         }
     };

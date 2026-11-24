@@ -269,6 +269,61 @@ impl std::fmt::Display for StateLoadError {
 
 impl std::error::Error for StateLoadError {}
 
+/// Type-erased custom state decoded off the audio thread for zero-allocation,
+/// lock-free swap on the audio thread.
+///
+/// Plugins opt in by returning `Ok(Some(DecodedState::new(state)))` from
+/// `decode_state` (host thread) and calling [`Self::swap_with`] inside
+/// `apply_decoded_state` (audio thread). The displaced old state remains
+/// inside this wrapper and is retired and dropped off the audio thread.
+pub struct DecodedState(Box<dyn std::any::Any + Send>);
+
+impl std::fmt::Debug for DecodedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecodedState(..)")
+    }
+}
+
+impl DecodedState {
+    /// Wrap a newly decoded state value constructed off the audio thread.
+    #[must_use]
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    /// Zero-allocation empty placeholder (`Box<()>`).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(())
+    }
+
+    /// Borrow the decoded state if its concrete type is `T`.
+    #[must_use]
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+
+    /// Mutably borrow the decoded state if its concrete type is `T`.
+    #[must_use]
+    pub fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.0.downcast_mut::<T>()
+    }
+
+    /// Swap the decoded `T` with `target` in place.
+    ///
+    /// Leaves the previous `target` value inside `self` so the wrapper retires
+    /// and drops it off the audio thread. Real-time safe: zero allocations,
+    /// zero deallocations, and zero locks.
+    pub fn swap_with<T: Send + 'static>(&mut self, target: &mut T) -> bool {
+        if let Some(inner) = self.0.downcast_mut::<T>() {
+            std::mem::swap(inner, target);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Apply a deserialized state to a plugin: write parameter values,
 /// snap smoothers, then hand the optional extra blob to
 /// [`crate::plugin::PluginRuntime::load_state`].
@@ -963,7 +1018,180 @@ mod tests {
     }
 }
 
-type QueuedLoad = (
+/// Default minimum window during which a recent audio-block heartbeat counts
+/// the audio thread as actively streaming. Expanded automatically by
+/// [`AudioHeartbeat::set_block_interval`] when a host negotiates a larger block
+/// period (e.g. 8,192 frames at 44.1 kHz ≈ 186 ms).
+pub(crate) const AUDIO_ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Maximum heartbeat activity window cap so pathological prepare parameters
+/// cannot make a stalled host look active indefinitely.
+const AUDIO_ACTIVE_WINDOW_MAX_US: u64 = 2_000_000;
+
+/// Extra margin above one negotiated block interval to absorb audio-thread
+/// scheduling jitter and the host handshake wait.
+const AUDIO_ACTIVE_INTERVAL_MARGIN_US: u64 = 50_000;
+
+/// Host-side poll interval while waiting for an audio-thread atomic completion.
+/// Keeps the audio thread 100% free of mutexes and `Thread::unpark` syscalls
+/// while waking the host well within a millisecond of block completion.
+pub(crate) const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(250);
+
+static MONOTONIC_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Initialize the process-wide monotonic epoch off the audio thread so audio
+/// heartbeats never trigger `OnceLock` initialization inside `process`.
+pub(crate) fn warm_monotonic_epoch() {
+    let _ = MONOTONIC_EPOCH.get_or_init(std::time::Instant::now);
+}
+
+#[cfg(test)]
+thread_local! { static TEST_TIME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn with_test_time(us: u64, run: impl FnOnce()) {
+    let old = TEST_TIME.replace(Some(us));
+    run();
+    TEST_TIME.set(old);
+}
+
+#[inline]
+fn monotonic_us() -> u64 {
+    #[cfg(test)]
+    if let Some(us) = TEST_TIME.get() {
+        return us;
+    }
+    let Some(epoch) = MONOTONIC_EPOCH.get() else {
+        return 0;
+    };
+    let micros = epoch.elapsed().as_micros();
+    #[allow(clippy::cast_possible_truncation)]
+    let clamped = micros.min(u128::from(u64::MAX)) as u64;
+    // Reserve 0 for "never ran / marked inactive".
+    clamped.max(1)
+}
+
+/// Lock-free, allocation-free audio-thread activity tracker shared by
+/// [`StateLoadQueue`] and [`crate::snapshot::SnapshotSlot`].
+pub(crate) struct AudioHeartbeat {
+    /// Microseconds since `MONOTONIC_EPOCH` of the last audio block, or `0`
+    /// when no block has run since construction or `mark_inactive`.
+    last_block_us: std::sync::atomic::AtomicU64,
+    /// Per-thread token of the last audio block caller (0 = none).
+    last_thread: std::sync::atomic::AtomicU64,
+    /// Activity window in microseconds, adjusted for the negotiated block period.
+    active_window_us: std::sync::atomic::AtomicU64,
+    /// Set by `mark_inactive()` and cleared by `record_block()`.
+    stopped: std::sync::atomic::AtomicBool,
+    /// Monotonic stop-transition counter incremented by `mark_inactive()`.
+    inactive_gen: std::sync::atomic::AtomicU64,
+}
+
+impl AudioHeartbeat {
+    pub(crate) fn new() -> Self {
+        warm_monotonic_epoch();
+        #[allow(clippy::cast_possible_truncation)]
+        let default_window_us = AUDIO_ACTIVE_WINDOW.as_micros() as u64;
+        Self {
+            last_block_us: std::sync::atomic::AtomicU64::new(0),
+            last_thread: std::sync::atomic::AtomicU64::new(0),
+            active_window_us: std::sync::atomic::AtomicU64::new(default_window_us),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            inactive_gen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Host thread (on prepare/activate): expand the activity window to cover
+    /// the host's negotiated block interval plus scheduling margin.
+    pub(crate) fn set_block_interval(&self, sample_rate: f64, max_block_size: usize) {
+        use std::sync::atomic::Ordering;
+        #[allow(clippy::cast_possible_truncation)]
+        let default_window_us = AUDIO_ACTIVE_WINDOW.as_micros() as u64;
+        let window_us = if sample_rate.is_finite() && sample_rate > 0.0 && max_block_size > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let block_us_f = (max_block_size as f64 / sample_rate) * 1_000_000.0;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let block_us = if block_us_f.is_finite() && block_us_f > 0.0 {
+                block_us_f.ceil().min(2_000_000.0) as u64
+            } else {
+                0
+            };
+            block_us
+                .saturating_add(AUDIO_ACTIVE_INTERVAL_MARGIN_US)
+                .clamp(default_window_us, AUDIO_ACTIVE_WINDOW_MAX_US)
+        } else {
+            default_window_us
+        };
+        self.active_window_us.store(window_us, Ordering::Release);
+    }
+
+    /// Audio thread: stamp a live block. Wait-free, zero allocations, zero syscalls.
+    #[inline]
+    pub(crate) fn record_block(&self) {
+        use std::sync::atomic::Ordering;
+        self.stopped.store(false, Ordering::Relaxed);
+        self.last_thread
+            .store(crate::wrapper::current_thread_token(), Ordering::Relaxed);
+        self.last_block_us.store(monotonic_us(), Ordering::Release);
+    }
+
+    /// Host thread (on stop/deactivate): clear activity immediately and advance
+    /// the stop counter so any in-flight wait loop exits without stalling.
+    #[inline]
+    pub(crate) fn mark_inactive(&self) {
+        use std::sync::atomic::Ordering;
+        self.last_block_us.store(0, Ordering::Release);
+        self.last_thread.store(0, Ordering::Relaxed);
+        self.stopped.store(true, Ordering::Release);
+        self.inactive_gen.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn inactive_gen(&self) -> u64 {
+        self.inactive_gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn was_stopped_since(&self, start_gen: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        self.stopped.load(Ordering::Acquire)
+            || self.inactive_gen.load(Ordering::Acquire) != start_gen
+    }
+
+    /// Host thread: true only when another thread ran an audio block within
+    /// the active window (at least [`AUDIO_ACTIVE_WINDOW`], expanded for the
+    /// negotiated block interval). Returns `false` for stopped, sleeping,
+    /// bypassed, suspended, or single-threaded callers.
+    #[must_use]
+    pub(crate) fn is_active_on_other_thread(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let last_us = self.last_block_us.load(Ordering::Acquire);
+        if last_us == 0 {
+            return false;
+        }
+        let last_tid = self.last_thread.load(Ordering::Relaxed);
+        if last_tid == 0 || last_tid == crate::wrapper::current_thread_token() {
+            return false;
+        }
+        let now_us = monotonic_us();
+        let window_us = self.active_window_us.load(Ordering::Acquire);
+        now_us.saturating_sub(last_us) <= window_us
+    }
+}
+
+/// Capacity of the lock-free retirement queue for swapped-out [`DecodedState`]
+/// values. Because `ready` has capacity 1 and every host push/wait drains
+/// `retired`, at most 1–2 entries sit here in practice; 8 provides ample slack
+/// so the audio thread never deallocates.
+const RETIRED_STATE_CAP: usize = 8;
+
+pub(crate) struct QueuedLoad {
+    pub(crate) state: std::sync::Arc<DeserializedState>,
+    pub(crate) backup: Option<std::sync::Arc<ParamsBackup>>,
+    pub(crate) decoded: Option<DecodedState>,
+}
+
+type RetainedOwner = (
     std::sync::Arc<DeserializedState>,
     Option<std::sync::Arc<ParamsBackup>>,
 );
@@ -971,17 +1199,26 @@ type QueuedLoad = (
 /// Host-produced, single audio-consumer state handoff. The host retains an Arc
 /// until it observes that neither the ready slot nor audio owns it. Audio only
 /// decrements an Arc; it can never perform the final free of a recalled state.
-/// At most one consumed state and one queued state survive a producer call.
-/// Persist lanes have already been applied on the host and are released there.
+/// Swapped-out [`DecodedState`] values return through the lock-free `retired`
+/// queue and are dropped on the host thread, so audio never deallocates them
+/// either. At most one consumed state and one queued state survive a producer
+/// call. Persist lanes have already been applied on the host and are released
+/// there.
 pub struct StateLoadQueue {
     ready: crossbeam_queue::ArrayQueue<QueuedLoad>,
-    owners: std::sync::Mutex<Vec<QueuedLoad>>,
+    retired: crossbeam_queue::ArrayQueue<DecodedState>,
+    owners: std::sync::Mutex<Vec<RetainedOwner>>,
     /// Address of the last state whose apply finished (0 = none), so the
     /// host can tell whether its own push has landed. The host keeps an
     /// `Arc` clone while it compares, so the address can't be reused.
     applied: std::sync::atomic::AtomicUsize,
+    /// Last accepted queued custom load. Its host-owned Arc supplies save bytes
+    /// until a current snapshot becomes available. Never lock from apply.
+    accepted_custom: std::sync::atomic::AtomicUsize,
     /// Whether that apply's `load_state` succeeded.
     applied_ok: std::sync::atomic::AtomicBool,
+    /// Audio-thread block heartbeat for sleeping-host detection.
+    heartbeat: AudioHeartbeat,
 }
 impl StateLoadQueue {
     /// Create a single-slot state handoff.
@@ -993,10 +1230,35 @@ impl StateLoadQueue {
         assert_eq!(capacity, 1, "state loads coalesce in one slot");
         Self {
             ready: crossbeam_queue::ArrayQueue::new(1),
+            retired: crossbeam_queue::ArrayQueue::new(RETIRED_STATE_CAP),
             owners: std::sync::Mutex::new(Vec::with_capacity(3)),
             applied: std::sync::atomic::AtomicUsize::new(0),
+            accepted_custom: std::sync::atomic::AtomicUsize::new(0),
             applied_ok: std::sync::atomic::AtomicBool::new(true),
+            heartbeat: AudioHeartbeat::new(),
         }
+    }
+    /// Host thread (on prepare/activate): configure the negotiated block
+    /// interval for sleeping-host heartbeat detection.
+    pub fn set_block_interval(&self, sample_rate: f64, max_block_size: usize) {
+        self.heartbeat
+            .set_block_interval(sample_rate, max_block_size);
+    }
+    /// Audio thread: record that an audio block is running. Wait-free, zero allocs.
+    #[inline]
+    pub fn record_audio_block(&self) {
+        self.heartbeat.record_block();
+    }
+    /// Host thread: mark audio inactive on stop/deactivate so any waiting host
+    /// returns promptly without stalling for the handshake timeout.
+    #[inline]
+    pub fn mark_audio_inactive(&self) {
+        self.heartbeat.mark_inactive();
+    }
+    /// Host thread: true when another thread recently ran an audio block.
+    #[must_use]
+    pub fn is_audio_active_on_other_thread(&self) -> bool {
+        self.heartbeat.is_active_on_other_thread()
     }
     /// Host thread only. All persist fields must already have been applied.
     pub fn force_push(&self, state: DeserializedState) {
@@ -1004,13 +1266,15 @@ impl StateLoadQueue {
     }
     /// [`Self::force_push`], returning a handle for [`Self::wait_applied`].
     pub fn push_tracked(&self, state: DeserializedState) -> std::sync::Arc<DeserializedState> {
-        self.push_with_backup(state, None)
+        self.push_with_backup_and_decoded(state, None, None)
     }
-    pub(crate) fn push_with_backup(
+    pub(crate) fn push_with_backup_and_decoded(
         &self,
         mut state: DeserializedState,
         backup: Option<ParamsBackup>,
+        decoded: Option<DecodedState>,
     ) -> std::sync::Arc<DeserializedState> {
+        self.reclaim_retired();
         let backup = backup.map(std::sync::Arc::new);
         state.persist = Vec::new();
         let state = std::sync::Arc::new(state);
@@ -1019,25 +1283,62 @@ impl StateLoadQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         owners.push((std::sync::Arc::clone(&state), backup.clone()));
-        drop(
-            self.ready
-                .force_push((std::sync::Arc::clone(&state), backup)),
-        );
+        drop(self.ready.force_push(QueuedLoad {
+            state: std::sync::Arc::clone(&state),
+            backup,
+            decoded,
+        }));
         // `> 2`: the ready slot or audio, plus the handle returned below.
         owners.retain(|(s, _)| {
             std::sync::Arc::strong_count(s) > 1 + usize::from(std::sync::Arc::ptr_eq(s, &state))
+                || self
+                    .accepted_custom
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == std::sync::Arc::as_ptr(s) as usize
         });
-        debug_assert!(owners.len() <= 2, "single audio consumer contract");
+        debug_assert!(owners.len() <= 3, "single audio consumer contract");
         state
     }
-    pub fn pop(&self) -> Option<std::sync::Arc<DeserializedState>> {
-        self.pop_with_backup().map(|(state, _)| state)
+    /// Audio thread: park a swapped-out [`DecodedState`] for off-thread drop.
+    /// Wait-free, zero allocations, zero deallocations while capacity holds.
+    pub(crate) fn retire_decoded(&self, old: DecodedState) {
+        let _ = self.retired.push(old);
     }
-    pub(crate) fn pop_with_backup(&self) -> Option<QueuedLoad> {
+    /// Host thread: drop any retired [`DecodedState`] values swapped out by the
+    /// audio thread.
+    pub fn reclaim_retired(&self) {
+        while let Some(old) = self.retired.pop() {
+            drop(old);
+        }
+    }
+    pub fn pop(&self) -> Option<std::sync::Arc<DeserializedState>> {
+        self.pop_queued().map(|q| q.state)
+    }
+    pub(crate) fn pop_queued(&self) -> Option<QueuedLoad> {
         self.ready.pop()
     }
-    /// Record that `state` (from [`Self::pop`]) has been applied. Two
-    /// atomic stores; safe on the audio thread.
+    pub(crate) fn set_accepted_custom(&self, state_ptr: usize) {
+        self.accepted_custom
+            .store(state_ptr, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn accepted_extra(&self) -> Option<Vec<u8>> {
+        let owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self
+            .accepted_custom
+            .load(std::sync::atomic::Ordering::Acquire);
+        owners
+            .iter()
+            .find(|(s, _)| std::sync::Arc::as_ptr(s) as usize == current)
+            .and_then(|(s, _)| s.extra.clone())
+    }
+    /// Record that `state` (from [`Self::pop`]) has been applied.
+    /// Strictly lock-free and syscall-free: safe inside `RtSection` on the
+    /// audio thread (publishes completion with atomics only).
+    #[inline]
     pub fn mark_applied(&self, state: &std::sync::Arc<DeserializedState>, ok: bool) {
         use std::sync::atomic::Ordering;
         self.applied_ok.store(ok, Ordering::Relaxed);
@@ -1050,22 +1351,50 @@ impl StateLoadQueue {
     }
     /// Host thread: wait up to `timeout` for the audio thread to apply
     /// `state`. `Some(ok)` is the `load_state` result; `None` means no
-    /// block ran in time and the state is still queued.
+    /// block ran in time (or audio stopped) and the state stays queued.
     #[must_use]
     pub fn wait_applied(
         &self,
         state: &std::sync::Arc<DeserializedState>,
         timeout: std::time::Duration,
     ) -> Option<bool> {
+        self.wait_applied_poll(state, timeout, || {})
+    }
+
+    pub(crate) fn wait_applied_poll(
+        &self,
+        state: &std::sync::Arc<DeserializedState>,
+        timeout: std::time::Duration,
+        mut on_poll: impl FnMut(),
+    ) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        let start_gen = self.heartbeat.inactive_gen();
+        if self.is_applied(state) {
+            return Some(self.applied_ok.load(Ordering::Relaxed));
+        }
+        if timeout.is_zero() || self.heartbeat.was_stopped_since(start_gen) {
+            return None;
+        }
         let deadline = std::time::Instant::now() + timeout;
+        let mut spins = 0u8;
         loop {
+            on_poll();
             if self.is_applied(state) {
-                return Some(self.applied_ok.load(std::sync::atomic::Ordering::Relaxed));
+                return Some(self.applied_ok.load(Ordering::Relaxed));
             }
-            if std::time::Instant::now() >= deadline {
+            if self.heartbeat.was_stopped_since(start_gen) {
                 return None;
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if spins < 4 {
+                spins += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep((deadline - now).min(WAIT_POLL_INTERVAL));
+            }
         }
     }
     /// Host thread: the newest pushed state if it has not been applied yet.

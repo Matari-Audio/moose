@@ -33,7 +33,7 @@ use moose_core::export::CustomClapExtension;
 use moose_core::main_thread::MainThreadHooks;
 use moose_core::plugin::{PreparationConfig, PreparationError};
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::state::{ForeignState, MigratedState, StateLoadError};
+use moose_core::state::{DecodedState, ForeignState, MigratedState, StateLoadError};
 use moose_core::tasks::InitContext;
 use moose_params::Params;
 use moose_params::sample::Sample;
@@ -105,7 +105,7 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// A host re-activation the current processor still fits (same sample
     /// rate and process mode, a max block no larger than the one it was
     /// built for) keeps it and calls [`Self::reactivate`] instead. Otherwise the
-    /// previous processor is deactivated first; the new one reads everything
+    /// previous processor is deactivated first (unless overlapping activation is enabled); the new one reads everything
     /// it needs (including `#[persist]` state) from `shared`.
     ///
     /// `cx` holds the instance's background-task spawners
@@ -172,9 +172,34 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// caches the next `process` reads (snap smoothers, for instance).
     /// Default: no-op.
     ///
+    /// **RT contract:** plugins that opt into off-thread decoding
+    /// ([`Self::decode_state`] returning `Ok(Some(_))`) invoke `state_changed`
+    /// inside an `RtSection` on the audio thread right after
+    /// [`Self::apply_decoded_state`], so `state_changed` must not allocate,
+    /// lock, or block on that path. Plugins returning `Ok(None)` keep the
+    /// legacy non-RT `load_state` path.
+    ///
     /// Custom state lives in `#[persist]` fields on [`Self::Shared`].
     fn state_changed(processor: &mut Self::Processor, shared: &Self::Shared) {
         let _ = (processor, shared);
+    }
+
+    /// Allow a replacement to activate while its predecessor is still alive.
+    /// Opt in only when both processors can hold resources concurrently. By default
+    /// teardown runs first: retain settings needed by the replacement in Shared.
+    const OVERLAPPING_ACTIVATION: bool = false;
+
+    /// Transfer processor-owned state (such as state previously swapped in via
+    /// [`Self::apply_decoded_state`]) from an outgoing processor to its
+    /// replacement when [`Self::activate`] rebuilds the processor for a new
+    /// [`AudioConfig`] (e.g. a sample-rate or max-block-size change).
+    ///
+    /// Only called with `OVERLAPPING_ACTIVATION` enabled, on the host main thread.
+    /// Plugins whose custom state lives solely
+    /// in `#[persist]` fields on [`Self::Shared`] do not need to override this.
+    /// Default: no-op.
+    fn transfer_state(old: &mut Self::Processor, new: &mut Self::Processor, shared: &Self::Shared) {
+        let _ = (old, new, shared);
     }
 
     /// Check custom state bytes on the host thread before they are applied.
@@ -185,6 +210,35 @@ pub trait Plugin<S: Sample = f32>: 'static {
     fn validate_state(data: &[u8]) -> Result<(), StateLoadError> {
         let _ = data;
         Ok(())
+    }
+
+    /// Decode custom state bytes off the audio thread into a ready-to-swap
+    /// [`DecodedState`].
+    ///
+    /// Opt-in zero-allocation RT state swap: return `Ok(Some(DecodedState::new(val)))`
+    /// here and swap `val` into your processor inside [`Self::apply_decoded_state`]
+    /// via [`DecodedState::swap_with`]. The displaced old state is retired and
+    /// dropped off the audio thread. Default returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(StateLoadError)` when the bytes cannot be decoded.
+    fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+        let _ = data;
+        Ok(None)
+    }
+
+    /// Swap a state decoded by [`Self::decode_state`] into the active processor.
+    ///
+    /// Runs inside an `RtSection` on the audio thread: must not allocate,
+    /// deallocate, lock, or block. Use [`DecodedState::swap_with`] to swap
+    /// in-place so the previous state drops off the audio thread.
+    fn apply_decoded_state(
+        processor: &mut Self::Processor,
+        shared: &Self::Shared,
+        decoded: &mut DecodedState,
+    ) {
+        let _ = (processor, shared, decoded);
     }
 
     /// Translate foreign state (a previous framework's blob or a renamed
@@ -231,9 +285,11 @@ impl<P> std::fmt::Debug for Lifecycle<P> {
 }
 
 /// The DSP state [`Lifecycle`] hands the shell: a processor once
-/// activated, and the instance's [`InitContext`] for each activation.
+/// activated, any pre-activation decoded state waiting for the first
+/// activation, and the instance's [`InitContext`] for each activation.
 pub struct ProcessorSlot<T> {
     slot: Slot<T>,
+    pending_decoded: Option<DecodedState>,
     cx: InitContext,
 }
 
@@ -241,6 +297,7 @@ impl<T> Default for ProcessorSlot<T> {
     fn default() -> Self {
         Self {
             slot: Slot::default(),
+            pending_decoded: None,
             cx: InitContext::default(),
         }
     }
@@ -259,8 +316,18 @@ enum Slot<T> {
     /// Not activated.
     #[default]
     Inactive,
+    /// Previous processor parked after a failed replacement `activate` so its
+    /// state can still transfer on a subsequent retry; produces silence in
+    /// `process` until a new `activate` succeeds.
+    ///
+    /// Boxed so `ProcessorSlot<T>` and `activate`'s stack frame stay small even
+    /// for large DSP structs on constrained host/test thread stacks.
+    Parked(Box<T>),
     /// Built by `activate` for `config`.
-    Active { processor: T, config: AudioConfig },
+    Active {
+        processor: Box<T>,
+        config: AudioConfig,
+    },
 }
 
 impl<T> ProcessorSlot<T> {
@@ -268,18 +335,33 @@ impl<T> ProcessorSlot<T> {
     #[must_use]
     pub fn processor(&self) -> Option<&T> {
         match &self.slot {
-            Slot::Active { processor, .. } => Some(processor),
-            Slot::Inactive => None,
+            Slot::Active { processor, .. } => Some(processor.as_ref()),
+            Slot::Inactive | Slot::Parked(_) => None,
         }
     }
 
     /// Mutable access to the processor, once activated.
     pub fn processor_mut(&mut self) -> Option<&mut T> {
         match &mut self.slot {
-            Slot::Active { processor, .. } => Some(processor),
-            Slot::Inactive => None,
+            Slot::Active { processor, .. } => Some(processor.as_mut()),
+            Slot::Inactive | Slot::Parked(_) => None,
         }
     }
+}
+
+#[inline(never)]
+fn activate_boxed<S: Sample, P: Plugin<S>>(
+    shared: &P::Shared,
+    audio: &AudioConfig,
+    cx: &InitContext,
+) -> Result<Box<P::Processor>, PreparationError> {
+    P::activate(shared, audio, cx).map(Box::new)
+}
+
+#[inline(never)]
+#[allow(clippy::boxed_local)] // Intentionally unboxes inside a separate frame so `activate()` stays tiny.
+fn deactivate_boxed<S: Sample, P: Plugin<S>>(processor: Box<P::Processor>) {
+    P::deactivate(*processor);
 }
 
 fn activate<S: Sample, P: Plugin<S>>(
@@ -297,12 +379,37 @@ fn activate<S: Sample, P: Plugin<S>>(
         P::reactivate(processor, shared, &config.audio);
         return Ok(());
     }
-    // Custom state lives in `#[persist]` on `Shared`, so a rebuilt
-    // processor carries nothing over: it reads everything from `shared`.
-    if let Slot::Active { processor: old, .. } = std::mem::take(&mut slot.slot) {
-        P::deactivate(old);
+    if !P::OVERLAPPING_ACTIVATION
+        && let Slot::Active { processor, .. } = std::mem::take(&mut slot.slot)
+    {
+        deactivate_boxed::<S, P>(processor);
     }
-    let processor = P::activate(shared, &config.audio, &slot.cx)?;
+    let mut processor = match activate_boxed::<S, P>(shared, &config.audio, &slot.cx) {
+        Ok(processor) => processor,
+        Err(err) => {
+            // Replacement failed: park any previously active processor so
+            // `process` outputs silence (and `processor()` is `None`), while
+            // preserving its state for a subsequent retry.
+            if matches!(slot.slot, Slot::Active { .. })
+                && let Slot::Active { processor: old, .. } = std::mem::take(&mut slot.slot)
+            {
+                slot.slot = Slot::Parked(old);
+            }
+            return Err(err);
+        }
+    };
+    if let Slot::Active {
+        processor: mut old, ..
+    }
+    | Slot::Parked(mut old) = std::mem::take(&mut slot.slot)
+    {
+        P::transfer_state(&mut old, &mut processor, shared);
+        deactivate_boxed::<S, P>(old);
+    }
+    if let Some(mut pending) = slot.pending_decoded.take() {
+        P::apply_decoded_state(&mut processor, shared, &mut pending);
+        P::state_changed(&mut processor, shared);
+    }
     slot.slot = Slot::Active {
         processor,
         config: config.audio,
@@ -360,6 +467,7 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
     fn init(_params: &P::Shared, cx: &InitContext) -> Self::DspState {
         ProcessorSlot {
             slot: Slot::default(),
+            pending_decoded: None,
             cx: cx.clone(),
         }
     }
@@ -405,6 +513,24 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
         P::validate_state(data)
     }
 
+    fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+        P::decode_state(data)
+    }
+
+    fn apply_decoded_state(
+        state: &mut Self::DspState,
+        params: &P::Shared,
+        decoded: &mut DecodedState,
+    ) {
+        if let Some(processor) = state.processor_mut() {
+            P::apply_decoded_state(processor, params, decoded);
+        } else if let Some(prev) = &mut state.pending_decoded {
+            std::mem::swap(prev, decoded);
+        } else {
+            state.pending_decoded = Some(std::mem::replace(decoded, DecodedState::empty()));
+        }
+    }
+
     fn migrate_state(foreign: &ForeignState) -> Option<MigratedState> {
         P::migrate_state(foreign)
     }
@@ -431,5 +557,244 @@ impl<S: Sample, P: Plugin<S>> PluginEditor<S> for Lifecycle<P> {
 
     fn editor(params: Arc<P::Shared>) -> Box<dyn Editor> {
         P::editor(params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moose_core::plugin::PreparationFrameBound;
+    use moose_params::DynamicParams;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static REFUSE_ACTIVATE: AtomicBool = AtomicBool::new(false);
+    static REACTIVATE_CALLS: AtomicU32 = AtomicU32::new(0);
+    static TRANSFER_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    struct PreActivatePlugin;
+
+    #[derive(Default)]
+    struct PreActivateProcessor {
+        loaded_tag: u32,
+        state_changed_calls: u32,
+    }
+
+    impl Plugin for PreActivatePlugin {
+        const OVERLAPPING_ACTIVATION: bool = true;
+        type Shared = DynamicParams<0>;
+        type MainThread = ();
+        type Processor = PreActivateProcessor;
+
+        fn main_thread(_shared: &Arc<Self::Shared>) -> Self::MainThread {}
+
+        fn activate(
+            _shared: &Self::Shared,
+            _config: &AudioConfig,
+            _cx: &InitContext,
+        ) -> Result<Self::Processor, PreparationError> {
+            if REFUSE_ACTIVATE.load(Ordering::Acquire) {
+                return Err(PreparationError::ResourceBudget);
+            }
+            Ok(PreActivateProcessor::default())
+        }
+
+        fn reactivate(
+            processor: &mut Self::Processor,
+            shared: &Self::Shared,
+            config: &AudioConfig,
+        ) {
+            let _ = config;
+            REACTIVATE_CALLS.fetch_add(1, Ordering::AcqRel);
+            Self::reset(processor, shared);
+        }
+
+        fn transfer_state(
+            old: &mut Self::Processor,
+            new: &mut Self::Processor,
+            _shared: &Self::Shared,
+        ) {
+            TRANSFER_CALLS.fetch_add(1, Ordering::AcqRel);
+            new.loaded_tag = old.loaded_tag;
+        }
+
+        fn process(
+            _processor: &mut Self::Processor,
+            _shared: &Self::Shared,
+            _buffer: &mut AudioBuffer<f32>,
+            _events: &EventList,
+            _context: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+
+        fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+            if data.len() == 4 {
+                let tag = u32::from_le_bytes(data.try_into().unwrap());
+                return Ok(Some(DecodedState::new(tag)));
+            }
+            Ok(None)
+        }
+
+        fn apply_decoded_state(
+            processor: &mut Self::Processor,
+            _shared: &Self::Shared,
+            decoded: &mut DecodedState,
+        ) {
+            decoded.swap_with(&mut processor.loaded_tag);
+        }
+
+        fn state_changed(processor: &mut Self::Processor, _shared: &Self::Shared) {
+            processor.state_changed_calls += 1;
+        }
+    }
+
+    #[test]
+    fn default_replacement_releases_exclusive_resource_before_activate() {
+        struct Exclusive;
+        static RESERVED: AtomicBool = AtomicBool::new(false);
+        impl Plugin for Exclusive {
+            type Processor = ();
+            type Shared = DynamicParams<0>;
+            type MainThread = ();
+
+            fn main_thread(_: &Arc<Self::Shared>) {}
+            fn activate(
+                _: &Self::Shared,
+                _: &AudioConfig,
+                _: &InitContext,
+            ) -> Result<(), PreparationError> {
+                if RESERVED.swap(true, Ordering::AcqRel) {
+                    return Err(PreparationError::ResourceBudget);
+                }
+                Ok(())
+            }
+            fn deactivate((): ()) {
+                assert!(RESERVED.swap(false, Ordering::AcqRel));
+            }
+            fn process(
+                (): &mut (),
+                _: &Self::Shared,
+                _: &mut AudioBuffer<f32>,
+                _: &EventList,
+                _: &mut ProcessContext,
+            ) -> ProcessStatus {
+                ProcessStatus::Normal
+            }
+        }
+        let shared = DynamicParams::<0>::new();
+        let mut slot =
+            <Lifecycle<Exclusive> as PluginLogicCore>::init(&shared, &InitContext::default());
+        for rate in [48_000.0, 96_000.0] {
+            let prep = PreparationConfig::new(
+                AudioConfig::new(rate, 512),
+                PreparationFrameBound::NegotiatedHost,
+            );
+            activate::<f32, Exclusive>(&mut slot, &shared, &prep).unwrap();
+        }
+    }
+
+    #[test]
+    fn pre_activation_decoded_state_survives_activate_reactivate_replacement_and_failed_retry() {
+        REFUSE_ACTIVATE.store(false, Ordering::Release);
+        REACTIVATE_CALLS.store(0, Ordering::Release);
+        TRANSFER_CALLS.store(0, Ordering::Release);
+
+        let shared = DynamicParams::<0>::new();
+        let mut slot = <Lifecycle<PreActivatePlugin> as PluginLogicCore>::init(
+            &shared,
+            &InitContext::default(),
+        );
+        assert!(slot.processor().is_none());
+
+        let mut first =
+            <Lifecycle<PreActivatePlugin> as PluginLogicCore>::decode_state(&7u32.to_le_bytes())
+                .unwrap()
+                .unwrap();
+        <Lifecycle<PreActivatePlugin> as PluginLogicCore>::apply_decoded_state(
+            &mut slot, &shared, &mut first,
+        );
+
+        let mut second =
+            <Lifecycle<PreActivatePlugin> as PluginLogicCore>::decode_state(&42u32.to_le_bytes())
+                .unwrap()
+                .unwrap();
+        <Lifecycle<PreActivatePlugin> as PluginLogicCore>::apply_decoded_state(
+            &mut slot,
+            &shared,
+            &mut second,
+        );
+        // The older pre-activation decoded state is swapped out into `second`
+        // so callers can retire it off the audio thread.
+        assert_eq!(second.downcast_ref::<u32>(), Some(&7));
+
+        // 1. First activation at 48 kHz / 512 receives 42.
+        let prep_48k = PreparationConfig::new(
+            AudioConfig::new(48_000.0, 512),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        <Lifecycle<PreActivatePlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep_48k)
+            .expect("first activation succeeds");
+        let processor = slot.processor().expect("processor active");
+        assert_eq!(processor.loaded_tag, 42);
+        assert_eq!(processor.state_changed_calls, 1);
+
+        // 2. Fitting reactivation (48 kHz / 256) keeps processor & tag without rebuilding.
+        let prep_fit = PreparationConfig::new(
+            AudioConfig::new(48_000.0, 256),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        <Lifecycle<PreActivatePlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep_fit)
+            .expect("fitting reactivation succeeds");
+        assert_eq!(REACTIVATE_CALLS.load(Ordering::Acquire), 1);
+        assert_eq!(TRANSFER_CALLS.load(Ordering::Acquire), 0);
+        assert_eq!(slot.processor().expect("active").loaded_tag, 42);
+
+        // 3. Config-change replacement (96 kHz / 512) transfers tag 42 to the new processor.
+        let prep_96k = PreparationConfig::new(
+            AudioConfig::new(96_000.0, 512),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        <Lifecycle<PreActivatePlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep_96k)
+            .expect("96 kHz replacement succeeds");
+        assert_eq!(TRANSFER_CALLS.load(Ordering::Acquire), 1);
+        assert_eq!(slot.processor().expect("active").loaded_tag, 42);
+
+        // 4. Failed replacement (192 kHz) parks the old processor (processor() == None)
+        //    and preserves tag 42 across the subsequent retry.
+        REFUSE_ACTIVATE.store(true, Ordering::Release);
+        let prep_192k = PreparationConfig::new(
+            AudioConfig::new(192_000.0, 512),
+            PreparationFrameBound::NegotiatedHost,
+        );
+        assert_eq!(
+            <Lifecycle<PreActivatePlugin> as PluginLogicCore>::prepare(
+                &mut slot, &shared, &prep_192k,
+            ),
+            Err(PreparationError::ResourceBudget)
+        );
+        assert_eq!(
+            <Lifecycle<PreActivatePlugin> as PluginLogicCore>::prepare(
+                &mut slot, &shared, &prep_192k
+            ),
+            Err(PreparationError::ResourceBudget)
+        );
+        assert!(
+            slot.processor().is_none(),
+            "failed replacement must not expose an active processor"
+        );
+
+        REFUSE_ACTIVATE.store(false, Ordering::Release);
+        <Lifecycle<PreActivatePlugin> as PluginLogicCore>::prepare(&mut slot, &shared, &prep_192k)
+            .expect("retry after failed replacement succeeds");
+        assert_eq!(TRANSFER_CALLS.load(Ordering::Acquire), 2);
+        assert_eq!(slot.processor().expect("active").loaded_tag, 42);
+    }
+
+    #[test]
+    fn processor_slot_stays_small_for_large_dsp_structs() {
+        assert!(
+            std::mem::size_of::<ProcessorSlot<[u8; 65_536]>>() < 1024,
+            "ProcessorSlot must box P::Processor so activate() and host/test stacks stay small"
+        );
     }
 }

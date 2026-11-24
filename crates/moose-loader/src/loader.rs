@@ -370,11 +370,11 @@ impl<S: Sample> NativeLoader<S> {
         // struct returns by value, so a shell must never call a canary
         // of a different shape. A dylib exporting only an older
         // `moose_abi_canary*` fails the lookup and is refused here.
-        let canary_fn: Symbol<fn() -> AbiCanary> = match unsafe { lib.get(b"moose_abi_canary_v2") }
+        let canary_fn: Symbol<fn() -> AbiCanary> = match unsafe { lib.get(b"moose_abi_canary_v3") }
         {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("missing moose_abi_canary_v2 export (stale pre-2.0 logic dylib?): {e}");
+                log::warn!("missing moose_abi_canary_v3 export (stale logic dylib?): {e}");
                 cleanup_temp(lib, &temp);
                 return None;
             }

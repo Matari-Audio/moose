@@ -8,8 +8,8 @@
 use std::cell::{Cell, UnsafeCell};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
-use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::ffi::{CStr, c_void};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use moose_core::editor::EditGroup;
@@ -24,9 +24,8 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 use super::view::View;
 use super::{Registration, cstr, retain, utf16_from, utf16_into};
-use crate::ffi::{
-    PRESENTATION_HIDDEN, PRESENTATION_UNAVAILABLE, Vst3LearnSource, Vst3NativeEvent, Vst3TrackInfo,
-    Vst3Transport,
+use crate::backend::{
+    ProcessArgs, Vst3Backend, Vst3LearnSource, Vst3NativeEvent, Vst3TrackInfo, Vst3Transport,
 };
 
 /// A wake's drain makes at most this many host calls; the rest wait for the
@@ -207,7 +206,7 @@ impl ParamCursor {
     unsafe fn new(host: &Host, queue: *mut IParamValueQueue, will_process: bool) -> Option<Self> {
         let q = unsafe { ComRef::from_raw(queue) }?;
         let id = unsafe { q.getParameterId() };
-        let prev = unsafe { (host.reg.cb.param_get_value)(host.ctx, id) };
+        let prev = host.backend().param_get_value(id);
         Some(Self {
             queue,
             id,
@@ -241,10 +240,10 @@ impl ParamCursor {
 
     /// Deliver `pending` to the plugin. Returns true when the event list
     /// refused it (the queue's final value is then committed directly).
-    unsafe fn emit(&mut self, host: &Host) -> bool {
-        let cb = host.reg.cb;
+    fn emit(&mut self, host: &Host) -> bool {
+        let backend = host.backend();
         let (offset, value) = self.pending;
-        let plain = unsafe { (cb.param_denormalize)(host.ctx, self.id, value) };
+        let plain = backend.param_denormalize(self.id, value);
         // The first point ramps from an implicit point at sample -1 holding
         // the last value (VST3 SDK), so sample 0 is already one step along.
         if self.last.is_none() {
@@ -253,9 +252,7 @@ impl ParamCursor {
         self.last = Some(plain);
         let mut dropped = false;
         if self.pushed_all
-            && unsafe {
-                (cb.push_param_change)(host.ctx, self.id, offset, plain, self.from.0, self.from.1)
-            } == 0
+            && !backend.push_param_change(self.id, offset, plain, self.from.0, self.from.1)
         {
             self.pushed_all = false;
             dropped = true;
@@ -266,12 +263,12 @@ impl ParamCursor {
 
     /// Commit the final value when no sub-block apply will, and tell the
     /// edit controller the parameter moved.
-    unsafe fn finish(&self, host: &Host) {
-        let cb = host.reg.cb;
+    fn finish(&self, host: &Host) {
+        let backend = host.backend();
         if let Some(plain) = self.last
-            && !(self.pushed_all && unsafe { (cb.param_is_chunked)(host.ctx, self.id) } != 0)
+            && !(self.pushed_all && backend.param_is_chunked(self.id))
         {
-            unsafe { (cb.param_set_value)(host.ctx, self.id, plain) };
+            backend.param_set_value(self.id, plain);
         }
         if self.last.is_some() {
             host.note_param_change(self.id);
@@ -282,9 +279,9 @@ impl ParamCursor {
     unsafe fn drain(&mut self, host: &Host) -> bool {
         let mut dropped = false;
         while unsafe { self.advance() } {
-            dropped |= unsafe { self.emit(host) };
+            dropped |= self.emit(host);
         }
-        unsafe { self.finish(host) };
+        self.finish(host);
         dropped
     }
 }
@@ -294,12 +291,13 @@ struct NoteCursor<'a> {
     list: Option<ComRef<'a, IEventList>>,
     count: i32,
     next: i32,
-    /// The next event, converted; `None` once the list is exhausted, the
-    /// host refused an event, or the plugin's queue filled.
-    pending: Option<Vst3NativeEvent>,
+    /// The next event, converted, plus any borrowed `SysEx` payload slice valid
+    /// for the duration of this `process` call (`'a`). `None` once the list is
+    /// exhausted, the host refused an event, or the plugin's queue filled.
+    pending: Option<(Vst3NativeEvent, Option<&'a [u8]>)>,
 }
 
-impl NoteCursor<'_> {
+impl<'a> NoteCursor<'a> {
     unsafe fn new(list: *mut IEventList) -> Self {
         let list = unsafe { ComRef::from_raw(list) };
         let mut cursor = Self {
@@ -338,6 +336,7 @@ impl NoteCursor<'_> {
             note_id: -1,
             ..Vst3NativeEvent::default()
         };
+        let mut data: Option<&'a [u8]> = None;
         unsafe {
             match n.kind {
                 NOTE_ON => {
@@ -360,8 +359,16 @@ impl NoteCursor<'_> {
                 DATA => {
                     let e = ev.__field0.data;
                     n.type_id = e.r#type;
-                    n.bytes = e.bytes;
-                    n.len = e.size;
+                    data = if e.size == 0 {
+                        Some(&[])
+                    } else if e.bytes.is_null() {
+                        None
+                    } else {
+                        // SAFETY: VST3 `IEventList` guarantees `e.bytes` points
+                        // to `e.size` readable bytes for the duration of
+                        // `process` (`'a`).
+                        Some(std::slice::from_raw_parts(e.bytes, e.size as usize))
+                    };
                 }
                 POLY_PRESSURE => {
                     let e = ev.__field0.polyPressure;
@@ -379,7 +386,7 @@ impl NoteCursor<'_> {
                 _ => {}
             }
         }
-        self.pending = Some(n);
+        self.pending = Some((n, data));
     }
 }
 
@@ -393,8 +400,190 @@ struct ViewSlot {
     attached: usize,
 }
 
+/// Monotonic, never-reused key for `INSTANCES` registry lookups.
+static NEXT_HOST_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Shared lock-free wake hub referenced by `Host` and by background
+/// `PersistChangeSignal` / `CatalogSignal` / `HostQueue` wake callbacks.
+/// Keeping this state behind an `Arc` lets callbacks run without borrowing
+/// `&Host`, avoiding any aliasing overlap with `&mut Host` inside `Host::drop`.
+#[repr(align(8))]
+struct HostWakes {
+    /// The catalog signal fired; the UI thread takes the changes.
+    catalog_pending: AtomicBool,
+    persist_pending: AtomicBool,
+    closing: AtomicBool,
+    #[cfg(target_os = "linux")]
+    restart_fd: AtomicI32,
+    #[cfg(target_os = "linux")]
+    edit_fd: AtomicI32,
+    #[cfg(target_os = "macos")]
+    main_queue: std::sync::OnceLock<super::wake::macos::MainQueueWake>,
+    #[cfg(target_os = "windows")]
+    message_wake: std::sync::OnceLock<super::wake::windows::MessageWake>,
+    /// Tracked Windows retry worker for failed `PostMessageW` calls on
+    /// `wake_persist`. Cancelled and joined in [`Self::stop_persist_retry`]
+    /// before `MessageWake` drops and frees the DLL module reference.
+    #[cfg(target_os = "windows")]
+    persist_retry_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(target_os = "windows")]
+    persist_retry_cv: std::sync::Condvar,
+}
+
+impl HostWakes {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            catalog_pending: AtomicBool::new(false),
+            persist_pending: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            restart_fd: AtomicI32::new(-1),
+            #[cfg(target_os = "linux")]
+            edit_fd: AtomicI32::new(-1),
+            #[cfg(target_os = "macos")]
+            main_queue: std::sync::OnceLock::new(),
+            #[cfg(target_os = "windows")]
+            message_wake: std::sync::OnceLock::new(),
+            #[cfg(target_os = "windows")]
+            persist_retry_worker: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            persist_retry_cv: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Cancel and join any Windows persist-retry worker before `MessageWake`
+    /// destroys its `HWND` and releases the module handle.
+    #[cfg(target_os = "windows")]
+    fn stop_persist_retry(&self) {
+        let handle = {
+            let mut slot = lock(&self.persist_retry_worker);
+            self.closing.store(true, Ordering::Release);
+            self.persist_retry_cv.notify_all();
+            slot.take()
+        };
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// Schedule a UI-thread flush. Lock-free, so the audio thread may call it.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+        allow(clippy::unused_self)
+    )]
+    fn wake_ui(&self) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let fd = self.restart_fd.load(Ordering::Acquire);
+            let fd = if fd >= 0 {
+                fd
+            } else {
+                self.edit_fd.load(Ordering::Acquire)
+            };
+            if fd >= 0 {
+                super::wake::linux::FdWake::notify_fd(fd);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(q) = self.main_queue.get() {
+            q.signal();
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(w) = self.message_wake.get() {
+            let _ = w.signal();
+        }
+    }
+
+    fn wake_persist(self: &Arc<Self>) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let first = !self.persist_pending.swap(true, Ordering::AcqRel);
+        #[cfg(target_os = "linux")]
+        if first {
+            let fd = self.restart_fd.load(Ordering::Acquire);
+            if fd >= 0 {
+                super::wake::linux::FdWake::notify_fd(fd);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if first && let Some(q) = self.main_queue.get() {
+            q.signal();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = first;
+            // Fast path: immediate `PostMessageW` (coalesced inside `MessageWake`).
+            let Some(w) = self.message_wake.get() else {
+                return;
+            };
+            if w.signal() {
+                return;
+            }
+            // Rare fallback when the UI message queue is momentarily full:
+            // spawn one tracked retry worker joined before `MessageWake` drops
+            // (so no detached thread can outlive DLL unload).
+            let mut slot = lock(&self.persist_retry_worker);
+            if self.closing.load(Ordering::Acquire) {
+                return;
+            }
+            if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+                return;
+            }
+            if let Some(old) = slot.take() {
+                let _ = old.join();
+            }
+            let wakes = Arc::clone(self);
+            match std::thread::Builder::new()
+                .name("moose-vst3-persist-wake-retry".into())
+                .spawn(move || {
+                    loop {
+                        {
+                            let guard = lock(&wakes.persist_retry_worker);
+                            if wakes.closing.load(Ordering::Acquire)
+                                || !wakes.persist_pending.load(Ordering::Acquire)
+                            {
+                                return;
+                            }
+                            let _ = wakes
+                                .persist_retry_cv
+                                .wait_timeout(guard, std::time::Duration::from_millis(10));
+                        }
+                        if wakes.closing.load(Ordering::Acquire)
+                            || !wakes.persist_pending.load(Ordering::Acquire)
+                            || wakes.message_wake.get().is_none_or(|w| w.signal())
+                        {
+                            return;
+                        }
+                    }
+                }) {
+                Ok(handle) => {
+                    *slot = Some(handle);
+                }
+                Err(_) => {
+                    // Thread creation failed: leave `slot` empty so a future
+                    // signal can retry, and make a bounded inline attempt now.
+                    drop(slot);
+                    for _ in 0..3 {
+                        std::thread::yield_now();
+                        if w.signal() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let _ = first;
+    }
+}
+
 pub(crate) struct Host {
-    pub ctx: *mut c_void,
+    pub id: usize,
+    backend: Option<Box<dyn Vst3Backend>>,
     pub reg: &'static Registration,
     config: UnsafeCell<Config>,
     scratch: UnsafeCell<Scratch>,
@@ -408,8 +597,6 @@ pub(crate) struct Host {
     /// A change that may move `presentation_revision` happened; the UI
     /// thread compares it once.
     presentation_check: AtomicBool,
-    /// The catalog signal fired; the UI thread takes the changes.
-    catalog_pending: AtomicBool,
     param_list: Mutex<ParamList>,
     /// Dedicated non-colliding parameter ID for the root unit's
     /// `kIsProgramChange` selector, exposed only when `program_list` is
@@ -421,7 +608,6 @@ pub(crate) struct Host {
     in_perform_edit: AtomicBool,
     persist_wanted: bool,
     persist_bound: AtomicBool,
-    persist_pending: AtomicBool,
     /// A `MARK_DIRTY` raised before `setComponentHandler` installed a handler.
     dirty_pending: AtomicBool,
     edits: Mutex<Edits>,
@@ -429,25 +615,17 @@ pub(crate) struct Host {
     #[cfg(target_os = "linux")]
     persist_wake: Mutex<Option<super::wake::linux::FdWake>>,
     #[cfg(target_os = "linux")]
-    restart_fd: AtomicI32,
-    #[cfg(target_os = "linux")]
-    edit_fd: AtomicI32,
-    #[cfg(target_os = "linux")]
     timer: Mutex<Option<super::wake::linux::TimerWake>>,
     /// The host context (factory `setHostContext`, else `initialize`), for
     /// `IWaylandHost`.
     #[cfg(target_os = "linux")]
     context: std::sync::OnceLock<ComPtr<FUnknown>>,
-    #[cfg(target_os = "macos")]
-    main_queue: std::sync::OnceLock<super::wake::macos::MainQueueWake>,
-    #[cfg(target_os = "windows")]
-    message_wake: std::sync::OnceLock<super::wake::windows::MessageWake>,
+    wakes: Arc<HostWakes>,
 }
 
-// SAFETY: `ctx` is the Rust plugin instance, built for cross-thread use by
-// the callback table. `config` follows the VST3 threading contract (written
-// only while inactive). `scratch` is touched only by `process` and
-// `setupProcessing`, which the host never overlaps. The view slot's raw
+// SAFETY: `backend` is `Send + Sync`. `config` follows the VST3 threading
+// contract (written only while inactive). `scratch` is touched only by `process`
+// and `setupProcessing`, which the host never overlaps. The view slot's raw
 // pointer is only dereferenced on the UI thread.
 unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
@@ -458,11 +636,10 @@ thread_local! {
     static PROCESSING: Cell<*const Host> = const { Cell::new(std::ptr::null()) };
 }
 
-/// Audio-thread restart request: sets bits for the UI thread to send.
 /// Flag a `restartComponent` for the UI thread. Lock-free on the audio
 /// thread (inside `process`); other threads find the instance through the
 /// registry.
-pub(super) fn mark_restart(ctx: *mut c_void, flags: i32) {
+pub(super) fn mark_restart(host_id: usize, flags: i32) {
     let flag = |host: &Host| {
         host.pending_restart.fetch_or(flags, Ordering::Release);
         // A state load can rename parameters too.
@@ -472,11 +649,11 @@ pub(super) fn mark_restart(ctx: *mut c_void, flags: i32) {
     // SAFETY: set only for the duration of `Host::process`.
     let on_audio = PROCESSING.with(|current| {
         unsafe { current.get().as_ref() }
-            .filter(|h| h.ctx == ctx)
+            .filter(|h| h.id == host_id)
             .map(flag)
     });
     if on_audio.is_none()
-        && let Some(host) = super::pin(ctx)
+        && let Some(host) = super::pin(host_id)
     {
         flag(&host);
         // A UI-thread caller (setState, the editor) delivers right away.
@@ -486,41 +663,33 @@ pub(super) fn mark_restart(ctx: *mut c_void, flags: i32) {
     }
 }
 
-/// Schedule a UI-thread drain of `HostQueue` through a borrowed `Host`
-/// pointer. Never pins `Arc<Host>`, never drops `Host`, and never drains
-/// synchronously — so a wake running on a background thread during teardown
-/// can never run `Host::drop` -> `HostQueue::close()` and self-deadlock.
+/// Schedule a UI-thread drain of `HostQueue` through the separately heap-owned
+/// [`HostWakes`] pointer bound by `Host::new`. Never borrows `&Host` (avoiding
+/// any aliasing overlap with `&mut Host` inside `Host::drop`), never pins
+/// `Arc<Host>`, never drops `Host`, and is lock-free on the audio thread.
 ///
 /// # Safety
-/// `host` is a live `Host` pointer bound by `Host::new`; `Host::drop` closes
-/// `HostQueue` (joining every in-flight call) before tearing down `Host` or
-/// its OS wakes.
-pub(super) unsafe fn wake_host_queue(host: *mut c_void) {
-    let Some(host) = (unsafe { host.cast::<Host>().as_ref() }) else {
+/// `host` must be null or the opaque [`HostWakes`] pointer cast to
+/// `*const Host` by `Host::new`; `Host::drop` closes `HostQueue` (joining
+/// every in-flight call) before mutating or dropping `HostWakes` / OS wakes.
+pub(super) unsafe fn wake_host_queue(host: *const Host) {
+    let Some(wakes) = (unsafe { host.cast::<HostWakes>().as_ref() }) else {
         return;
     };
-    let on_audio = PROCESSING.with(|current| current.get() == std::ptr::from_ref(host));
-    host.wake_ui();
-    if !on_audio {
-        #[cfg(target_os = "linux")]
-        if host.restart_fd.load(Ordering::Acquire) < 0 {
-            let e = lock(&host.edits);
-            host.wake_edits(&e);
-        }
-    }
+    wakes.wake_ui();
 }
 
 /// Drain the instance's `HostQueue` on the UI thread, or wake the UI thread
 /// when called off it. Lock-free on the audio thread.
-pub(super) fn flush_host_queue(ctx: *mut c_void) {
+pub(super) fn flush_host_queue(host_id: usize) {
     // SAFETY: set only for the duration of `Host::process`.
     let on_audio = PROCESSING.with(|current| {
         unsafe { current.get().as_ref() }
-            .filter(|h| h.ctx == ctx)
+            .filter(|h| h.id == host_id)
             .map(Host::wake_ui)
     });
     if on_audio.is_none()
-        && let Some(host) = super::pin(ctx)
+        && let Some(host) = super::pin(host_id)
     {
         let can_deliver = {
             let e = lock(&host.edits);
@@ -544,10 +713,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn default_active_mask(count: u32, kinds: *const u8) -> u32 {
-    (0..count.min(32))
-        .filter(|&i| kinds.is_null() || unsafe { *kinds.add(i as usize) } == 0)
-        .fold(0, |mask, i| mask | (1 << i))
+fn default_active_mask(kinds: &[u8]) -> u32 {
+    kinds
+        .iter()
+        .take(32)
+        .enumerate()
+        .filter(|&(_, &k)| k == 0)
+        .fold(0, |mask, (i, _)| mask | (1 << i))
 }
 
 /// Canonical `SpeakerArrangement` per channel count; the popcount fallback
@@ -575,14 +747,21 @@ const fn speaker_arrangement(channels: u32) -> u64 {
 
 fn refresh_bus_channels(reg: &Registration, cfg: &mut Config) {
     for (b, w) in cfg.in_bus_channels.iter_mut().enumerate() {
-        *w = unsafe { (reg.cb.layout_bus_channels)(cfg.layout, 0, b as u32) };
+        *w = reg.factory.layout_bus_channels(cfg.layout, false, b as u32);
     }
     for (b, w) in cfg.out_bus_channels.iter_mut().enumerate() {
-        *w = unsafe { (reg.cb.layout_bus_channels)(cfg.layout, 1, b as u32) };
+        *w = reg.factory.layout_bus_channels(cfg.layout, true, b as u32);
     }
 }
 
 impl Host {
+    #[inline]
+    pub(crate) fn backend(&self) -> &dyn Vst3Backend {
+        self.backend
+            .as_deref()
+            .expect("Vst3Backend lives for the lifetime of Host")
+    }
+
     /// A new instance, or `None` when the plugin's constructor failed.
     pub(super) fn new(
         reg: &'static Registration,
@@ -592,12 +771,9 @@ impl Host {
         )]
         factory_run_loop: Option<ComPtr<vst3::Steinberg::Linux::IRunLoop>>,
     ) -> Option<Arc<Self>> {
-        let desc = reg.desc;
-        let cb = reg.cb;
-        let ctx = unsafe { (cb.create)() };
-        if ctx.is_null() {
-            return None;
-        }
+        let desc = &reg.desc;
+        let backend = reg.factory.create()?;
+        let id = NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed);
         let mut config = Config {
             sample_rate: 44100.0,
             max_frames: 1024,
@@ -606,12 +782,15 @@ impl Host {
             layout: 0,
             total_in: desc.num_inputs,
             total_out: desc.num_outputs,
-            in_bus_channels: vec![0; desc.num_input_buses as usize],
-            out_bus_channels: vec![0; desc.num_output_buses as usize],
+            in_bus_channels: vec![0; desc.input_bus_kinds.len()],
+            out_bus_channels: vec![0; desc.output_bus_kinds.len()],
         };
         refresh_bus_channels(reg, &mut config);
+        let presentation_revision = backend.param_presentation_revision();
+        let persist_wanted = backend.wants_persist_notifications();
         let host = Arc::new(Self {
-            ctx,
+            id,
+            backend: Some(backend),
             reg,
             config: UnsafeCell::new(config),
             scratch: UnsafeCell::new(Scratch {
@@ -622,28 +801,20 @@ impl Host {
                 param_cursors: Vec::with_capacity(reg.params.len() + PARAM_CURSOR_SLACK),
                 param_heap: BinaryHeap::with_capacity(reg.params.len() + PARAM_CURSOR_SLACK),
             }),
-            in_active: AtomicU32::new(default_active_mask(
-                desc.num_input_buses,
-                desc.input_bus_kinds,
-            )),
-            out_active: AtomicU32::new(default_active_mask(
-                desc.num_output_buses,
-                desc.output_bus_kinds,
-            )),
+            in_active: AtomicU32::new(default_active_mask(&desc.input_bus_kinds)),
+            out_active: AtomicU32::new(default_active_mask(&desc.output_bus_kinds)),
             handler: Mutex::new(None),
             has_handler3: AtomicBool::new(false),
             in_drain_queue: AtomicBool::new(false),
             pending_restart: AtomicI32::new(0),
-            presentation_revision: AtomicU64::new(unsafe { (cb.param_presentation_revision)(ctx) }),
+            presentation_revision: AtomicU64::new(presentation_revision),
             presentation_check: AtomicBool::new(false),
-            catalog_pending: AtomicBool::new(false),
             param_list: Mutex::new(ParamList::All),
             program_change_id: allocate_program_change_id(reg),
             selected_program: AtomicI32::new(0),
             in_perform_edit: AtomicBool::new(false),
-            persist_wanted: unsafe { (cb.wants_persist_notifications)(ctx) },
+            persist_wanted,
             persist_bound: AtomicBool::new(false),
-            persist_pending: AtomicBool::new(false),
             dirty_pending: AtomicBool::new(false),
             edits: Mutex::new(Edits {
                 #[cfg(target_os = "linux")]
@@ -654,89 +825,59 @@ impl Host {
             #[cfg(target_os = "linux")]
             persist_wake: Mutex::new(None),
             #[cfg(target_os = "linux")]
-            restart_fd: AtomicI32::new(-1),
-            #[cfg(target_os = "linux")]
-            edit_fd: AtomicI32::new(-1),
-            #[cfg(target_os = "linux")]
             timer: Mutex::new(None),
             #[cfg(target_os = "linux")]
             context: std::sync::OnceLock::new(),
-            #[cfg(target_os = "macos")]
-            main_queue: std::sync::OnceLock::new(),
-            #[cfg(target_os = "windows")]
-            message_wake: std::sync::OnceLock::new(),
+            wakes: HostWakes::new(),
         });
         super::register_instance(&host);
-        // Instances are created on the host UI thread, so these wakes bind
-        // to it.
+        // Instances are created on the host UI thread, so these wakes bind to it.
         #[cfg(target_os = "macos")]
-        if let Some(q) = super::wake::macos::MainQueueWake::new(ctx, main_queue_event) {
-            let _ = host.main_queue.set(q);
+        if let Some(q) = super::wake::macos::MainQueueWake::new(id as *mut c_void, main_queue_event)
+        {
+            let _ = host.wakes.main_queue.set(q);
         }
         #[cfg(target_os = "windows")]
-        if let Some(w) = super::wake::windows::MessageWake::new(ctx, win_message_event) {
-            let _ = host.message_wake.set(w);
+        if let Some(w) =
+            super::wake::windows::MessageWake::new(id as *mut c_void, win_message_event)
+        {
+            let _ = host.wakes.message_wake.set(w);
         }
         #[cfg(target_os = "linux")]
         if let Some(rl) = factory_run_loop {
             host.bind_persist_run_loop(rl);
         }
         host.bind_persist_signal();
-        // The host hasn't read the list yet: changes from construction are
-        // already in it.
-        let _ = unsafe { (cb.take_catalog_changes)(ctx) };
-        let me = Arc::as_ptr(&host).cast_mut().cast();
-        unsafe { (cb.bind_host_queue)(ctx, me) };
-        unsafe { (cb.set_catalog_waker)(ctx, Some(Self::wake_catalog), me) };
-        // Drain any `HostNotice` raised synchronously during `hooks.connect`
-        // inside `cb_create` before `Host` was bound.
+        // The host hasn't read the list yet: changes from construction are already in it.
+        let _ = host.backend().take_catalog_changes();
+        // SAFETY: pass the separately heap-owned `HostWakes` pointer (opaque
+        // `*const Host` token); `Host::drop` closes and joins `host_queue`
+        // before mutating or dropping `self.wakes`, and `wake_host_queue` never
+        // constructs `&Host` (zero aliasing with `&mut Host` in `Host::drop`).
+        unsafe {
+            host.backend()
+                .bind_host_queue(id, Some(Arc::as_ptr(&host.wakes).cast::<Host>()));
+        };
+        let catalog_wakes = Arc::clone(&host.wakes);
+        host.backend().set_catalog_waker(Some(Box::new(move || {
+            catalog_wakes.catalog_pending.store(true, Ordering::Release);
+            catalog_wakes.wake_ui();
+        })));
+        // Drain any `HostNotice` raised synchronously during `hooks.connect`.
         host.drain_host_queue();
         host.flush_pending_restart();
         Some(host)
     }
 
     /// Schedule a UI-thread flush. Lock-free, so the audio thread may call it.
-    // `self` holds the wake on Linux and macOS.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-        allow(clippy::unused_self)
-    )]
     fn wake_ui(&self) {
-        #[cfg(target_os = "linux")]
-        {
-            let fd = self.restart_fd.load(Ordering::Acquire);
-            let fd = if fd >= 0 {
-                fd
-            } else {
-                self.edit_fd.load(Ordering::Acquire)
-            };
-            if fd >= 0 {
-                super::wake::linux::FdWake::notify_fd(fd);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        if let Some(q) = self.main_queue.get() {
-            q.signal();
-        }
-        #[cfg(target_os = "windows")]
-        if let Some(w) = self.message_wake.get() {
-            w.signal();
-        }
-    }
-
-    /// The parameter set's `CatalogSignal` wake. Any non-audio thread.
-    unsafe extern "C" fn wake_catalog(context: *mut c_void) {
-        // SAFETY: `context` is this `Host`, bound in `new`; `drop` unbinds
-        // it first, which waits for a running wake.
-        let host = unsafe { &*context.cast::<Self>() };
-        host.catalog_pending.store(true, Ordering::Release);
-        host.wake_ui();
+        self.wakes.wake_ui();
     }
 
     /// A processed or host-set change to `id`: if it can rename parameters,
     /// have the UI thread compare the presentation revision. Audio-safe.
     fn note_param_change(&self, id: u32) {
-        if unsafe { (self.reg.cb.param_affects_presentation)(self.ctx, id) } {
+        if self.backend().param_affects_presentation(id) {
             self.check_presentation();
         }
     }
@@ -749,7 +890,7 @@ impl Host {
 
     pub(super) fn drain_host_queue(&self) {
         if !self.in_drain_queue.swap(true, Ordering::AcqRel) {
-            unsafe { (self.reg.cb.drain_host_queue)(self.ctx) };
+            self.backend().drain_host_queue();
             self.in_drain_queue.store(false, Ordering::Release);
         }
     }
@@ -758,18 +899,12 @@ impl Host {
 
     /// Indices of the parameters a dynamic-list host should see. UI thread.
     fn available_params(&self) -> Vec<usize> {
-        let mut title = [0 as c_char; 512];
+        let backend = self.backend();
         (0..self.reg.params.len())
             .filter(|&i| {
-                let bits = unsafe {
-                    (self.reg.cb.param_presentation)(
-                        self.ctx,
-                        self.reg.params[i].id,
-                        title.as_mut_ptr(),
-                        512,
-                    )
-                };
-                bits < 0 || bits & PRESENTATION_UNAVAILABLE == 0
+                backend
+                    .param_presentation(self.reg.params[i].id)
+                    .is_none_or(|p| !p.unavailable)
             })
             .collect()
     }
@@ -847,11 +982,12 @@ impl Host {
         }
         #[cfg(target_os = "macos")]
         {
-            self.main_queue.get().is_none() || super::wake::macos::on_main_thread()
+            self.wakes.main_queue.get().is_none() || super::wake::macos::on_main_thread()
         }
         #[cfg(target_os = "windows")]
         {
-            self.message_wake
+            self.wakes
+                .message_wake
                 .get()
                 .is_none_or(|w| w.thread == std::thread::current().id())
         }
@@ -871,18 +1007,18 @@ impl Host {
         if let Some(w) = &edits.wake {
             w.notify();
         } else {
-            let fd = self.restart_fd.load(Ordering::Acquire);
+            let fd = self.wakes.restart_fd.load(Ordering::Acquire);
             if fd >= 0 {
                 super::wake::linux::FdWake::notify_fd(fd);
             }
         }
         #[cfg(target_os = "macos")]
-        if let Some(q) = self.main_queue.get() {
+        if let Some(q) = self.wakes.main_queue.get() {
             q.signal();
         }
         #[cfg(target_os = "windows")]
-        if let Some(w) = self.message_wake.get() {
-            w.signal();
+        if let Some(w) = self.wakes.message_wake.get() {
+            let _ = w.signal();
         }
     }
 
@@ -1121,7 +1257,7 @@ impl Host {
         let Some(menu) = (unsafe { ComPtr::from_raw(raw_menu) }) else {
             return;
         };
-        let Some(host_arc) = super::pin(self.ctx) else {
+        let Some(host_arc) = super::pin(self.id) else {
             return;
         };
         let target_com = ComWrapper::new(ContextMenuTarget {
@@ -1208,11 +1344,10 @@ impl Host {
         };
         self.flush_dirty();
         self.flush_persist_change();
-        let cb = self.reg.cb;
+        let backend = self.backend();
         let mut check = self.presentation_check.swap(false, Ordering::AcqRel);
-        if self.catalog_pending.swap(false, Ordering::AcqRel) {
-            let changes =
-                CatalogChange::from_bits_truncate(unsafe { (cb.take_catalog_changes)(self.ctx) });
+        if self.wakes.catalog_pending.swap(false, Ordering::AcqRel) {
+            let changes = CatalogChange::from_bits_truncate(backend.take_catalog_changes());
             let support = self.dynamic_support();
             if changes.contains(CatalogChange::STRUCTURE) {
                 self.relist_params();
@@ -1222,7 +1357,7 @@ impl Host {
             check = true;
         }
         if check {
-            let revision = unsafe { (cb.param_presentation_revision)(self.ctx) };
+            let revision = backend.param_presentation_revision();
             if self.presentation_revision.swap(revision, Ordering::AcqRel) != revision {
                 let mut flags = RestartFlags_::kParamTitlesChanged as i32;
                 if self.relist_params() {
@@ -1237,27 +1372,6 @@ impl Host {
         }
     }
 
-    unsafe extern "C" fn wake_persist(context: *mut c_void) {
-        let host = unsafe { &*context.cast::<Self>() };
-        // Already pending: a wake is on its way. Windows: the thread timer
-        // drains on its next tick.
-        let first = !host.persist_pending.swap(true, Ordering::AcqRel);
-        #[cfg(target_os = "linux")]
-        if first && let Some(w) = lock(&host.persist_wake).as_ref() {
-            w.notify();
-        }
-        #[cfg(target_os = "macos")]
-        if first && let Some(q) = host.main_queue.get() {
-            q.signal();
-        }
-        #[cfg(target_os = "windows")]
-        if first && let Some(w) = host.message_wake.get() {
-            w.signal();
-        }
-        #[cfg(target_os = "windows")]
-        let _ = first;
-    }
-
     fn bind_persist_signal(&self) {
         if !self.persist_wanted || self.persist_bound.load(Ordering::Acquire) {
             return;
@@ -1265,16 +1379,18 @@ impl Host {
         #[cfg(target_os = "linux")]
         let ready = lock(&self.persist_wake).is_some();
         #[cfg(target_os = "macos")]
-        let ready = self.main_queue.get().is_some();
+        let ready = self.wakes.main_queue.get().is_some();
         #[cfg(target_os = "windows")]
-        let ready = self.message_wake.get().is_some();
+        let ready = self.wakes.message_wake.get().is_some();
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         let ready = false;
         if !ready || self.persist_bound.swap(true, Ordering::AcqRel) {
             return;
         }
-        let me = std::ptr::from_ref(self).cast_mut().cast();
-        unsafe { (self.reg.cb.set_persist_waker)(self.ctx, Some(Self::wake_persist), me) };
+        let wakes = Arc::clone(&self.wakes);
+        self.backend().set_persist_waker(Some(Box::new(move || {
+            wakes.wake_persist();
+        })));
     }
 
     /// Deliver a `MARK_DIRTY` that arrived before an `IComponentHandler2` existed.
@@ -1298,14 +1414,13 @@ impl Host {
             return;
         };
         if self.persist_bound.load(Ordering::Acquire)
-            && !self.persist_pending.swap(false, Ordering::AcqRel)
+            && !self.wakes.persist_pending.swap(false, Ordering::AcqRel)
         {
             return;
         }
-        let (mut id, mut value) = (0u32, 0f64);
-        if !unsafe { (self.reg.cb.take_persist_change)(self.ctx, &raw mut id, &raw mut value) } {
+        let Some((id, value)) = self.backend().take_persist_change() else {
             return;
-        }
+        };
         unsafe {
             handler.beginEdit(id);
             self.in_perform_edit.store(true, Ordering::Relaxed);
@@ -1330,7 +1445,7 @@ impl Host {
             Host::on_instance_wake,
         );
         if let Some(wake) = slot.as_ref() {
-            self.restart_fd.store(wake.fd(), Ordering::Release);
+            self.wakes.restart_fd.store(wake.fd(), Ordering::Release);
         }
         drop(slot);
         self.bind_persist_signal();
@@ -1358,7 +1473,7 @@ impl Host {
         // the detach batch.
         let old = {
             let mut e = self.drain_locked(lock(&self.edits), true);
-            self.edit_fd.store(-1, Ordering::Release);
+            self.wakes.edit_fd.store(-1, Ordering::Release);
             e.wake.take()
         };
         drop(old);
@@ -1371,7 +1486,7 @@ impl Host {
             e.ui_thread = Some(std::thread::current().id());
         }
         if let Some(wake) = FdWake::bind(rl.clone(), Arc::downgrade(self), Host::on_ui_tick) {
-            self.edit_fd.store(wake.fd(), Ordering::Release);
+            self.wakes.edit_fd.store(wake.fd(), Ordering::Release);
             let mut e = lock(&self.edits);
             e.wake = Some(wake);
             if !e.pending.is_empty() {
@@ -1506,7 +1621,7 @@ impl Host {
 
         let mut notes = unsafe { NoteCursor::new(events) };
         loop {
-            let note_offset = notes.pending.as_ref().map(|n| n.sample_offset);
+            let note_offset = notes.pending.as_ref().map(|(n, _)| n.sample_offset);
             let next_param = heap.peek().map(|&Reverse(key)| key);
             let take_note = match (note_offset, next_param) {
                 (None, None) => break,
@@ -1515,23 +1630,23 @@ impl Host {
                 (None, Some(_)) => false,
             };
             if take_note {
-                let Some(event) = notes.pending.take() else {
+                let Some((event, data)) = notes.pending.take() else {
                     break;
                 };
                 // Actual exhaustion ends the note prefix. A reserve refusal
                 // drops the whole pair but continues to later exact-only events.
                 // Parameter points continue using their reserved headroom.
-                let status = unsafe { (self.reg.cb.push_input_event)(self.ctx, &raw const event) };
+                let status = self.backend().push_input_event(&event, data);
                 if status != OUTPUT_QUEUE_FULL {
                     unsafe { notes.advance() };
                 }
             } else if let Some(Reverse((_, index))) = heap.pop() {
                 let cursor = &mut cursors[index as usize];
-                dropped |= unsafe { cursor.emit(self) };
+                dropped |= cursor.emit(self);
                 if unsafe { cursor.advance() } {
                     heap.push(Reverse((cursor.pending.0, index)));
                 } else {
-                    unsafe { cursor.finish(self) };
+                    cursor.finish(self);
                 }
             }
         }
@@ -1549,7 +1664,7 @@ impl Host {
         let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
             return;
         };
-        let cb = self.reg.cb;
+        let backend = self.backend();
         for i in 0..unsafe { changes.getParameterCount() } {
             let Some(queue) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else {
                 continue;
@@ -1561,9 +1676,8 @@ impl Host {
                     == kResultOk
             {
                 let id = unsafe { queue.getParameterId() };
-                unsafe {
-                    (cb.param_set_value)(self.ctx, id, (cb.param_denormalize)(self.ctx, id, value));
-                };
+                let plain = backend.param_denormalize(id, value);
+                backend.param_set_value(id, plain);
             }
         }
     }
@@ -1574,8 +1688,8 @@ impl Host {
         let sig = has(kTimeSigValid);
         let cycle = has(kCycleValid);
         Vst3Transport {
-            playing: i32::from(has(kPlaying)),
-            recording: i32::from(has(kRecording)),
+            playing: has(kPlaying),
+            recording: has(kRecording),
             tempo: if has(kTempoValid) { ctx.tempo } else { 120.0 },
             time_sig_num: if sig { ctx.timeSigNumerator } else { 4 },
             time_sig_den: if sig { ctx.timeSigDenominator } else { 4 },
@@ -1592,22 +1706,20 @@ impl Host {
             },
             cycle_start_beats: if cycle { ctx.cycleStartMusic } else { 0.0 },
             cycle_end_beats: if cycle { ctx.cycleEndMusic } else { 0.0 },
-            // kCycleActive is "loop engaged"; kCycleValid only says the
-            // markers are readable.
-            cycle_active: i32::from(has(kCycleActive)),
+            cycle_active: has(kCycleActive),
         }
     }
 
     /// Hand the plugin's output events to the host list in global order.
     /// Note-id bookkeeping is committed only after the host accepted each.
     unsafe fn drain_output_events(&self, list: *mut IEventList) -> u32 {
-        let cb = self.reg.cb;
+        let backend = self.backend();
         let list = unsafe { ComRef::from_raw(list) };
         let mut result = OUTPUT_END;
-        unsafe { (cb.begin_output_events)(self.ctx) };
+        backend.begin_output_events();
         loop {
             let mut n = Vst3NativeEvent::default();
-            match unsafe { (cb.next_output_event)(self.ctx, &raw mut n) } {
+            match backend.next_output_event(&mut n) {
                 OUTPUT_END => return result,
                 OUTPUT_EMITTED => {}
                 code @ (OUTPUT_UNSUPPORTED | OUTPUT_INVALID | OUTPUT_QUEUE_FULL) => return code,
@@ -1677,7 +1789,7 @@ impl Host {
             if unsafe { list.addEvent(&raw mut ev) } != kResultOk {
                 return OUTPUT_QUEUE_FULL;
             }
-            unsafe { (cb.commit_output_event)(self.ctx) };
+            backend.commit_output_event();
             result = OUTPUT_EMITTED;
         }
     }
@@ -1693,11 +1805,10 @@ impl Host {
         let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
             return result;
         };
-        let cb = self.reg.cb;
+        let backend = self.backend();
         for i in 0..count {
-            let (mut id, mut offset, mut value) = (0u32, 0i32, 0f64);
-            unsafe {
-                (cb.get_output_param)(self.ctx, i, &raw mut id, &raw mut offset, &raw mut value);
+            let Some((id, offset, value)) = backend.output_param(i) else {
+                continue;
             };
             let mut index = 0;
             let queue = unsafe { changes.addParameterData(&raw const id, &raw mut index) };
@@ -1716,27 +1827,21 @@ impl Host {
 
     #[allow(clippy::too_many_lines)]
     unsafe fn process(&self, data: &mut ProcessData) -> tresult {
-        let cb = self.reg.cb;
-        let desc = self.reg.desc;
+        let backend = self.backend();
+        let desc = &self.reg.desc;
         let cfg = self.config();
         // Never reinterpret buffers at a width other than the negotiated one.
         if data.symbolicSampleSize != cfg.sample_size {
             return kResultFalse;
         }
-        // A parameter flush: no audio buses at all on a plugin that has
-        // them (Live sends these with nonzero numSamples for suspended
-        // devices). A pure-MIDI plugin legitimately processes this shape.
         let suspended_flush = (desc.num_inputs > 0 || desc.num_outputs > 0)
             && data.numInputs == 0
             && data.numOutputs == 0;
         let will_process = data.numSamples > 0 && !suspended_flush;
         let frames = data.numSamples.max(0) as u32;
 
-        // Notes and automation interleave by sample offset; each has its own
-        // capacity (the plugin side reserves event-list headroom for
-        // parameter points). Automation can still exceed that capacity.
         if will_process {
-            unsafe { (cb.begin_input_events)(self.ctx, frames) };
+            backend.begin_input_events(frames);
         }
         let dropped = unsafe {
             self.ingest_inputs(data.inputEvents, data.inputParameterChanges, will_process)
@@ -1751,9 +1856,6 @@ impl Host {
         let in_active = self.in_active.load(Ordering::Acquire);
         let out_active = self.out_active.load(Ordering::Acquire);
 
-        // Flatten every declared bus at its negotiated width, in bus order.
-        // Inactive or missing channels keep their position as null and are
-        // filled from scratch below.
         let num_in = gather(
             data.inputs,
             data.numInputs,
@@ -1774,8 +1876,6 @@ impl Host {
         );
         let (mut num_in, mut num_out) = (num_in, num_out);
 
-        // Missing inputs read shared silence; missing outputs write their own
-        // discard block. Skipped if the host overruns its declared block size.
         if frames <= cfg.max_frames {
             let max_frames = cfg.max_frames as usize;
             if !scratch.silence.is_empty() {
@@ -1819,43 +1919,36 @@ impl Host {
             }
         }
 
-        let transport_ptr = transport
-            .as_ref()
-            .map_or(std::ptr::null(), std::ptr::from_ref);
-        let process = if use64 { cb.process_f64 } else { cb.process };
+        let mut args = ProcessArgs {
+            inputs: &scratch.in_ptrs[..num_in],
+            outputs: &mut scratch.out_ptrs[..num_out],
+            in_bus_channels: &cfg.in_bus_channels,
+            in_bus_active: in_active,
+            out_bus_channels: &cfg.out_bus_channels,
+            out_bus_active: out_active,
+            num_frames: frames,
+            transport: transport.as_ref(),
+            process_mode: data.processMode,
+        };
         PROCESSING.with(|p| p.set(self));
-        let ok = unsafe {
-            process(
-                self.ctx,
-                scratch.in_ptrs.as_ptr(),
-                scratch.out_ptrs.as_mut_ptr(),
-                num_in as u32,
-                num_out as u32,
-                cfg.in_bus_channels.as_ptr(),
-                desc.num_input_buses,
-                in_active,
-                cfg.out_bus_channels.as_ptr(),
-                desc.num_output_buses,
-                out_active,
-                frames,
-                transport_ptr,
-                data.processMode,
-            )
+        let ok = if use64 {
+            unsafe { backend.process_f64(&mut args) }
+        } else {
+            unsafe { backend.process_f32(&mut args) }
         };
         PROCESSING.with(|p| p.set(std::ptr::null()));
         if dropped {
             unsafe { self.commit_final_values(data.inputParameterChanges) };
         }
 
-        if ok == 0 {
-            unsafe { (cb.finish_output_events)(self.ctx, OUTPUT_INVALID) };
+        if !ok {
+            backend.finish_output_events(OUTPUT_INVALID);
             return kResultOk;
         }
 
-        // Rendered audio is not silent; clear the host's previous flags.
         if !data.outputs.is_null() {
             let buses =
-                (desc.num_output_buses.min(32) as usize).min(data.numOutputs.max(0) as usize);
+                (desc.num_output_buses().min(32) as usize).min(data.numOutputs.max(0) as usize);
             for b in 0..buses {
                 if out_active & (1 << b) != 0 {
                     unsafe { (*data.outputs.add(b)).silenceFlags = 0 };
@@ -1863,7 +1956,7 @@ impl Host {
             }
         }
 
-        let out_params = unsafe { (cb.get_output_param_count)(self.ctx) };
+        let out_params = backend.output_param_count();
         let mut result = unsafe { self.drain_output_events(data.outputEvents) };
         if out_params > 0 && matches!(result, OUTPUT_END | OUTPUT_EMITTED) {
             result = if data.outputParameterChanges.is_null() {
@@ -1872,7 +1965,7 @@ impl Host {
                 unsafe { self.write_output_params(data.outputParameterChanges, out_params, result) }
             };
         }
-        unsafe { (cb.finish_output_events)(self.ctx, result) };
+        backend.finish_output_events(result);
         kResultOk
     }
 
@@ -1929,18 +2022,19 @@ impl Drop for Host {
     fn drop(&mut self) {
         // No new editor call can find this instance; one already inside
         // holds an `Arc`, so none is running.
-        super::unregister_instance(self.ctx);
-        let cb = self.reg.cb;
-        // Joins a running catalog wake, which points at `self`.
-        unsafe { (cb.set_catalog_waker)(self.ctx, None, std::ptr::null_mut()) };
-        if self.persist_bound.load(Ordering::Acquire) {
-            // Joins any worker wake before the wakes go away.
-            unsafe { (cb.set_persist_waker)(self.ctx, None, std::ptr::null_mut()) };
+        super::unregister_instance(self.id);
+        self.wakes.closing.store(true, Ordering::Release);
+        if let Some(backend) = self.backend.as_deref() {
+            // Unbinds and joins catalog/persist wakers (which share `Arc<HostWakes>`,
+            // never `&Host`).
+            backend.set_catalog_waker(None);
+            if self.persist_bound.load(Ordering::Acquire) {
+                backend.set_persist_waker(None);
+            }
+            // Closes `HostQueue` and joins any in-flight `wake_host_queue` while
+            // `self` and its OS wakes are still alive.
+            unsafe { backend.bind_host_queue(0, None) };
         }
-        // Closes `HostQueue` and joins any in-flight `wake_host_queue` while
-        // `self` and its OS wakes are still alive. Because `wake_host_queue`
-        // never pins `Arc<Host>`, it cannot re-enter `Host::drop` here.
-        unsafe { (cb.bind_host_queue)(self.ctx, std::ptr::null_mut()) };
         // Queued editor calls go out while the handler is still held, if
         // this thread may make them (the last reference can be a worker's).
         {
@@ -1958,33 +2052,50 @@ impl Drop for Host {
             e.closed = true;
             e.pending.clear();
             #[cfg(target_os = "linux")]
-            drop(e.wake.take());
+            {
+                self.wakes.edit_fd.store(-1, Ordering::Release);
+                drop(e.wake.take());
+            }
         }
         #[cfg(target_os = "linux")]
         {
+            self.wakes.restart_fd.store(-1, Ordering::Release);
             lock(&self.persist_wake).take();
             lock(&self.timer).take();
         }
         #[cfg(target_os = "macos")]
-        drop(self.main_queue.take());
+        if let Some(wakes) = Arc::get_mut(&mut self.wakes) {
+            drop(wakes.main_queue.take());
+        }
         #[cfg(target_os = "windows")]
-        drop(self.message_wake.take());
+        {
+            // Cancel and join any persist-retry worker BEFORE destroying
+            // `MessageWake` and releasing the DLL module reference.
+            self.wakes.stop_persist_retry();
+            if let Some(wakes) = Arc::get_mut(&mut self.wakes) {
+                drop(wakes.message_wake.take());
+            }
+        }
         lock(&self.handler).take();
-        unsafe { (cb.destroy)(self.ctx) };
+        if let Some(backend) = self.backend.take() {
+            // Firewall panics during plugin/editor teardown so they cannot
+            // unwind across COM `IUnknown::release`.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(backend)));
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn main_queue_event(ctx: *mut c_void) {
-    if let Some(host) = super::pin(ctx) {
+    if let Some(host) = super::pin(ctx as usize) {
         host.on_ui_tick();
     }
 }
 
 #[cfg(target_os = "windows")]
 fn win_message_event(ctx: *mut c_void) {
-    if let Some(host) = super::pin(ctx) {
-        if let Some(w) = host.message_wake.get() {
+    if let Some(host) = super::pin(ctx as usize) {
+        if let Some(w) = host.wakes.message_wake.get() {
             w.clear_pending();
         }
         host.on_ui_tick();
@@ -2006,15 +2117,12 @@ impl Class for ContextMenuTarget {
 
 impl IContextMenuTargetTrait for ContextMenuTarget {
     unsafe fn executeMenuItem(&self, tag: int32) -> tresult {
-        // A host may keep the menu (and so this target) past the instance;
-        // upgrading the Weak<Host> ties execution strictly to the original
-        // live instance and prevents pointer-reuse dispatch to a new one.
         let Some(host) = self.host.upgrade() else {
             return kResultFalse;
         };
         #[allow(clippy::cast_sign_loss, reason = "tags are the u32 actions we set")]
         let action = tag as u32;
-        if unsafe { (host.reg.cb.perform_menu)(host.ctx, self.target, action) } != 0 {
+        if host.backend().perform_menu(self.target, action) {
             kResultOk
         } else {
             kResultFalse
@@ -2113,11 +2221,11 @@ impl IAudioPresentationLatencyTrait for Component {
         let Some(is_in) = is_dir(dir) else {
             return kInvalidArgument;
         };
-        let d = self.host.reg.desc;
+        let d = &self.host.reg.desc;
         let bus_count = if is_in {
-            d.num_input_buses
+            d.num_input_buses()
         } else {
-            d.num_output_buses
+            d.num_output_buses()
         };
         let Ok(bus) = u32::try_from(bus_index) else {
             return kInvalidArgument;
@@ -2125,14 +2233,9 @@ impl IAudioPresentationLatencyTrait for Component {
         if bus >= bus_count {
             return kInvalidArgument;
         }
-        unsafe {
-            (self.host.reg.cb.set_audio_presentation_latency)(
-                self.host.ctx,
-                i32::from(is_in),
-                bus,
-                latency_in_samples,
-            );
-        }
+        self.host
+            .backend()
+            .set_audio_presentation_latency(is_in, bus, latency_in_samples);
         kResultOk
     }
 }
@@ -2181,18 +2284,16 @@ impl IComponentTrait for Component {
     }
 
     unsafe fn getBusCount(&self, kind: MediaType, dir: BusDirection) -> int32 {
-        let d = self.host.reg.desc;
+        let d = &self.host.reg.desc;
         let Some(input) = is_dir(dir) else {
             return 0;
         };
-        // An audio bus only where that side has channels: a phantom
-        // zero-channel bus crashes strict hosts (Bitwig).
         match kind {
             k if k == MediaTypes_::kAudio as i32 => {
                 (if input {
-                    d.num_input_buses
+                    d.num_input_buses()
                 } else {
-                    d.num_output_buses
+                    d.num_output_buses()
                 }) as i32
             }
             k if k == MediaTypes_::kEvent as i32 => {
@@ -2219,7 +2320,7 @@ impl IComponentTrait for Component {
         if index < 0 {
             return kInvalidArgument;
         }
-        let d = self.host.reg.desc;
+        let d = &self.host.reg.desc;
         let default_active = BusInfo_::BusFlags_::kDefaultActive as u32;
         if kind == MediaTypes_::kEvent as i32 {
             let ports = if input {
@@ -2232,7 +2333,6 @@ impl IComponentTrait for Component {
             }
             bus.mediaType = kind;
             bus.direction = dir;
-            // moose carries all 16 MIDI channels end to end.
             bus.channelCount = 16;
             let base = if input { "Event In" } else { "Event Out" };
             let name = if ports > 1 {
@@ -2248,15 +2348,15 @@ impl IComponentTrait for Component {
         if kind != MediaTypes_::kAudio as i32 {
             return kInvalidArgument;
         }
-        let (count, kinds) = if input {
-            (d.num_input_buses, d.input_bus_kinds)
+        let kinds = if input {
+            &d.input_bus_kinds
         } else {
-            (d.num_output_buses, d.output_bus_kinds)
+            &d.output_bus_kinds
         };
-        if index as u32 >= count {
+        let Some(&bus_kind) = kinds.get(index as usize) else {
             return kInvalidArgument;
-        }
-        let aux = !kinds.is_null() && unsafe { *kinds.add(index as usize) } != 0;
+        };
+        let aux = bus_kind != 0;
         bus.mediaType = kind;
         bus.direction = dir;
         bus.channelCount = self.host.bus_channels(dir, index as u32) as i32;
@@ -2272,8 +2372,6 @@ impl IComponentTrait for Component {
         } else {
             BusTypes_::kMain as i32
         };
-        // Main buses are live on a fresh instance; aux buses wait for
-        // activateBus.
         bus.flags = if aux { 0 } else { default_active };
         kResultOk
     }
@@ -2293,7 +2391,7 @@ impl IComponentTrait for Component {
         index: int32,
         state: TBool,
     ) -> tresult {
-        let d = self.host.reg.desc;
+        let d = &self.host.reg.desc;
         let Some(input) = is_dir(dir) else {
             return kInvalidArgument;
         };
@@ -2316,9 +2414,9 @@ impl IComponentTrait for Component {
             return kInvalidArgument;
         }
         let count = if input {
-            d.num_input_buses
+            d.num_input_buses()
         } else {
-            d.num_output_buses
+            d.num_output_buses()
         };
         if index as u32 >= count || index >= 32 {
             return kInvalidArgument;
@@ -2338,27 +2436,27 @@ impl IComponentTrait for Component {
 
     unsafe fn setActive(&self, state: TBool) -> tresult {
         let h = &self.host;
-        let cb = h.reg.cb;
+        let backend = h.backend();
         let cfg = h.config();
-        unsafe {
-            if state != 0 {
-                if (cb.prepare)(h.ctx, cfg.sample_rate, cfg.max_frames, cfg.process_mode) == 0 {
-                    return kResultFalse;
-                }
-            } else {
-                (cb.reset)(h.ctx, cfg.sample_rate, cfg.max_frames, cfg.process_mode);
+        if state != 0 {
+            if !backend.prepare(cfg.sample_rate, cfg.max_frames, cfg.process_mode) {
+                return kResultFalse;
             }
-            // A state load while suspended must not wait for the audio thread.
-            (cb.set_active)(h.ctx, i32::from(state != 0));
+        } else {
+            backend.reset(cfg.sample_rate, cfg.max_frames, cfg.process_mode);
         }
+        backend.set_active(state != 0);
         kResultOk
     }
 
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
-        let h = &self.host;
-        if !state.is_null()
-            && unsafe { (h.reg.cb.state_load_stream)(h.ctx, state.cast(), super::read_state_chunk) }
-                != 0
+        let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
+            return kResultFalse;
+        };
+        if self
+            .host
+            .backend()
+            .state_load_stream(&mut |dst| super::read_state_chunk(stream, dst))
         {
             kResultOk
         } else {
@@ -2367,11 +2465,13 @@ impl IComponentTrait for Component {
     }
 
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
-        let h = &self.host;
-        if !state.is_null()
-            && unsafe {
-                (h.reg.cb.state_save_stream)(h.ctx, state.cast(), super::write_state_chunk)
-            } != 0
+        let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
+            return kResultFalse;
+        };
+        if self
+            .host
+            .backend()
+            .state_save_stream(&mut |src| super::write_state_chunk(stream, src))
         {
             kResultOk
         } else {
@@ -2389,11 +2489,8 @@ impl IAudioProcessorTrait for Component {
         num_outs: int32,
     ) -> tresult {
         let h = &self.host;
-        let d = h.reg.desc;
-        // One arrangement per declared bus, matched per bus (a sidechain on
-        // its own width) against the declared layouts. kResultFalse makes
-        // the host ask getBusArrangement for what we do support.
-        if num_ins != d.num_input_buses as i32 || num_outs != d.num_output_buses as i32 {
+        let d = &h.reg.desc;
+        if num_ins != d.num_input_buses() as i32 || num_outs != d.num_output_buses() as i32 {
             return kResultFalse;
         }
         if (num_ins > 0 && inputs.is_null()) || (num_outs > 0 && outputs.is_null()) {
@@ -2419,19 +2516,11 @@ impl IAudioProcessorTrait for Component {
         }) {
             return kResultFalse;
         }
-        let layout = unsafe {
-            (h.reg.cb.match_bus_layout_perbus)(
-                ins.as_ptr(),
-                ins.len() as u32,
-                outs.as_ptr(),
-                outs.len() as u32,
-            )
-        };
-        if layout < 0 {
+        let Some(layout) = h.reg.factory.match_bus_layout_perbus(&ins, &outs) else {
             return kResultFalse;
-        }
+        };
         let cfg = unsafe { h.config_mut() };
-        cfg.layout = layout as u32;
+        cfg.layout = layout;
         refresh_bus_channels(h.reg, cfg);
         cfg.total_in = ins.iter().sum();
         cfg.total_out = outs.iter().sum();
@@ -2444,11 +2533,11 @@ impl IAudioProcessorTrait for Component {
         index: int32,
         arr: *mut SpeakerArrangement,
     ) -> tresult {
-        let d = self.host.reg.desc;
+        let d = &self.host.reg.desc;
         let count = if dir == BusDirections_::kInput as i32 {
-            d.num_input_buses
+            d.num_input_buses()
         } else {
-            d.num_output_buses
+            d.num_output_buses()
         };
         if arr.is_null() || index < 0 || index as u32 >= count {
             return kInvalidArgument;
@@ -2463,20 +2552,18 @@ impl IAudioProcessorTrait for Component {
 
     unsafe fn canProcessSampleSize(&self, size: int32) -> tresult {
         let ok = size == SymbolicSampleSizes_::kSample32 as i32
-            || (size == SymbolicSampleSizes_::kSample64 as i32
-                && self.host.reg.desc.supports_f64 != 0);
+            || (size == SymbolicSampleSizes_::kSample64 as i32 && self.host.reg.desc.supports_f64);
         if ok { kResultOk } else { kResultFalse }
     }
 
     unsafe fn getLatencySamples(&self) -> uint32 {
-        unsafe { (self.host.reg.cb.get_latency)(self.host.ctx) }
+        self.host.backend().get_latency()
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
         let Some(setup) = (unsafe { setup.as_ref() }) else {
             return kInvalidArgument;
         };
-        // Refuse a sample size we never offered.
         if unsafe { self.canProcessSampleSize(setup.symbolicSampleSize) } != kResultOk {
             return kResultFalse;
         }
@@ -2487,7 +2574,7 @@ impl IAudioProcessorTrait for Component {
         cfg.max_frames = setup.maxSamplesPerBlock.max(0) as u32;
         cfg.process_mode = setup.processMode;
         let frames = cfg.max_frames as usize;
-        let d = h.reg.desc;
+        let d = &h.reg.desc;
         let scratch = unsafe { &mut *h.scratch.get() };
         scratch.silence = if d.max_inputs > 0 {
             vec![0.0; frames]
@@ -2501,15 +2588,12 @@ impl IAudioProcessorTrait for Component {
     unsafe fn setProcessing(&self, state: TBool) -> tresult {
         let h = &self.host;
         let cfg = h.config();
-        unsafe {
-            (h.reg.cb.set_processing)(
-                h.ctx,
-                i32::from(state != 0),
-                cfg.sample_rate,
-                cfg.max_frames,
-                cfg.process_mode,
-            );
-        }
+        h.backend().set_processing(
+            state != 0,
+            cfg.sample_rate,
+            cfg.max_frames,
+            cfg.process_mode,
+        );
         kResultOk
     }
 
@@ -2521,13 +2605,12 @@ impl IAudioProcessorTrait for Component {
     }
 
     unsafe fn getTailSamples(&self) -> uint32 {
-        unsafe { (self.host.reg.cb.get_tail)(self.host.ctx) }
+        self.host.backend().get_tail()
     }
 }
 
 impl IEditControllerTrait for Component {
     unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
-        // Single component: setState already loaded everything.
         kResultOk
     }
 
@@ -2541,19 +2624,20 @@ impl IEditControllerTrait for Component {
 
     unsafe fn getParameterCount(&self) -> int32 {
         let base = self.host.param_count() as i32;
-        let has_programs = !unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty();
+        let has_programs = !self.host.backend().program_list().is_empty();
         base + i32::from(has_programs)
     }
 
     unsafe fn getParameterInfo(&self, index: int32, info: *mut ParameterInfo) -> tresult {
         let reg = self.host.reg;
+        let backend = self.host.backend();
         let Some(info) = (unsafe { info.as_mut() }) else {
             return kInvalidArgument;
         };
         let base_count = self.host.param_count() as i32;
         if index == base_count {
             use ParameterInfo_::ParameterFlags_::*;
-            let programs = unsafe { (reg.cb.program_list)(self.host.ctx) };
+            let programs = backend.program_list();
             if programs.is_empty() {
                 return kInvalidArgument;
             }
@@ -2572,30 +2656,23 @@ impl IEditControllerTrait for Component {
         };
         let p = &reg.params[index];
         info.id = p.id;
-        utf16_into(&mut info.title, unsafe { cstr(p.name) });
-        utf16_into(&mut info.shortTitle, unsafe { cstr(p.short_name) });
-        utf16_into(&mut info.units, unsafe { cstr(p.units) });
+        utf16_into(&mut info.title, &p.name);
+        utf16_into(&mut info.shortTitle, &p.short_name);
+        utf16_into(&mut info.units, &p.units);
         info.stepCount = p.step_count;
         info.defaultNormalizedValue = p.default_normalized;
-        let mut live_default = p.default_normalized;
-        let live_step =
-            unsafe { (reg.cb.param_step_count)(self.host.ctx, p.id, &raw mut live_default) };
-        if live_step >= 0 {
+        if let Some((live_step, live_default)) = backend.param_step_count(p.id) {
             info.stepCount = live_step;
-            info.defaultNormalizedValue = live_default;
+            if let Some(d) = live_default {
+                info.defaultNormalizedValue = d;
+            }
         }
         info.unitId = reg.param_unit[index];
         info.flags = p.flags;
-        let mut title = [0 as c_char; 512];
-        let bits =
-            unsafe { (reg.cb.param_presentation)(self.host.ctx, p.id, title.as_mut_ptr(), 512) };
-        if bits >= 0 {
-            let title = unsafe { cstr(title.as_ptr()) };
-            utf16_into(&mut info.title, title);
-            utf16_into(&mut info.shortTitle, title);
-            // Listed but unavailable only in slot-pool mode: a free slot.
-            if bits & (PRESENTATION_HIDDEN | PRESENTATION_UNAVAILABLE) != 0 {
-                // The SDK defines hidden as read-only and not automatable.
+        if let Some(presentation) = backend.param_presentation(p.id) {
+            utf16_into(&mut info.title, &presentation.name);
+            utf16_into(&mut info.shortTitle, &presentation.name);
+            if presentation.hidden || presentation.unavailable {
                 use ParameterInfo_::ParameterFlags_::*;
                 info.flags =
                     (info.flags | kIsReadOnly as i32 | kIsHidden as i32) & !(kCanAutomate as i32);
@@ -2614,8 +2691,9 @@ impl IEditControllerTrait for Component {
             return kInvalidArgument;
         };
         let h = &self.host;
+        let backend = h.backend();
         if id == h.program_change_id {
-            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let programs = backend.program_list();
             let Some(preset) = program_index_from_normalized(normalized, programs.len())
                 .and_then(|i| programs.get(i))
             else {
@@ -2624,10 +2702,9 @@ impl IEditControllerTrait for Component {
             utf16_into(string, &preset.name);
             return kResultOk;
         }
-        let plain = unsafe { (h.reg.cb.param_denormalize)(h.ctx, id, normalized) };
-        let mut buf = [0 as c_char; 128];
-        if unsafe { (h.reg.cb.param_format)(h.ctx, id, plain, buf.as_mut_ptr(), 128) } > 0 {
-            utf16_into(string, unsafe { cstr(buf.as_ptr()) });
+        let plain = backend.param_denormalize(id, normalized);
+        if let Some(text) = backend.param_format(id, plain) {
+            utf16_into(string, &text);
         } else {
             utf16_into(string, &format!("{plain:.2}"));
         }
@@ -2644,66 +2721,62 @@ impl IEditControllerTrait for Component {
             return kInvalidArgument;
         }
         let h = &self.host;
+        let backend = h.backend();
         let raw_text = unsafe { utf16_from(string, 256) };
         if id == h.program_change_id {
-            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let programs = backend.program_list();
             let Some(idx) = programs.iter().position(|p| p.name == raw_text) else {
                 return kResultFalse;
             };
             unsafe { *normalized = program_normalized_from_index(idx, programs.len()) };
             return kResultOk;
         }
-        let Ok(text) = std::ffi::CString::new(raw_text) else {
+        let Some(plain) = backend.param_parse(id, &raw_text) else {
             return kResultFalse;
         };
-        let mut plain = 0.0;
-        if unsafe { (h.reg.cb.param_parse)(h.ctx, id, text.as_ptr(), &raw mut plain) } == 0 {
-            return kResultFalse;
-        }
-        unsafe { *normalized = (h.reg.cb.param_normalize)(h.ctx, id, plain) };
+        unsafe { *normalized = backend.param_normalize(id, plain) };
         kResultOk
     }
 
     unsafe fn normalizedParamToPlain(&self, id: ParamID, normalized: ParamValue) -> ParamValue {
         let h = &self.host;
+        let backend = h.backend();
         if id == h.program_change_id {
-            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let programs = backend.program_list();
             return program_index_from_normalized(normalized, programs.len()).unwrap_or(0) as f64;
         }
-        unsafe { (h.reg.cb.param_denormalize)(h.ctx, id, normalized) }
+        backend.param_denormalize(id, normalized)
     }
 
     unsafe fn plainParamToNormalized(&self, id: ParamID, plain: ParamValue) -> ParamValue {
         let h = &self.host;
+        let backend = h.backend();
         if id == h.program_change_id {
-            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let programs = backend.program_list();
             if programs.len() <= 1 {
                 return 0.0;
             }
             let idx = (plain.round().clamp(0.0, (programs.len() - 1) as f64)) as usize;
             return program_normalized_from_index(idx, programs.len());
         }
-        unsafe { (h.reg.cb.param_normalize)(h.ctx, id, plain) }
+        backend.param_normalize(id, plain)
     }
 
     unsafe fn getParamNormalized(&self, id: ParamID) -> ParamValue {
-        // Hosts poll this on the UI thread: a good moment to send what the
-        // audio thread flagged.
         let h = &self.host;
         if h.may_deliver(&lock(&h.edits)) {
             h.on_ui_tick();
         }
+        let backend = h.backend();
         if id == h.program_change_id {
-            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let programs = backend.program_list();
             let idx = usize::try_from(h.selected_program.load(Ordering::Acquire))
                 .unwrap_or(0)
                 .min(programs.len().saturating_sub(1));
             return program_normalized_from_index(idx, programs.len());
         }
-        unsafe {
-            let plain = (h.reg.cb.param_get_value)(h.ctx, id);
-            (h.reg.cb.param_normalize)(h.ctx, id, plain)
-        }
+        let plain = backend.param_get_value(id);
+        backend.param_normalize(id, plain)
     }
 
     unsafe fn setParamNormalized(&self, id: ParamID, value: ParamValue) -> tresult {
@@ -2711,30 +2784,28 @@ impl IEditControllerTrait for Component {
         if h.in_perform_edit.load(Ordering::Relaxed) {
             return kResultOk;
         }
+        let backend = h.backend();
         if id == h.program_change_id {
-            let programs = unsafe { (h.reg.cb.program_list)(h.ctx) };
+            let programs = backend.program_list();
             let Some(idx) = program_index_from_normalized(value, programs.len()) else {
                 return kInvalidArgument;
             };
             if !programs[idx].state.is_empty() {
-                let mut reader = SliceReadState {
-                    bytes: &programs[idx].state,
-                    pos: 0,
-                };
-                if unsafe {
-                    (h.reg.cb.state_load_stream)(h.ctx, (&raw mut reader).cast(), read_slice_chunk)
-                } == 0
-                {
+                let mut slice = programs[idx].state.as_slice();
+                if !backend.state_load_stream(&mut |dst| {
+                    let take = slice.len().min(dst.len());
+                    dst[..take].copy_from_slice(&slice[..take]);
+                    slice = &slice[take..];
+                    take as i64
+                }) {
                     return kResultFalse;
                 }
             }
             h.selected_program.store(idx as i32, Ordering::Release);
             return kResultOk;
         }
-        unsafe {
-            let plain = (h.reg.cb.param_denormalize)(h.ctx, id, value);
-            (h.reg.cb.param_set_value)(h.ctx, id, plain);
-        }
+        let plain = backend.param_denormalize(id, value);
+        backend.param_set_value(id, plain);
         h.note_param_change(id);
         kResultOk
     }
@@ -2799,11 +2870,15 @@ impl IMidiMappingTrait for Component {
         controller: CtrlNumber,
         id: *mut ParamID,
     ) -> tresult {
-        let h = &self.host;
-        if !id.is_null()
-            && unsafe { (h.reg.cb.midi_mapping_get_param_id)(h.ctx, bus, channel, controller, id) }
-                != 0
+        let Some(out) = (unsafe { id.as_mut() }) else {
+            return kResultFalse;
+        };
+        if let Some(pid) = self
+            .host
+            .backend()
+            .midi_mapping_get_param_id(bus, channel, controller)
         {
+            *out = pid;
             kResultOk
         } else {
             kResultFalse
@@ -2812,25 +2887,13 @@ impl IMidiMappingTrait for Component {
 }
 
 impl Component {
-    /// Every MIDI 1 input assignment `getMidiControllerAssignment` would
-    /// answer, in bus / channel / controller order. Controllers run to
-    /// kCtrlProgramChange (130).
     fn midi1_assignments(&self, mut each: impl FnMut(Midi1ControllerParamIDAssignment)) {
         let h = &self.host;
+        let backend = h.backend();
         for bus in 0..h.reg.desc.midi_input_ports.max(0) {
             for channel in 0..16i16 {
                 for controller in 0..=130i16 {
-                    let mut id = 0;
-                    if unsafe {
-                        (h.reg.cb.midi_mapping_get_param_id)(
-                            h.ctx,
-                            bus,
-                            channel,
-                            controller,
-                            &raw mut id,
-                        )
-                    } != 0
-                    {
+                    if let Some(id) = backend.midi_mapping_get_param_id(bus, channel, controller) {
                         each(Midi1ControllerParamIDAssignment {
                             pId: id,
                             busIndex: bus,
@@ -2904,6 +2967,7 @@ impl IParameterFunctionNameTrait for Component {
             return kInvalidArgument;
         }
         let h = &self.host;
+        let backend = h.backend();
         let want = unsafe { CStr::from_ptr(name) };
         let found = h
             .reg
@@ -2912,10 +2976,7 @@ impl IParameterFunctionNameTrait for Component {
             .zip(&h.reg.param_unit)
             .filter(|&(_, &u)| unit == kRootUnitId || u == unit)
             .map(|(p, _)| p.id)
-            .find(|&pid| {
-                let f = unsafe { (h.reg.cb.param_function_name)(h.ctx, pid) };
-                !f.is_null() && unsafe { CStr::from_ptr(f) } == want
-            });
+            .find(|&pid| backend.param_function_name(pid) == Some(want));
         unsafe { *id = found.unwrap_or(kNoParamId) };
         if found.is_some() {
             kResultTrue
@@ -2935,17 +2996,11 @@ impl IRemapParamIDTrait for Component {
         if plugin_to_replace_uid.is_null() || new_param_id.is_null() {
             return kInvalidArgument;
         }
-        let h = &self.host;
-        let mut out_id: u32 = kNoParamId;
-        let ok = unsafe {
-            (h.reg.cb.remap_param_id)(
-                h.ctx,
-                plugin_to_replace_uid.cast::<u8>(),
-                old_param_id,
-                &raw mut out_id,
-            )
-        };
-        if ok != 0 {
+        let mut cid = [0u8; 16];
+        unsafe {
+            std::ptr::copy_nonoverlapping(plugin_to_replace_uid.cast::<u8>(), cid.as_mut_ptr(), 16);
+        }
+        if let Some(out_id) = self.host.backend().remap_param_id(cid, old_param_id) {
             unsafe { *new_param_id = out_id };
             kResultOk
         } else {
@@ -2968,17 +3023,12 @@ impl IInfoListenerTrait for Component {
                 size_of_val(&name) as u32,
             )
         } == kResultOk)
-            .then(|| CString::new(unsafe { utf16_from(name.as_ptr(), name.len()) }).ok())
-            .flatten();
+            .then(|| unsafe { utf16_from(name.as_ptr(), name.len()) });
         let mut color = 0i64;
-        let has_color = unsafe { list.getInt(kChannelColorKey, &raw mut color) } == kResultOk;
-        let info = Vst3TrackInfo {
-            name: name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
-            // `ColorSpec` is a 32-bit ARGB value carried in an int64.
-            color_argb: color as u32,
-            has_color,
-        };
-        unsafe { (self.host.reg.cb.track_info_changed)(self.host.ctx, &raw const info) };
+        let color_argb = (unsafe { list.getInt(kChannelColorKey, &raw mut color) } == kResultOk)
+            .then_some(color as u32);
+        let info = Vst3TrackInfo { name, color_argb };
+        self.host.backend().track_info_changed(&info);
         kResultTrue
     }
 }
@@ -2988,10 +3038,7 @@ impl Component {
         let (Ok(bus), Ok(channel @ 0..=15)) = (u32::try_from(bus), u8::try_from(channel)) else {
             return kInvalidArgument;
         };
-        let h = &self.host;
-        // SAFETY: `ctx` is this component's live plugin instance, and the
-        // learn interfaces are UI-thread calls, as the callback requires.
-        if unsafe { (h.reg.cb.midi_learn)(h.ctx, bus, channel, source) } != 0 {
+        if self.host.backend().midi_learn(bus, channel, source) {
             kResultTrue
         } else {
             kResultFalse
@@ -3071,8 +3118,7 @@ impl IUnitInfoTrait for Component {
         let (Some(info), Some(unit)) = (unsafe { info.as_mut() }, unit) else {
             return kInvalidArgument;
         };
-        let has_programs =
-            unit.id == 0 && !unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty();
+        let has_programs = unit.id == 0 && !self.host.backend().program_list().is_empty();
         info.id = unit.id;
         info.parentUnitId = unit.parent;
         utf16_into(&mut info.name, &unit.name);
@@ -3085,7 +3131,7 @@ impl IUnitInfoTrait for Component {
     }
 
     unsafe fn getProgramListCount(&self) -> int32 {
-        i32::from(!unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty())
+        i32::from(!self.host.backend().program_list().is_empty())
     }
 
     unsafe fn getProgramListInfo(&self, index: int32, info: *mut ProgramListInfo) -> tresult {
@@ -3095,7 +3141,7 @@ impl IUnitInfoTrait for Component {
         if index != 0 {
             return kInvalidArgument;
         }
-        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let programs = self.host.backend().program_list();
         if programs.is_empty() {
             return kInvalidArgument;
         }
@@ -3117,7 +3163,7 @@ impl IUnitInfoTrait for Component {
         if list != PROGRAM_LIST_ID {
             return kInvalidArgument;
         }
-        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let programs = self.host.backend().program_list();
         let Some(preset) = usize::try_from(index).ok().and_then(|i| programs.get(i)) else {
             return kInvalidArgument;
         };
@@ -3138,7 +3184,7 @@ impl IUnitInfoTrait for Component {
         if list != PROGRAM_LIST_ID || attribute.is_null() {
             return kInvalidArgument;
         }
-        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let programs = self.host.backend().program_list();
         let Some(preset) = usize::try_from(index).ok().and_then(|i| programs.get(i)) else {
             return kInvalidArgument;
         };
@@ -3191,9 +3237,7 @@ impl IUnitInfoTrait for Component {
 
 impl IProgramListDataTrait for Component {
     unsafe fn programDataSupported(&self, list_id: ProgramListID) -> tresult {
-        if list_id == PROGRAM_LIST_ID
-            && !unsafe { (self.host.reg.cb.program_list)(self.host.ctx) }.is_empty()
-        {
+        if list_id == PROGRAM_LIST_ID && !self.host.backend().program_list().is_empty() {
             kResultTrue
         } else {
             kResultFalse
@@ -3212,7 +3256,7 @@ impl IProgramListDataTrait for Component {
         if list_id != PROGRAM_LIST_ID {
             return kInvalidArgument;
         }
-        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let programs = self.host.backend().program_list();
         let Some(preset) = usize::try_from(program_index)
             .ok()
             .and_then(|i| programs.get(i))
@@ -3245,21 +3289,24 @@ impl IProgramListDataTrait for Component {
         program_index: int32,
         data: *mut IBStream,
     ) -> tresult {
-        if list_id != PROGRAM_LIST_ID || data.is_null() {
+        let Some(stream) = (unsafe { ComRef::from_raw(data) }) else {
+            return kInvalidArgument;
+        };
+        if list_id != PROGRAM_LIST_ID {
             return kInvalidArgument;
         }
-        let programs = unsafe { (self.host.reg.cb.program_list)(self.host.ctx) };
+        let backend = self.host.backend();
+        let programs = backend.program_list();
         let Some(index) = usize::try_from(program_index)
             .ok()
             .filter(|&i| i < programs.len())
         else {
             return kInvalidArgument;
         };
-        let Some(bytes) = read_program_stream(data) else {
+        let Some(bytes) = read_program_stream(stream) else {
             return kResultFalse;
         };
-        let h = &self.host;
-        if unsafe { (h.reg.cb.set_program_data)(h.ctx, index, bytes.as_ptr(), bytes.len()) } {
+        if backend.set_program_data(index, &bytes) {
             kResultOk
         } else {
             kResultFalse
@@ -3270,11 +3317,11 @@ impl IProgramListDataTrait for Component {
 /// Bounded read cap for `IProgramListData::setProgramData` streams (32 MiB).
 const MAX_PROGRAM_DATA_BYTES: usize = 32 * 1024 * 1024;
 
-fn read_program_stream(stream: *mut IBStream) -> Option<Vec<u8>> {
+fn read_program_stream(stream: ComRef<'_, IBStream>) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let n = unsafe { super::read_state_chunk(stream.cast(), chunk.as_mut_ptr(), 4096) };
+        let n = super::read_state_chunk(stream, &mut chunk);
         if n < 0 {
             return None;
         }
@@ -3314,27 +3361,6 @@ fn program_normalized_from_index(index: usize, count: usize) -> f64 {
     } else {
         index.min(count - 1) as f64 / (count - 1) as f64
     }
-}
-
-struct SliceReadState<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-unsafe extern "C" fn read_slice_chunk(ctx: *mut c_void, dst: *mut u8, max_len: u32) -> i64 {
-    if ctx.is_null() || dst.is_null() {
-        return -1;
-    }
-    let state = unsafe { &mut *ctx.cast::<SliceReadState<'_>>() };
-    let remaining = state.bytes.len().saturating_sub(state.pos);
-    let take = remaining.min(max_len as usize);
-    if take > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(state.bytes.as_ptr().add(state.pos), dst, take);
-        }
-        state.pos += take;
-    }
-    take as i64
 }
 
 /// The predefined note-expression types moose bridges to per-note MIDI 2.0
@@ -3477,8 +3503,10 @@ impl IKeyswitchControllerTrait for Component {
         if bus < 0 || bus >= self.host.reg.desc.midi_input_ports || !(0..16).contains(&channel) {
             return 0;
         }
-        unsafe { (self.host.reg.cb.keyswitches)(self.host.ctx, bus as u32, channel as u8) }.len()
-            as i32
+        self.host
+            .backend()
+            .keyswitches(bus as u32, channel as u8)
+            .len() as i32
     }
 
     unsafe fn getKeyswitchInfo(
@@ -3494,8 +3522,7 @@ impl IKeyswitchControllerTrait for Component {
         let Some(info) = (unsafe { info.as_mut() }) else {
             return kInvalidArgument;
         };
-        let list =
-            unsafe { (self.host.reg.cb.keyswitches)(self.host.ctx, bus as u32, channel as u8) };
+        let list = self.host.backend().keyswitches(bus as u32, channel as u8);
         let Some(ks) = usize::try_from(key_switch_index)
             .ok()
             .and_then(|i| list.get(i))
@@ -3581,7 +3608,7 @@ mod tests {
     #[test]
     fn main_buses_start_active() {
         let kinds = [0u8, 1, 0];
-        assert_eq!(default_active_mask(3, kinds.as_ptr()), 0b101);
-        assert_eq!(default_active_mask(2, std::ptr::null()), 0b11);
+        assert_eq!(default_active_mask(&kinds), 0b101);
+        assert_eq!(default_active_mask(&[0, 0]), 0b11);
     }
 }
