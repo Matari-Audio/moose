@@ -1,10 +1,10 @@
 //! Input events and parameter changes from the host, converted to moose events.
 
+use crate::backend::Vst3NativeEvent;
 use crate::instance::{Vst3Instance, Vst3Scratch};
 use crate::midi_proxy::{allocated_midi_proxy_decode, midi_proxy_event};
 use crate::output_events::midi_event_from_map_with_range;
 
-use crate::ffi::Vst3NativeEvent;
 use moose_core::events::{
     Event, EventBody, EventList, ExactEvent, ExactEventBody, ExactEventMetadata,
     ExactEventQualifiers, ExactNoteAddress, ExactNoteKind, PushError, Vst3EventMetadata,
@@ -28,74 +28,48 @@ pub(crate) const VST3_EVENT_QUEUE_FULL: u32 = 4;
 pub(crate) const VST3_EVENT_RESERVED: u32 = 5;
 pub(crate) const VST3_EVENT_IS_LIVE: u32 = 1;
 
-pub(crate) unsafe extern "C" fn cb_begin_input_events<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    num_frames: u32,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
+impl<P: PluginExport> Vst3Instance<P> {
+    pub(crate) fn begin_input_events_impl(&self, num_frames: u32) {
+        let mut audio = self.audio.enter();
         audio.event_list.clear();
         audio.input_num_frames = num_frames;
     }
-}
 
-pub(crate) unsafe extern "C" fn cb_push_input_event<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    event: *const Vst3NativeEvent,
-) -> u32 {
-    unsafe {
-        if event.is_null() {
-            return VST3_EVENT_INVALID;
-        }
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
-        push_vst3_input_event::<P>(&mut audio, &*event)
+    pub(crate) fn push_input_event_impl(
+        &self,
+        event: &Vst3NativeEvent,
+        data: Option<&[u8]>,
+    ) -> u32 {
+        let mut audio = self.audio.enter();
+        push_vst3_input_event::<P>(&mut audio, event, data)
     }
-}
 
-/// One host automation point, plain (denormalized) value. Returns 1 when
-/// queued, 0 when the event list is full (the COM layer then commits the
-/// queue's final value directly, so no change is lost).
-pub(crate) unsafe extern "C" fn cb_push_param_change<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    id: u32,
-    sample_offset: i32,
-    plain: f64,
-    from_offset: i32,
-    from_plain: f64,
-) -> i32 {
-    // SAFETY: ctx is a live instance; called on the audio thread inside
-    // process(), like `cb_push_input_event`.
-    let inst = unsafe { &*ctx.cast::<Vst3Instance<P>>() };
-    let mut audio = inst.audio.enter();
-    let Ok(sample_offset) = u32::try_from(sample_offset) else {
-        return 0;
-    };
-    // A segment that starts after its end (a host sending points out of
-    // order) degrades to a step at the point. So does a non-linear range:
-    // the host's segment is linear in normalized space, and a plain-value
-    // ramp would leave its curve.
-    // ponytail: steps for non-linear ranges; carry normalized ramps if a
-    // PerSample plugin with log params needs the curve.
-    let linear = matches!(
-        inst.param_ranges
-            .binary_search_by_key(&id, |(i, _)| *i)
-            .map(|at| inst.param_ranges[at].1),
-        Ok(ParamRange::Linear { .. })
-    );
-    let ramp_from = u32::try_from(from_offset)
-        .ok()
-        .filter(|from| linear && *from <= sample_offset)
-        .map(|from| (from, from_plain));
-    i32::from(push_vst3_param_change::<P>(
-        inst,
-        &mut audio,
-        id,
-        sample_offset,
-        plain,
-        ramp_from,
-    ))
+    /// One host automation point, plain (denormalized) value. Returns `true` when
+    /// queued, `false` when the event list is full.
+    pub(crate) fn push_param_change_impl(
+        &self,
+        id: u32,
+        sample_offset: i32,
+        plain: f64,
+        from_offset: i32,
+        from_plain: f64,
+    ) -> bool {
+        let mut audio = self.audio.enter();
+        let Ok(sample_offset) = u32::try_from(sample_offset) else {
+            return false;
+        };
+        let linear = matches!(
+            self.param_ranges
+                .binary_search_by_key(&id, |(i, _)| *i)
+                .map(|at| self.param_ranges[at].1),
+            Ok(ParamRange::Linear { .. })
+        );
+        let ramp_from = u32::try_from(from_offset)
+            .ok()
+            .filter(|from| linear && *from <= sample_offset)
+            .map(|from| (from, from_plain));
+        push_vst3_param_change::<P>(self, &mut audio, id, sample_offset, plain, ramp_from)
+    }
 }
 
 /// Queue one sample-accurate parameter change. `set_plain` is deferred to
@@ -110,12 +84,6 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
     ramp_from: Option<(u32, f64)>,
 ) -> bool {
     let list = &mut audio.event_list;
-    // Unbound MIDI controllers arrive on the hidden proxy ids: decode
-    // straight to the event. No `ParamChange` and no `Params` write - a
-    // proxy is not a plugin parameter. Denormalize is identity for proxy
-    // ids, so `value` is the host's raw `0..=1`. The id carries the event
-    // bus it was mapped for, so multi-port plugins keep controllers per
-    // port.
     if let Some((port, channel, controller)) = allocated_midi_proxy_decode(&inst.midi_proxy_ids, id)
     {
         #[allow(clippy::cast_possible_truncation)]
@@ -128,23 +96,12 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
             ))
             .is_ok();
     }
-    // MIDI-mapped controllers (pitch bend, CC, pressure, program) arrive
-    // as parameter changes because VST3 has no native input event for
-    // them. Bridge them back into the MIDI event the plugin expects, in
-    // addition to the plain `ParamChange` so the bound parameter still
-    // tracks the controller. The bridged event is port 0: an explicit
-    // `midi_map` binds one plugin parameter across every bus, so the host
-    // delivers a bus-less change with no originating port to recover.
     let mapped = inst.midi_maps.binary_search_by_key(&id, |(id, _)| *id).ok();
     if list.len() + 1 + usize::from(mapped.is_some()) > list.capacity() {
-        // Not silent: the plugin sees the overflow, and the COM layer
-        // commits the queue's final value directly.
         list.record_overflow(PushError::EventFull);
         return false;
     }
     let point = param_point_event(inst.automation, id, sample_offset, value, ramp_from);
-    // A `ParamRamp` starts at the previous point, before the bridged MIDI
-    // event: push it first so the pair stays in offset order.
     let point_first = point.sample_offset < sample_offset;
     if point_first {
         list.push(point);
@@ -166,9 +123,6 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
 
 /// Host input events (notes, pressure, `SysEx`) may fill the typed event
 /// lane only up to `capacity - capacity / VST3_AUTOMATION_RESERVE_DIVISOR`.
-/// The rest is reserved for parameter automation, which the COM layer
-/// interleaves with notes by sample offset. This reserves capacity, not
-/// delivery: a mapped parameter point can need two typed slots.
 pub(crate) const VST3_AUTOMATION_RESERVE_DIVISOR: usize = 4;
 
 /// Typed-lane slots host input events may use in a list of `capacity`.
@@ -176,8 +130,6 @@ pub(crate) const fn input_event_typed_limit(capacity: usize) -> usize {
     capacity - capacity / VST3_AUTOMATION_RESERVE_DIVISOR
 }
 
-/// Whether one more typed host input event would eat into the automation
-/// reserve. Records the overflow, so the refusal is never silent.
 fn input_event_lane_full(list: &mut EventList) -> bool {
     if list.len() < input_event_typed_limit(list.capacity()) {
         return false;
@@ -186,7 +138,6 @@ fn input_event_lane_full(list: &mut EventList) -> bool {
     true
 }
 
-/// Classify a typed refusal separately from exhaustion of either lane.
 fn input_refusal_status(list: &EventList) -> u32 {
     if list.len() < list.capacity() && list.exact_len() < list.exact_capacity() {
         VST3_EVENT_RESERVED
@@ -195,9 +146,6 @@ fn input_refusal_status(list: &EventList) -> u32 {
     }
 }
 
-/// Push an exact host event with its optional typed fallback, keeping the
-/// typed lane's automation reserve. Refuse both halves atomically; never
-/// deliver an exact note whose typed fallback was refused.
 fn push_input_pair(
     list: &mut EventList,
     typed: Option<Event>,
@@ -210,10 +158,6 @@ fn push_input_pair(
     }
 }
 
-/// The event for one host queue point. `PerSample` plugins ramp
-/// themselves, so they get the segment from the previous point as a linear
-/// `ParamRamp`; `BlockSplit` plugins get the point, and the chunker splits
-/// there.
 pub(crate) fn param_point_event(
     automation: moose_core::Automation,
     id: u32,
@@ -243,6 +187,7 @@ pub(crate) fn param_point_event(
 pub(crate) fn push_vst3_input_event<P: PluginExport>(
     audio: &mut Vst3Scratch<P>,
     event: &Vst3NativeEvent,
+    data: Option<&[u8]>,
 ) -> u32 {
     let Ok(sample_offset) = u32::try_from(event.sample_offset) else {
         return VST3_EVENT_INVALID;
@@ -353,17 +298,15 @@ pub(crate) fn push_vst3_input_event<P: PluginExport>(
             audio.event_list.try_push_exact(exact)
         }
         VST3_EVENT_DATA => {
-            if event.type_id != 0 || (event.len > 0 && event.bytes.is_null()) {
+            if event.type_id != 0 {
                 return VST3_EVENT_INVALID;
             }
+            let Some(bytes) = data else {
+                return VST3_EVENT_INVALID;
+            };
             if input_event_lane_full(&mut audio.event_list) {
                 return input_refusal_status(&audio.event_list);
             }
-            let bytes = if event.len == 0 {
-                &[][..]
-            } else {
-                unsafe { std::slice::from_raw_parts(event.bytes, event.len as usize) }
-            };
             let exact = ExactEvent::new(
                 sample_offset,
                 ExactEventBody::SysEx {

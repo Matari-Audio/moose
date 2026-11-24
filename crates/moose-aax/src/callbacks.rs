@@ -303,6 +303,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
         if plugin.prepare(&prep).is_err() {
             return;
         }
+        inst.pending_state.set_block_interval(sr, mf as usize);
+        inst.snapshot.set_block_interval(sr, mf as usize);
         plugin.reset(&prep.audio);
         audio.prepared = true;
 
@@ -370,6 +372,7 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
 
         // Run queued state loads before entering `RtSection`: `load_state`
         // may allocate, matching CLAP, VST3, and AU.
+        inst.pending_state.record_audio_block();
         apply_queued_state(&mut *plugin, &inst.pending_state);
 
         let _rt = RtSection::enter();

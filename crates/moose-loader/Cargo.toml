@@ -14,13 +14,8 @@ log = "0.4"
 crc32fast = "1.5"
 moose-core = { workspace = true }
 moose-params = { workspace = true }
-# `moose-gui-types` is the type surface (layout / interaction /
-# render / theme / widgets) the canary fingerprint inspects across
-# the dylib boundary.
-moose-gui-types = { workspace = true }
-# `moose-plugin` carries the `PluginLogicCore` blanket and the
-# `PluginLogic` / `PluginLogic64` leaf traits the macro-generated
-# wrappers reference. Always required.
+# `moose-plugin` carries the `Plugin` / `PluginLogicCore` traits the
+# macro-generated wrappers reference. Always required.
 moose-plugin = { workspace = true }
 
 [dependencies.libloading]

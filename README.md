@@ -5,7 +5,7 @@ A Rust audio plugin framework. Build **CLAP**, **VST3**, **AU (v2 & v3 on macOS)
 ## Highlights
 
 - **One codebase, native format parity** — CLAP 1.2.10+ (polyphonic modulation, ambisonics, host thread pool, nested Wayland, drafts), Steinberg VST3 3.7+/3.8+ (pure-Rust COM, `IParameterFinder`, `IKeyswitchController`, `IUnitInfo`/`IProgramListData`, `IPluginCompatibility`, `IWaylandFrame`), first-class macOS Audio Unit v2 & v3 (`AUParameterTree`, sample-accurate ramps, `auval` validated), static-linked Pro Tools AAX (`AAX_CMonolithicParameters`, macOS & Windows), and Standalone.
-- **Real-time safe & event-driven** — wait-free audio-thread entry across every format (never blocks even on misbehaving overlapping hosts), zero audio-thread heap allocations or locks (enforced via `--features rt-paranoid`), lock-free host handoffs verified with `loom`, and event-driven OS wakes with zero UI-thread polling (`eventfd`/`IRunLoop` on Linux, libdispatch `DATA_OR` on macOS, `HWND_MESSAGE` on Windows).
+- **Real-time safe & event-driven** — wait-free audio-thread entry across every format (never blocks even on misbehaving overlapping hosts), zero audio-thread heap allocations or locks (enforced via `--features rt-paranoid`), off-audio-thread state decoding with lock-free RT swaps (`DecodedState`) and zero sleeping-host stalls, lock-free host handoffs verified with `loom`, and event-driven OS wakes with zero UI-thread polling (`eventfd`/`IRunLoop` on Linux, libdispatch `DATA_OR` on macOS, `HWND_MESSAGE` on Windows).
 - **Fast local loop & out-of-the-box CI** — `cargo moose new` initializes a single plugin or multi-plugin workspace in milliseconds with fast-compile dev profiles, hot-reload `--shell` builds, headless PNG screenshots, and a cross-platform GitHub Actions CI workflow ready on day one.
 
 ## Quick Start
@@ -169,7 +169,7 @@ Place `.preset` TOML files in a `presets/` directory next to your crate and `car
 
 - **Core & DSP:** `moose`, `moose-core`, `moose-params`, `moose-derive`, `moose-dsp`, `moose-simd`, `moose-utils`
 - **Formats & Runtime:** `moose-clap`, `moose-vst3`, `moose-au`, `moose-aax`, `moose-standalone`, `moose-plugin`, `moose-loader`, `moose-shim-types`
-- **GUI & Assets:** `moose-mui`, `moose-font`, `moose-gui-types`, `moose-gui-utils`
+- **GUI & Assets:** `moose-mui`, `moose-font`
 - **Tooling & Testing:** `cargo-moose`, `moose-build`, `moose-driver`, `moose-test`
 
 ## Requirements

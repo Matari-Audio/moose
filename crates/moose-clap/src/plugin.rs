@@ -253,6 +253,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             if instance.prepare(&config).is_err() {
                 return false;
             }
+            data.pending_state
+                .set_block_interval(sample_rate, max_block);
+            data.snapshot.set_block_interval(sample_rate, max_block);
             data.panic_latch.clear_with(|msg| {
                 if !data.host.log(data.host_log, CLAP_LOG_ERROR, msg) {
                     eprintln!("{msg}");
@@ -330,6 +333,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
         let data = data_from_plugin::<P>(plugin);
         data.host.debug_assert_main_thread(data.host_thread_check);
         data.active.store(false, Ordering::Relaxed);
+        data.pending_state.mark_audio_inactive();
+        data.snapshot.mark_audio_inactive();
         // A `state_load` while active queues its blob for the audio thread
         // to drain at the top of the next block. If the host deactivates
         // before that block runs (sample-rate / buffer change, offline
@@ -375,6 +380,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_stop_processing<P: PluginExport>(
     // SAFETY: CLAP supplies a live instance for this factory's plugin type.
     let data = unsafe { data_from_plugin::<P>(plugin) };
     data.processing.store(false, Ordering::Release);
+    data.pending_state.mark_audio_inactive();
+    data.snapshot.mark_audio_inactive();
 }
 
 pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plugin) {

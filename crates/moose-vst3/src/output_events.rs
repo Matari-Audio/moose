@@ -1,5 +1,6 @@
 //! Output events from the plugin to the host: notes, MIDI, expressions and output parameters.
 
+use crate::backend::Vst3NativeEvent;
 use crate::input_events::{
     VST3_EVENT_DATA, VST3_EVENT_EMITTED, VST3_EVENT_END, VST3_EVENT_INVALID, VST3_EVENT_IS_LIVE,
     VST3_EVENT_LEGACY_MIDI_CC_OUT, VST3_EVENT_NOTE_EXPRESSION, VST3_EVENT_NOTE_OFF,
@@ -8,11 +9,8 @@ use crate::input_events::{
 };
 use crate::instance::{OutputNoteIds, OutputSourceIdentity, PendingOutputMutation, Vst3Instance};
 #[cfg(test)]
-use moose_core::midi::{downconvert_to_midi1, per_note_bend_from_semitones};
+use moose_core::midi::per_note_bend_from_semitones;
 
-use crate::ffi::Vst3NativeEvent;
-#[cfg(test)]
-use crate::instance::Vst3MidiEvent;
 use moose_core::cast::len_u32;
 use moose_core::events::{
     Event, EventBody, EventList, ExactAddress, ExactEventBody, ExactEventMetadata,
@@ -24,79 +22,6 @@ use moose_core::midi::{
 };
 use moose_params::{MidiSource, ParamInfo, ParamRange};
 
-// ---------------------------------------------------------------------------
-// Output event callbacks
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-pub(crate) fn try_encode_vst3_midi(event: &Event) -> Option<Vst3MidiEvent> {
-    let body = match event.body {
-        body if note_expression_of(&body).is_some() => return None,
-        other => downconvert_to_midi1(&other).unwrap_or(other),
-    };
-    let (status, data1, data2) = match body {
-        EventBody::NoteOn {
-            channel,
-            note,
-            velocity,
-            ..
-        } => (0x90 | (channel & 0x0F), note, velocity),
-        EventBody::NoteOff {
-            channel,
-            note,
-            velocity,
-            ..
-        } => (0x80 | (channel & 0x0F), note, velocity),
-        EventBody::ControlChange {
-            channel, cc, value, ..
-        } => (0xB0 | (channel & 0x0F), cc, value),
-        EventBody::Aftertouch {
-            channel,
-            note,
-            pressure,
-            ..
-        } => (0xA0 | (channel & 0x0F), note, pressure),
-        EventBody::ChannelPressure {
-            channel, pressure, ..
-        } => (0xD0 | (channel & 0x0F), pressure, 0),
-        EventBody::PitchBend { channel, value, .. } => {
-            let (lsb, msb) = pitch_bend_to_bytes(value);
-            (0xE0 | (channel & 0x0F), lsb, msb)
-        }
-        EventBody::ProgramChange {
-            channel, program, ..
-        } => (0xC0 | (channel & 0x0F), program, 0),
-        _ => return None,
-    };
-    Some(Vst3MidiEvent {
-        sample_offset: event.sample_offset,
-        status,
-        data1,
-        data2,
-        port: event.port,
-        note_id: -1,
-        ne_value: 0.0,
-    })
-}
-
-/// VST3 has no native CC / pitch-bend / channel-pressure / program
-/// input event. Hosts route those MIDI messages to a parameter the
-/// plugin advertises through `IMidiMapping` (see
-/// `cb_midi_mapping_get_param_id`) and deliver them as parameter
-/// changes. When `info` carries such a binding, turn the parameter
-/// change back into the MIDI event the plugin expects, so event-based
-/// plugins behave the same here as on AU / CLAP / LV2 (which hand the
-/// plugin raw MIDI). Returns `None` for unmapped parameters - the
-/// caller still emits the plain `ParamChange`.
-///
-/// `plain` is the denormalized value the shim already produced; we
-/// re-normalize through the parameter's range so the MIDI-domain
-/// mapping is independent of how the binding parameter declares its
-/// range.
-//
-// `norm as f32` is a lossless-enough narrowing of a clamped `0..=1`
-// value; the MIDI encoders take `f32`.
-#[allow(clippy::cast_possible_truncation)]
 /// A parameter's precomputed MIDI-controller binding. Built once per
 /// instance for every param that declares a `midi_map`, so the audio
 /// thread can bridge a mapped controller change to its `EventBody`
@@ -120,9 +45,7 @@ impl MidiMap {
 }
 
 /// Bridge a MIDI-mapped parameter change back into the `EventBody` the
-/// plugin expects. VST3 has no native input event for channel MIDI, so
-/// the host delivers it as a parameter change on the mapped id.
-// `normalize` yields a `0.0..=1.0` value; the MIDI encoders take `f32`.
+/// plugin expects.
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn midi_event_from_map(map: &MidiMap, plain: f64) -> EventBody {
@@ -138,9 +61,6 @@ pub(crate) fn midi_event_from_map_with_range(
     let channel = map.channel;
     let norm = range.normalize(plain) as f32; // 0.0..=1.0
     match map.source {
-        // Host-normalized `0..1` is the pitch-wheel position (0 = full
-        // down, 0.5 = center, 1 = full up); shift to `[-1, 1]` for the
-        // 14-bit encoder.
         MidiSource::PitchBend => EventBody::PitchBend {
             group: 0,
             channel,
@@ -171,12 +91,9 @@ pub(crate) enum Vst3EncodeResult {
     Invalid,
 }
 
-pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
+impl<P: PluginExport> Vst3Instance<P> {
+    pub(crate) fn begin_output_events_impl(&self) {
+        let mut audio = self.audio.enter();
         audio.output_cursor = LosslessEventCursor::default();
         audio.output_preflight_status = if audio.output_events.overflow().is_some() {
             VST3_EVENT_QUEUE_FULL
@@ -196,8 +113,8 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
                         return valid_output_param(
                             event,
                             audio.input_num_frames,
-                            &inst.param_infos,
-                            inst.params_arc.as_ref(),
+                            &self.param_infos,
+                            self.params_arc.as_ref(),
                         )
                         .is_none()
                         .then_some(VST3_EVENT_INVALID);
@@ -220,18 +137,9 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
         };
         audio.pending_output_mutation = PendingOutputMutation::None;
     }
-}
 
-pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    out: *mut Vst3NativeEvent,
-) -> u32 {
-    unsafe {
-        if out.is_null() {
-            return VST3_EVENT_INVALID;
-        }
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
+    pub(crate) fn next_output_event_impl(&self, out: &mut Vst3NativeEvent) -> u32 {
+        let mut audio = self.audio.enter();
         audio.pending_output_mutation = PendingOutputMutation::None;
         let scr = &mut *audio;
         if scr.output_preflight_status != VST3_EVENT_END {
@@ -260,22 +168,16 @@ pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
         ) {
             Vst3EncodeResult::Emitted(native, mutation) => {
                 scr.pending_output_mutation = mutation;
-                out.write(native);
+                *out = native;
                 VST3_EVENT_EMITTED
             }
             Vst3EncodeResult::Unsupported => VST3_EVENT_UNSUPPORTED,
             Vst3EncodeResult::Invalid => VST3_EVENT_INVALID,
         }
     }
-}
 
-pub(crate) unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    status: u32,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
+    pub(crate) fn finish_output_events_impl(&self, status: u32) {
+        let mut audio = self.audio.enter();
         let status = audio.output_events.overflow().map_or_else(
             || match status {
                 VST3_EVENT_END | VST3_EVENT_EMITTED => OutputEventStatus::Success,
@@ -287,19 +189,49 @@ pub(crate) unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
         );
         audio.output_events.set_output_status(status);
     }
-}
 
-pub(crate) unsafe extern "C" fn cb_commit_output_event<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let mut audio = inst.audio.enter();
+    pub(crate) fn commit_output_event_impl(&self) {
+        let mut audio = self.audio.enter();
         let mutation = std::mem::replace(
             &mut audio.pending_output_mutation,
             PendingOutputMutation::None,
         );
         audio.output_note_ids.commit(mutation);
+    }
+
+    pub(crate) fn output_param_count_impl(&self) -> u32 {
+        let audio = self.audio.enter();
+        len_u32(
+            audio
+                .output_events
+                .iter()
+                .filter(|e| {
+                    valid_output_param(
+                        e,
+                        audio.input_num_frames,
+                        &self.param_infos,
+                        self.params_arc.as_ref(),
+                    )
+                    .is_some()
+                })
+                .count(),
+        )
+    }
+
+    pub(crate) fn output_param_impl(&self, index: u32) -> Option<(u32, i32, f64)> {
+        let audio = self.audio.enter();
+        audio
+            .output_events
+            .iter()
+            .filter_map(|e| {
+                valid_output_param(
+                    e,
+                    audio.input_num_frames,
+                    &self.param_infos,
+                    self.params_arc.as_ref(),
+                )
+            })
+            .nth(index as usize)
     }
 }
 
@@ -453,8 +385,6 @@ pub(crate) fn encode_exact_vst3_output<P: PluginExport>(
                 PendingOutputMutation::None,
             )
         }
-        // Raw MIDI 1.0 and UMP, legacy note expression, and every exact
-        // variant without a native VST3 representation stay unsupported.
         _ => Vst3EncodeResult::Unsupported,
     };
     match encoded {
@@ -505,7 +435,6 @@ pub(crate) fn encode_detailed_note<P: PluginExport>(
             };
             (VST3_EVENT_NOTE_OFF, 0, note_id, mutation)
         }
-        // Choke, End, and future note kinds have no native VST3 event.
         _ => return Vst3EncodeResult::Unsupported,
     };
     Vst3EncodeResult::Emitted(
@@ -730,23 +659,9 @@ pub(crate) fn sysex_native_event(
     }
 }
 
-/// Map a moose per-note MIDI 2.0 event to a VST3 note-expression tuple
-/// `(type_id, note_id, value)`. VST3 has no UMP; per-note richness rides
-/// `INoteExpressionController` value events keyed by `note_id`. We key
-/// `note_id` deterministically as `(channel << 7) | note` - the shim
-/// stamps the plugin's `NoteOn` with the same id, so notes and their
-/// expression correlate without any per-instance tracking state. Returns
-/// `None` for per-note controllers VST3 has no predefined type for; the
-/// value is normalized `0..=1` (VST3's `NoteExpressionValue` domain).
 #[cfg(test)]
 pub(crate) fn note_expression_of(body: &EventBody) -> Option<(u32, i32, f64)> {
-    // Predefined VST3 NoteExpressionTypeIDs (reverse of the input map):
-    // Volume=0, Pan=1, Tuning=2, Vibrato=3, Expression=4, Brightness=5.
     let (type_id, channel, note, value) = match *body {
-        // Registered per-note controllers only: the predefined VST3
-        // expression types carry the registered indices' semantics;
-        // an assignable index is manufacturer-defined and must not
-        // alias onto them.
         EventBody::PerNoteCC {
             channel,
             note,
@@ -776,47 +691,29 @@ pub(crate) fn note_expression_of(body: &EventBody) -> Option<(u32, i32, f64)> {
     Some((type_id, vst3_note_id(channel, note), value))
 }
 
-/// Deterministic VST3 `noteId` for a moose note: `(channel << 7) | note`.
-/// The C++ shim stamps every emitted note-on/off with the same formula,
-/// so a plug-in's note-expression events address the live note without
-/// any shared correlation state.
 #[cfg(test)]
 pub(crate) fn vst3_note_id(channel: u8, note: u8) -> i32 {
     (i32::from(channel & 0x0F) << 7) | i32::from(note & 0x7F)
 }
 
-/// Normalize a wire-native 32-bit per-note value into VST3's `0..=1`
-/// `NoteExpressionValue` domain.
 #[cfg(test)]
 pub(crate) fn u32_to_unit(v: u32) -> f64 {
     f64::from(v) / f64::from(u32::MAX)
 }
 
-/// VST3's tuning note-expression span: normalized `0..=1` covers
-/// `-120..=+120` semitones (`plain = 240 * (norm - 0.5)` per the SDK).
 pub(crate) const VST3_TUNING_SPAN_SEMITONES: f64 = 240.0;
 
-/// VST3 tuning norm (`0..=1`, ±120 st) -> wire per-note bend. The wire
-/// full-scale is ±48 st, so a wider host bend saturates.
 #[cfg(test)]
 pub(crate) fn vst3_tuning_to_wire(norm: f64) -> u32 {
     per_note_bend_from_semitones((norm - 0.5) * VST3_TUNING_SPAN_SEMITONES)
 }
 
-/// Wire per-note bend (±48 st full-scale) -> VST3 tuning norm
-/// (`0..=1`, ±120 st), so the same event bends identically on every
-/// semitone-denominated host domain.
 pub(crate) fn wire_to_vst3_tuning(v: u32) -> f64 {
     0.5 + per_note_bend_semitones(v) / VST3_TUNING_SPAN_SEMITONES
 }
 
-/// Inverse of [`u32_to_unit`]: widen a VST3 `NoteExpressionValue` into
-/// the wire-native 32-bit per-note domain. Hosts are supposed to stay
-/// in `0..=1`, but the value crosses an FFI boundary - clamp first.
 #[cfg(test)]
 pub(crate) fn unit_to_u32(v: f64) -> u32 {
-    // Clamped to `0..=u32::MAX` before the cast, so no truncation or
-    // sign loss is possible.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scaled = (v.clamp(0.0, 1.0) * f64::from(u32::MAX)).round() as u32;
     scaled
@@ -838,58 +735,4 @@ fn valid_output_param<P: moose_params::Params>(
     let sample_offset = i32::try_from(event.sample_offset).unwrap_or(0);
     let range = params.live_param_range(id).unwrap_or(info.range);
     Some((id, sample_offset, range.normalize(value)))
-}
-
-pub(crate) unsafe extern "C" fn cb_get_output_param_count<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-) -> u32 {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        len_u32(
-            audio
-                .output_events
-                .iter()
-                .filter(|e| {
-                    valid_output_param(
-                        e,
-                        audio.input_num_frames,
-                        &inst.param_infos,
-                        inst.params_arc.as_ref(),
-                    )
-                    .is_some()
-                })
-                .count(),
-        )
-    }
-}
-
-pub(crate) unsafe extern "C" fn cb_get_output_param<P: PluginExport>(
-    ctx: *mut std::ffi::c_void,
-    index: u32,
-    out_id: *mut u32,
-    out_sample_offset: *mut i32,
-    out_value: *mut f64,
-) {
-    unsafe {
-        let inst = &*ctx.cast::<Vst3Instance<P>>();
-        let audio = inst.audio.enter();
-        if let Some((id, sample_offset, normalized)) = audio
-            .output_events
-            .iter()
-            .filter_map(|e| {
-                valid_output_param(
-                    e,
-                    audio.input_num_frames,
-                    &inst.param_infos,
-                    inst.params_arc.as_ref(),
-                )
-            })
-            .nth(index as usize)
-        {
-            *out_id = id;
-            *out_sample_offset = sample_offset;
-            *out_value = normalized;
-        }
-    }
 }

@@ -27,7 +27,6 @@ while IFS= read -r p; do
     crates/moose-standalone/src/menu_macos.rs | \
     crates/moose-standalone/src/windowed_macos.rs | \
     crates/cargo-moose/src/commands/install/au_v3.rs | \
-    crates/moose-gui-types/src/ios.rs | \
     crates/moose-au/* | \
     crates/cargo-moose/templates/au3/* | \
     scripts/gui-window-test.sh | scripts/macos-cursor-poke.swift | \

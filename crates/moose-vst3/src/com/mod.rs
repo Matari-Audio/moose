@@ -2,8 +2,8 @@
 //! from the MIT `pluginterfaces` headers).
 //!
 //! The objects here own everything host-facing: interface layout, IIDs,
-//! result codes, threading of host calls. Plugin behaviour stays in the
-//! callback table that `lib.rs` registers (`ffi::Vst3Callbacks`).
+//! result codes, threading of host calls. Plugin behaviour lives directly
+//! behind the typed [`crate::backend::Vst3Backend`] trait.
 //!
 //! The SDK's enum constants are `u32` on Unix and `i32` on Windows, and
 //! its counts and indices are `int32`; the casts between them are
@@ -33,15 +33,15 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use vst3::Steinberg::{IBStream, IBStreamTrait, kResultFalse, kResultOk};
 use vst3::{ComPtr, ComRef};
 
-use crate::ffi::{Vst3Callbacks, Vst3ParamDescriptor, Vst3PluginDescriptor};
+use crate::backend::{ParamDescriptor, PluginDescriptor, Vst3FactoryBackend};
 
 pub(crate) use component::Host;
 
 /// Everything `register` hands over, plus the unit tree derived from it.
 pub(crate) struct Registration {
-    pub desc: &'static Vst3PluginDescriptor,
-    pub cb: &'static Vst3Callbacks,
-    pub params: &'static [Vst3ParamDescriptor],
+    pub desc: PluginDescriptor,
+    pub factory: Box<dyn Vst3FactoryBackend>,
+    pub params: Vec<ParamDescriptor>,
     pub units: Vec<Unit>,
     /// `IUnitInfo` unit id per entry of `params`.
     pub param_unit: Vec<i32>,
@@ -53,10 +53,6 @@ pub(crate) struct Unit {
     pub name: String,
 }
 
-// SAFETY: every pointer inside is to leaked, immutable registration data.
-unsafe impl Send for Registration {}
-unsafe impl Sync for Registration {}
-
 static REGISTRATION: OnceLock<Registration> = OnceLock::new();
 
 pub(crate) fn registration() -> Option<&'static Registration> {
@@ -64,14 +60,14 @@ pub(crate) fn registration() -> Option<&'static Registration> {
 }
 
 pub(crate) fn register(
-    desc: &'static Vst3PluginDescriptor,
-    cb: &'static Vst3Callbacks,
-    params: &'static [Vst3ParamDescriptor],
+    desc: PluginDescriptor,
+    factory: Box<dyn Vst3FactoryBackend>,
+    params: Vec<ParamDescriptor>,
 ) {
-    let (units, param_unit) = build_units(params);
+    let (units, param_unit) = build_units(&params);
     let _ = REGISTRATION.set(Registration {
         desc,
-        cb,
+        factory,
         params,
         units,
         param_unit,
@@ -79,7 +75,7 @@ pub(crate) fn register(
 }
 
 /// One unit per distinct `/`-separated group path, root unit 0.
-fn build_units(params: &[Vst3ParamDescriptor]) -> (Vec<Unit>, Vec<i32>) {
+pub(crate) fn build_units(params: &[ParamDescriptor]) -> (Vec<Unit>, Vec<i32>) {
     let mut units = vec![Unit {
         id: 0,
         parent: -1,
@@ -91,10 +87,7 @@ fn build_units(params: &[Vst3ParamDescriptor]) -> (Vec<Unit>, Vec<i32>) {
         .map(|p| {
             let mut parent = 0;
             let mut path = String::new();
-            for name in unsafe { cstr(p.group) }
-                .split('/')
-                .filter(|s| !s.is_empty())
-            {
+            for name in p.group.split('/').filter(|s| !s.is_empty()) {
                 if !path.is_empty() {
                     path.push('/');
                 }
@@ -123,7 +116,7 @@ pub(crate) fn factory() -> *mut c_void {
 // Strings
 // ---------------------------------------------------------------------------
 
-/// `&str` from a registration C string; empty for null or invalid UTF-8.
+/// `&str` from a host C string; empty for null or invalid UTF-8.
 pub(crate) unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         ""
@@ -185,19 +178,15 @@ pub(crate) unsafe fn utf16_from(p: *const u16, max: usize) -> String {
 
 /// One bounded read from a host `IBStream` straight into the Rust parser.
 /// Returns the byte count, or -1 on an error or an impossible count.
-pub(crate) unsafe extern "C" fn read_state_chunk(
-    stream: *mut c_void,
-    dst: *mut u8,
-    requested: u32,
-) -> i64 {
-    let Some(stream) = (unsafe { ComRef::from_raw(stream.cast::<IBStream>()) }) else {
+pub(crate) fn read_state_chunk(stream: ComRef<'_, IBStream>, dst: &mut [u8]) -> i64 {
+    let Ok(requested) = u32::try_from(dst.len()) else {
         return -1;
     };
-    if dst.is_null() || requested == 0 || requested > 8192 {
+    if requested == 0 || requested > 8192 {
         return -1;
     }
     let mut count = 0;
-    let result = unsafe { stream.read(dst.cast(), requested as i32, &raw mut count) };
+    let result = unsafe { stream.read(dst.as_mut_ptr().cast(), requested as i32, &raw mut count) };
     if count < 0 || count as u32 > requested || (result != kResultOk && result != kResultFalse) {
         return -1;
     }
@@ -205,69 +194,31 @@ pub(crate) unsafe extern "C" fn read_state_chunk(
 }
 
 /// One bounded write to a host `IBStream`. Returns the byte count, or -1.
-pub(crate) unsafe extern "C" fn write_state_chunk(
-    stream: *mut c_void,
-    src: *const u8,
-    requested: u32,
-) -> i64 {
-    let Some(stream) = (unsafe { ComRef::from_raw(stream.cast::<IBStream>()) }) else {
+pub(crate) fn write_state_chunk(stream: ComRef<'_, IBStream>, src: &[u8]) -> i64 {
+    let Ok(requested) = u32::try_from(src.len()) else {
         return -1;
     };
-    if src.is_null() || requested == 0 || requested > 8192 {
+    if requested == 0 || requested > 8192 {
         return -1;
     }
     let mut count = 0;
-    let result = unsafe { stream.write(src.cast_mut().cast(), requested as i32, &raw mut count) };
+    let result = unsafe {
+        stream.write(
+            src.as_ptr().cast_mut().cast(),
+            requested as i32,
+            &raw mut count,
+        )
+    };
     if count <= 0 || count as u32 > requested || result != kResultOk {
         return -1;
     }
     i64::from(count)
 }
 
-/// Write a whole blob, looping over partial writes. 1 when every byte
-/// landed, 0 on an empty or oversized blob, no progress, a count past the
-/// request, or an error before the end.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) unsafe extern "C" fn write_state_stream(
-    stream: *mut c_void,
-    data: *const u8,
-    len: u32,
-) -> i32 {
-    let Some(stream) = (unsafe { ComRef::from_raw(stream.cast::<IBStream>()) }) else {
-        return 0;
-    };
-    if data.is_null() || len == 0 || len > i32::MAX as u32 {
-        return 0;
-    }
-    let mut offset = 0u32;
-    while offset < len {
-        let request = (len - offset).min(65536) as i32;
-        let mut written = 0;
-        let r = unsafe {
-            stream.write(
-                data.add(offset as usize).cast_mut().cast(),
-                request,
-                &raw mut written,
-            )
-        };
-        if written <= 0 || written > request {
-            return 0;
-        }
-        offset += written as u32;
-        if r != kResultOk && offset < len {
-            return 0;
-        }
-    }
-    1
-}
-
 // ---------------------------------------------------------------------------
-// Instance registry: Rust ctx -> live host object
+// Instance registry: monotonic instance ID -> live host object
 // ---------------------------------------------------------------------------
 
-/// Editor calls arrive with the Rust ctx, possibly on a worker thread and
-/// possibly after the host released the component. A `Weak` per ctx lets
-/// such a call pin the instance only while it is alive.
 static INSTANCES: Mutex<Vec<(usize, Weak<Host>)>> = Mutex::new(Vec::new());
 
 fn instances() -> std::sync::MutexGuard<'static, Vec<(usize, Weak<Host>)>> {
@@ -277,89 +228,92 @@ fn instances() -> std::sync::MutexGuard<'static, Vec<(usize, Weak<Host>)>> {
 }
 
 pub(crate) fn register_instance(host: &Arc<Host>) {
-    instances().push((host.ctx as usize, Arc::downgrade(host)));
+    instances().push((host.id, Arc::downgrade(host)));
 }
 
-pub(crate) fn unregister_instance(ctx: *mut c_void) {
-    instances().retain(|(key, _)| *key != ctx as usize);
+pub(crate) fn unregister_instance(id: usize) {
+    instances().retain(|(key, _)| *key != id);
 }
 
-/// The live instance for `ctx`, held for the duration of the call.
-pub(crate) fn pin(ctx: *mut c_void) -> Option<Arc<Host>> {
+/// The live instance for `id`, held for the duration of the call.
+pub(crate) fn pin(id: usize) -> Option<Arc<Host>> {
+    if id == 0 {
+        return None;
+    }
     instances()
         .iter()
-        .find(|(key, _)| *key == ctx as usize)
+        .find(|(key, _)| *key == id)
         .and_then(|(_, weak)| weak.upgrade())
 }
 
 // ---------------------------------------------------------------------------
-// Calls from lib.rs
+// Host notifications from Vst3Instance / Vst3Host
 // ---------------------------------------------------------------------------
 
-pub(crate) fn begin_edit(ctx: *mut c_void, id: u32) {
-    if let Some(host) = pin(ctx) {
+pub(crate) fn begin_edit(host_id: usize, id: u32) {
+    if let Some(host) = pin(host_id) {
         host.submit(component::EditOp::Begin(id));
     }
 }
 
-pub(crate) fn perform_edit(ctx: *mut c_void, id: u32, normalized: f64) {
-    if let Some(host) = pin(ctx) {
+pub(crate) fn perform_edit(host_id: usize, id: u32, normalized: f64) {
+    if let Some(host) = pin(host_id) {
         host.submit(component::EditOp::Perform(id, normalized));
     }
 }
 
-pub(crate) fn end_edit(ctx: *mut c_void, id: u32) {
-    if let Some(host) = pin(ctx) {
+pub(crate) fn end_edit(host_id: usize, id: u32) {
+    if let Some(host) = pin(host_id) {
         host.submit(component::EditOp::End(id));
     }
 }
 
-pub(crate) fn request_resize(ctx: *mut c_void, w: u32, h: u32) -> i32 {
-    pin(ctx).map_or(0, |host| host.submit(component::EditOp::Resize(w, h)))
+pub(crate) fn request_resize(host_id: usize, w: u32, h: u32) -> bool {
+    pin(host_id).is_some_and(|host| host.submit(component::EditOp::Resize(w, h)) != 0)
 }
 
-pub(crate) fn mark_dirty(ctx: *mut c_void) {
-    if let Some(host) = pin(ctx) {
+pub(crate) fn mark_dirty(host_id: usize) {
+    if let Some(host) = pin(host_id) {
         host.submit(component::EditOp::Dirty);
     }
 }
 
-pub(crate) fn group_edit(ctx: *mut c_void, edge: moose_core::editor::EditGroup) {
-    if let Some(host) = pin(ctx) {
+pub(crate) fn group_edit(host_id: usize, edge: moose_core::editor::EditGroup) {
+    if let Some(host) = pin(host_id) {
         host.submit(component::EditOp::Group(edge));
     }
 }
 
-pub(crate) fn mark_restart(ctx: *mut c_void, flags: i32) {
-    component::mark_restart(ctx, flags);
+pub(crate) fn mark_restart(host_id: usize, flags: i32) {
+    component::mark_restart(host_id, flags);
 }
 
-pub(crate) fn flush_host_queue(ctx: *mut c_void) {
-    component::flush_host_queue(ctx);
+pub(crate) fn flush_host_queue(host_id: usize) {
+    component::flush_host_queue(host_id);
 }
 
-pub(crate) unsafe fn wake_host_queue(host: *mut c_void) {
+pub(crate) unsafe fn wake_host_queue(host: *const Host) {
     unsafe { component::wake_host_queue(host) };
 }
 
-pub(crate) fn check_presentation(ctx: *mut c_void) {
-    if let Some(host) = pin(ctx) {
+pub(crate) fn check_presentation(host_id: usize) {
+    if let Some(host) = pin(host_id) {
         host.check_presentation();
     }
 }
 
-pub(crate) fn has_context_menu(ctx: *mut c_void) -> bool {
-    pin(ctx).is_some_and(|host| host.has_context_menu())
+pub(crate) fn has_context_menu(host_id: usize) -> bool {
+    pin(host_id).is_some_and(|host| host.has_context_menu())
 }
 
 pub(crate) fn popup_context_menu(
-    ctx: *mut c_void,
+    host_id: usize,
     target: moose_core::main_thread::MenuTarget,
     x: i32,
     y: i32,
     items: &[moose_core::main_thread::MenuItem],
 ) {
-    if let Some(host) = pin(ctx) {
+    if let Some(host) = pin(host_id) {
         host.popup_context_menu(target, x, y, items);
     }
 }
@@ -394,19 +348,11 @@ mod tests {
 
     #[test]
     fn units_follow_group_paths() {
-        let p = |g: &'static CStr| Vst3ParamDescriptor {
-            id: 0,
-            name: c"".as_ptr(),
-            short_name: c"".as_ptr(),
-            units: c"".as_ptr(),
-            min: 0.0,
-            max: 1.0,
-            default_normalized: 0.0,
-            step_count: 0,
-            flags: 0,
-            group: g.as_ptr(),
+        let p = |g: &str| ParamDescriptor {
+            group: g.to_owned(),
+            ..ParamDescriptor::default()
         };
-        let (units, map) = build_units(&[p(c""), p(c"Osc/A"), p(c"Osc"), p(c"Osc/A")]);
+        let (units, map) = build_units(&[p(""), p("Osc/A"), p("Osc"), p("Osc/A")]);
         assert_eq!(units.len(), 3);
         assert_eq!(map, vec![0, 2, 1, 2]);
         assert_eq!(units[2].parent, 1);

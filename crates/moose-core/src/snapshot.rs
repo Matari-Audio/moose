@@ -18,9 +18,12 @@
 //! audio-thread producer (`publish`) uses `try_lock` and never blocks, so
 //! there is no priority inversion on the audio side.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::state::{AudioHeartbeat, WAIT_POLL_INTERVAL};
 
 /// Capacity the inline publish buffer is pre-warmed to by
 /// [`SnapshotSlot::new`], off the audio thread, so the first per-block
@@ -38,11 +41,24 @@ pub const SNAPSHOT_PREALLOC: usize = 256;
 pub struct SnapshotSlot {
     /// Inline lane: the audio thread copies serialized bytes here each
     /// dirty block via `try_lock` (see [`Self::publish`]).
-    bytes: Mutex<Vec<u8>>,
+    bytes: Mutex<(Option<u64>, Vec<u8>)>,
+    slot_id: u64,
     /// Off-thread lane: a background thread swaps a whole pre-serialized
-    /// buffer in (see [`Self::store_arc`]). `read` prefers this over
-    /// `bytes`. The audio thread never touches this lock.
-    swapped: Mutex<Option<Arc<Vec<u8>>>>,
+    /// buffer in (see [`Self::store_arc`]), tagged with the [`Self::load_gen`]
+    /// observed when it was published. `read` prefers this over `bytes` only
+    /// when its generation matches the current `load_gen`, so a state load
+    /// never gets overridden by an older background snapshot. The audio thread
+    /// never touches this lock.
+    swapped: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+    /// Accepted custom state bytes retained for host-owned pre-activation
+    /// decoded loads whose live serializer returns empty (e.g. an unactivated
+    /// `Lifecycle` processor). Tagged with `load_gen` so any later state load
+    /// invalidates it immediately. Never touched on the audio thread.
+    pending_extra: Mutex<Option<(u64, Vec<u8>)>>,
+    /// Monotonic state-load generation. Incremented wait-free by
+    /// [`Self::mark_state_loaded`] whenever a custom state load lands so older
+    /// off-thread publisher snapshots cannot override newer inline state.
+    load_gen: AtomicU64,
     /// Set once *either* lane publishes for the first time. Until then a
     /// reader falls back to the locked `save_state()` path.
     supported: AtomicBool,
@@ -51,6 +67,14 @@ pub struct SnapshotSlot {
     /// end of its next `process` and stores the ticket in `served`.
     requested: AtomicU64,
     served: AtomicU64,
+    /// Snapshot ticket associated with the last queued state load applied on
+    /// the audio thread, published before `StateLoadQueue::mark_applied` so
+    /// the waiting host waits on that original ticket instead of requesting
+    /// a second block.
+    last_load_state: AtomicUsize,
+    last_load_ticket: AtomicU64,
+    /// Audio-thread block heartbeat recorded on every `pending_request` poll.
+    heartbeat: AudioHeartbeat,
 }
 
 impl SnapshotSlot {
@@ -68,20 +92,32 @@ impl SnapshotSlot {
     /// thread.
     #[must_use]
     pub fn with_capacity(cap: usize) -> Arc<Self> {
+        static NEXT_SLOT: AtomicU64 = AtomicU64::new(1);
         let slot = Self {
-            bytes: Mutex::new(Vec::with_capacity(cap)),
+            slot_id: NEXT_SLOT.fetch_add(1, Ordering::Relaxed),
+            bytes: Mutex::new((None, Vec::with_capacity(cap))),
             swapped: Mutex::new(None),
+            pending_extra: Mutex::new(None),
+            load_gen: AtomicU64::new(0),
             supported: AtomicBool::new(false),
             requested: AtomicU64::new(0),
             served: AtomicU64::new(0),
+            last_load_state: AtomicUsize::new(0),
+            last_load_ticket: AtomicU64::new(0),
+            heartbeat: AudioHeartbeat::new(),
         };
-        // Warm both locks off the audio thread: some platforms' std
-        // `Mutex` (macOS boxes a `pthread_mutex_t`) lazily allocate the OS
-        // mutex on first lock, which would otherwise land on the first
-        // `publish` from the audio thread. Locking here forces that
-        // one-time init at construction instead.
+        // Warm locks off the audio thread: some platforms' std `Mutex`
+        // (macOS boxes a `pthread_mutex_t`) lazily allocate the OS mutex on
+        // first lock, which would otherwise land on the first `publish` from
+        // the audio thread. Locking here forces that one-time init at
+        // construction instead.
         drop(slot.bytes.lock().unwrap_or_else(PoisonError::into_inner));
         drop(slot.swapped.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(
+            slot.pending_extra
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         Arc::new(slot)
     }
 
@@ -100,8 +136,10 @@ impl SnapshotSlot {
     /// last-published generation - the block must be retried.
     pub fn publish(&self, write: impl FnOnce(&mut Vec<u8>) -> bool) -> bool {
         if let Ok(mut guard) = self.bytes.try_lock() {
-            guard.clear();
-            if write(&mut guard) {
+            guard.1.clear();
+            guard.0 = None;
+            if write(&mut guard.1) {
+                guard.0 = Some(self.load_gen.load(Ordering::Acquire));
                 self.supported.store(true, Ordering::Release);
             }
             true
@@ -116,8 +154,9 @@ impl SnapshotSlot {
     /// bytes. Never call this from the audio thread.
     pub fn store_inline(&self, write: impl FnOnce(&mut Vec<u8>)) {
         let mut guard = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.clear();
-        write(&mut guard);
+        guard.1.clear();
+        write(&mut guard.1);
+        guard.0 = (!guard.1.is_empty()).then(|| self.load_gen.load(Ordering::Acquire));
         self.supported.store(true, Ordering::Release);
     }
 
@@ -127,17 +166,91 @@ impl SnapshotSlot {
         self.requested.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    /// Audio thread: the newest outstanding request ticket, if any. One
-    /// relaxed-cost atomic pair per block.
+    /// Audio thread: the newest outstanding request ticket, if any. Also
+    /// stamps the audio heartbeat so host saves know blocks are running.
     #[must_use]
     pub fn pending_request(&self) -> Option<u64> {
+        self.heartbeat.record_block();
         let requested = self.requested.load(Ordering::Acquire);
         (requested > self.served.load(Ordering::Relaxed)).then_some(requested)
     }
 
+    /// Host thread (on prepare/activate): configure the negotiated block
+    /// interval for sleeping-host heartbeat detection.
+    pub fn set_block_interval(&self, sample_rate: f64, max_block_size: usize) {
+        self.heartbeat
+            .set_block_interval(sample_rate, max_block_size);
+    }
+
+    /// Audio thread: associate `ticket` with `state_ptr` (from a queued load)
+    /// before reporting load completion. Wait-free, zero locks, zero allocs.
+    #[inline]
+    pub(crate) fn record_load_ticket(&self, state_ptr: usize, ticket: u64) {
+        self.last_load_ticket.store(ticket, Ordering::Relaxed);
+        self.last_load_state.store(state_ptr, Ordering::Release);
+    }
+
+    /// Host thread: return the snapshot ticket requested for `state_ptr` when
+    /// it was applied, if no newer load has superseded it.
+    #[must_use]
+    pub(crate) fn ticket_for_load(&self, state_ptr: usize) -> Option<u64> {
+        if self.last_load_state.load(Ordering::Acquire) == state_ptr {
+            let ticket = self.last_load_ticket.load(Ordering::Relaxed);
+            (ticket > 0).then_some(ticket)
+        } else {
+            None
+        }
+    }
+
+    /// Host thread: retain raw custom bytes from an accepted host-owned
+    /// decoded load when the live serializer returned empty (e.g. pre-activation
+    /// `Lifecycle` slot). Invalidated automatically on the next custom load.
+    pub(crate) fn store_pending_extra(&self, bytes: Vec<u8>) {
+        let generation = self.load_gen.load(Ordering::Acquire);
+        *self
+            .pending_extra
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((generation, bytes));
+        self.supported.store(true, Ordering::Release);
+    }
+
+    /// Host thread: read any pending pre-activation custom bytes for the
+    /// current load generation.
+    #[must_use]
+    pub(crate) fn read_pending_extra(&self) -> Option<Vec<u8>> {
+        self.pending_extra
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.load_gen.load(Ordering::Acquire))
+            .map(|(_, bytes)| bytes.clone())
+    }
+
+    /// Audio or host thread: record that a custom state load landed so any
+    /// older off-thread publisher snapshot cannot override the freshly loaded
+    /// state. Wait-free, zero locks, zero allocations.
+    #[inline]
+    pub fn mark_state_loaded(&self) {
+        self.load_gen.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Host thread: true when another thread recently polled
+    /// [`Self::pending_request`] from an audio block.
+    #[must_use]
+    pub fn is_audio_active_on_other_thread(&self) -> bool {
+        self.heartbeat.is_active_on_other_thread()
+    }
+
+    /// Host thread: mark audio inactive on stop/deactivate so any waiting save
+    /// returns promptly without stalling for the handshake timeout.
+    pub fn mark_audio_inactive(&self) {
+        self.heartbeat.mark_inactive();
+    }
+
     /// Audio thread: serve `ticket` by publishing `write`'s bytes into the
     /// inline lane. On lock contention the request stays outstanding and
-    /// the next block retries.
+    /// the next block retries. Publishes completion with atomics only (zero
+    /// waker mutexes or `Thread::unpark` syscalls).
     pub fn serve(&self, ticket: u64, write: impl FnOnce(&mut Vec<u8>)) {
         if self.publish(|buf| {
             write(buf);
@@ -148,30 +261,88 @@ impl SnapshotSlot {
     }
 
     /// Host thread: wait up to `timeout` for the audio thread to serve
-    /// `ticket`. `false` means no block ran in time (host stopped calling
-    /// `process` without telling us, a sleeping CLAP plugin); the caller
-    /// falls back to the last published snapshot.
+    /// `ticket`. `false` means no block ran in time (or audio stopped); the
+    /// caller falls back to the last published snapshot.
     #[must_use]
     pub fn wait_served(&self, ticket: u64, timeout: Duration) -> bool {
+        self.wait_served_poll(ticket, timeout, || {})
+    }
+
+    pub(crate) fn wait_served_poll(
+        &self,
+        ticket: u64,
+        timeout: Duration,
+        mut on_poll: impl FnMut(),
+    ) -> bool {
+        let start_gen = self.heartbeat.inactive_gen();
+        if self.served.load(Ordering::Acquire) >= ticket {
+            return true;
+        }
+        if timeout.is_zero() || self.heartbeat.was_stopped_since(start_gen) {
+            return false;
+        }
         let deadline = Instant::now() + timeout;
+        let mut spins = 0u8;
         loop {
+            on_poll();
             if self.served.load(Ordering::Acquire) >= ticket {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if self.heartbeat.was_stopped_since(start_gen) {
                 return false;
             }
-            std::thread::sleep(Duration::from_micros(200));
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if spins < 4 {
+                spins += 1;
+                thread::yield_now();
+            } else {
+                thread::sleep((deadline - now).min(WAIT_POLL_INTERVAL));
+            }
         }
+    }
+
+    /// Current state-load generation token. Capture this before starting
+    /// off-thread serialization and pass it to [`Self::store_arc_for_generation`]
+    /// (or [`SnapshotPublisher::publish_for_generation`]) so a host state load
+    /// landing mid-serialization causes the stale snapshot to be rejected.
+    #[must_use]
+    pub fn generation(&self) -> SnapshotGeneration {
+        SnapshotGeneration(self.load_gen.load(Ordering::Acquire), self.slot_id)
     }
 
     /// Off-thread lane: swap a whole pre-serialized snapshot in. Called
     /// from a background thread (a task-pool handler, a loader worker) -
     /// **never the audio thread** - so the bytes are never copied under a
-    /// real-time deadline. Takes read preference in [`Self::read`].
+    /// real-time deadline. Takes read preference in [`Self::read`] while
+    /// its load generation matches the current [`Self::load_gen`].
     pub fn store_arc(&self, bytes: Vec<u8>) {
-        *self.swapped.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(bytes));
+        let generation = self.generation();
+        let _ = self.store_arc_for_generation(bytes, generation);
+    }
+
+    /// Off-thread lane: publish `bytes` bound to the `generation` captured
+    /// when serialization began.
+    ///
+    /// Returns `true` if stored, or `false` if rejected because a newer host
+    /// state load advanced `load_gen` or a newer-generation snapshot is
+    /// already stored. Equal-generation updates overwrite normally.
+    pub fn store_arc_for_generation(&self, bytes: Vec<u8>, generation: SnapshotGeneration) -> bool {
+        let mut guard = self.swapped.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = self.load_gen.load(Ordering::Acquire);
+        if generation.1 != self.slot_id
+            || generation.0 != current
+            || guard
+                .as_ref()
+                .is_some_and(|(stored_gen, _)| *stored_gen > generation.0)
+        {
+            return false;
+        }
+        *guard = Some((generation.0, Arc::new(bytes)));
         self.supported.store(true, Ordering::Release);
+        true
     }
 
     /// Whether the plugin has ever published a snapshot on either lane.
@@ -186,48 +357,55 @@ impl SnapshotSlot {
     /// Host / GUI thread: the latest published snapshot, or `None` when
     /// the plugin doesn't publish snapshots (nothing ever written) so
     /// the caller can fall back to the locked `save_state()` path. The
-    /// off-thread lane wins over the inline lane - a plugin publishing
-    /// large state there never touches `bytes`.
+    /// off-thread lane wins over the inline lane only when it belongs to
+    /// the current state-load generation; an older publisher snapshot never
+    /// overrides a newer state load.
     #[must_use]
     pub fn read(&self) -> Option<Vec<u8>> {
         if !self.supported.load(Ordering::Acquire) {
             return None;
         }
-        if let Some(arc) = self
-            .swapped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
-            return Some((**arc).clone());
-        }
-        Some(
-            self.bytes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
-        )
+        Some(self.read_current().unwrap_or_default())
     }
 
-    /// Just the off-thread (publisher) lane's bytes, or `None` when a
-    /// background thread hasn't published there. A non-realtime save path
-    /// (LV2) uses this to pick up a publisher-lane snapshot the plugin's
-    /// live `save_state()` can't produce, without also reading the inline
-    /// lane - which it serves live from the plugin instead, so a
-    /// version-gated inline slot never makes it save stale bytes.
+    pub(crate) fn read_current(&self) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.read_offthread() {
+            return Some(bytes);
+        }
+        let inline = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        if inline.0 == Some(self.load_gen.load(Ordering::Acquire)) {
+            return Some(inline.1.clone());
+        }
+        drop(inline);
+        self.read_pending_extra()
+    }
+
+    /// Just the off-thread (publisher) lane's bytes for the current state-load
+    /// generation, or `None` when no matching publisher snapshot exists. A
+    /// non-realtime save path uses this to pick up a publisher-lane snapshot
+    /// the plugin's live `save_state()` can't produce, without letting a
+    /// pre-load publisher snapshot override a newer state load.
     #[must_use]
     pub fn read_offthread(&self) -> Option<Vec<u8>> {
         self.swapped
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map(|arc| (**arc).clone())
+            .filter(|(generation, _)| *generation == self.load_gen.load(Ordering::Acquire))
+            .map(|(_, arc)| (**arc).clone())
     }
 }
 
+/// Opaque state-load generation token captured before off-thread snapshot
+/// serialization begins (via [`SnapshotPublisher::generation`] or
+/// [`SnapshotSlot::generation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnapshotGeneration(u64, u64);
+
 /// Plugin-facing handle for the off-thread snapshot lane. Obtain it from
 /// `InitContext::snapshot_publisher()`, stash it in your DSP state, and
-/// call [`Self::publish`] from a background-task handler after your
+/// call [`Self::publish`] (or [`Self::generation`] +
+/// [`Self::publish_for_generation`]) from a background-task handler after your
 /// custom state changes (a sample load, a wavetable swap). The audio
 /// thread never copies the bytes; the host reads whatever was last
 /// published. Cloneable and `Send + Sync` so a task handler can hold it.
@@ -256,10 +434,27 @@ impl SnapshotPublisher {
         }
     }
 
+    /// Capture the current state-load generation before starting off-thread
+    /// serialization, then pass the token to [`Self::publish_for_generation`].
+    #[must_use]
+    pub fn generation(&self) -> SnapshotGeneration {
+        self.slot.generation()
+    }
+
     /// Publish a freshly serialized snapshot. Call from a background
     /// thread (never the audio thread) after your custom state changes.
     pub fn publish(&self, bytes: Vec<u8>) {
         self.slot.store_arc(bytes);
+    }
+
+    /// Publish a snapshot serialized for `generation` (captured via
+    /// [`Self::generation`] before serialization began).
+    ///
+    /// Returns `true` if stored, or `false` if rejected because a host state
+    /// load superseded `generation` while serialization was in flight.
+    #[must_use]
+    pub fn publish_for_generation(&self, generation: SnapshotGeneration, bytes: Vec<u8>) -> bool {
+        self.slot.store_arc_for_generation(bytes, generation)
     }
 }
 
@@ -431,5 +626,52 @@ mod tests {
         });
         assert!(landed);
         assert_eq!(slot.read().expect("published").len(), 8192);
+    }
+
+    #[test]
+    fn foreign_generation_cannot_replace_a_snapshot() {
+        let a = SnapshotSlot::new();
+        let b = SnapshotSlot::new();
+        b.store_arc(vec![1]);
+        for _ in 0..2 {
+            assert!(!b.store_arc_for_generation(vec![2], a.generation()));
+            a.mark_state_loaded();
+        }
+        assert_eq!(b.read(), Some(vec![1]));
+        assert!(b.store_arc_for_generation(vec![3], b.generation()));
+    }
+
+    #[test]
+    fn stale_generation_publish_is_rejected_and_cannot_clobber_newer_generation() {
+        let slot = SnapshotSlot::new();
+        let publisher = SnapshotPublisher::new(&slot);
+
+        // Background task begins serializing state A at generation 0.
+        let gen0 = publisher.generation();
+
+        // A host state load advances the generation to 1 and publishes B.
+        slot.mark_state_loaded();
+        let gen1 = publisher.generation();
+        assert!(gen1 > gen0);
+        assert!(publisher.publish_for_generation(gen1, b"GEN1_B".to_vec()));
+        assert_eq!(slot.read(), Some(b"GEN1_B".to_vec()));
+
+        // The stale gen-0 serialization finishes after the load and tries to
+        // commit: must be rejected and must NOT overwrite GEN1_B.
+        assert!(!publisher.publish_for_generation(gen0, b"STALE_A".to_vec()));
+        assert_eq!(slot.read(), Some(b"GEN1_B".to_vec()));
+        assert_eq!(slot.read_offthread(), Some(b"GEN1_B".to_vec()));
+
+        // Equal-generation updates still succeed cleanly.
+        assert!(publisher.publish_for_generation(gen1, b"GEN1_B2".to_vec()));
+        assert_eq!(slot.read(), Some(b"GEN1_B2".to_vec()));
+
+        // A stale gen-0 commit is also rejected even if no gen-1 publisher
+        // entry has been stored yet (leaving inline state intact).
+        slot.mark_state_loaded();
+        slot.store_inline(|buf| buf.extend_from_slice(b"INLINE_C"));
+        assert!(!publisher.publish_for_generation(gen1, b"STALE_B".to_vec()));
+        assert_eq!(slot.read(), Some(b"INLINE_C".to_vec()));
+        assert!(slot.read_offthread().is_none());
     }
 }

@@ -1,8 +1,8 @@
 # moose-mui
 
-[MUI](https://github.com/Matari-Audio/MUI) editors for moose plugins. The
-moose port of MUI's `mui-truce`; enable it through the facade with
-`moose = { features = ["mui"] }` and import from `moose::mui`.
+[MUI](https://github.com/Matari-Audio/MUI) editors for moose plugins. Enable
+this crate through the facade with `moose = { features = ["mui"] }` and import
+from `moose::mui`.
 
 - `MuiEditor` implements moose's `Editor`: a baseview child window under the
   host's, a wgpu surface on it, and one `Ui` frame per native event.

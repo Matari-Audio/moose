@@ -2,9 +2,6 @@
 //!
 //! Plugin authors implement [`Plugin`] (shared, main-thread, and audio
 //! processor parts as three types) and export it via `moose::plugin!`.
-//!
-//! `moose-plugin` depends on `moose-gui-types` (light: layout, render
-//! trait, widget regions) without pulling in any windowing or renderer crate.
 
 use moose_core::buffer::AudioBuffer;
 use moose_core::bus::BusLayout;
@@ -12,9 +9,7 @@ use moose_core::config::AudioConfig;
 use moose_core::editor::Editor;
 use moose_core::events::EventList;
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::state::{ForeignState, MigratedState, StateLoadError};
-use moose_gui_types::interaction::WidgetRegion;
-use moose_gui_types::widgets::WidgetType;
+use moose_core::state::{DecodedState, ForeignState, MigratedState, StateLoadError};
 use moose_params::sample::Sample;
 
 mod lifecycle;
@@ -148,6 +143,26 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         Ok(())
     }
 
+    /// Decode custom state off the audio thread into a ready-to-swap
+    /// [`DecodedState`]. Default returns `Ok(None)` (legacy `load_state`).
+    ///
+    /// # Errors
+    /// Returns `Err(StateLoadError)` when the bytes cannot be decoded.
+    fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
+        let _ = data;
+        Ok(None)
+    }
+
+    /// Swap a decoded state into `state` on the audio thread (zero-alloc,
+    /// RT-safe). Displaced state stays in `decoded` and is dropped off-thread.
+    fn apply_decoded_state(
+        state: &mut Self::DspState,
+        params: &Self::Params,
+        decoded: &mut DecodedState,
+    ) {
+        let _ = (state, params, decoded);
+    }
+
     fn state_changed(state: &mut Self::DspState, params: &Self::Params) {
         let _ = (state, params);
     }
@@ -200,29 +215,4 @@ pub trait BackgroundTask: Send + 'static {
         self.run(params);
         None
     }
-}
-
-// ---------------------------------------------------------------------------
-// Default hit test
-// ---------------------------------------------------------------------------
-
-/// Default hit test: circular for knobs, rectangular for everything
-/// else, skip meters.
-#[must_use]
-pub fn default_hit_test(widgets: &[WidgetRegion], x: f32, y: f32) -> Option<usize> {
-    for (i, w) in widgets.iter().enumerate() {
-        if w.widget_type == WidgetType::Meter {
-            continue;
-        }
-        if w.widget_type == WidgetType::Knob {
-            let dx = x - w.cx;
-            let dy = y - w.cy;
-            if dx * dx + dy * dy <= w.radius * w.radius {
-                return Some(i);
-            }
-        } else if x >= w.x && x <= w.x + w.w && y >= w.y && y <= w.y + w.h {
-            return Some(i);
-        }
-    }
-    None
 }

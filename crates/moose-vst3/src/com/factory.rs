@@ -9,7 +9,7 @@ use vst3::Steinberg::*;
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 use super::component::{Component, Host};
-use super::{Registration, c8_into, cstr, registration, utf16_into};
+use super::{Registration, c8_into, registration, utf16_into};
 
 /// The SDK the bindings were generated from.
 const SDK_VERSION: &str = "VST 3.8.0";
@@ -18,8 +18,11 @@ const COMPATIBILITY_CATEGORY: &str = "Plugin Compatibility Class";
 
 /// Non-empty compatibility JSON declared by the plugin, if any.
 fn compatibility_json(reg: &'static Registration) -> Option<&'static [u8]> {
-    let s = unsafe { cstr(reg.desc.compatibility_json) };
-    (!s.is_empty()).then_some(s.as_bytes())
+    reg.desc
+        .compatibility_json
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::as_bytes)
 }
 
 /// Deterministic, collision-free sibling CID for the compatibility class.
@@ -64,16 +67,10 @@ impl IPluginCompatibilityTrait for Compatibility {
 }
 
 pub(super) struct Factory {
-    /// Linux: the host run loop from `setHostContext`, handed to new
-    /// instances for their persist wake.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     run_loop: Mutex<Option<ComPtr<Linux::IRunLoop>>>,
-    /// Linux: the `setHostContext` object, handed to new instances for
-    /// `IWaylandHost`.
     #[cfg(target_os = "linux")]
     context: Mutex<Option<ComPtr<FUnknown>>>,
-    /// Optional per-factory registration override used by unit tests so they
-    /// can exercise `Factory` without mutating the process-global `OnceLock`.
     #[cfg(test)]
     reg_override: Option<&'static Registration>,
 }
@@ -121,9 +118,9 @@ impl IPluginFactoryTrait for Factory {
             return kInvalidArgument;
         };
         *info = unsafe { std::mem::zeroed() };
-        c8_into(&mut info.vendor, unsafe { cstr(reg.desc.vendor) });
-        c8_into(&mut info.url, unsafe { cstr(reg.desc.url) });
-        c8_into(&mut info.email, unsafe { cstr(reg.desc.email) });
+        c8_into(&mut info.vendor, &reg.desc.vendor);
+        c8_into(&mut info.url, &reg.desc.url);
+        c8_into(&mut info.email, &reg.desc.email);
         info.flags = kUnicode as i32;
         kResultOk
     }
@@ -147,12 +144,12 @@ impl IPluginFactoryTrait for Factory {
         info.cardinality = kManyInstances as i32;
         if index == 0 {
             info.cid = reg.desc.cid.map(|b| b as i8);
-            c8_into(&mut info.category, unsafe { cstr(reg.desc.category) });
+            c8_into(&mut info.category, &reg.desc.category);
         } else {
             info.cid = compatibility_cid(reg.desc.cid).map(|b| b as i8);
             c8_into(&mut info.category, COMPATIBILITY_CATEGORY);
         }
-        c8_into(&mut info.name, unsafe { cstr(reg.desc.name) });
+        c8_into(&mut info.name, &reg.desc.name);
         kResultOk
     }
 
@@ -199,8 +196,6 @@ impl IPluginFactoryTrait for Factory {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        // A null instance means the plugin's create() panicked: fail
-        // instantiation instead of handing the host an inert plugin.
         let Some(host) = Host::new(reg, run_loop) else {
             return kResultFalse;
         };
@@ -233,22 +228,21 @@ impl IPluginFactory2Trait for Factory {
         if index != 0 && !(index == 1 && has_compat) {
             return kInvalidArgument;
         }
-        let d = reg.desc;
+        let d = &reg.desc;
         *info = unsafe { std::mem::zeroed() };
         info.cardinality = kManyInstances as i32;
         if index == 0 {
             info.cid = d.cid.map(|b| b as i8);
-            c8_into(&mut info.category, unsafe { cstr(d.category) });
-            c8_into(&mut info.subCategories, unsafe { cstr(d.subcategories) });
+            c8_into(&mut info.category, &d.category);
+            c8_into(&mut info.subCategories, &d.subcategories);
         } else {
             info.cid = compatibility_cid(d.cid).map(|b| b as i8);
             c8_into(&mut info.category, COMPATIBILITY_CATEGORY);
         }
-        c8_into(&mut info.name, unsafe { cstr(d.name) });
-        // Single component: processor and controller in one object.
+        c8_into(&mut info.name, &d.name);
         info.classFlags = 0;
-        c8_into(&mut info.vendor, unsafe { cstr(d.vendor) });
-        c8_into(&mut info.version, unsafe { cstr(d.version) });
+        c8_into(&mut info.vendor, &d.vendor);
+        c8_into(&mut info.version, &d.version);
         c8_into(&mut info.sdkVersion, SDK_VERSION);
         kResultOk
     }
@@ -263,21 +257,21 @@ impl IPluginFactory3Trait for Factory {
         if index != 0 && !(index == 1 && has_compat) {
             return kInvalidArgument;
         }
-        let d = reg.desc;
+        let d = &reg.desc;
         *info = unsafe { std::mem::zeroed() };
         info.cardinality = kManyInstances as i32;
         if index == 0 {
             info.cid = d.cid.map(|b| b as i8);
-            c8_into(&mut info.category, unsafe { cstr(d.category) });
-            c8_into(&mut info.subCategories, unsafe { cstr(d.subcategories) });
+            c8_into(&mut info.category, &d.category);
+            c8_into(&mut info.subCategories, &d.subcategories);
         } else {
             info.cid = compatibility_cid(d.cid).map(|b| b as i8);
             c8_into(&mut info.category, COMPATIBILITY_CATEGORY);
         }
-        utf16_into(&mut info.name, unsafe { cstr(d.name) });
+        utf16_into(&mut info.name, &d.name);
         info.classFlags = 0;
-        utf16_into(&mut info.vendor, unsafe { cstr(d.vendor) });
-        utf16_into(&mut info.version, unsafe { cstr(d.version) });
+        utf16_into(&mut info.vendor, &d.vendor);
+        utf16_into(&mut info.version, &d.version);
         utf16_into(&mut info.sdkVersion, SDK_VERSION);
         kResultOk
     }
@@ -287,7 +281,6 @@ impl IPluginFactory3Trait for Factory {
         {
             *self.run_loop.lock().unwrap_or_else(PoisonError::into_inner) =
                 super::wake::linux::run_loop_of(context);
-            // SAFETY: `context` is null or a live host object for this call.
             *self.context.lock().unwrap_or_else(PoisonError::into_inner) =
                 unsafe { super::retain(context) };
         }

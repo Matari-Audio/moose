@@ -551,21 +551,15 @@ pub(crate) unsafe fn gui_set_parent_inner<P: PluginExport>(
 /// of the child). The child stays at its built size; `AppKit` just
 /// repositions it as the parent resizes.
 ///
-/// Mirrors `moose-lv2`'s `anchor_child_to_top` (the non-resizable
-/// arm of `anchor_child_for_resize`). No `objc` dep needed in
-/// moose-clap until the autoresize-mask install path comes back -
-/// we use a local `class!`-free `msg_send!` via `objc2_app_kit`
-/// types instead.
+/// Mirrors the non-resizable top-anchor behaviour via `objc2::msg_send!`.
 #[cfg(target_os = "macos")]
 pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
-    use objc::runtime::Object;
-    use objc::{msg_send, sel, sel_impl};
+    use objc2::runtime::AnyObject;
+    use objc2::{Encode, Encoding, msg_send};
     // `MinYMargin | MaxXMargin`: bottom margin and right margin
     // elastic, view size + top/left margins fixed. As the parent
     // resizes, AppKit grows the empty space below/right of the
-    // child rather than dragging the child along. Per-frame
-    // `reanchor_to_superview_top` (from `on_frame`) catches any
-    // host-driven setFrame that bypasses autoresize.
+    // child rather than dragging the child along.
     const NSVIEW_MIN_Y_MARGIN: u64 = 8;
     const NSVIEW_MAX_X_MARGIN: u64 = 4;
     #[repr(C)]
@@ -574,11 +568,17 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
         x: f64,
         y: f64,
     }
+    unsafe impl Encode for NsPoint {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct NsSize {
         width: f64,
         height: f64,
+    }
+    unsafe impl Encode for NsSize {
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -586,29 +586,35 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
         origin: NsPoint,
         size: NsSize,
     }
+    unsafe impl Encode for NsRect {
+        const ENCODING: Encoding =
+            Encoding::Struct("CGRect", &[NsPoint::ENCODING, NsSize::ENCODING]);
+    }
     if parent.is_null() {
         return;
     }
-    let parent_obj = parent.cast::<Object>();
-    let parent_frame: NsRect = msg_send![parent_obj, frame];
-    let subviews: *mut Object = msg_send![parent_obj, subviews];
-    if subviews.is_null() {
-        return;
-    }
-    let count: usize = msg_send![subviews, count];
-    for i in 0..count {
-        let child: *mut Object = msg_send![subviews, objectAtIndex: i];
-        if child.is_null() {
-            continue;
+    unsafe {
+        let parent_obj = parent.cast::<AnyObject>();
+        let parent_frame: NsRect = msg_send![parent_obj, frame];
+        let subviews: *mut AnyObject = msg_send![parent_obj, subviews];
+        if subviews.is_null() {
+            return;
         }
-        let child_frame: NsRect = msg_send![child, frame];
-        let new_origin = NsPoint {
-            x: child_frame.origin.x,
-            y: parent_frame.size.height - child_frame.size.height,
-        };
-        let _: () = msg_send![child, setFrameOrigin: new_origin];
-        let _: () =
-            msg_send![child, setAutoresizingMask: NSVIEW_MIN_Y_MARGIN | NSVIEW_MAX_X_MARGIN];
+        let count: usize = msg_send![subviews, count];
+        for i in 0..count {
+            let child: *mut AnyObject = msg_send![subviews, objectAtIndex: i];
+            if child.is_null() {
+                continue;
+            }
+            let child_frame: NsRect = msg_send![child, frame];
+            let new_origin = NsPoint {
+                x: child_frame.origin.x,
+                y: parent_frame.size.height - child_frame.size.height,
+            };
+            let _: () = msg_send![child, setFrameOrigin: new_origin];
+            let _: () =
+                msg_send![child, setAutoresizingMask: NSVIEW_MIN_Y_MARGIN | NSVIEW_MAX_X_MARGIN];
+        }
     }
 }
 

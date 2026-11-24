@@ -14,7 +14,7 @@ use moose_core::meters::MeterStore;
 use moose_core::plugin::PluginRuntime;
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::snapshot::{SnapshotPublisher, SnapshotSlot};
-use moose_core::state::{ForeignState, MigratedState, StateLoadError};
+use moose_core::state::{DecodedState, ForeignState, MigratedState, StateLoadError};
 use moose_core::tasks::{AnyTaskSpawner, InitContext, warm_pool};
 use moose_params::Params;
 use moose_params::sample::Sample;
@@ -282,6 +282,26 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         <L as PluginLogicCore<S>>::validate_state(data)
     }
 
+    fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError>
+    where
+        Self: Sized,
+    {
+        <L as PluginLogicCore<S>>::decode_state(data)
+    }
+
+    /// Swap an off-thread decoded state into the live processor and run
+    /// `L::state_changed`.
+    ///
+    /// When a plugin opts into off-thread decoding (`decode_state` returning
+    /// `Ok(Some(_))`), queued audio-thread loads call this method inside an
+    /// `RtSection` — so `L::state_changed` **must** also be real-time safe
+    /// (zero allocations, locks, or blocking). Plugins returning `Ok(None)`
+    /// continue using `load_state` outside `RtSection`.
+    fn apply_decoded_state(&mut self, decoded: &mut DecodedState) {
+        L::apply_decoded_state(&mut self.state, &self.params, decoded);
+        L::state_changed(&mut self.state, &self.params);
+    }
+
     fn latency(&self) -> u32 {
         L::latency(&self.state)
     }
@@ -460,6 +480,25 @@ macro_rules! export_static {
                 Self: Sized,
             {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::validate_state(data)
+            }
+
+            fn decode_state(
+                data: &[u8],
+            ) -> Result<
+                Option<$crate::__macro_deps::moose_core::state::DecodedState>,
+                $crate::__macro_deps::moose_core::state::StateLoadError,
+            >
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::decode_state(data)
+            }
+
+            fn apply_decoded_state(
+                &mut self,
+                decoded: &mut $crate::__macro_deps::moose_core::state::DecodedState,
+            ) {
+                self.inner.apply_decoded_state(decoded);
             }
 
             fn latency(&self) -> u32 {

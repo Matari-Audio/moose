@@ -197,12 +197,17 @@ pub trait PluginExport: PluginRuntime + Sized {
 /// the plugin.
 #[must_use]
 pub fn read_custom_state_offthread<P: PluginExport>(plugin: &P) -> Vec<u8> {
-    plugin.snapshot_slot().read_offthread().unwrap_or_else(|| {
+    current_custom_state(plugin).unwrap_or_default()
+}
+
+pub(crate) fn current_custom_state<P: PluginExport>(plugin: &P) -> Option<Vec<u8>> {
+    plugin.snapshot_slot().read_offthread().or_else(|| {
         let mut buf = Vec::new();
         if plugin.snapshot_into(&mut buf) {
-            buf
+            Some(buf)
         } else {
-            plugin.save_state()
+            let legacy = plugin.save_state();
+            (!legacy.is_empty()).then_some(legacy)
         }
     })
 }

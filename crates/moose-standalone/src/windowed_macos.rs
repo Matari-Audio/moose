@@ -4,8 +4,8 @@
 //! `make_resizable` re-asserts it, and the rest pins the content
 //! limits, zoom and child layout baseview doesn't manage.
 
-use objc::runtime::Object;
-use objc::{msg_send, sel, sel_impl};
+use objc2::runtime::{AnyObject, Bool};
+use objc2::{Encode, Encoding, msg_send};
 
 /// `AppKit`'s `NSWindowStyleMaskResizable` value. Lives in
 /// `<AppKit/NSWindow.h>` as `NSWindowStyleMaskResizable = 1 << 3`.
@@ -20,7 +20,7 @@ pub unsafe fn window_of(ns_view: *mut std::ffi::c_void) -> *mut std::ffi::c_void
     if ns_view.is_null() {
         return std::ptr::null_mut();
     }
-    let window: *mut Object = unsafe { msg_send![ns_view.cast::<Object>(), window] };
+    let window: *mut AnyObject = unsafe { msg_send![ns_view.cast::<AnyObject>(), window] };
     window.cast()
 }
 
@@ -37,7 +37,7 @@ pub unsafe fn make_resizable(ns_window: *mut std::ffi::c_void) {
     if ns_window.is_null() {
         return;
     }
-    let window = ns_window.cast::<Object>();
+    let window = ns_window.cast::<AnyObject>();
     let mask: u64 = unsafe { msg_send![window, styleMask] };
     let new_mask = mask | NS_WINDOW_STYLE_MASK_RESIZABLE;
     let _: () = unsafe { msg_send![window, setStyleMask: new_mask] };
@@ -62,7 +62,7 @@ pub unsafe fn pin_content_size(ns_window: *mut std::ffi::c_void, w: u32, h: u32)
     if ns_window.is_null() {
         return;
     }
-    let window = ns_window.cast::<Object>();
+    let window = ns_window.cast::<AnyObject>();
     let size = NsSize {
         width: f64::from(w),
         height: f64::from(h),
@@ -100,7 +100,7 @@ pub unsafe fn install_content_limits(
     if ns_window.is_null() {
         return;
     }
-    let window = ns_window.cast::<Object>();
+    let window = ns_window.cast::<AnyObject>();
     let min_size = NsSize {
         width: f64::from(min.0.max(1)),
         height: f64::from(min.1.max(1)),
@@ -161,16 +161,16 @@ pub unsafe fn disable_zoom(ns_window: *mut std::ffi::c_void) {
     if ns_window.is_null() {
         return;
     }
-    let window = ns_window.cast::<Object>();
+    let window = ns_window.cast::<AnyObject>();
 
     // Grey out + disable the green button (covers click and the
     // title-bar double-click zoom gesture). The button can be nil on
     // a borderless window; baseview's is `Titled`, so it exists, but
     // guard anyway.
-    let zoom_button: *mut Object =
+    let zoom_button: *mut AnyObject =
         unsafe { msg_send![window, standardWindowButton: NS_WINDOW_ZOOM_BUTTON] };
     if !zoom_button.is_null() {
-        let _: () = unsafe { msg_send![zoom_button, setEnabled: false] };
+        let _: () = unsafe { msg_send![zoom_button, setEnabled: Bool::NO] };
     }
 
     // Forbid native fullscreen so `⌃⌘F` / the View menu can't bypass
@@ -220,8 +220,8 @@ pub unsafe fn install_subview_centering(ns_view: *mut std::ffi::c_void) {
     // child by the time `editor.open()` returns (baseview adds a
     // parented view with `addSubview:` synchronously). Walking *that* view's subviews finds the
     // editor's NSView reliably.
-    let parent = ns_view.cast::<Object>();
-    let subviews: *mut Object = unsafe { msg_send![parent, subviews] };
+    let parent = ns_view.cast::<AnyObject>();
+    let subviews: *mut AnyObject = unsafe { msg_send![parent, subviews] };
     if subviews.is_null() {
         return;
     }
@@ -229,7 +229,7 @@ pub unsafe fn install_subview_centering(ns_view: *mut std::ffi::c_void) {
     let mask =
         NSVIEW_MIN_X_MARGIN | NSVIEW_MAX_X_MARGIN | NSVIEW_MIN_Y_MARGIN | NSVIEW_MAX_Y_MARGIN;
     for i in 0..count {
-        let child: *mut Object = unsafe { msg_send![subviews, objectAtIndex: i] };
+        let child: *mut AnyObject = unsafe { msg_send![subviews, objectAtIndex: i] };
         if child.is_null() {
             continue;
         }
@@ -264,8 +264,8 @@ pub unsafe fn layout_child_centered(
     if ns_view.is_null() {
         return;
     }
-    let parent = ns_view.cast::<Object>();
-    let subviews: *mut Object = unsafe { msg_send![parent, subviews] };
+    let parent = ns_view.cast::<AnyObject>();
+    let subviews: *mut AnyObject = unsafe { msg_send![parent, subviews] };
     if subviews.is_null() {
         return;
     }
@@ -273,7 +273,7 @@ pub unsafe fn layout_child_centered(
     if count == 0 {
         return;
     }
-    let child: *mut Object = unsafe { msg_send![subviews, objectAtIndex: 0usize] };
+    let child: *mut AnyObject = unsafe { msg_send![subviews, objectAtIndex: 0usize] };
     if child.is_null() {
         return;
     }
@@ -314,6 +314,9 @@ struct NsSize {
     width: f64,
     height: f64,
 }
+unsafe impl Encode for NsSize {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -321,12 +324,18 @@ struct NsPoint {
     x: f64,
     y: f64,
 }
+unsafe impl Encode for NsPoint {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NsRect {
     origin: NsPoint,
     size: NsSize,
+}
+unsafe impl Encode for NsRect {
+    const ENCODING: Encoding = Encoding::Struct("CGRect", &[NsPoint::ENCODING, NsSize::ENCODING]);
 }
 
 /// Read the standalone `NSWindow`'s content frame size in logical
@@ -343,10 +352,10 @@ pub unsafe fn content_logical_size(ns_window: *mut std::ffi::c_void) -> Option<(
     if ns_window.is_null() {
         return None;
     }
-    let window = ns_window.cast::<Object>();
+    let window = ns_window.cast::<AnyObject>();
     // `contentLayoutRect` returns the rect inside the window's
     // content view, excluding title bar / toolbar - matches what
-    // the editor occupies. Native `NSRect` return; objc 0.2's
+    // the editor occupies. Native `NSRect` return; objc2's
     // `msg_send!` infers the layout from the bound type.
     let rect: NsRect = unsafe { msg_send![window, contentLayoutRect] };
     let w = rect.size.width.round();

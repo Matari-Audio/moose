@@ -10,8 +10,6 @@ members = [
     "crates/moose-aax",
     "crates/moose-standalone",
     "crates/moose-driver",
-    "crates/moose-gui-types",
-    "crates/moose-gui-utils",
     "crates/moose-plugin",
     "crates/moose-test",
     "test-support",
@@ -54,13 +52,6 @@ keywords = ["audio", "plugin", "vst3", "clap", "daw"]
 readme = "README.md"
 
 # Workspace-wide lint config. Crates opt in with `lints.workspace = true`.
-# `objc` 0.2's `msg_send!` / `class!` / `sel!` macros emit
-# `#[cfg(feature = "cargo-clippy")]` checks against the destination crate;
-# whitelist that cfg value so the unexpected_cfgs lint stops complaining
-# about an upstream macro-hygiene issue.
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
-
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # New in clippy 1.98 (style); `as_chunks` would churn every SIMD kernel.
@@ -87,7 +78,6 @@ moose-au = { version = "7.0.0", path = "crates/moose-au" }
 moose-aax = { version = "7.0.0", path = "crates/moose-aax" }
 moose-standalone = { version = "7.0.0", path = "crates/moose-standalone" }
 moose-driver = { version = "7.0.0", path = "crates/moose-driver" }
-moose-gui-types = { version = "7.0.0", path = "crates/moose-gui-types" }
 moose-plugin = { version = "7.0.0", path = "crates/moose-plugin" }
 moose-test = { version = "7.0.0", path = "crates/moose-test" }
 moose-test-fixtures = { path = "test-support" }
