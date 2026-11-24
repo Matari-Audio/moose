@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use moose_params::Params;
 use moose_params::sample::Float;
 
 use crate::events::TransportInfo;
-use crate::main_thread::{HostNotice, MenuTarget};
+use crate::main_thread::{HostNotice, MenuTarget, ParamIndication, ParamIndicationState};
 use crate::tasks::{AnyTaskSpawner, TaskSpawner};
 
 /// A lock-free editor factory bound to a plugin's param store.
@@ -668,6 +670,276 @@ pub enum EditorNotificationDelivery {
     QueuedAll,
 }
 
+/// Live host modulation state for one parameter (plain units).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ParamModulation {
+    /// Monophonic modulation offset (`CLAP_EVENT_PARAM_MOD` with `note_id == -1`).
+    pub mono: f64,
+    /// Polyphonic modulation envelope `(min, max)` observed across active notes
+    /// when the host has sent per-note `CLAP_EVENT_PARAM_MOD` (`note_id >= 0`).
+    pub poly_range: Option<(f64, f64)>,
+}
+
+struct PolyModSlot {
+    id: u32,
+    /// Packed `(min: f32, max: f32)` in a single atomic word:
+    /// high 32 bits = `min.to_bits()`, low 32 bits = `max.to_bits()`.
+    /// [`Self::EMPTY`] (`u64::MAX`, a quiet-NaN pair) denotes an inactive slot
+    /// so `(0.0, 0.0)` stays distinct from inactive, and a reader sees both
+    /// bounds from one load (no torn reads, no reader retry).
+    packed: AtomicU64,
+}
+
+impl PolyModSlot {
+    const EMPTY: u64 = u64::MAX;
+
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            packed: AtomicU64::new(Self::EMPTY),
+        }
+    }
+
+    #[inline]
+    fn pack(min: f32, max: f32) -> u64 {
+        ((u64::from(min.to_bits())) << 32) | u64::from(max.to_bits())
+    }
+
+    #[inline]
+    fn unpack(bits: u64) -> Option<(f32, f32)> {
+        if bits == Self::EMPTY {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let min = f32::from_bits((bits >> 32) as u32);
+        #[allow(clippy::cast_possible_truncation)]
+        let max = f32::from_bits(bits as u32);
+        if !min.is_finite() || !max.is_finite() {
+            return None;
+        }
+        Some((min.min(max), min.max(max)))
+    }
+
+    #[inline]
+    fn record(&self, amount: f64) -> bool {
+        if !amount.is_finite() {
+            return false;
+        }
+        // A finite offset beyond the f32 range saturates to `±f32::MAX`
+        // so it still reports active modulation.
+        #[allow(clippy::cast_possible_truncation)]
+        let value = (amount as f32).clamp(f32::MIN, f32::MAX);
+        let mut cur = self.packed.load(Ordering::Acquire);
+        loop {
+            let (min, max) = match Self::unpack(cur) {
+                Some((lo, hi)) => (lo.min(value), hi.max(value)),
+                None => (value, value),
+            };
+            let next = Self::pack(min, max);
+            match self
+                .packed
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    #[inline]
+    fn clear(&self) {
+        self.packed.store(Self::EMPTY, Ordering::Release);
+    }
+
+    #[inline]
+    fn read(&self) -> Option<(f64, f64)> {
+        Self::unpack(self.packed.load(Ordering::Acquire))
+            .map(|(min, max)| (f64::from(min), f64::from(max)))
+    }
+}
+
+/// Per-instance reactive UI feedback shared between a format wrapper and its
+/// open editor:
+///
+/// - Main-thread host [`ParamIndicationState`] table (`clap.param-indication/4`)
+///   with a monotonic revision counter.
+/// - Pre-allocated, lock-free single-`AtomicU64` per-parameter polyphonic
+///   modulation range slots (updated on the audio thread with zero
+///   allocations or locks; recording is a lock-free `compare_exchange_weak`
+///   retry loop, which can retry spuriously, and reading is a single load).
+/// - A coalesced editor wakeup callback invoked on the host main thread when
+///   indications, automation, or modulation change.
+pub struct EditorFeedback {
+    indications: RwLock<HashMap<u32, ParamIndicationState>>,
+    indication_rev: AtomicU64,
+    poly_slots: Box<[PolyModSlot]>,
+    any_poly_active: AtomicBool,
+    has_waker: AtomicBool,
+    waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for EditorFeedback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditorFeedback")
+            .field(
+                "indication_rev",
+                &self.indication_rev.load(Ordering::Relaxed),
+            )
+            .field("poly_slot_count", &self.poly_slots.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl EditorFeedback {
+    /// Allocate feedback storage for the given parameter IDs. Pre-allocates the
+    /// sorted poly-modulation slot array once off the audio thread so audio
+    /// updates never allocate or lock.
+    #[must_use]
+    pub fn new(param_ids: impl IntoIterator<Item = u32>) -> Self {
+        let mut ids: Vec<u32> = param_ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let poly_slots = ids
+            .into_iter()
+            .map(PolyModSlot::new)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            indications: RwLock::new(HashMap::new()),
+            indication_rev: AtomicU64::new(0),
+            poly_slots,
+            any_poly_active: AtomicBool::new(false),
+            has_waker: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Main thread: apply a host [`ParamIndication`] update and wake the open
+    /// editor when the indication changed.
+    pub fn set_indication(&self, id: u32, indication: &ParamIndication) -> bool {
+        let changed = {
+            let mut map = self
+                .indications
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.entry(id).or_default().apply(indication)
+        };
+        if changed {
+            self.indication_rev.fetch_add(1, Ordering::Release);
+            self.wake_editor();
+        }
+        changed
+    }
+
+    /// Read the current combined [`ParamIndicationState`] for `id`.
+    #[must_use]
+    pub fn indication(&self, id: u32) -> ParamIndicationState {
+        self.indications
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Monotonic revision bumped on every indication change.
+    #[must_use]
+    pub fn indication_revision(&self) -> u64 {
+        self.indication_rev.load(Ordering::Acquire)
+    }
+
+    /// Audio thread (RT-safe: zero allocations, zero locks): reset active
+    /// polyphonic modulation slots before recording a new block's events so
+    /// each slot reflects active live modulation instead of latching session
+    /// extremes forever.
+    #[inline]
+    pub fn begin_poly_mod_block(&self) {
+        let _ = self.clear_poly_mod();
+    }
+
+    /// Audio thread (RT-safe: zero allocations, zero locks): record a
+    /// polyphonic `CLAP_EVENT_PARAM_MOD` offset for `id`. NaN and infinite
+    /// offsets are ignored; finite offsets beyond the `f32` range saturate to
+    /// `±f32::MAX`. Uses a lock-free CAS retry loop (see [`EditorFeedback`]).
+    #[inline]
+    pub fn record_poly_mod(&self, id: u32, amount: f64) {
+        if let Ok(idx) = self.poly_slots.binary_search_by_key(&id, |s| s.id)
+            && self.poly_slots[idx].record(amount)
+        {
+            self.any_poly_active.store(true, Ordering::Release);
+        }
+    }
+
+    /// Audio/main thread (RT-safe: zero allocations, zero locks): clear all
+    /// polyphonic modulation summaries (e.g. on reset/deactivate/stop/silence).
+    /// Returns `true` when any slot was active and cleared.
+    #[inline]
+    pub fn clear_poly_mod(&self) -> bool {
+        if !self.any_poly_active.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.any_poly_active.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        for slot in &self.poly_slots {
+            slot.clear();
+        }
+        true
+    }
+
+    /// Read the current polyphonic modulation range `(min, max)` for `id`.
+    #[must_use]
+    pub fn poly_range(&self, id: u32) -> Option<(f64, f64)> {
+        self.poly_slots
+            .binary_search_by_key(&id, |s| s.id)
+            .ok()
+            .and_then(|idx| self.poly_slots[idx].read())
+    }
+
+    /// Build the combined [`ParamModulation`] snapshot for `id` using `mono`
+    /// from the parameter store plus the tracked polyphonic range.
+    #[must_use]
+    pub fn modulation(&self, id: u32, mono: f64) -> ParamModulation {
+        ParamModulation {
+            mono,
+            poly_range: self.poly_range(id),
+        }
+    }
+
+    /// Audio-thread safe (single atomic load) check for whether an open editor
+    /// has registered a wakeup callback. Format wrappers check this before
+    /// signalling `HostSignal::EDITOR_WAKE` so headless/closed-editor
+    /// automation never wakes the host main thread unnecessarily.
+    #[inline]
+    #[must_use]
+    pub fn has_waker(&self) -> bool {
+        self.has_waker.load(Ordering::Acquire)
+    }
+
+    /// Install or clear the editor's 0 Hz render-loop wakeup callback.
+    pub fn set_waker(&self, waker: Option<Arc<dyn Fn() + Send + Sync>>) {
+        let mut slot = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.has_waker.store(waker.is_some(), Ordering::Release);
+        *slot = waker;
+    }
+
+    /// Main thread: invoke the registered editor waker (if an editor is open).
+    /// Releases the internal lock before calling the callback.
+    pub fn wake_editor(&self) {
+        let waker = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+}
+
 /// Everything an editor asks of its host, implemented once per format
 /// wrapper and handed to the editor inside its [`PluginContext`].
 ///
@@ -743,6 +1015,29 @@ pub trait HostContext: EditorBridge {
     ) -> bool {
         false
     }
+
+    /// Current host indication state (automation state/colour and controller
+    /// mapping) for parameter `id` (`clap.param-indication/4`).
+    fn param_indication(&self, _id: u32) -> ParamIndicationState {
+        ParamIndicationState::default()
+    }
+
+    /// Monotonic revision counter bumped whenever any parameter's
+    /// [`ParamIndicationState`] changes.
+    fn param_indication_revision(&self) -> u64 {
+        0
+    }
+
+    /// Current live modulation offsets (mono + optional poly range, in plain
+    /// units) for parameter `id` (`CLAP_EVENT_PARAM_MOD`).
+    fn param_modulation(&self, _id: u32) -> ParamModulation {
+        ParamModulation::default()
+    }
+
+    /// Register or clear a main-thread wakeup callback that nudges the open
+    /// editor's 0 Hz render loop when host automation, modulation, or
+    /// indications change.
+    fn set_editor_waker(&self, _waker: Option<Arc<dyn Fn() + Send + Sync>>) {}
 }
 
 /// A [`ClosureBridge`] is a host with no optional notifications.
@@ -956,6 +1251,33 @@ impl<P: ?Sized> PluginContext<P> {
     /// thread except the audio thread.
     pub fn notify_host(&self, notice: HostNotice) {
         self.host.notify(notice);
+    }
+
+    /// Current host indication state (automation state/colour and mapped
+    /// controller metadata) for parameter `id`.
+    #[must_use]
+    pub fn param_indication(&self, id: impl Into<u32>) -> ParamIndicationState {
+        self.host.param_indication(id.into())
+    }
+
+    /// Monotonic revision counter for host parameter indications.
+    #[must_use]
+    pub fn param_indication_revision(&self) -> u64 {
+        self.host.param_indication_revision()
+    }
+
+    /// Live modulation offsets (mono + optional poly range, plain units) for
+    /// parameter `id`.
+    #[must_use]
+    pub fn param_modulation(&self, id: impl Into<u32>) -> ParamModulation {
+        self.host.param_modulation(id.into())
+    }
+
+    /// Register (`Some`) or clear (`None`) a wakeup callback that wakes the
+    /// editor's 0 Hz render loop when host automation, modulation, or
+    /// parameter indications change.
+    pub fn set_editor_waker(&self, waker: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.host.set_editor_waker(waker);
     }
 
     /// Which notifications the format already queues safely.
@@ -1715,5 +2037,86 @@ mod host_context_tests {
             context.notification_delivery(),
             EditorNotificationDelivery::HostThread
         );
+    }
+
+    #[test]
+    fn poly_mod_finite_offset_beyond_f32_range_stays_active() {
+        let fb = EditorFeedback::new([7]);
+        fb.record_poly_mod(7, 1e40);
+        assert_eq!(
+            fb.poly_range(7),
+            Some((f64::from(f32::MAX), f64::from(f32::MAX)))
+        );
+        fb.record_poly_mod(7, -1e40);
+        assert_eq!(
+            fb.poly_range(7),
+            Some((f64::from(f32::MIN), f64::from(f32::MAX)))
+        );
+        fb.begin_poly_mod_block();
+        fb.record_poly_mod(7, f64::INFINITY);
+        fb.record_poly_mod(7, f64::NAN);
+        assert_eq!(fb.poly_range(7), None);
+    }
+
+    #[test]
+    fn poly_mod_tracks_live_blocks_clears_and_is_atomic_u64_consistent() {
+        let feedback = Arc::new(EditorFeedback::new([0, 1]));
+        assert_eq!(feedback.poly_range(0), None);
+        assert!(!feedback.clear_poly_mod());
+
+        // Zero modulation offset is distinguishable from inactive (`EMPTY`).
+        feedback.begin_poly_mod_block();
+        feedback.record_poly_mod(0, 0.0);
+        assert_eq!(feedback.poly_range(0), Some((0.0, 0.0)));
+
+        // Non-finite values are ignored and cannot corrupt the packed sentinel.
+        feedback.record_poly_mod(0, f64::NAN);
+        feedback.record_poly_mod(0, f64::INFINITY);
+        assert_eq!(feedback.poly_range(0), Some((0.0, 0.0)));
+
+        // Block 1: wide range (-1.0, 3.0).
+        feedback.begin_poly_mod_block();
+        feedback.record_poly_mod(0, -1.0);
+        feedback.record_poly_mod(0, 3.0);
+        assert_eq!(feedback.poly_range(0), Some((-1.0, 3.0)));
+
+        // Block 2: narrower live range shrinks instead of latching extremes.
+        feedback.begin_poly_mod_block();
+        feedback.record_poly_mod(0, 0.25);
+        feedback.record_poly_mod(0, 0.5);
+        assert_eq!(feedback.poly_range(0), Some((0.25, 0.5)));
+
+        // Clear returns true once, then false when already clear.
+        assert!(feedback.clear_poly_mod());
+        assert_eq!(feedback.poly_range(0), None);
+        assert!(!feedback.clear_poly_mod());
+
+        // Concurrent writer/reader stress test: single-AtomicU64 reader must
+        // never observe torn `lo > hi` or uninitialized `(0.0, 0.0)`.
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_fb = Arc::clone(&feedback);
+        let writer_done = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            for i in 0..5_000u32 {
+                writer_fb.begin_poly_mod_block();
+                writer_fb.record_poly_mod(0, -2.5);
+                writer_fb.record_poly_mod(0, 4.0);
+                if i % 3 == 0 {
+                    let _ = writer_fb.clear_poly_mod();
+                }
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            if let Some((lo, hi)) = feedback.poly_range(0) {
+                assert!(lo <= hi, "torn poly_range: lo={lo} > hi={hi}");
+                assert!(
+                    lo != 0.0 || hi != 0.0,
+                    "observed uninitialized (0.0, 0.0) before min/max store"
+                );
+            }
+        }
+        writer.join().unwrap();
     }
 }

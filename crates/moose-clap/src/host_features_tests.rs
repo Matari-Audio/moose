@@ -718,6 +718,63 @@ fn param_indication_reaches_the_hooks() {
     });
 }
 
+#[test]
+fn param_indication_updates_editor_context_and_wakes_editor() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    with_modular(|plugin, _, _| unsafe {
+        let _ = seen();
+        let ctx = crate::gui::editor_context::<Plugin>(plugin);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        ctx.set_editor_waker(Some(Arc::new({
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        })));
+        let rev0 = ctx.param_indication_revision();
+        let ext = &*(*plugin).get_extension.unwrap()(plugin, CLAP_EXT_PARAM_INDICATION.as_ptr())
+            .cast::<clap_plugin_param_indication>();
+        let color = clap_color {
+            alpha: 255,
+            red: 10,
+            green: 20,
+            blue: 30,
+        };
+        ext.set_mapping.unwrap()(
+            plugin,
+            0,
+            true,
+            &raw const color,
+            c"Macro A".as_ptr(),
+            c"Host Macro A".as_ptr(),
+        );
+        ext.set_automation.unwrap()(
+            plugin,
+            0,
+            CLAP_PARAM_INDICATION_AUTOMATION_RECORDING,
+            &raw const color,
+        );
+        assert!(ctx.param_indication_revision() > rev0);
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        let state = ctx.param_indication(0u32);
+        assert_eq!(state.automation, AutomationState::Recording);
+        assert_eq!(
+            state.automation_color,
+            Some(HostColor {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            })
+        );
+        assert_eq!(
+            state.mapping.as_ref().map(|m| m.label.as_str()),
+            Some("Macro A")
+        );
+        ctx.set_editor_waker(None);
+    });
+}
+
 /// Items a fake menu builder received: (kind, label, action).
 type Built = Vec<(clap_context_menu_item_kind, String, u32)>;
 

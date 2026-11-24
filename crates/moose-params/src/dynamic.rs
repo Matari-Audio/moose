@@ -804,6 +804,11 @@ impl<const N: usize> Params for DynamicParams<N> {
         }
     }
 
+    fn get_modulation(&self, id: u32) -> f64 {
+        self.slot_for_id(id)
+            .map_or(0.0, |slot| self.modulation(slot))
+    }
+
     fn clear_modulations(&self) {
         for cell in &self.slots {
             cell.modulation.store(0f64.to_bits(), Ordering::Relaxed);

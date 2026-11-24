@@ -5,7 +5,7 @@ use crate::output_events::MidiMap;
 
 use moose_core::TransportSlot;
 use moose_core::buffer::RawBufferScratch;
-use moose_core::editor::{Editor, EditorBuilder};
+use moose_core::editor::{Editor, EditorBuilder, EditorFeedback};
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
@@ -53,6 +53,10 @@ pub(crate) struct EditorScaleState {
     /// Content scale from `setContentScaleFactor` (f64 bits, `0` until the
     /// host sends one; ignored on macOS).
     pub(crate) host_scale: AtomicU64,
+    /// Last content scale actually applied to the editor via `set_scale_factor`
+    /// (`0` = none applied yet). Tracked separately from `host_scale` so scale
+    /// changes reported while the GUI guard is held are applied after release.
+    pub(crate) last_applied: AtomicU64,
     /// Open editor's own window scale (`Editor::window_scale`, f64 bits, `0` = none).
     pub(crate) window_scale: AtomicU64,
 }
@@ -70,9 +74,32 @@ impl EditorScaleState {
             .unwrap_or(1.0)
     }
 
+    /// Scale factor between VST3 `ViewRect` coordinates and editor logical
+    /// points: always `1.0` on macOS (VST3/AppKit `ViewRect` is in logical
+    /// points even on Retina displays where `window_scale` is `2.0`), and
+    /// [`Self::host_scale`] on Windows/Linux.
+    pub(crate) fn view_rect_scale(&self) -> f64 {
+        #[cfg(target_os = "macos")]
+        {
+            1.0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.host_scale()
+        }
+    }
+
     /// The last content scale the host sent, if it ever did.
     pub(crate) fn reported_host_scale(&self) -> Option<f64> {
         match self.host_scale.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f64::from_bits(bits)),
+        }
+    }
+
+    /// The last host content scale actually applied to the editor.
+    pub(crate) fn applied_host_scale(&self) -> Option<f64> {
+        match self.last_applied.load(Ordering::Relaxed) {
             0 => None,
             bits => Some(f64::from_bits(bits)),
         }
@@ -90,6 +117,10 @@ impl EditorScaleState {
     pub(crate) fn set_host_scale(&self, scale: f64) {
         self.host_scale.store(scale.to_bits(), Ordering::Relaxed);
     }
+
+    pub(crate) fn set_applied_host_scale(&self, scale: f64) {
+        self.last_applied.store(scale.to_bits(), Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct Vst3Instance<P: PluginExport> {
@@ -105,6 +136,8 @@ pub(crate) struct Vst3Instance<P: PluginExport> {
     pub(crate) params_arc: Arc<P::Params>,
     /// Shared meter storage, set once at instance creation.
     pub(crate) meter_store: Arc<MeterStore>,
+    /// Shared reactive UI feedback (indications, modulation, 0 Hz editor waker).
+    pub(crate) feedback: Arc<EditorFeedback>,
     /// Lock-free custom-state slot the audio thread publishes into.
     pub(crate) snapshot: Arc<SnapshotSlot>,
     /// Background-task spawner (`None` unless the plugin wired `tasks:`).
@@ -228,6 +261,9 @@ pub(crate) struct Vst3Scratch<P: PluginExport> {
     pub(crate) output_preflight_status: u32,
     pub(crate) output_note_ids: OutputNoteIds,
     pub(crate) pending_output_mutation: PendingOutputMutation,
+    /// Coalesced flag set by `push_vst3_param_change` so `process_block`
+    /// signals `HostSignal::EDITOR_WAKE` at most once per audio block.
+    pub(crate) param_changed_this_block: bool,
 }
 
 /// Main/UI-thread-owned editor state (see [`Vst3Instance::gui`]).

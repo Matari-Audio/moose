@@ -853,6 +853,15 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         })
         .collect();
     let modulation_arms = id_arms(&modulation_bodies);
+    let get_modulation_bodies: Vec<_> = param_fields
+        .iter()
+        .filter(|f| f.kind == ParamKind::Float)
+        .map(|f| {
+            let ident = f.access();
+            (ident.clone(), quote! { self.#ident.modulation() })
+        })
+        .collect();
+    let get_modulation_arms = id_arms(&get_modulation_bodies);
     let clear_modulation_stmts: Vec<_> = modulation_bodies
         .iter()
         .map(|(ident, _)| quote! { self.#ident.clear_modulation(); })
@@ -1823,6 +1832,21 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
                     #(#modulation_arms)*
                     _ => {
                         #(self.#nested_idents.set_modulation(id, amount);)*
+                    }
+                }
+            }
+
+            fn get_modulation(&self, id: u32) -> f64 {
+                match id {
+                    #(#get_modulation_arms)*
+                    _ => {
+                        #(
+                            let nested = self.#nested_idents.get_modulation(id);
+                            if nested != 0.0 {
+                                return nested;
+                            }
+                        )*
+                        0.0
                     }
                 }
             }

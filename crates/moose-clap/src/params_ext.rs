@@ -232,9 +232,13 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
     // - matching the other `clap_plugin_params` callbacks.
     run_extern_callback_with::<P, ()>("CLAP", "params_flush", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
-        // `flush` is never concurrent with `process` (CLAP contract), so it
-        // owns the audio scratch through the cell for its event conversion.
-        let mut audio = data.audio.enter();
+        // `flush` is never concurrent with `process` (CLAP contract), and runs
+        // on the audio thread while active (including 0-frame `process` calls),
+        // so entry must be strictly wait-free without parking or triggering
+        // `rt-paranoid`'s lock check.
+        let Some(mut audio) = data.audio.try_enter() else {
+            return;
+        };
         let scr = &mut *audio;
         // params_flush only forwards param values to the plugin and
         // sweeps GUI-driven changes outward; it doesn't iterate the
@@ -250,6 +254,8 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
         // effect. Mirrors what the audio-thread chunker does inside
         // `apply_pending_events`.
         let params = data.params_arc.as_ref() as &dyn Params;
+        let mut wake_editor = false;
+        let mut saw_poly_mod = false;
         for ev in scr.event_list.iter() {
             match ev.body {
                 EventBody::ParamChange { id, value } => {
@@ -258,6 +264,7 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
                         None => params.set_plain(id, value),
                     }
                     defer_param_change(&mut scr.deferred_params, id, value);
+                    wake_editor = true;
                 }
                 // Conversion accepts wildcard note IDs only for fully global
                 // modulation. Flush has no sample timeline: update the shared
@@ -268,9 +275,22 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
                     value,
                 } => {
                     params.set_modulation(id, value);
+                    wake_editor = true;
+                }
+                EventBody::ParamMod { id, note_id, value } if note_id >= 0 => {
+                    if !saw_poly_mod {
+                        data.feedback.begin_poly_mod_block();
+                        saw_poly_mod = true;
+                    }
+                    data.feedback.record_poly_mod(id, value);
+                    wake_editor = true;
                 }
                 _ => {}
             }
+        }
+        if wake_editor && data.feedback.has_waker() {
+            data.host_queue
+                .signal(moose_core::host_queue::HostSignal::EDITOR_WAKE);
         }
         request_changed_presentation(data, &scr.event_list);
         let _ = flush_gui_changes::<P>(data, out_events);

@@ -342,6 +342,39 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
             Some(proc.frames_count),
         );
 
+        // Track polyphonic modulation ranges and wake any open 0 Hz editor on
+        // host automation or modulation events (RT-safe: pure atomics, zero allocs).
+        let mut wake_editor = false;
+        let mut saw_poly_mod = false;
+        for event in scr.event_list.iter() {
+            match event.body {
+                EventBody::ParamChange { .. } => {
+                    wake_editor = true;
+                }
+                EventBody::ParamMod { id, note_id, value } => {
+                    if note_id >= 0 {
+                        if !saw_poly_mod {
+                            data.feedback.begin_poly_mod_block();
+                            saw_poly_mod = true;
+                        }
+                        data.feedback.record_poly_mod(id, value);
+                    }
+                    wake_editor = true;
+                }
+                _ => {}
+            }
+        }
+        if !saw_poly_mod
+            && scr.sounding_notes.voices.is_empty()
+            && scr.sounding_notes.complete
+            && data.feedback.clear_poly_mod()
+        {
+            wake_editor = true;
+        }
+        if wake_editor && data.feedback.has_waker() {
+            data.host_queue.signal(HostSignal::EDITOR_WAKE);
+        }
+
         // Build transport info from the CLAP transport event (or default).
         let transport = if proc.transport.is_null() {
             TransportInfo::default()

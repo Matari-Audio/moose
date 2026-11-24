@@ -96,10 +96,14 @@ macro_rules! enable_rt_paranoid {
 // type alias.
 mod prelude_impl {
     pub use moose_core::custom_state::{AtomicCell, State as StateTrait, StateBinding, StateField};
+    pub use moose_core::main_thread::{
+        AutomationState, BusDirection, HostColor, HostMapping, Midi2Controller,
+        Midi2ControllerAssignment, Midi2ControllerKind, ParamIndication, ParamIndicationState,
+    };
     pub use moose_core::plugin::PreparationError;
     pub use moose_core::sample::{Float, Sample as SampleTrait};
     pub use moose_core::state::{
-        DecodedState, ForeignState, MigratedState, PluginFormat, StateLoadError,
+        DecodedState, ForeignState, MigratedState, PluginFormat, StateContext, StateLoadError,
         StateMigrationChain, StateMigrationStep,
     };
     pub use std::f64::consts::TAU;
@@ -125,9 +129,9 @@ mod prelude_impl {
     // signals it as an internal contract.
     pub use moose_core::{
         AudioConfig, BusActivation, BusConfig, BusKind, BusLayout, BusRoute, BusRouting,
-        ChannelConfig, Editor, Event, EventBody, EventList, IntoEditor, NoEditor, PluginCategory,
-        PluginContext, PluginExport, PluginInfo, ProcessContext, ProcessMode, ProcessStatus,
-        TransportInfo,
+        ChannelConfig, Editor, Event, EventBody, EventList, IntoEditor, NoEditor, ParamModulation,
+        PluginCategory, PluginContext, PluginExport, PluginInfo, ProcessContext, ProcessMode,
+        ProcessStatus, TransportInfo,
     };
     pub use moose_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
     pub use moose_params::{

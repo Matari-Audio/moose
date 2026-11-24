@@ -14,7 +14,7 @@ use moose_core::meters::MeterStore;
 use moose_core::plugin::PluginRuntime;
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::snapshot::{SnapshotPublisher, SnapshotSlot};
-use moose_core::state::{DecodedState, ForeignState, MigratedState, StateLoadError};
+use moose_core::state::{DecodedState, ForeignState, MigratedState, StateContext, StateLoadError};
 use moose_core::tasks::{AnyTaskSpawner, InitContext, warm_pool};
 use moose_params::Params;
 use moose_params::sample::Sample;
@@ -238,6 +238,10 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         L::save_state(&self.state)
     }
 
+    fn save_state_with_context(&self, context: StateContext) -> Option<Vec<u8>> {
+        L::save_state_with_context(&self.state, context)
+    }
+
     fn republish_snapshot(&mut self) {
         // Host thread, plugin owned: serialize live.
         self.snapshots
@@ -251,6 +255,16 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         // refreshed caches - fire it whether or not load_state
         // succeeded so partial state still triggers a refresh.
         L::state_changed(&mut self.state, &self.params);
+        result
+    }
+
+    fn load_state_with_context(
+        &mut self,
+        data: &[u8],
+        context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        let result = L::load_state_with_context(&mut self.state, data, context);
+        L::state_changed_with_context(&mut self.state, &self.params, context);
         result
     }
 
@@ -282,11 +296,28 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         <L as PluginLogicCore<S>>::validate_state(data)
     }
 
+    fn validate_state_with_context(data: &[u8], context: StateContext) -> Result<(), StateLoadError>
+    where
+        Self: Sized,
+    {
+        <L as PluginLogicCore<S>>::validate_state_with_context(data, context)
+    }
+
     fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError>
     where
         Self: Sized,
     {
         <L as PluginLogicCore<S>>::decode_state(data)
+    }
+
+    fn decode_state_with_context(
+        data: &[u8],
+        context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError>
+    where
+        Self: Sized,
+    {
+        <L as PluginLogicCore<S>>::decode_state_with_context(data, context)
     }
 
     /// Swap an off-thread decoded state into the live processor and run
@@ -300,6 +331,15 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
     fn apply_decoded_state(&mut self, decoded: &mut DecodedState) {
         L::apply_decoded_state(&mut self.state, &self.params, decoded);
         L::state_changed(&mut self.state, &self.params);
+    }
+
+    fn apply_decoded_state_with_context(
+        &mut self,
+        decoded: &mut DecodedState,
+        context: StateContext,
+    ) {
+        L::apply_decoded_state_with_context(&mut self.state, &self.params, decoded, context);
+        L::state_changed_with_context(&mut self.state, &self.params, context);
     }
 
     fn latency(&self) -> u32 {
@@ -435,6 +475,13 @@ macro_rules! export_static {
                 self.inner.save_state()
             }
 
+            fn save_state_with_context(
+                &self,
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) -> Option<Vec<u8>> {
+                self.inner.save_state_with_context(context)
+            }
+
             fn snapshot_into(&self, buf: &mut Vec<u8>) -> bool {
                 self.inner.snapshot_into(buf)
             }
@@ -444,6 +491,14 @@ macro_rules! export_static {
                 data: &[u8],
             ) -> Result<(), $crate::__macro_deps::moose_core::state::StateLoadError> {
                 self.inner.load_state(data)
+            }
+
+            fn load_state_with_context(
+                &mut self,
+                data: &[u8],
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) -> Result<(), $crate::__macro_deps::moose_core::state::StateLoadError> {
+                self.inner.load_state_with_context(data, context)
             }
 
             fn republish_snapshot(&mut self) {
@@ -482,6 +537,16 @@ macro_rules! export_static {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::validate_state(data)
             }
 
+            fn validate_state_with_context(
+                data: &[u8],
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) -> Result<(), $crate::__macro_deps::moose_core::state::StateLoadError>
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::validate_state_with_context(data, context)
+            }
+
             fn decode_state(
                 data: &[u8],
             ) -> Result<
@@ -494,11 +559,32 @@ macro_rules! export_static {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::decode_state(data)
             }
 
+            fn decode_state_with_context(
+                data: &[u8],
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) -> Result<
+                Option<$crate::__macro_deps::moose_core::state::DecodedState>,
+                $crate::__macro_deps::moose_core::state::StateLoadError,
+            >
+            where
+                Self: Sized,
+            {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::decode_state_with_context(data, context)
+            }
+
             fn apply_decoded_state(
                 &mut self,
                 decoded: &mut $crate::__macro_deps::moose_core::state::DecodedState,
             ) {
                 self.inner.apply_decoded_state(decoded);
+            }
+
+            fn apply_decoded_state_with_context(
+                &mut self,
+                decoded: &mut $crate::__macro_deps::moose_core::state::DecodedState,
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) {
+                self.inner.apply_decoded_state_with_context(decoded, context);
             }
 
             fn latency(&self) -> u32 {
@@ -597,6 +683,14 @@ macro_rules! export_static {
             ) -> Box<dyn $crate::__macro_deps::moose_core::main_thread::MainThreadHooks> {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::main_thread(
                     &self.inner.params,
+                )
+            }
+
+            fn midi2_controller_assignments(
+                direction: $crate::__macro_deps::moose_core::main_thread::BusDirection,
+            ) -> Vec<$crate::__macro_deps::moose_core::main_thread::Midi2ControllerAssignment> {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::midi2_controller_assignments(
+                    direction,
                 )
             }
 

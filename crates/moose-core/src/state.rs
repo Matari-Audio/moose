@@ -16,6 +16,50 @@ pub use moose_utils::state::{
     serialize_state_for_schema, serialize_state_v2, vst3_cid,
 };
 
+/// Host-reported reason a plugin's state is being saved or loaded.
+///
+/// Maps CLAP `clap.state-context/2` (`CLAP_STATE_CONTEXT_FOR_*`), CLAP
+/// `clap.preset-load`, and VST3 `IStreamAttributes`
+/// (`PresetAttributes::kStateType` / `StateType::*`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StateContext {
+    /// No context was reported by the host (plain `clap.state`, VST3 without
+    /// `IStreamAttributes`, AU, AAX, standalone, or an unrecognized attribute).
+    #[default]
+    Unknown,
+    /// Saving or loading a user/factory preset (CLAP
+    /// `CLAP_STATE_CONTEXT_FOR_PRESET`, `clap.preset-load`, VST3
+    /// `StateType::kTrackPreset` / `"Preset"`).
+    Preset,
+    /// Saving or loading a DAW project/session (CLAP
+    /// `CLAP_STATE_CONTEXT_FOR_PROJECT`, VST3 `StateType::kProject`).
+    Project,
+    /// Duplicating an existing plugin instance (CLAP
+    /// `CLAP_STATE_CONTEXT_FOR_DUPLICATE`).
+    Duplicate,
+    /// Copy/paste of plugin state between instances.
+    CopyPaste,
+    /// Saving or loading the plugin's default state (VST3 `StateType::kDefault`).
+    Default,
+}
+
+impl StateContext {
+    pub(crate) const COUNT: usize = 6;
+
+    #[must_use]
+    pub(crate) const fn to_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Preset => 1,
+            Self::Project => 2,
+            Self::Duplicate => 3,
+            Self::CopyPaste => 4,
+            Self::Default => 5,
+        }
+    }
+}
+
 /// The plugin format whose wrapper found a foreign state blob.
 /// Carried in [`ForeignState::Raw`] so a `migrate_state`
 /// implementation can branch per format when the old builds
@@ -369,13 +413,23 @@ pub fn try_apply_state<P: crate::export::PluginExport>(
     plugin: &mut P,
     state: &DeserializedState,
 ) -> Result<(), StateLoadError> {
+    try_apply_state_with_context(plugin, state, StateContext::Unknown)
+}
+
+/// [`try_apply_state`] carrying the host-reported [`StateContext`].
+///
+/// # Errors
+/// Forwards the plugin's
+/// [`crate::plugin::PluginRuntime::load_state_with_context`] error.
+pub fn try_apply_state_with_context<P: crate::export::PluginExport>(
+    plugin: &mut P,
+    state: &DeserializedState,
+    context: StateContext,
+) -> Result<(), StateLoadError> {
     use moose_params::Params;
     plugin.params().restore_values(&state.params);
     plugin.params().snap_smoothers();
-    match &state.extra {
-        Some(extra) => plugin.load_state(extra),
-        None => Ok(()),
-    }
+    plugin.load_state_with_context(state.extra.as_deref().unwrap_or(&[]), context)
 }
 
 /// Parameter values and `#[persist]` as they were before a load, so a load
@@ -405,6 +459,40 @@ impl ParamsBackup {
     pub fn restore<P: moose_params::Params>(&self, params: &P) {
         params.restore_state(&self.values, &self.persist);
         params.snap_smoothers();
+    }
+}
+
+/// RAII rollback guard that restores a [`ParamsBackup`] on drop unless
+/// [`Self::commit`] is called — keeping pre-applied parameter mutations atomic
+/// across both `Err` returns and caught panics inside plugin state hooks.
+pub struct ParamsRollbackGuard<'a, P: moose_params::Params> {
+    backup: &'a ParamsBackup,
+    params: &'a P,
+    committed: bool,
+}
+
+impl<'a, P: moose_params::Params> ParamsRollbackGuard<'a, P> {
+    /// Arm rollback restoration of `backup` onto `params` until [`Self::commit`].
+    #[must_use]
+    pub fn new(backup: &'a ParamsBackup, params: &'a P) -> Self {
+        Self {
+            backup,
+            params,
+            committed: false,
+        }
+    }
+
+    /// Disarm rollback once the state load has been accepted.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<P: moose_params::Params> Drop for ParamsRollbackGuard<'_, P> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.backup.restore(self.params);
+        }
     }
 }
 
@@ -1158,6 +1246,17 @@ impl AudioHeartbeat {
             || self.inactive_gen.load(Ordering::Acquire) != start_gen
     }
 
+    /// Host thread: bounded wait timeout scaled to the negotiated audio block
+    /// interval (at least `floor`) so large blocks (e.g. 8,192 frames at
+    /// 44.1 kHz) do not time out before one block completes.
+    #[must_use]
+    pub(crate) fn handshake_timeout(&self, floor: std::time::Duration) -> std::time::Duration {
+        let window_us = self
+            .active_window_us
+            .load(std::sync::atomic::Ordering::Acquire);
+        std::time::Duration::from_micros(window_us).max(floor)
+    }
+
     /// Host thread: true only when another thread ran an audio block within
     /// the active window (at least [`AUDIO_ACTIVE_WINDOW`], expanded for the
     /// negotiated block interval). Returns `false` for stopped, sleeping,
@@ -1189,6 +1288,7 @@ pub(crate) struct QueuedLoad {
     pub(crate) state: std::sync::Arc<DeserializedState>,
     pub(crate) backup: Option<std::sync::Arc<ParamsBackup>>,
     pub(crate) decoded: Option<DecodedState>,
+    pub(crate) context: StateContext,
 }
 
 type RetainedOwner = (
@@ -1270,9 +1370,18 @@ impl StateLoadQueue {
     }
     pub(crate) fn push_with_backup_and_decoded(
         &self,
+        state: DeserializedState,
+        backup: Option<ParamsBackup>,
+        decoded: Option<DecodedState>,
+    ) -> std::sync::Arc<DeserializedState> {
+        self.push_with_backup_decoded_and_context(state, backup, decoded, StateContext::Unknown)
+    }
+    pub(crate) fn push_with_backup_decoded_and_context(
+        &self,
         mut state: DeserializedState,
         backup: Option<ParamsBackup>,
         decoded: Option<DecodedState>,
+        context: StateContext,
     ) -> std::sync::Arc<DeserializedState> {
         self.reclaim_retired();
         let backup = backup.map(std::sync::Arc::new);
@@ -1287,6 +1396,7 @@ impl StateLoadQueue {
             state: std::sync::Arc::clone(&state),
             backup,
             decoded,
+            context,
         }));
         // `> 2`: the ready slot or audio, plus the handle returned below.
         owners.retain(|(s, _)| {

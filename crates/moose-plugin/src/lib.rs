@@ -9,7 +9,7 @@ use moose_core::config::AudioConfig;
 use moose_core::editor::Editor;
 use moose_core::events::EventList;
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::state::{DecodedState, ForeignState, MigratedState, StateLoadError};
+use moose_core::state::{DecodedState, ForeignState, MigratedState, StateContext, StateLoadError};
 use moose_params::sample::Sample;
 
 mod lifecycle;
@@ -70,6 +70,15 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         Box::new(())
     }
 
+    /// Static MIDI 2.0 controller-to-parameter assignments (VST3 SDK 3.8
+    /// `IMidiMapping2`). Default: empty.
+    #[must_use]
+    fn midi2_controller_assignments(
+        _direction: moose_core::main_thread::BusDirection,
+    ) -> Vec<moose_core::main_thread::Midi2ControllerAssignment> {
+        Vec::new()
+    }
+
     /// Build initial state from params.
     fn init(params: &Self::Params, cx: &InitContext) -> Self::DspState;
 
@@ -108,6 +117,17 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         Vec::new()
     }
 
+    /// Context-aware variant of [`Self::save_state`], called strictly on the
+    /// host/main thread (never on the audio thread). Return `Some(bytes)` to
+    /// override the snapshot / `save_state` fallback for `context` (including
+    /// `Some(Vec::new())` to intentionally omit extra state). For context-aware
+    /// saves while audio is actively running, publish off-thread via
+    /// `SnapshotPublisher::publish_for_context`. Default returns `None`.
+    fn save_state_with_context(state: &Self::DspState, _context: StateContext) -> Option<Vec<u8>> {
+        let _ = state;
+        None
+    }
+
     /// Restore plugin-specific state.
     ///
     /// # Errors
@@ -115,6 +135,23 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     fn load_state(state: &mut Self::DspState, data: &[u8]) -> Result<(), StateLoadError> {
         let _ = (state, data);
         Ok(())
+    }
+
+    /// Context-aware variant of [`Self::load_state`]. Default delegates to
+    /// [`Self::load_state`] when `data` is non-empty.
+    ///
+    /// # Errors
+    /// Returns `Err(StateLoadError)` when the blob cannot be decoded.
+    fn load_state_with_context(
+        state: &mut Self::DspState,
+        data: &[u8],
+        _context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        if data.is_empty() {
+            Ok(())
+        } else {
+            Self::load_state(state, data)
+        }
     }
 
     /// Translate foreign state into moose shape.
@@ -143,6 +180,17 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         Ok(())
     }
 
+    /// Context-aware variant of [`Self::validate_state`].
+    ///
+    /// # Errors
+    /// The bytes are not a state this plugin can load in `context`.
+    fn validate_state_with_context(
+        data: &[u8],
+        _context: StateContext,
+    ) -> Result<(), StateLoadError> {
+        Self::validate_state(data)
+    }
+
     /// Decode custom state off the audio thread into a ready-to-swap
     /// [`DecodedState`]. Default returns `Ok(None)` (legacy `load_state`).
     ///
@@ -151,6 +199,17 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     fn decode_state(data: &[u8]) -> Result<Option<DecodedState>, StateLoadError> {
         let _ = data;
         Ok(None)
+    }
+
+    /// Context-aware variant of [`Self::decode_state`].
+    ///
+    /// # Errors
+    /// Returns `Err(StateLoadError)` when the bytes cannot be decoded in `context`.
+    fn decode_state_with_context(
+        data: &[u8],
+        _context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError> {
+        Self::decode_state(data)
     }
 
     /// Swap a decoded state into `state` on the audio thread (zero-alloc,
@@ -163,8 +222,27 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         let _ = (state, params, decoded);
     }
 
+    /// Context-aware variant of [`Self::apply_decoded_state`].
+    fn apply_decoded_state_with_context(
+        state: &mut Self::DspState,
+        params: &Self::Params,
+        decoded: &mut DecodedState,
+        _context: StateContext,
+    ) {
+        Self::apply_decoded_state(state, params, decoded);
+    }
+
     fn state_changed(state: &mut Self::DspState, params: &Self::Params) {
         let _ = (state, params);
+    }
+
+    /// Context-aware variant of [`Self::state_changed`].
+    fn state_changed_with_context(
+        state: &mut Self::DspState,
+        params: &Self::Params,
+        _context: StateContext,
+    ) {
+        Self::state_changed(state, params);
     }
 
     fn latency(state: &Self::DspState) -> u32 {

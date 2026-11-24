@@ -5,7 +5,10 @@ use crate::data_from_plugin;
 
 use clap_sys::ext::preset_load::clap_plugin_preset_load;
 use clap_sys::ext::state::clap_plugin_state;
-use clap_sys::ext::state_context::clap_plugin_state_context_type;
+use clap_sys::ext::state_context::{
+    CLAP_STATE_CONTEXT_FOR_DUPLICATE, CLAP_STATE_CONTEXT_FOR_PRESET,
+    CLAP_STATE_CONTEXT_FOR_PROJECT, clap_plugin_state_context_type,
+};
 use clap_sys::factory::preset_discovery::{
     CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
 };
@@ -15,9 +18,10 @@ use moose_core::events::{EventBody, EventList};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostSignal;
 use moose_core::presets::parse_preset_file;
-use moose_core::state;
-use moose_core::state::PluginFormat;
-use moose_core::wrapper::{apply_or_queue_state, custom_state_for_save, run_extern_callback_with};
+use moose_core::state::{self, PluginFormat, StateContext};
+use moose_core::wrapper::{
+    apply_or_queue_state_with_context, custom_state_for_save_with_context, run_extern_callback_with,
+};
 use moose_params::Params;
 use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
@@ -27,9 +31,26 @@ use std::sync::atomic::Ordering;
 // Extension: state
 // ---------------------------------------------------------------------------
 
+pub(crate) fn clap_state_context(context: clap_plugin_state_context_type) -> StateContext {
+    match context {
+        CLAP_STATE_CONTEXT_FOR_PRESET => StateContext::Preset,
+        CLAP_STATE_CONTEXT_FOR_DUPLICATE => StateContext::Duplicate,
+        CLAP_STATE_CONTEXT_FOR_PROJECT => StateContext::Project,
+        _ => StateContext::Unknown,
+    }
+}
+
 pub(crate) unsafe extern "C" fn state_save<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_ostream,
+) -> bool {
+    unsafe { state_save_with_context::<P>(plugin, stream, StateContext::Unknown) }
+}
+
+unsafe fn state_save_with_context<P: PluginExport>(
+    plugin: *const clap_plugin,
+    stream: *const clap_ostream,
+    context: StateContext,
 ) -> bool {
     // Guard the user's `save_state()` against panics so a stray
     // `unwrap` in custom-state code degrades to "save failed" instead
@@ -58,11 +79,12 @@ pub(crate) unsafe extern "C" fn state_save<P: PluginExport>(
             }
             return true;
         }
-        let extra = custom_state_for_save(
+        let extra = custom_state_for_save_with_context(
             &data.plugin,
             &data.snapshot,
             &data.pending_state,
             !data.processing.load(Ordering::Acquire),
+            context,
         );
         write_snapshot::<P>(data.plugin_id_hash, &data.params_arc, &extra, |bytes| {
             write_fn(stream, bytes.as_ptr().cast::<c_void>(), bytes.len() as u64)
@@ -123,6 +145,14 @@ pub(crate) unsafe extern "C" fn state_load<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_istream,
 ) -> bool {
+    unsafe { state_load_with_context::<P>(plugin, stream, StateContext::Unknown) }
+}
+
+unsafe fn state_load_with_context<P: PluginExport>(
+    plugin: *const clap_plugin,
+    stream: *const clap_istream,
+    context: StateContext,
+) -> bool {
     // Guard the user's `load_state()` / custom deserialize against
     // panics so a malformed blob degrades to "load failed" instead of
     // aborting the host across this `extern "C"` boundary.
@@ -134,6 +164,7 @@ pub(crate) unsafe extern "C" fn state_load<P: PluginExport>(
         };
 
         let backup = state::ParamsBackup::capture(&*data.params_arc);
+        let rollback = state::ParamsRollbackGuard::new(&backup, &*data.params_arc);
         let Some(deserialized) = state::read_and_apply_params::<P>(
             |buf| read_fn(stream, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u64),
             data.plugin_id_hash,
@@ -151,9 +182,10 @@ pub(crate) unsafe extern "C" fn state_load<P: PluginExport>(
         // first running a process block - clap-validator reads back
         // immediately after a load round-trip.
 
-        if !load_custom_state(data, deserialized, &backup) {
+        if !load_custom_state_with_context(data, deserialized, &backup, context) {
             return false;
         }
+        rollback.commit();
 
         if let Some(ref mut editor) = data.gui.enter().editor {
             editor.state_changed();
@@ -172,10 +204,11 @@ pub(crate) unsafe extern "C" fn state_load<P: PluginExport>(
 /// in time, reads the queued bytes through `custom_state_view`).
 /// `false`: the plugin's `load_state` rejected it and params and
 /// `#[persist]` were put back; the caller reports failure to the host.
-pub(crate) fn load_custom_state<P: PluginExport>(
+pub(crate) fn load_custom_state_with_context<P: PluginExport>(
     data: &ClapPluginData<P>,
     deserialized: state::DeserializedState,
     backup: &state::ParamsBackup,
+    context: StateContext,
 ) -> bool {
     let can_own = !data.processing.load(Ordering::Acquire);
     if can_own && let Some(mut audio) = data.audio.try_enter() {
@@ -184,7 +217,7 @@ pub(crate) fn load_custom_state<P: PluginExport>(
         // deferred events in convert_input_events.
         audio.deferred_params.clear();
     }
-    match apply_or_queue_state(
+    match apply_or_queue_state_with_context(
         &data.plugin,
         &*data.params_arc,
         &data.snapshot,
@@ -192,6 +225,7 @@ pub(crate) fn load_custom_state<P: PluginExport>(
         deserialized,
         backup,
         can_own,
+        context,
     ) {
         Ok(()) => true,
         Err(e) => {
@@ -223,22 +257,24 @@ pub(crate) unsafe fn request_value_rescan<P: PluginExport>(data: &ClapPluginData
     data.host_queue.signal(HostSignal::PARAM_RESCAN);
 }
 
-/// `state-context`: every context saves and loads the full state. Moose
-/// state has no project-only or preset-only parts to leave out.
+/// `clap.state-context/2`: forwards the host's `context_type` as a
+/// [`StateContext`] so plugins can discriminate project, preset, and
+/// duplicate state saves/loads while staying backwards-compatible with plain
+/// `clap.state`.
 pub(crate) unsafe extern "C" fn state_context_save<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_ostream,
-    _context: clap_plugin_state_context_type,
+    context: clap_plugin_state_context_type,
 ) -> bool {
-    unsafe { state_save::<P>(plugin, stream) }
+    unsafe { state_save_with_context::<P>(plugin, stream, clap_state_context(context)) }
 }
 
 pub(crate) unsafe extern "C" fn state_context_load<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_istream,
-    _context: clap_plugin_state_context_type,
+    context: clap_plugin_state_context_type,
 ) -> bool {
-    unsafe { state_load::<P>(plugin, stream) }
+    unsafe { state_load_with_context::<P>(plugin, stream, clap_state_context(context)) }
 }
 
 pub(crate) fn make_state_extension<P: PluginExport>() -> clap_plugin_state {
@@ -319,10 +355,12 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
         }
 
         let backup = state::ParamsBackup::capture(&*data.params_arc);
+        let rollback = state::ParamsRollbackGuard::new(&backup, &*data.params_arc);
         state::apply_params(&*data.params_arc, &deserialized);
-        if !load_custom_state(data, deserialized, &backup) {
+        if !load_custom_state_with_context(data, deserialized, &backup, StateContext::Preset) {
             return false;
         }
+        rollback.commit();
         if let Some(ref mut editor) = data.gui.enter().editor {
             editor.state_changed();
         }

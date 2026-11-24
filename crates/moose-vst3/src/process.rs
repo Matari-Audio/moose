@@ -180,6 +180,11 @@ impl<P: PluginExport> Vst3Instance<P> {
             scr.scratch
                 .finish_widening(outputs, num_output_channels, len_u32(num_frames));
 
+            if std::mem::take(&mut scr.param_changed_this_block) && self.feedback.has_waker() {
+                self.host_queue
+                    .signal(moose_core::host_queue::HostSignal::EDITOR_WAKE);
+            }
+
             self.delay
                 .observe_and_signal(plugin.latency(), plugin.tail(), &self.host_queue);
         })
@@ -198,6 +203,7 @@ impl<P: PluginExport> Vst3Instance<P> {
                 audio.event_list.clear();
                 audio.output_events.clear();
                 audio.output_events.clear_overflow();
+                audio.param_changed_this_block = false;
             }
         }
         ok

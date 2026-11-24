@@ -335,6 +335,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
         data.active.store(false, Ordering::Relaxed);
         data.pending_state.mark_audio_inactive();
         data.snapshot.mark_audio_inactive();
+        if data.feedback.clear_poly_mod() {
+            data.feedback.wake_editor();
+        }
         // A `state_load` while active queues its blob for the audio thread
         // to drain at the top of the next block. If the host deactivates
         // before that block runs (sample-rate / buffer change, offline
@@ -382,6 +385,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_stop_processing<P: PluginExport>(
     data.processing.store(false, Ordering::Release);
     data.pending_state.mark_audio_inactive();
     data.snapshot.mark_audio_inactive();
+    if data.feedback.clear_poly_mod() && data.feedback.has_waker() {
+        data.host_queue.signal(HostSignal::EDITOR_WAKE);
+    }
 }
 
 pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plugin) {
@@ -396,6 +402,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *cons
         };
         audio.sounding_notes.clear_all();
         data.params_arc.clear_modulations();
+        data.feedback.clear_poly_mod();
         let mode = ProcessMode::from_u8(data.render_mode.load(Ordering::Relaxed));
         let Some(mut instance) = data.plugin.try_enter() else {
             return;
@@ -481,6 +488,10 @@ impl<P: PluginExport> HostSink for ClapSink<'_, P> {
 
     fn request_restart(&mut self) {
         self.pending |= HostSignal::RESTART;
+    }
+
+    fn editor_wake(&mut self) {
+        self.data.feedback.wake_editor();
     }
 
     fn flush_signals(&mut self) {

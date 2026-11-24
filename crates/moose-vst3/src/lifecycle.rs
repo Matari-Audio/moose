@@ -26,7 +26,7 @@ use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostQueue, HostSignal, HostSink, dispatch};
 use moose_core::main_thread::{
     BusDirection, HostColor, HostNotifier, Keyswitch, LearnSource, MenuTarget, Midi2Controller,
-    Midi2ControllerKind, ProgramPreset, TrackInfo,
+    Midi2ControllerAssignment, Midi2ControllerKind, ProgramPreset, TrackInfo,
 };
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
@@ -75,6 +75,9 @@ impl<P: PluginExport> Vst3Instance<P> {
             hooks.connect(host_notifier);
             let main_thread = MainThreadCell::new(hooks);
             let meter_store = plugin.meter_store();
+            let feedback = Arc::new(moose_core::EditorFeedback::new(
+                param_infos.iter().map(|i| i.id),
+            ));
             let snapshot = plugin.snapshot_slot();
             let task_spawner = plugin.task_spawner();
             let editor_builder = plugin.editor_builder();
@@ -96,6 +99,7 @@ impl<P: PluginExport> Vst3Instance<P> {
                 plugin: PluginCell::new(plugin),
                 params_arc,
                 meter_store,
+                feedback,
                 snapshot,
                 task_spawner,
                 editor_builder,
@@ -129,6 +133,7 @@ impl<P: PluginExport> Vst3Instance<P> {
                     output_preflight_status: VST3_EVENT_END,
                     output_note_ids: OutputNoteIds::new(),
                     pending_output_mutation: PendingOutputMutation::None,
+                    param_changed_this_block: false,
                 }),
                 gui: PluginCell::new(Vst3Gui { editor: None }),
                 host_queue,
@@ -361,6 +366,11 @@ impl<P: PluginExport> HostSink for Vst3Sink<'_, P> {
 
     fn tail_changed(&mut self) {
         let _ = self.inst.delay.commit_tail();
+    }
+
+    fn editor_wake(&mut self) {
+        self.inst.apply_pending_content_scale();
+        self.inst.feedback.wake_editor();
     }
 
     fn flush_signals(&mut self) {
@@ -668,8 +678,24 @@ impl<P: PluginExport> Vst3Backend for Vst3Instance<P> {
         self.state_load_stream_impl(read)
     }
 
+    fn state_load_stream_with_context(
+        &self,
+        context: state::StateContext,
+        read: &mut dyn FnMut(&mut [u8]) -> i64,
+    ) -> bool {
+        self.state_load_stream_with_context_impl(context, read)
+    }
+
     fn state_save_stream(&self, write: &mut dyn FnMut(&[u8]) -> i64) -> bool {
         self.state_save_stream_impl(write)
+    }
+
+    fn state_save_stream_with_context(
+        &self,
+        context: state::StateContext,
+        write: &mut dyn FnMut(&[u8]) -> i64,
+    ) -> bool {
+        self.state_save_stream_with_context_impl(context, write)
     }
 
     fn gui_has_editor(&self) -> bool {
@@ -743,6 +769,13 @@ impl<P: PluginExport> Vst3Backend for Vst3Instance<P> {
         controller: i16,
     ) -> Option<u32> {
         self.midi_mapping_get_param_id_impl(bus_index, channel, controller)
+    }
+
+    fn midi2_controller_assignments(
+        &self,
+        direction: BusDirection,
+    ) -> Vec<Midi2ControllerAssignment> {
+        self.midi2_controller_assignments_impl(direction)
     }
 
     fn wants_persist_notifications(&self) -> bool {

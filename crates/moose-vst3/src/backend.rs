@@ -7,7 +7,10 @@
 
 use std::ffi::{CStr, c_void};
 
-use moose_core::main_thread::{Keyswitch, MenuTarget, ProgramPreset};
+use moose_core::main_thread::{
+    BusDirection, Keyswitch, MenuTarget, Midi2ControllerAssignment, ProgramPreset,
+};
+use moose_core::state::StateContext;
 
 /// Owned plugin descriptor handed to the COM factory at registration.
 #[derive(Clone, Debug, Default)]
@@ -312,8 +315,24 @@ pub(crate) trait Vst3Backend: Send + Sync + 'static {
         false
     }
 
+    fn state_load_stream_with_context(
+        &self,
+        _context: StateContext,
+        read: &mut dyn FnMut(&mut [u8]) -> i64,
+    ) -> bool {
+        self.state_load_stream(read)
+    }
+
     fn state_save_stream(&self, _write: &mut dyn FnMut(&[u8]) -> i64) -> bool {
         false
+    }
+
+    fn state_save_stream_with_context(
+        &self,
+        _context: StateContext,
+        write: &mut dyn FnMut(&[u8]) -> i64,
+    ) -> bool {
+        self.state_save_stream(write)
     }
 
     // --- GUI ---
@@ -383,6 +402,13 @@ pub(crate) trait Vst3Backend: Send + Sync + 'static {
         _controller: i16,
     ) -> Option<u32> {
         None
+    }
+
+    fn midi2_controller_assignments(
+        &self,
+        _direction: BusDirection,
+    ) -> Vec<Midi2ControllerAssignment> {
+        Vec::new()
     }
 
     fn wants_persist_notifications(&self) -> bool {

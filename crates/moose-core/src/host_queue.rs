@@ -89,6 +89,9 @@ bitflags::bitflags! {
         /// Pending edit-group transitions (`clap.undo/4`) waiting to drain on
         /// the host main thread.
         const UNDO_GROUP = 1 << 16;
+        /// Audio-thread parameter automation or modulation update requesting a
+        /// coalesced wakeup of the open editor's 0 Hz render loop on the main thread.
+        const EDITOR_WAKE = 1 << 17;
     }
 }
 
@@ -501,6 +504,8 @@ pub trait HostSink {
     fn request_restart(&mut self) {}
     /// [`HostSignal::UNDO_GROUP`]: pending edit-group / undo transitions are ready.
     fn undo_groups_ready(&mut self) {}
+    /// [`HostSignal::EDITOR_WAKE`]: coalesced wakeup for the open editor's UI loop.
+    fn editor_wake(&mut self) {}
     /// Called once after all raised signals have been delivered and before
     /// queued [`HostMessage`]s are processed.
     fn flush_signals(&mut self) {}
@@ -562,6 +567,9 @@ pub fn dispatch(drain: Drain<'_>, sink: &mut dyn HostSink) {
     }
     if signals.contains(HostSignal::UNDO_GROUP) {
         sink.undo_groups_ready();
+    }
+    if signals.contains(HostSignal::EDITOR_WAKE) {
+        sink.editor_wake();
     }
     sink.flush_signals();
     for message in drain {
@@ -838,6 +846,9 @@ mod tests {
             }
             fn undo_groups_ready(&mut self) {
                 self.calls.push("undo_groups_ready");
+            }
+            fn editor_wake(&mut self) {
+                self.calls.push("editor_wake");
             }
             fn flush_signals(&mut self) {
                 self.calls.push("flush_signals");

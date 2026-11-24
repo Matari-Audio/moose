@@ -184,6 +184,135 @@ mod tests {
         );
     }
 
+    /// Contextual state saves (`Project`, `Preset`, `Unknown`) during active
+    /// audio processing must incur ZERO allocations and ZERO deallocations on
+    /// the audio thread.
+    #[test]
+    fn state_context_save_during_active_audio_is_allocation_free() {
+        use moose_core::buffer::AudioBuffer;
+        use moose_core::config::AudioConfig;
+        use moose_core::events::{EventList, TransportInfo};
+        use moose_core::export::PluginExport;
+        use moose_core::plugin::PluginRuntime;
+        use moose_core::process::ProcessContext;
+        use moose_core::snapshot::SnapshotPublisher;
+        use moose_core::state::{StateContext, StateLoadQueue};
+        use moose_core::wrapper::{PluginCell, custom_state_for_save_with_context};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::Duration;
+
+        let mut shell = PluginShell::create();
+        shell.reset(&AudioConfig::new(48_000.0, 64));
+        let slot = shell.snapshot_slot();
+        let publisher = SnapshotPublisher::new(&slot);
+        publisher.publish(b"ordinary-live".to_vec());
+        publisher.publish_for_context(StateContext::Project, b"project-only".to_vec());
+        publisher.publish_for_context(StateContext::Preset, Vec::new());
+
+        let cell = Arc::new(PluginCell::new(shell));
+        let queue = Arc::new(StateLoadQueue::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let audio_violations = Arc::new(AtomicU32::new(0));
+        let (tx_ready, rx_ready) = std::sync::mpsc::sync_channel::<()>(1);
+
+        let audio = {
+            let cell = Arc::clone(&cell);
+            let queue = Arc::clone(&queue);
+            let stop = Arc::clone(&stop);
+            let audio_violations = Arc::clone(&audio_violations);
+            std::thread::spawn(move || {
+                let in_l = [0.25f32; 64];
+                let in_r = [0.25f32; 64];
+                let mut out_l = [0.0f32; 64];
+                let mut out_r = [0.0f32; 64];
+                let events = EventList::with_capacity(8);
+                let mut out_events = EventList::with_capacity(8);
+                let prev_dealloc = moose::rt::check_dealloc();
+                moose::rt::set_check_dealloc(true);
+
+                let transport = TransportInfo::default();
+                // Warm one block before auditing.
+                {
+                    let mut guard = cell.enter();
+                    queue.record_audio_block();
+                    let inputs = [&in_l[..], &in_r[..]];
+                    let mut outputs = [&mut out_l[..], &mut out_r[..]];
+                    // SAFETY: disjoint 64-sample slices live for the `process` call.
+                    let mut buf = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
+                    let mut ctx = ProcessContext::new(&transport, 48_000.0, 64, &mut out_events);
+                    let _ = guard.process(&mut buf, &events, &mut ctx);
+                }
+                let _ = tx_ready.try_send(());
+
+                while !stop.load(Ordering::Acquire) {
+                    let mut guard = cell.enter();
+                    queue.record_audio_block();
+                    let ((), violations) = moose::rt::audit(|| {
+                        out_events.clear();
+                        let inputs = [&in_l[..], &in_r[..]];
+                        let mut outputs = [&mut out_l[..], &mut out_r[..]];
+                        // SAFETY: disjoint 64-sample slices live for the `process` call.
+                        let mut buf =
+                            unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
+                        let mut ctx =
+                            ProcessContext::new(&transport, 48_000.0, 64, &mut out_events);
+                        let _ = guard.process(&mut buf, &events, &mut ctx);
+                    });
+                    audio_violations.fetch_add(violations, Ordering::Relaxed);
+                    drop(guard);
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                moose::rt::set_check_dealloc(prev_dealloc);
+            })
+        };
+
+        rx_ready
+            .recv_timeout(Duration::from_secs(5))
+            .expect("audio thread started");
+
+        for _ in 0..8 {
+            assert_eq!(
+                custom_state_for_save_with_context(
+                    &cell,
+                    &slot,
+                    &queue,
+                    false,
+                    StateContext::Project
+                ),
+                b"project-only"
+            );
+            assert_eq!(
+                custom_state_for_save_with_context(
+                    &cell,
+                    &slot,
+                    &queue,
+                    false,
+                    StateContext::Preset
+                ),
+                b""
+            );
+            assert_eq!(
+                custom_state_for_save_with_context(
+                    &cell,
+                    &slot,
+                    &queue,
+                    false,
+                    StateContext::Unknown
+                ),
+                b"ordinary-live"
+            );
+        }
+
+        stop.store(true, Ordering::Release);
+        audio.join().unwrap();
+
+        assert_eq!(
+            audio_violations.load(Ordering::Relaxed),
+            0,
+            "contextual state saves during active audio must incur 0 audio-thread allocations/deallocations"
+        );
+    }
+
     #[test]
     fn info_is_valid() {
         moose_test::assert_valid_info::<PluginShell>();

@@ -70,6 +70,7 @@ unsafe fn deliver<P: PluginExport>(
     // (param-indication.h); `deliver` runs only inside them.
     let main = unsafe { MainThread::assume() };
     run_extern_callback_with::<P, ()>("CLAP", "param_indication", (), || {
+        data.feedback.set_indication(id, &indication);
         data.with_hooks(&main, |hooks| {
             hooks.param_indication(&main, id, indication);
         });

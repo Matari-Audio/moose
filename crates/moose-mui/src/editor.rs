@@ -1,4 +1,5 @@
 //! moose's `Editor` over the window in [`crate::window`].
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moose_core::editor::{Editor, PluginContext, RawWindowHandle};
@@ -35,6 +36,13 @@ pub(crate) struct Session<P: Params> {
     /// The size `build` was designed at, fitted to the window; `None` is
     /// [`MuiEditor::fixed_zoom`].
     design: Option<Size>,
+    /// Coalescing flag shared with the host editor waker so rapid bursts of
+    /// automation/modulation/indication updates poke `Requests::redraw` once
+    /// per frame.
+    wake_pending: Arc<AtomicBool>,
+    /// Last computed zoom factor, shared with [`Bridge`] for logical context
+    /// menu coordinates.
+    last_zoom: std::sync::atomic::AtomicU64,
 }
 
 impl<P: Params> View for Session<P> {
@@ -61,12 +69,18 @@ impl<P: Params> View for Session<P> {
             f(ui);
         }
     }
-    fn build(&mut self, ui: &mut Ui, _: &Input) -> El {
+    fn build(&mut self, ui: &mut Ui, input: &Input) -> El {
+        // SeqCst pairs with `install_host_waker`'s SeqCst swap so ARM64 cannot
+        // reorder subsequent state reads ahead of clearing `wake_pending`.
+        self.wake_pending.swap(false, Ordering::SeqCst);
+        let zoom = f64::from_bits(self.last_zoom.load(Ordering::Relaxed));
+        self.bridge.set_zoom(zoom);
         let root = (self.build)(ui, &mut self.bridge);
-        self.bridge.end_unbound();
+        self.bridge.finish_frame(ui, input);
         root
     }
     fn changed(&mut self) -> bool {
+        self.wake_pending.swap(false, Ordering::SeqCst);
         // Both run every tick: the bridge snapshots values as it compares.
         self.bridge.changed() | self.changed.as_mut().is_some_and(|f| f())
     }
@@ -75,11 +89,14 @@ impl<P: Params> View for Session<P> {
             (window.width / d.width).min(window.height / d.height)
         });
         let user = self.user_zoom.as_ref().map_or(1.0, |f| f(window));
-        fit * if user.is_finite() && user > 0.0 {
-            user
-        } else {
-            1.0
-        }
+        let zoom = fit
+            * if user.is_finite() && user > 0.0 {
+                user
+            } else {
+                1.0
+            };
+        self.last_zoom.store(zoom.to_bits(), Ordering::Relaxed);
+        zoom
     }
     fn request_resize(&mut self, width: u32, height: u32) -> bool {
         self.bridge.request_resize(width, height)
@@ -131,6 +148,7 @@ impl<P: Params> View for Session<P> {
 pub struct MuiEditor<P: Params> {
     shared: Arc<Mutex<Shared<Session<P>>>>,
     requests: Arc<Requests>,
+    wake_pending: Arc<AtomicBool>,
     keys: Option<window::KeyHook>,
     win32_parent: Option<Box<dyn FnMut(Option<isize>) + Send>>,
     pointer: Option<window::PointerHook>,
@@ -186,6 +204,7 @@ impl<P: Params> MuiEditor<P> {
         build: impl FnMut(&mut Ui, &mut Bridge<P>) -> El + Send + 'static,
     ) -> Self {
         let size = size.into();
+        let wake_pending = Arc::new(AtomicBool::new(false));
         let session = Session {
             bridge: Bridge::new(Arc::clone(&params)),
             build: Box::new(build),
@@ -196,10 +215,13 @@ impl<P: Params> MuiEditor<P> {
             closed: None,
             user_zoom: None,
             design: Some(size),
+            wake_pending: Arc::clone(&wake_pending),
+            last_zoom: std::sync::atomic::AtomicU64::new(1.0f64.to_bits()),
         };
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
             requests: Arc::default(),
+            wake_pending,
             keys: None,
             win32_parent: None,
             pointer: None,
@@ -336,6 +358,7 @@ impl<P: Params> MuiEditor<P> {
             self.requests.on_pointer(Arc::clone(pointer));
         }
         self.requests.set_wheel_policy(self.wheel);
+        self.wake_pending.store(false, Ordering::Release);
         #[cfg(target_os = "linux")]
         if let Some(hook) = &self.x11_hook {
             let hook = Arc::clone(hook);
@@ -365,6 +388,19 @@ impl<P: Params> MuiEditor<P> {
     pub fn fixed_zoom(self) -> Self {
         lock(&self.shared).view.design = None;
         self
+    }
+
+    /// Install a coalesced 0 Hz wakeup callback on the attached host context
+    /// so host automation, modulation, and `param-indication` updates nudge
+    /// [`Requests::redraw`] without polling.
+    fn install_host_waker(&self, context: &PluginContext) {
+        let requests = Arc::clone(&self.requests);
+        let pending = Arc::clone(&self.wake_pending);
+        context.set_editor_waker(Some(Arc::new(move || {
+            if !pending.swap(true, Ordering::SeqCst) {
+                requests.redraw();
+            }
+        })));
     }
 
     fn has_window(&self) -> bool {
@@ -529,21 +565,31 @@ impl<P: Params> Editor for MuiEditor<P> {
         if self.has_window() {
             self.close();
         }
+        // A request made while closed was for the last window.
+        self.reset_requests();
         lock(&self.shared)
             .view
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
-        // A request made while closed was for the last window.
-        self.reset_requests();
         self.publish_win32_parent(Some(parent));
         #[cfg(target_os = "linux")]
         if let RawWindowHandle::WaylandSurface { display, surface } = parent {
             self.embed(display, surface);
+            if self.has_window() {
+                self.install_host_waker(&context);
+            } else {
+                self.close();
+            }
             return;
         }
         #[cfg(target_os = "linux")]
         if let RawWindowHandle::WaylandNested { socket, token } = parent {
             self.embed_nested(socket, token);
+            if self.has_window() {
+                self.install_host_waker(&context);
+            } else {
+                self.close();
+            }
             return;
         }
         #[cfg(target_os = "linux")]
@@ -575,6 +621,11 @@ impl<P: Params> Editor for MuiEditor<P> {
             Arc::clone(&self.requests),
         );
         self.window = opened.map(Handle);
+        if self.has_window() {
+            self.install_host_waker(&context);
+        } else {
+            self.close();
+        }
     }
 
     fn is_open(&self) -> bool {
@@ -594,11 +645,11 @@ impl<P: Params> Editor for MuiEditor<P> {
         closed: Arc<dyn Fn() + Send + Sync>,
     ) -> bool {
         self.close();
+        self.reset_requests();
         lock(&self.shared)
             .view
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
-        self.reset_requests();
         self.requests.on_close(closed);
         self.window = window::open_floating_threaded(
             title,
@@ -608,7 +659,13 @@ impl<P: Params> Editor for MuiEditor<P> {
             Arc::clone(&self.requests),
         )
         .map(Handle);
-        self.window.is_some()
+        if self.window.is_some() {
+            self.install_host_waker(&context);
+            true
+        } else {
+            self.close();
+            false
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -624,11 +681,11 @@ impl<P: Params> Editor for MuiEditor<P> {
         closed: Arc<dyn Fn() + Send + Sync>,
     ) -> bool {
         self.close();
+        self.reset_requests();
         lock(&self.shared)
             .view
             .bridge
             .attach(context.with_params(Arc::clone(&self.params)));
-        self.reset_requests();
         // A floating window has no host window behind it: unused keys go
         // to the host's listener (the standalone's shortcuts and MIDI keys).
         let unhandled = context.clone();
@@ -648,6 +705,7 @@ impl<P: Params> Editor for MuiEditor<P> {
         ) {
             Ok(window) => {
                 self.floating = Some(window);
+                self.install_host_waker(&context);
                 true
             }
             Err(error) => {

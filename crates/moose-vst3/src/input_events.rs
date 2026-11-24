@@ -118,6 +118,7 @@ pub(crate) fn push_vst3_param_change<P: PluginExport>(
     if !point_first {
         list.push(point);
     }
+    audio.param_changed_this_block = true;
     true
 }
 
