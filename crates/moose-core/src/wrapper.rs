@@ -1276,6 +1276,7 @@ mod state_handshake_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "wall-clock latency bound; Miri is ~100x slower")]
     fn sleeping_host_does_not_stall_50ms_on_load_or_save() {
         let plugin = PluginCell::new(SwapPlugin::create());
         let params = plugin.enter().params_arc();
