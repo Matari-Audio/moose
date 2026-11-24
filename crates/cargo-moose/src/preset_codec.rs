@@ -360,11 +360,11 @@ mod tests {
 
     #[test]
     fn format_detection() {
-        let f = |p: &str| PresetFormat::from_path(Path::new(p), "kurvpreset");
+        let f = |p: &str| PresetFormat::from_path(Path::new(p), "synthpreset");
         assert_eq!(f("a.vstpreset"), Some(PresetFormat::Vst3));
         assert_eq!(f("a.trucepreset"), Some(PresetFormat::MoosePreset));
         // A configured `[presets] extension` is the native container too.
-        assert_eq!(f("a.kurvpreset"), Some(PresetFormat::MoosePreset));
+        assert_eq!(f("a.synthpreset"), Some(PresetFormat::MoosePreset));
         assert_eq!(f("a.aupreset"), Some(PresetFormat::Au));
         assert_eq!(f("a.ttl"), None);
         assert_eq!(f("a.preset"), Some(PresetFormat::AuthoredToml));
