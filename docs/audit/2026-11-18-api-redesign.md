@@ -269,7 +269,7 @@ What string IDs do instead:
   load, `StateMigrationChain` runs first (`v -> v + 1`), then
   `resolve_named_params` maps string IDs to the current numeric IDs, so a
   renumbered parameter still gets its saved value. Plugins on schema `0`
-  (`kontra`, `kurv`) keep writing byte-identical v1, and every load path
+  (e.g. `kontra`) keep writing byte-identical v1, and every load path
   still reads v1.
 - **One path for everything.** Host state (`parse_or_migrate`,
   `read_and_apply_params`), `restore_plugin` and preset loads share

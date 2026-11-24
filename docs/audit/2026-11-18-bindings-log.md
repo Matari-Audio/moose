@@ -315,10 +315,10 @@ Merged: #43 (trait gaps, `plugin:` key), #44 (clippy moose-au and moose-gpu),
 #46 (host notices, MIDI 2 learn, group edit across handler swap), #48 (VST3
 Wayland view), #50–#55 (examples and workspace plugins on `moose::Plugin`),
 #56 (keep a processor that still fits), #59 (`requires_fallible_preparation`,
-`reactivate`, asymmetry-rider, objekt and pitch-tracker), #60 (`cargo moose
+`reactivate`, and three more plugins), #60 (`cargo moose
 new` scaffolds `moose::Plugin`), and this branch, which deprecates
 `PluginLogic`, `PluginLogic64`, `PurePluginLogic(64)` and `plugin! { logic: }`.
-Every in-tree plugin except kurv is on `moose::Plugin`.
+Every in-tree plugin except one is on `moose::Plugin`.
 
 `reset` keeps a signature without a sample rate. A kept processor always has
 the rate it was built with, and `reactivate` gets the full `AudioConfig` on the

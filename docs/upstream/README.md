@@ -53,7 +53,7 @@ were triaged as inherited/reference work rather than blanket cherry-picks.
 - [#233](https://github.com/truce-audio/truce/issues/233): implement or clarify
   Editor::idle scheduling. MUI has its own frame loop; avoid duplicate polling.
 - CLAP latency: move changed notifications into activation; request restart
-  while active. Previously reproduced by Korrekt's param-set-events validation;
+  while active. Previously reproduced by a plugin's param-set-events validation;
   deferred separately, not silently included in this upstream batch.
 - [#222](https://github.com/truce-audio/truce/pull/222) and #231 loader: optional
   DSP/file utilities only when a consuming product needs them.
