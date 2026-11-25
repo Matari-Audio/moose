@@ -4,6 +4,54 @@ Notable changes per release.
 
 ## Unreleased
 
+- **Host identity (`HostIdentity`).** `InitContext::host()` and
+  `PreparationConfig::host` carry `HostIdentity { format: HostFormat, name,
+  version }`. CLAP reads `clap_host.name`/`version`; VST3 asks
+  `IHostApplication::getName` (factory `setHostContext`, refreshed by
+  `IComponent::initialize`); AU/AAX use the host process name; the
+  standalone reports `moose-standalone`. Wrappers pass an explicit
+  `tasks::InstanceContext` through the new `PluginExport::create_for`
+  (defaults to `create`). The static (`export_static!`) and hot-reload
+  (`plugin!`) shells forward it to every generation. `None` only outside a
+  wrapper (test drivers, offline render).
+- **Plugin-initiated process wake (`ProcessWaker`).**
+  `InitContext::process_waker()` maps to CLAP `host.request_process`. It is
+  lock- and allocation-free, and it is inert during creation, after a
+  failed creation, before `init` and after `destroy`. Other formats return
+  `None` because their hosts keep processing.
+- **Standalone host control.**
+  - New APIs: `moose_standalone::run_with_args(defaults, argv)`,
+    `cli::parse_from`, `on_audio_opened` and `reopen_audio(argv)`.
+  - `on_audio_opened` receives exactly one `Result<AudioOpened, String>`
+    per request: launch, controller/menu change, or `reopen_audio`.
+  - `reopen_audio(argv)` is a validated live reconfiguration covering
+    `--audio-api`, devices, `--sample-rate`, `--buffer`, `--bus-layout`,
+    enable flags and channel routes. The plugin and its state are kept.
+  - One worker thread owns both streams and commits a request completely,
+    or restores the previous configuration. Capture reopens at the active
+    layout's input width, up to 16 ports.
+  - New `--audio-api <name>` / `MOOSE_STANDALONE_AUDIO_API` flag.
+    `--list-devices` honors it.
+  - New `jack` cargo feature (`cpal/jack`).
+  - Output-callback scratch is preallocated for the negotiated buffer
+    bound; a new `rt-paranoid` feature audits it.
+- **Breaking (host-parity rollout; spec `docs/specs/host-parity-apis.md`):**
+  - `PreparationConfig` is `#[non_exhaustive]`. Use
+    `PreparationConfig::new(..)` and `.with_host(..)`, not a struct literal.
+  - `cli::Options` gained `audio_api`; build it with `cli::parse_from`.
+  - `AudioHandles` comes only from `start_audio`, and only one session may
+    run per process.
+  - `InputController::{set_enabled, set_device}` and
+    `OutputController::{set_device, set_layout}` return `Result` (a stopped
+    worker is an error).
+  - `list_devices` takes the API name.
+  - An invalid `--bus-layout`, channel route, rate or buffer is an error
+    instead of a warning, and so is an unsupported explicit sample rate.
+  - `StaticShell::from_parts` takes an `Option<InstanceContext>`.
+  - Hot-reload logic dylibs must be rebuilt: ABI epoch 13 with
+    `moose_init_state(.., Option<InstanceContext>)` and
+    `moose_prepare_v2(&PreparationConfig)`.
+
 - **Breaking: `moose::Plugin` drops its processor-side custom-state hooks.**
   `save_state`, `load_state`, `snapshot_into`, `snapshot_version`,
   `snapshot_prealloc_hint` and `SNAPSHOTS` are gone; keep custom state in

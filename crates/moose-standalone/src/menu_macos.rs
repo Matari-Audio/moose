@@ -887,7 +887,9 @@ fn ensure_class() -> &'static AnyClass {
                     return;
                 };
                 let want = !state.input.is_enabled();
-                state.input.set_enabled(want);
+                if let Err(e) = state.input.set_enabled(want) {
+                    eprintln!("audio: {e}");
+                }
                 vlog!(
                     "mic: {} (request, via menu)",
                     if want { "ON" } else { "OFF" }
@@ -964,7 +966,9 @@ fn ensure_class() -> &'static AnyClass {
                 };
                 if let Some(name) = item_title(sender) {
                     vlog!("input device: {name}");
-                    state.input.set_device(Some(name));
+                    if let Err(e) = state.input.set_device(Some(name)) {
+                        eprintln!("audio: {e}");
+                    }
                 }
             }
         }
@@ -989,7 +993,9 @@ fn ensure_class() -> &'static AnyClass {
                 };
                 if let Some(name) = item_title(sender) {
                     vlog!("output device: {name}");
-                    state.output.set_device(Some(name));
+                    if let Err(e) = state.output.set_device(Some(name)) {
+                        eprintln!("audio: {e}");
+                    }
                 }
             }
         }
@@ -1070,7 +1076,9 @@ fn ensure_class() -> &'static AnyClass {
                 let tag: i64 = msg_send![sender, tag];
                 let idx = usize::try_from(tag).unwrap_or(0);
                 vlog!("bus layout: index {idx}");
-                state.output.set_layout(idx);
+                if let Err(e) = state.output.set_layout(idx) {
+                    eprintln!("audio: {e}");
+                }
                 let menu: *mut AnyObject = msg_send![sender, menu];
                 update_channel_checkmarks(menu, tag);
             }

@@ -566,6 +566,11 @@ fn activate<S: Sample, P: Plugin<S>>(
     config: &PreparationConfig,
 ) -> Result<(), PreparationError> {
     config.validate()?;
+    // The activation's host identity is the freshest (a VST3 host may name
+    // itself only after instantiation); `activate` reads it from `cx`.
+    if let Some(host) = &config.host {
+        slot.cx.set_host(host.clone());
+    }
     if let Slot::Active {
         processor,
         config: built,

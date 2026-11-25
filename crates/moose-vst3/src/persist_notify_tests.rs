@@ -14,7 +14,21 @@ struct Loop {
     fd: Cell<i32>,
     thread: std::thread::ThreadId,
 }
-unsafe extern "C" fn qi(raw: *mut c_void, _: *const u8, out: *mut *mut c_void) -> i32 {
+/// Answers only `FUnknown` / `IRunLoop`, like a real run-loop context (the
+/// factory also asks it for `IHostApplication`).
+unsafe extern "C" fn qi(raw: *mut c_void, iid: *const u8, out: *mut *mut c_void) -> i32 {
+    use vst3::com_scrape_types::Interface;
+    // SAFETY: The plugin passes a pointer to a 16-byte interface id.
+    let iid = unsafe { std::slice::from_raw_parts(iid, 16) };
+    let known = [
+        <vst3::Steinberg::FUnknown as Interface>::IID,
+        <vst3::Steinberg::Linux::IRunLoop as Interface>::IID,
+    ];
+    if !known.iter().any(|k| k.as_slice() == iid) {
+        // SAFETY: The plugin passes a writable out-slot.
+        unsafe { *out = std::ptr::null_mut() };
+        return vst3::Steinberg::kNoInterface;
+    }
     // SAFETY: The plugin calls this `queryInterface` with a writable out-slot. Handing back `raw`
     // without an add-ref is fine because this fake ignores reference counts for its lifetime.
     unsafe {

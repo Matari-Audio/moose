@@ -51,12 +51,14 @@ pub use events::{
 };
 pub use export::PluginExport;
 pub use heap_init::{HeapInit, heap_box_array_init};
-pub use info::{Automation, MidiDialect, PluginCategory, PluginInfo};
+pub use info::{Automation, HostFormat, HostIdentity, MidiDialect, PluginCategory, PluginInfo};
+pub use main_thread::ProcessWaker;
 pub use meters::MeterStore;
 pub use plugin::PluginRuntime;
 pub use process::{ProcessContext, ProcessStatus};
 pub use rt::{RtSection, allow_alloc};
 pub use snapshot::SnapshotSlot;
+pub use tasks::InstanceContext;
 
 #[cfg(feature = "rt-paranoid")]
 pub use rt::RtCheckAlloc;

@@ -28,6 +28,15 @@
 //!   connected (`--midi-input`; see [`midi`]).
 //!
 //! See [`cli`] for the full flag surface.
+//!
+//! # Embedding control
+//!
+//! [`run_with_args`] takes argv explicitly, [`on_audio_opened`] reports
+//! one terminal [`AudioOpened`] or error per audio request (launch included)
+//! and [`reopen_audio`] submits validated API / device / rate / buffer /
+//! layout / channel flags to the running audio as one transaction, without
+//! recreating the plugin. `--audio-api jack` (with the `jack` feature)
+//! runs on JACK, capturing up to 16 ports for wide-input plugins.
 
 pub mod audio;
 pub mod cli;
@@ -64,6 +73,7 @@ pub mod windowed_x11;
 
 pub mod headless;
 
+pub use audio::{AudioOpened, on_audio_opened, reopen_audio};
 pub use moose_core::export::PluginExport;
 
 // ---------------------------------------------------------------------------
@@ -176,13 +186,26 @@ pub fn run_with<P: PluginExport>(defaults: Defaults)
 where
     P::Params: 'static,
 {
+    run_with_args::<P, _>(defaults, std::env::args_os());
+}
+
+/// [`run_with`] over explicit arguments instead of the process argv, so a
+/// launcher can inject or rewrite flags (e.g. a fixed `--bus-layout`).
+/// Like `std::env::args_os()`, `args` starts with the program name.
+pub fn run_with_args<P, I>(defaults: Defaults, args: I)
+where
+    P: PluginExport,
+    P::Params: 'static,
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
     // Must run before any stdout/stderr output: Rust caches the
     // standard handles on first use, so attaching after the first
     // `eprintln!` would leave the cached null handles in place and
     // any later prints would still vanish.
     attach_parent_console();
 
-    let mut opts = match cli::parse() {
+    let mut opts = match cli::parse_from(args) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -221,7 +244,10 @@ where
     }
 
     if opts.list_devices {
-        audio::list_devices();
+        if let Err(e) = audio::list_devices(opts.audio_api.as_deref()) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
         return;
     }
     if opts.list_midi {

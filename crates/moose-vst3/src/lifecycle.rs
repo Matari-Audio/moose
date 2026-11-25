@@ -24,6 +24,7 @@ use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList, LosslessEventCursor};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostQueue, HostSignal, HostSink, dispatch};
+use moose_core::info::HostIdentity;
 use moose_core::main_thread::{
     BusDirection, HostColor, HostNotifier, Keyswitch, LearnSource, MenuTarget, Midi2Controller,
     Midi2ControllerAssignment, Midi2ControllerKind, ProgramPreset, TrackInfo,
@@ -31,6 +32,7 @@ use moose_core::main_thread::{
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
 use moose_core::state;
+use moose_core::tasks::InstanceContext;
 use moose_core::thread::{MainThread, MainThreadCell};
 use moose_core::wrapper::{PluginCell, apply_queued_state, enter_plugin, run_extern_callback_with};
 use moose_params::{MidiSource, ParamFunction, ParamRange, Params, PersistChangeSignal};
@@ -40,9 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 
 impl<P: PluginExport> Vst3Instance<P> {
     /// Construct a new plugin instance, firewalling any panic in `P::create` / `init`.
-    pub(crate) fn create() -> Option<Self> {
+    /// `host` reaches the plugin's `init` and every `prepare`.
+    pub(crate) fn create(host: HostIdentity) -> Option<Self> {
         run_extern_callback_with::<P, Option<Self>>("vst3", "create", None, || {
-            let mut plugin = P::create();
+            let mut plugin = P::create_for(InstanceContext::new(host.clone()));
             plugin.init();
             let info = P::info();
             let param_infos = plugin.params().param_catalog();
@@ -93,6 +96,7 @@ impl<P: PluginExport> Vst3Instance<P> {
                 .collect();
 
             Some(Self {
+                host: std::sync::Mutex::new(host),
                 persist_signal: std::sync::Mutex::new(None),
                 catalog_signal: std::sync::Mutex::new(None),
                 main_thread,
@@ -173,6 +177,12 @@ impl<P: PluginExport> Vst3Instance<P> {
                 AudioConfig::new(sample_rate, max_frames)
                     .with_process_mode(vst3_process_mode(process_mode)),
                 PreparationFrameBound::NegotiatedHost,
+            )
+            .with_host(
+                self.host
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             );
             if config.validate().is_err() {
                 return false;
@@ -534,6 +544,14 @@ pub(crate) fn vst3_topology_consistent(layouts: &[BusLayout]) -> bool {
 // ---------------------------------------------------------------------------
 
 impl<P: PluginExport> Vst3Backend for Vst3Instance<P> {
+    fn set_host_name(&self, name: &str) {
+        let mut host = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *host = host.clone().with_name(name);
+    }
+
     fn prepare(&self, sample_rate: f64, max_frames: u32, process_mode: i32) -> bool {
         self.prepare_impl(sample_rate, max_frames, process_mode)
     }
@@ -912,4 +930,10 @@ impl<P: PluginExport> Vst3Backend for Vst3Instance<P> {
                 .is_some_and(|mut hooks| hooks.set_program_data(&main, index, data))
         })
     }
+}
+
+/// Identity for test-built instances (no host context).
+#[cfg(test)]
+pub(crate) fn vst3_test_host() -> HostIdentity {
+    HostIdentity::new(moose_core::info::HostFormat::Vst3)
 }

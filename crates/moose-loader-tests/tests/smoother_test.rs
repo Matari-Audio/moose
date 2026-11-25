@@ -89,7 +89,7 @@ fn smoother_ramps_gradually() {
     let mut shell = moose_loader::static_shell::StaticShell::<
         SmootherParams,
         Lifecycle<SmootherPlugin>,
-    >::from_parts(params, None);
+    >::from_parts(params, None, None);
     shell
         .prepare(&PreparationConfig::new(
             AudioConfig::new(44100.0, 64),
@@ -172,7 +172,7 @@ fn static_shell_reset_snaps_smoothers() {
     let mut shell = moose_loader::static_shell::StaticShell::<
         SmootherParams,
         Lifecycle<SmootherPlugin>,
-    >::from_parts(Arc::clone(&params), None);
+    >::from_parts(Arc::clone(&params), None, None);
 
     // Target away from both the default and the smoother's current
     // value, then reset.
@@ -379,5 +379,99 @@ mod extension_export {
                 .0,
             7
         )));
+    }
+}
+
+/// GAP-1/GAP-2 through a real export entry point: the wrapper's
+/// `create_for` context reaches `Plugin::activate` via the static shell,
+/// and `prepare`'s host overrides it (VST3 learns the name late).
+mod host_identity_export {
+    use super::*;
+    use moose_core::export::PluginExport;
+    use moose_core::info::{HostFormat, HostIdentity};
+    use moose_core::main_thread::ProcessWaker;
+    use moose_core::tasks::InstanceContext;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    type Sample = f32;
+
+    static SEEN: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
+    static WAKES: AtomicU32 = AtomicU32::new(0);
+
+    struct HostLogic;
+
+    impl Plugin for HostLogic {
+        type Shared = SmootherParams;
+        type MainThread = ();
+        type Processor = ();
+
+        fn main_thread(_: &Arc<SmootherParams>) {}
+
+        fn activate(
+            _: &SmootherParams,
+            _: &AudioConfig,
+            cx: &InitContext,
+        ) -> Result<(), PreparationError> {
+            SEEN.lock()
+                .unwrap()
+                .push(cx.host().and_then(|h| h.name.as_deref().map(str::to_owned)));
+            if let Some(waker) = cx.process_waker() {
+                waker.wake();
+            }
+            Ok(())
+        }
+
+        fn process(
+            (): &mut (),
+            _: &SmootherParams,
+            _: &mut AudioBuffer,
+            _: &EventList,
+            _: &mut ProcessContext,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+        fn editor(_: Arc<SmootherParams>) -> Box<dyn moose::prelude::Editor> {
+            Box::new(NoEditor)
+        }
+    }
+    moose_loader::export_static! {
+        params: SmootherParams,
+        info: unreachable!(),
+        logic: Lifecycle<HostLogic>,
+    }
+
+    #[test]
+    fn create_for_context_and_prepare_host_reach_activate() {
+        let identity = HostIdentity::new(HostFormat::Clap).with_name("Probe Host");
+        let mut instance = __HotShellWrapper::create_for(
+            InstanceContext::new(identity.clone()).with_process_waker(ProcessWaker::new(|| {
+                WAKES.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let config = || {
+            PreparationConfig::new(
+                AudioConfig::new(48000.0, 64),
+                PreparationFrameBound::ExplicitDriver,
+            )
+        };
+        instance.prepare(&config()).unwrap();
+        assert_eq!(*SEEN.lock().unwrap(), vec![Some("Probe Host".into())]);
+        assert_eq!(
+            WAKES.load(Ordering::SeqCst),
+            1,
+            "the context's waker reaches activate"
+        );
+        // A host learned only at prepare (VST3 names the host late) reaches
+        // the activation it precedes.
+        let mut late = __HotShellWrapper::create();
+        late.prepare(
+            &config().with_host(HostIdentity::new(HostFormat::Vst3).with_name("Late Name")),
+        )
+        .unwrap();
+        assert_eq!(SEEN.lock().unwrap().last(), Some(&Some("Late Name".into())));
+        // Without a wrapper context or a prepare host the shell stays hostless.
+        let mut bare = __HotShellWrapper::create();
+        bare.prepare(&config()).unwrap();
+        assert_eq!(SEEN.lock().unwrap().last(), Some(&None));
     }
 }

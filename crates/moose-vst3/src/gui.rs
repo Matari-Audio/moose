@@ -627,7 +627,8 @@ mod tests {
 
     #[test]
     fn vst3_host_context_routes_state_and_signals_through_host_queue() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         let editor_ctx = editor_context(&inst);
 
         editor_ctx.set_state(vec![1, 2, 3]);
@@ -654,7 +655,8 @@ mod tests {
 
     #[test]
     fn busy_gui_get_size_returns_cached_last_phys_size_instead_of_zero() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         inst.gui.enter().editor = Some(Box::new(RecordingEditor {
             size: (640, 400),
             open: false,
@@ -670,7 +672,8 @@ mod tests {
 
     #[test]
     fn gui_open_with_only_replays_reported_host_scale() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         let scales = Arc::new(Mutex::new(Vec::new()));
         inst.gui.enter().editor = Some(Box::new(RecordingEditor {
             size: (500, 300),
@@ -698,7 +701,8 @@ mod tests {
 
     #[test]
     fn gui_set_size_clears_stale_pending_resize() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         inst.gui.enter().editor = Some(Box::new(RecordingEditor {
             size: (400, 300),
             open: true,
@@ -718,7 +722,8 @@ mod tests {
 
     #[test]
     fn scale_reported_while_gui_held_is_applied_after_release() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         let scales = Arc::new(Mutex::new(Vec::new()));
         inst.gui.enter().editor = Some(Box::new(RecordingEditor {
             size: (400, 300),
@@ -750,7 +755,8 @@ mod tests {
 
     #[test]
     fn midi_mapping_rejects_negative_channel() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         assert_eq!(inst.midi_mapping_get_param_id_impl(0, -1, 1), None);
     }
 }

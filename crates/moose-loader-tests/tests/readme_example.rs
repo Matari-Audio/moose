@@ -21,7 +21,7 @@ fn readme_minimal_example_compiles_and_processes_audio() {
     type Logic = Lifecycle<readme_minimal_example::Gain>;
     let params = Arc::new(readme_minimal_example::GainParams::new());
     let mut shell =
-        StaticShell::<readme_minimal_example::GainParams, Logic>::from_parts(params, None);
+        StaticShell::<readme_minimal_example::GainParams, Logic>::from_parts(params, None, None);
     shell
         .prepare(&PreparationConfig::new(
             AudioConfig::new(48_000.0, 64),

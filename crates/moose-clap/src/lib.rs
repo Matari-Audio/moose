@@ -69,6 +69,7 @@ mod plugin;
 mod ports;
 pub mod presets;
 mod process;
+mod process_wake;
 mod remote_controls;
 mod state_ext;
 mod track_info;
@@ -108,9 +109,12 @@ use moose_core::config::ProcessMode;
 use moose_core::events::{EVENT_LIST_PREALLOC, EventList};
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
-use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
+use moose_core::info::{
+    HostFormat, HostIdentity, PluginCategory, PluginInfo, resolve_name_override,
+};
 use moose_core::main_thread::HostNotifier;
 use moose_core::state;
+use moose_core::tasks::InstanceContext;
 use moose_core::thread::MainThreadCell;
 use moose_core::wrapper::{PluginCell, copy_c_str, run_extern_callback_with};
 use moose_params::Params;
@@ -1316,49 +1320,131 @@ unsafe fn data_from_plugin<P: PluginExport>(
 // Factory: create_plugin
 // ---------------------------------------------------------------------------
 
+/// GAP-1: the wrapper format plus the host's self-reported
+/// `clap_host.name` / `clap_host.version`.
+///
+/// # Safety
+/// `host` is null or a live `clap_host` whose strings are NUL-terminated.
+unsafe fn clap_host_identity(host: *const clap_host) -> HostIdentity {
+    let mut identity = HostIdentity::new(HostFormat::Clap);
+    // SAFETY: caller contract.
+    if let Some(host) = unsafe { host.as_ref() } {
+        let read = |p: *const std::ffi::c_char| {
+            // SAFETY: CLAP host strings are NUL-terminated and live as long
+            // as the host.
+            (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy())
+        };
+        if let Some(name) = read(host.name) {
+            identity = identity.with_name(&name);
+        }
+        if let Some(version) = read(host.version) {
+            identity = identity.with_version(&version);
+        }
+    }
+    identity
+}
+
+/// Per-instance host plumbing: the GAP-1 identity, the thread-safe host
+/// handle and the main-thread wake queue.
+///
+/// # Safety
+/// `raw` is a live `clap_host` that outlives the instance.
+unsafe fn clap_host_parts(
+    raw: *const clap_host,
+) -> (
+    HostIdentity,
+    host_handle::HostHandle<host_handle::Any>,
+    Arc<HostQueue>,
+) {
+    // SAFETY: caller contract.
+    let identity = unsafe { clap_host_identity(raw) };
+    // SAFETY: the host outlives the instance, and `HostHandle<Any>`
+    // exposes only `[thread-safe]` host calls.
+    let host = unsafe { host_handle::HostHandle::any(raw) };
+    let queue = Arc::new(HostQueue::new(move || {
+        // SAFETY: `destroy` closes the queue before the instance and
+        // its host pointer go away.
+        unsafe { host.request_callback() };
+    }));
+    (identity, host, queue)
+}
+
+/// Whether `P`'s bus layouts fit `BusRouting` (logs the refusal if not).
+fn layouts_fit_routing<P: PluginExport>() -> bool {
+    let fits = bus_layouts_fit_routing(&P::bus_layouts());
+    if !fits {
+        eprintln!(
+            "[moose CLAP] {} declares an audio-bus topology beyond BusRouting's limit of 32 \
+             buses per direction and 65,535 channels per bus - instance creation refused.",
+            std::any::type_name::<P>(),
+        );
+    }
+    fits
+}
+
 /// Create a `clap_plugin` instance for the given plugin type.
 ///
 /// # Safety
-/// Called by the host through the factory. The descriptor must remain valid
-/// for the lifetime of the returned plugin.
+/// Called by the host through the factory (`clap_plugin_factory.create_plugin`).
+/// - `descriptor` must remain valid for the lifetime of the returned plugin.
+/// - `host` must be null or point to a `clap_host` that stays valid until
+///   the returned plugin's `destroy` returns (or, on a null return, until
+///   this call returns). Its `name` / `version` must be null or
+///   NUL-terminated strings, valid for this call.
+///
+/// The `ProcessWaker` handed to `create_for` starts disarmed: it calls the
+/// host only between a successful `clap_plugin.init` and `destroy`, so a
+/// waker that escapes a failed creation or `init` never touches the host;
+/// a null return also closes the gate.
 #[must_use]
+pub unsafe fn create_plugin_instance<P: PluginExport>(
+    descriptor: *const clap_plugin_descriptor,
+    host: *const clap_host,
+) -> *const clap_plugin {
+    let gate = Arc::<process_wake::WakeGate>::default();
+    // SAFETY: forwarded caller contract.
+    let plugin = unsafe { create_gated::<P>(descriptor, host, Arc::clone(&gate)) };
+    if plugin.is_null() {
+        // No `destroy` follows a null return and the host may be freed
+        // right after it: shut the gate on any waker clone that escaped.
+        gate.close();
+    }
+    plugin
+}
+
+/// [`create_plugin_instance`] with its process-wake gate supplied.
+///
+/// # Safety
+/// As [`create_plugin_instance`].
 #[expect(
     clippy::too_many_lines,
     reason = "initializes ClapPluginData fields and static CLAP vtable in one place"
 )]
-pub unsafe fn create_plugin_instance<P: PluginExport>(
+unsafe fn create_gated<P: PluginExport>(
     descriptor: *const clap_plugin_descriptor,
     host: *const clap_host,
+    process_wake: Arc<process_wake::WakeGate>,
 ) -> *const clap_plugin {
     // Author `create` runs here (its `init` is guarded separately in
     // `clap_plugin_init`). Guard the constructor too - the factory's
     // extern "C" caller is bare, so a panic would abort the host. A null
     // return tells the host construction failed.
     run_extern_callback_with::<P, *const clap_plugin>("CLAP", "create", ptr::null(), || {
-        let layouts = P::bus_layouts();
-        if !bus_layouts_fit_routing(&layouts) {
-            eprintln!(
-                "[moose CLAP] {} declares an audio-bus topology beyond BusRouting's limit of 32 \
-                 buses per direction and 65,535 channels per bus - instance creation refused.",
-                std::any::type_name::<P>(),
-            );
+        if !layouts_fit_routing::<P>() {
             return ptr::null();
         }
-        let instance = P::create();
+        // SAFETY: CLAP factory contract: `host` is live and outlives the instance.
+        let (host_identity, host, host_queue) = unsafe { clap_host_parts(host) };
+        let instance = P::create_for(
+            InstanceContext::new(host_identity.clone())
+                .with_process_waker(process_wake::process_waker(&process_wake, host)),
+        );
         let info = P::info();
         let plugin_id_hash = state::hash_plugin_id(info.clap_id);
         let param_infos = instance.params().param_catalog();
         let param_count = param_infos.len();
         let params_arc = instance.params_arc();
         let hooks = MainThreadCell::new(instance.main_thread());
-        // SAFETY: the host outlives the instance, and `HostHandle<Any>`
-        // exposes only `[thread-safe]` host calls (`request_callback`).
-        let host = unsafe { host_handle::HostHandle::any(host) };
-        let host_queue = Arc::new(HostQueue::new(move || {
-            // SAFETY: `destroy` closes the queue before the instance and
-            // its host pointer go away.
-            unsafe { host.request_callback() };
-        }));
         let host_notifier = HostNotifier::from_queue(Arc::clone(&host_queue));
         let exposed = Mutex::new(catalog_sync::ExposedParams::new(
             Arc::clone(&param_infos),
@@ -1383,6 +1469,7 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
         // amortizes the cost into instance creation, where it belongs.
         // Read before `info` is moved into the struct literal below.
         let midi_input_ports = info.midi_input_ports;
+        let layouts = P::bus_layouts();
         let max_in = layouts
             .iter()
             .map(|l| l.total_input_channels() as usize)
@@ -1420,6 +1507,8 @@ pub unsafe fn create_plugin_instance<P: PluginExport>(
             info,
             plugin_id_hash,
             host,
+            host_identity,
+            process_wake,
             host_params: ptr::null(),
             host_latency: ptr::null(),
             host_tail: ptr::null(),

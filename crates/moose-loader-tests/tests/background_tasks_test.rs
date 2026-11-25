@@ -104,6 +104,7 @@ fn background_task_runs_when_scheduled_from_process() {
         moose_loader::static_shell::StaticShell::<TaskParams, Lifecycle<TaskPlugin>>::from_parts(
             params,
             Some(tasks),
+            None,
         );
     shell
         .prepare(&PreparationConfig::new(

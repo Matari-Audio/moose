@@ -73,6 +73,10 @@ gui = [
     "windows-sys/Win32_UI_Shell",
     "dep:rfd",
 ]
+# JACK audio API (`--audio-api jack`), via cpal's JACK host.
+jack = ["cpal/jack"]
+# Count audio-thread allocations in this crate's tests (`RtCheckAlloc`).
+rt-paranoid = ["moose-core/rt-paranoid"]
 playback = ["dep:hound", "dep:moose-driver", "moose-driver/wav", "dep:ctrlc"]
 
 [lints]

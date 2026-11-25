@@ -20,6 +20,8 @@ pub struct Options {
     pub headless: bool,
     pub list_devices: bool,
     pub list_midi: bool,
+    /// cpal host API by name (`--audio-api`, e.g. `alsa`, `jack`, `asio`).
+    pub audio_api: Option<String>,
     pub output_device: Option<String>,
     pub input_device: Option<String>,
     /// Output channel routing spec (`direct`, a channel like `3`, or a
@@ -117,6 +119,10 @@ OPTIONS:
   --headless                Run audio only; no window
   --list-devices            List audio output + input devices and exit
   --list-midi               List MIDI input devices and exit
+  --audio-api <name>        Audio API (cpal host, e.g. alsa, jack,
+                            coreaudio, wasapi, asio; default: the
+                            platform default). `jack` needs the
+                            `jack` cargo feature.
   --output <name>           Audio output device (substring match)
   --input <name>            Audio input device (effect plugins)
   --output-channels <spec>  Route output to specific device channels:
@@ -208,7 +214,22 @@ fn print_help() {
 /// argument, fails the type-coercion (`f64`, `usize`, etc.), or an
 /// unrecognized positional / leftover token slips through.
 pub fn parse() -> Result<Options, String> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    parse_from(std::env::args_os())
+}
+
+/// [`parse`] over explicit arguments instead of the process argv. Like
+/// `std::env::args_os()`, `args` starts with the program name, which is
+/// skipped.
+///
+/// # Errors
+///
+/// Same as [`parse`].
+pub fn parse_from<I>(args: I) -> Result<Options, String>
+where
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
+    let args: Vec<std::ffi::OsString> = args.into_iter().skip(1).map(Into::into).collect();
     let mut args = pico_args::Arguments::from_vec(args);
 
     // Presence flags first (affect the rest of parsing).
@@ -228,6 +249,9 @@ pub fn parse() -> Result<Options, String> {
     let verbose = args.contains(["-v", "--verbose"]);
 
     // Parse values - each `Option<...>` short-circuits to None if absent.
+    let audio_api = args
+        .opt_value_from_str::<_, String>("--audio-api")
+        .map_err(|e| format!("--audio-api: {e}"))?;
     let output_device = args
         .opt_value_from_str::<_, String>("--output")
         .map_err(|e| format!("--output: {e}"))?;
@@ -307,6 +331,7 @@ pub fn parse() -> Result<Options, String> {
         headless,
         list_devices,
         list_midi,
+        audio_api: audio_api.or_else(|| env("AUDIO_API")),
         output_device: output_device.or_else(|| env("OUTPUT")),
         input_device: input_device.or_else(|| env("INPUT")),
         output_channels: output_channels.or_else(|| env("OUTPUT_CHANNELS")),
@@ -370,4 +395,17 @@ fn parse_on_off(s: &str, source: &str) -> Result<bool, String> {
 
 fn env(name: &str) -> Option<String> {
     moose_utils::env::var(&format!("MOOSE_STANDALONE_{name}"))
+}
+
+#[cfg(test)]
+mod parse_from_tests {
+    use super::*;
+
+    #[test]
+    fn parse_from_skips_program_name_and_reads_audio_api() {
+        let opts = parse_from(["app", "--audio-api", "jack", "--bus-layout", "2"]).unwrap();
+        assert_eq!(opts.audio_api.as_deref(), Some("jack"));
+        assert_eq!(opts.bus_layout, Some(2));
+        assert!(parse_from(["app", "stray"]).is_err());
+    }
 }

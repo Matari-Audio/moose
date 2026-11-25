@@ -31,6 +31,7 @@
 //! pub fn moose_init_state(
 //!     params: *const (),
 //!     tasks: Option<AnyTaskSpawner>,
+//!     instance: Option<InstanceContext>,
 //! ) -> *mut () { /* Box<State> */ }
 //! #[unsafe(no_mangle)]
 //! pub fn moose_process(state: *mut (), params: *const (), /* ... */) { }
@@ -177,9 +178,13 @@ macro_rules! export_plugin {
             tasks: ::core::option::Option<
                 $crate::__macro_deps::moose_core::tasks::AnyTaskSpawner,
             >,
+            instance: ::core::option::Option<
+                $crate::__macro_deps::moose_core::tasks::InstanceContext,
+            >,
         ) -> *mut () {
             let params: &$params = unsafe { &*(params_ptr as *const $params) };
-            let cx = $crate::__macro_deps::moose_core::tasks::InitContext::new(tasks);
+            let cx = $crate::__macro_deps::moose_core::tasks::InitContext::new(tasks)
+                .with_instance(instance);
             let state = <$logic as $crate::PluginLogicCore<Sample>>::init(params, &cx);
             Box::into_raw(Box::new(state)).cast::<()>()
         }
@@ -215,20 +220,16 @@ macro_rules! export_plugin {
         }
 
         #[unsafe(no_mangle)]
-        pub fn moose_prepare_v1(
+        pub fn moose_prepare_v2(
             state: *mut (),
             params_ptr: *const (),
-            config: &$crate::__macro_deps::moose_core::config::AudioConfig,
+            config: &$crate::__macro_deps::moose_core::plugin::PreparationConfig,
         ) -> bool {
             let state = unsafe {
                 &mut *state.cast::<<$logic as $crate::PluginLogicCore<Sample>>::DspState>()
             };
             let params: &$params = unsafe { &*(params_ptr as *const $params) };
-            let config = $crate::__macro_deps::moose_core::plugin::PreparationConfig::new(
-                *config,
-                $crate::__macro_deps::moose_core::plugin::PreparationFrameBound::NegotiatedHost,
-            );
-            <$logic as $crate::PluginLogicCore<Sample>>::prepare(state, params, &config).is_ok()
+            <$logic as $crate::PluginLogicCore<Sample>>::prepare(state, params, config).is_ok()
         }
 
         #[unsafe(no_mangle)]

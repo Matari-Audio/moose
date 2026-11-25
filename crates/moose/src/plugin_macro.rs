@@ -319,6 +319,25 @@ macro_rules! __plugin_hot_reload {
         }
 
         impl __HotShellWrapper {
+            fn __moose_create(
+                instance: ::core::option::Option<$crate::core::tasks::InstanceContext>,
+            ) -> Self {
+                let params = <$params>::new();
+                let path = Self::dylib_path();
+                let tasks: ::core::option::Option<
+                    $crate::core::tasks::AnyTaskSpawner,
+                > = ::core::option::Option::None;
+                $(let tasks = {
+                    $(let _ = ::core::marker::PhantomData::<$task>;)+
+                    ::core::option::Option::Some(
+                        $crate::core::tasks::AnyTaskSpawner::routed(),
+                    )
+                };)?
+                Self {
+                    inner: $crate::__reexport::HotShell::new_with_tasks(params, path, tasks, instance),
+                }
+            }
+
             fn dylib_path() -> std::path::PathBuf {
                 // Runtime escape hatch - point the shell at any
                 // dylib (advanced; only works when the DAW inherits
@@ -547,20 +566,11 @@ macro_rules! __plugin_hot_reload {
             type Params = $params;
 
             fn create() -> Self {
-                let params = <$params>::new();
-                let path = Self::dylib_path();
-                let tasks: ::core::option::Option<
-                    $crate::core::tasks::AnyTaskSpawner,
-                > = ::core::option::Option::None;
-                $(let tasks = {
-                    $(let _ = ::core::marker::PhantomData::<$task>;)+
-                    ::core::option::Option::Some(
-                        $crate::core::tasks::AnyTaskSpawner::routed(),
-                    )
-                };)?
-                Self {
-                    inner: $crate::__reexport::HotShell::new_with_tasks(params, path, tasks),
-                }
+                Self::__moose_create(None)
+            }
+
+            fn create_for(instance: $crate::core::tasks::InstanceContext) -> Self {
+                Self::__moose_create(Some(instance))
             }
 
             fn params(&self) -> &$params {

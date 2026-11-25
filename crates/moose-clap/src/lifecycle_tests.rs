@@ -1587,3 +1587,188 @@ fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
         (*plugin).deactivate.unwrap()(plugin);
     });
 }
+
+// GAP-1 / GAP-2: host identity and process waker reach `init` and `prepare`.
+struct HostProbe {
+    inner: TestPlugin,
+    init_host: Option<moose_core::info::HostIdentity>,
+    waker: Option<moose_core::main_thread::ProcessWaker>,
+    prepared_host: Option<moose_core::info::HostIdentity>,
+}
+
+/// What `HostProbe::create_for` does with the waker it is handed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateMode {
+    Normal,
+    /// Wake during creation (CLAP forbids host calls here).
+    WakeInCreate,
+    /// Publish the waker, then panic: the factory returns null.
+    EscapeThenPanic,
+}
+
+thread_local! {
+    static CREATE_MODE: std::cell::Cell<CreateMode> = const { std::cell::Cell::new(CreateMode::Normal) };
+    static ESCAPED: std::cell::RefCell<Option<moose_core::main_thread::ProcessWaker>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl PluginExport for HostProbe {
+    type Params = TestParams;
+    fn create() -> Self {
+        unreachable!("wrappers call create_for")
+    }
+    fn create_for(instance: moose_core::tasks::InstanceContext) -> Self {
+        // What the `plugin!` shells do before calling the author's `init`.
+        let cx = moose_core::tasks::InitContext::new(None).with_instance(Some(instance));
+        let waker = cx.process_waker();
+        match CREATE_MODE.get() {
+            CreateMode::Normal => {}
+            CreateMode::WakeInCreate => waker.as_ref().expect("waker").wake(),
+            CreateMode::EscapeThenPanic => {
+                ESCAPED.with(|e| *e.borrow_mut() = waker.clone());
+                panic!("create failed after publishing its waker");
+            }
+        }
+        Self {
+            inner: TestPlugin::create(),
+            init_host: cx.host().cloned(),
+            waker,
+            prepared_host: None,
+        }
+    }
+    fn params(&self) -> &TestParams {
+        self.inner.params()
+    }
+    fn params_arc(&self) -> Arc<TestParams> {
+        self.inner.params_arc()
+    }
+    fn meter_store(&self) -> Arc<MeterStore> {
+        self.inner.meter_store()
+    }
+    fn snapshot_slot(&self) -> Arc<SnapshotSlot> {
+        self.inner.snapshot_slot()
+    }
+}
+
+impl PluginRuntime for HostProbe {
+    type Sample = f32;
+    fn info() -> PluginInfo {
+        TestPlugin::info()
+    }
+    fn reset(&mut self, _: &AudioConfig) {}
+    fn prepare(
+        &mut self,
+        config: &moose_core::plugin::PreparationConfig,
+    ) -> Result<(), moose_core::plugin::PreparationError> {
+        self.prepared_host.clone_from(&config.host);
+        Ok(())
+    }
+    fn process(
+        &mut self,
+        _: &mut AudioBuffer,
+        _: &EventList,
+        _: &mut ProcessContext,
+    ) -> ProcessStatus {
+        ProcessStatus::Normal
+    }
+}
+
+thread_local! {
+    static PROCESS_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+unsafe extern "C" fn count_request_process(_: *const clap_host) {
+    PROCESS_REQUESTS.set(PROCESS_REQUESTS.get() + 1);
+}
+
+fn test_host() -> clap_host {
+    // SAFETY: an all-zero `clap_host` is a valid "no callbacks" host.
+    let mut host: clap_host = unsafe { std::mem::zeroed() };
+    host.clap_version = clap_sys::version::CLAP_VERSION;
+    host.get_extension = Some(no_extension);
+    host.name = c"Test Host".as_ptr();
+    host.version = c"9.1".as_ptr();
+    host.request_process = Some(count_request_process);
+    host
+}
+
+#[test]
+fn host_identity_and_process_waker_reach_init_and_prepare() {
+    use moose_core::info::HostFormat;
+    CREATE_MODE.set(CreateMode::Normal);
+    let host = test_host();
+    // SAFETY: host and descriptor outlive the plugin; calls are serial.
+    unsafe {
+        let descriptor = DescriptorHolder::new(&HostProbe::info());
+        let plugin =
+            create_plugin_instance::<HostProbe>(&raw const descriptor.descriptor, &raw const host);
+        assert!(!plugin.is_null());
+        let waker = enter_plugin(&data_from_plugin::<HostProbe>(plugin).plugin)
+            .waker
+            .clone()
+            .expect("CLAP provides a process waker");
+        let before = PROCESS_REQUESTS.get();
+        waker.wake();
+        assert_eq!(PROCESS_REQUESTS.get(), before, "inert before init");
+        assert!((*plugin).init.unwrap()(plugin));
+        assert!((*plugin).activate.unwrap()(plugin, 48_000., 1, 512));
+        let data = data_from_plugin::<HostProbe>(plugin);
+        let (init_host, prepared_host) = {
+            let probe = enter_plugin(&data.plugin);
+            (probe.init_host.clone(), probe.prepared_host.clone())
+        };
+        let init_host = init_host.expect("init sees the host");
+        assert_eq!(init_host.format, HostFormat::Clap);
+        assert_eq!(init_host.name.as_deref(), Some("Test Host"));
+        assert_eq!(init_host.version.as_deref(), Some("9.1"));
+        assert_eq!(prepared_host, Some(init_host));
+
+        waker.wake();
+        assert_eq!(PROCESS_REQUESTS.get(), before + 1);
+        (*plugin).deactivate.unwrap()(plugin);
+        (*plugin).destroy.unwrap()(plugin);
+        // A waker kept past `destroy` must not touch the host.
+        waker.wake();
+        assert_eq!(PROCESS_REQUESTS.get(), before + 1);
+    }
+}
+
+#[test]
+fn process_waker_never_calls_the_host_during_creation() {
+    CREATE_MODE.set(CreateMode::WakeInCreate);
+    let host = test_host();
+    let before = PROCESS_REQUESTS.get();
+    // SAFETY: host and descriptor outlive the plugin; calls are serial.
+    unsafe {
+        let descriptor = DescriptorHolder::new(&HostProbe::info());
+        let plugin =
+            create_plugin_instance::<HostProbe>(&raw const descriptor.descriptor, &raw const host);
+        CREATE_MODE.set(CreateMode::Normal);
+        assert!(!plugin.is_null());
+        assert_eq!(PROCESS_REQUESTS.get(), before, "no host call inside create");
+        (*plugin).destroy.unwrap()(plugin);
+    }
+}
+
+#[test]
+fn waker_escaped_from_failed_creation_stays_inert() {
+    CREATE_MODE.set(CreateMode::EscapeThenPanic);
+    let before = PROCESS_REQUESTS.get();
+    // SAFETY: host and descriptor outlive the call; a null result has no
+    // instance to destroy. The host is freed when the block ends, as a
+    // host may do right after a failed `create_plugin`.
+    let plugin = unsafe {
+        let host = Box::new(test_host());
+        let descriptor = DescriptorHolder::new(&HostProbe::info());
+        create_plugin_instance::<HostProbe>(&raw const descriptor.descriptor, &raw const *host)
+    };
+    CREATE_MODE.set(CreateMode::Normal);
+    assert!(plugin.is_null(), "a panicking create returns null");
+    let escaped = ESCAPED
+        .with(|e| e.borrow_mut().take())
+        .expect("waker escaped");
+    // No `destroy` will ever run for this instance; the waker must still
+    // never reach the host.
+    escaped.wake();
+    assert_eq!(PROCESS_REQUESTS.get(), before);
+}

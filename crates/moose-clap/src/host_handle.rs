@@ -133,6 +133,23 @@ impl HostHandle<Any> {
         }
     }
 
+    /// Ask the host to resume processing a sleeping plugin
+    /// (`host.request_process`, `[thread-safe]`).
+    ///
+    /// # Safety
+    /// The underlying `clap_host` must still be alive.
+    pub(crate) unsafe fn request_process(self) {
+        if !self.raw.is_null() {
+            // SAFETY: caller guarantees `self.raw` is live; `request_process`
+            // is `[thread-safe]` per CLAP `host.h`.
+            unsafe {
+                if let Some(request) = (*self.raw).request_process {
+                    request(self.raw);
+                }
+            }
+        }
+    }
+
     /// Ask the host to deactivate and reactivate the plugin
     /// (`host.request_restart`, `[thread-safe]`).
     ///

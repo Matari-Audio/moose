@@ -830,9 +830,14 @@ impl Host {
             allow(unused_variables, clippy::needless_pass_by_value)
         )]
         factory_run_loop: Option<ComPtr<vst3::Steinberg::Linux::IRunLoop>>,
+        host_name: Option<&str>,
     ) -> Option<Arc<Self>> {
         let desc = &reg.desc;
-        let backend = reg.factory.create()?;
+        let mut identity = moose_core::info::HostIdentity::new(moose_core::info::HostFormat::Vst3);
+        if let Some(name) = host_name {
+            identity = identity.with_name(name);
+        }
+        let backend = reg.factory.create(&identity)?;
         let id = NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed);
         let mut config = Config {
             sample_rate: 44100.0,
@@ -2427,20 +2432,11 @@ impl IPluginBaseTrait for Component {
         unsafe {
             self.host.set_host_context(context);
         }
-        if let Some(app) =
-            // SAFETY: `context` is null (handled by `from_raw`) or the host's live context for this
-            // call.
-            unsafe { ComRef::from_raw(context) }.and_then(|c| c.cast::<IHostApplication>())
-        {
-            let mut name: String128 = [0; 128];
-            // SAFETY: `app` is the live `IHostApplication`; `name` is a local `String128`.
-            if unsafe { app.getName(&raw mut name) } == kResultOk {
-                // SAFETY: `name` is a local array of `name.len()` units; the read stops at its NUL
-                // or end.
-                let name = unsafe { utf16_from(name.as_ptr(), name.len()) };
-                self.host
-                    .set_dynamic_support(DynamicSupport::for_host(&name));
-            }
+        // SAFETY: `context` is null or the host's live context for this call.
+        if let Some(name) = unsafe { super::host_app_name(context) } {
+            self.host
+                .set_dynamic_support(DynamicSupport::for_host(&name));
+            self.host.backend().set_host_name(&name);
         }
         kResultOk
     }

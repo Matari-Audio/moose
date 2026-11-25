@@ -123,7 +123,7 @@ type Shell = StaticShell<LcParams, Lifecycle<Lc>>;
 
 fn shell() -> (Shell, Arc<LcParams>) {
     let params = Arc::new(LcParams::new());
-    (Shell::from_parts(Arc::clone(&params), None), params)
+    (Shell::from_parts(Arc::clone(&params), None, None), params)
 }
 
 fn config() -> PreparationConfig {

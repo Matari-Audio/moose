@@ -124,6 +124,9 @@ impl EditorScaleState {
 }
 
 pub(crate) struct Vst3Instance<P: PluginExport> {
+    /// Wrapper format and host name; the name may arrive late, from
+    /// `IComponent::initialize`. UI thread only (`initialize`, `prepare`).
+    pub(crate) host: std::sync::Mutex<moose_core::info::HostIdentity>,
     pub(crate) persist_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,
     /// The bound `CatalogSignal` (same type as the persist signal).
     pub(crate) catalog_signal: std::sync::Mutex<Option<Arc<PersistChangeSignal>>>,

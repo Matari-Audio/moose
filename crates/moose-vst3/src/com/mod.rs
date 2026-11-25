@@ -162,6 +162,27 @@ pub(crate) fn c8_into(dst: &mut [c_char], s: &str) {
     dst[end] = 0;
 }
 
+/// `IHostApplication::getName` of a host context, if it answers.
+///
+/// # Safety
+/// `context` is null or a live `FUnknown`.
+pub(crate) unsafe fn host_app_name(context: *mut vst3::Steinberg::FUnknown) -> Option<String> {
+    use vst3::Steinberg::Vst::{IHostApplication, IHostApplicationTrait, String128};
+    // SAFETY: caller contract: `context` is null (-> `None`) or a live
+    // `FUnknown` borrowed for this call; `ComRef` takes no reference.
+    let context = unsafe { vst3::ComRef::from_raw(context) }?;
+    // `cast` is `queryInterface`: the returned `ComPtr` owns the reference
+    // the host added and releases it on drop.
+    let app = context.cast::<IHostApplication>()?;
+    let mut name: String128 = [0; 128];
+    // SAFETY: `app` is a live `IHostApplication`; `getName` writes at most
+    // 128 UTF-16 units into this initialized local buffer.
+    let ok = unsafe { app.getName(&raw mut name) } == vst3::Steinberg::kResultOk;
+    // SAFETY: `name` is initialized and the read is bounded to its 128
+    // units even when the host omitted the terminator.
+    ok.then(|| unsafe { utf16_from(name.as_ptr(), name.len()) })
+}
+
 /// Host UTF-16 text (NUL-terminated) to a `String`.
 pub(crate) unsafe fn utf16_from(p: *const u16, max: usize) -> String {
     if p.is_null() {

@@ -107,6 +107,8 @@ pub(crate) struct ParamTrackEntry {
 }
 
 pub(crate) struct AuInstance<P: PluginExport> {
+    /// Wrapper format and host process name, for every `prepare`.
+    pub(crate) host_identity: moose_core::info::HostIdentity,
     // First fields: close worker requests and dispatch sources before any
     // native/editor/host-sink teardown.
     pub(crate) persist_signal: Option<Arc<PersistChangeSignal>>,

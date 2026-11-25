@@ -2,7 +2,7 @@ use crate::buffer::AudioBuffer;
 use crate::bus::BusLayout;
 use crate::config::AudioConfig;
 use crate::events::EventList;
-use crate::info::PluginInfo;
+use crate::info::{HostIdentity, PluginInfo};
 use crate::process::{ProcessContext, ProcessStatus};
 use moose_params::sample::Sample;
 
@@ -28,14 +28,30 @@ pub enum PreparationError {
 }
 /// Offaudio activation request, distinct from a bounded audio-thread reset.
 /// Keeps the exact maximum and its provenance; never substitutes scratch size.
+/// Build it with [`Self::new`] (fields may be added).
+#[non_exhaustive]
 pub struct PreparationConfig {
     pub audio: AudioConfig,
     pub frame_bound: PreparationFrameBound,
+    /// The wrapper and host application driving this activation. Set by
+    /// every format wrapper and by the static and hot-reload shells; `None`
+    /// only for callers outside a wrapper (offline drivers, test harnesses).
+    pub host: Option<HostIdentity>,
 }
 impl PreparationConfig {
     #[must_use]
     pub fn new(audio: AudioConfig, frame_bound: PreparationFrameBound) -> Self {
-        Self { audio, frame_bound }
+        Self {
+            audio,
+            frame_bound,
+            host: None,
+        }
+    }
+    /// Attach the host identity (set by format wrappers).
+    #[must_use]
+    pub fn with_host(mut self, host: HostIdentity) -> Self {
+        self.host = Some(host);
+        self
     }
     /// # Errors
     /// Returns `InvalidGeometry` for a nonpositive or nonfinite sample rate or zero block size.

@@ -570,7 +570,9 @@ unsafe extern "system" fn subclass_proc(
 
                 if cmd_id == MENU_CMD_MIC && state.has_mic_item {
                     let want = !state.input.is_enabled();
-                    state.input.set_enabled(want);
+                    if let Err(e) = state.input.set_enabled(want) {
+                        eprintln!("audio: {e}");
+                    }
                     vlog!(
                         "mic: {} (request, via menu)",
                         if want { "ON" } else { "OFF" }
@@ -649,7 +651,9 @@ unsafe extern "system" fn subclass_proc(
                         get_menu_string(state.hmenu_input_devices, u32::from(cmd_id))
                     {
                         vlog!("input device: {name}");
-                        state.input.set_device(Some(name));
+                        if let Err(e) = state.input.set_device(Some(name)) {
+                            eprintln!("audio: {e}");
+                        }
                     }
                     return 0;
                 }
@@ -659,7 +663,9 @@ unsafe extern "system" fn subclass_proc(
                         get_menu_string(state.hmenu_output_devices, u32::from(cmd_id))
                     {
                         vlog!("output device: {name}");
-                        state.output.set_device(Some(name));
+                        if let Err(e) = state.output.set_device(Some(name)) {
+                            eprintln!("audio: {e}");
+                        }
                     }
                     return 0;
                 }
@@ -696,7 +702,9 @@ unsafe extern "system" fn subclass_proc(
                     let idx = usize::from(cmd_id - MENU_CMD_BUS_LAYOUT_BASE);
                     if let Some(&(num_in, num_out)) = state.bus_layouts.get(idx) {
                         vlog!("bus layout: {num_in} in / {num_out} out");
-                        state.output.set_layout(idx);
+                        if let Err(e) = state.output.set_layout(idx) {
+                            eprintln!("audio: {e}");
+                        }
                     }
                     return 0;
                 }

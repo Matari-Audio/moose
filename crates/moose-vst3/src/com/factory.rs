@@ -76,6 +76,9 @@ pub(super) struct Factory {
     run_loop: Mutex<Option<ComPtr<Linux::IRunLoop>>>,
     #[cfg(target_os = "linux")]
     context: Mutex<Option<ComPtr<FUnknown>>>,
+    /// `IHostApplication::getName` of the `setHostContext` context, so a
+    /// new instance's `init` already sees the host name.
+    host_name: Mutex<Option<String>>,
     #[cfg(test)]
     reg_override: Option<&'static Registration>,
 }
@@ -100,6 +103,7 @@ pub(super) fn new_factory() -> *mut c_void {
         run_loop: Mutex::new(None),
         #[cfg(target_os = "linux")]
         context: Mutex::new(None),
+        host_name: Mutex::new(None),
         #[cfg(test)]
         reg_override: None,
     })
@@ -113,6 +117,7 @@ pub(super) fn new_test_factory(reg: &'static Registration) -> ComWrapper<Factory
         run_loop: Mutex::new(None),
         #[cfg(target_os = "linux")]
         context: Mutex::new(None),
+        host_name: Mutex::new(None),
         reg_override: Some(reg),
     })
 }
@@ -215,7 +220,12 @@ impl IPluginFactoryTrait for Factory {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let Some(host) = Host::new(reg, run_loop) else {
+        let host_name = self
+            .host_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(host) = Host::new(reg, run_loop, host_name.as_deref()) else {
             return kResultFalse;
         };
         #[cfg(target_os = "linux")]
@@ -307,7 +317,14 @@ impl IPluginFactory3Trait for Factory {
         kResultOk
     }
 
-    unsafe fn setHostContext(&self, #[allow(unused_variables)] context: *mut FUnknown) -> tresult {
+    unsafe fn setHostContext(&self, context: *mut FUnknown) -> tresult {
+        let name =
+            // SAFETY: `context` is null or the host's live context for this call.
+            unsafe { super::host_app_name(context) };
+        *self
+            .host_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = name;
         #[cfg(target_os = "linux")]
         {
             *self.run_loop.lock().unwrap_or_else(PoisonError::into_inner) =

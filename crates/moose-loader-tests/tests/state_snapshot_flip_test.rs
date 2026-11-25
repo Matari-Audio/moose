@@ -107,7 +107,8 @@ fn shell<L>() -> StaticShell<StateParams, L>
 where
     L: PluginLogicCore<f32, Params = StateParams>,
 {
-    let mut shell = StaticShell::<StateParams, L>::from_parts(Arc::new(StateParams::new()), None);
+    let mut shell =
+        StaticShell::<StateParams, L>::from_parts(Arc::new(StateParams::new()), None, None);
     shell.reset(&AudioConfig::new(44100.0, 64));
     shell
 }

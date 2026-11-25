@@ -226,8 +226,10 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
     const CH: u32 = 2;
     let frames = FRAMES as usize;
 
-    let inst = Vst3Instance::<P>::create()
-        .expect("vst3 smoke: create returned None (plugin construction failed)");
+    let inst = Vst3Instance::<P>::create(moose_core::info::HostIdentity::new(
+        moose_core::info::HostFormat::Vst3,
+    ))
+    .expect("vst3 smoke: create returned None (plugin construction failed)");
     assert!(inst.prepare_impl(48_000.0, FRAMES, 0));
 
     let in_left = vec![0.5f32; frames];

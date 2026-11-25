@@ -338,7 +338,9 @@ macro_rules! impl_heap_init_tuple {
                     let $T = {
                         // SAFETY: field projection within valid `dst`.
                         let p = unsafe { core::ptr::addr_of_mut!((*dst).$idx) };
+                        // SAFETY: `p` is the uninitialised field slot projected above.
                         unsafe { $T::heap_init_in_place(p) };
+                        // SAFETY: `p` was fully initialised just above.
                         unsafe { __private::FieldDropGuard::new(p) }
                     };
                 )+

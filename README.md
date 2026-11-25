@@ -161,6 +161,12 @@ moose::plugin! { plugin: Gain, params: GainParams }
 - Headless (`NoEditor`, the default `Plugin::editor` implementation)
 - Any custom renderer via a raw window handle (`Editor` trait, supporting Cocoa, Win32, X11, and Wayland)
 
+## Host Identity, Process Wake & Standalone Control
+
+- `InitContext::host()` / `PreparationConfig::host` return a `HostIdentity { format: HostFormat, name, version }`: the wrapper format plus the host product name (CLAP `clap_host.name`/`version`, VST3 `IHostApplication::getName`, the host process name on AU/AAX, `moose-standalone` itself). Use it for labels and diagnostics, not DSP branches. Wrappers pass it explicitly through `PluginExport::create_for(InstanceContext)`.
+- `InitContext::process_waker()` returns a `ProcessWaker` on CLAP (`host.request_process`; lock- and allocation-free, inert until `init` succeeds and after `destroy`) and `None` on formats whose hosts keep processing.
+- `moose_standalone::run_with_args` takes argv explicitly. `on_audio_opened` receives one `Result<AudioOpened, String>` per audio request (launch included). `reopen_audio(args)` validates `--audio-api` / device / `--sample-rate` / `--buffer` / layout / channel flags and applies them to the running audio as one transaction, rolling back on failure, without recreating the plugin. `--audio-api <name>` picks the cpal host; the `jack` feature adds JACK, capturing up to 16 ports for wide-input plugins.
+
 ## Presets
 
 Place `.preset` TOML files in a `presets/` directory next to your crate and `cargo moose install` / `package` ships them automatically as CLAP preset-discovery entries, `.vstpreset` files, and AU factory presets / `.aupreset` files. Use `cargo moose preset list | init | pull | convert | import | export` to author and round-trip presets with your DAW.

@@ -427,7 +427,7 @@ impl<const BLOCK_SPLIT: bool> PluginExport for ExportHarness<BLOCK_SPLIT> {
     type Params = HarnessParams;
     fn create() -> Self {
         Self {
-            inner: StaticShell::from_parts(Arc::new(HarnessParams::new()), None),
+            inner: StaticShell::from_parts(Arc::new(HarnessParams::new()), None, None),
         }
     }
     fn params(&self) -> &HarnessParams {
