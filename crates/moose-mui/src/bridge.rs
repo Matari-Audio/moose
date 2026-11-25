@@ -6,7 +6,7 @@ use std::sync::Arc;
 use moose_core::editor::{ParamModulation, PluginContext};
 use moose_core::main_thread::{MenuTarget, ParamIndicationState};
 use moose_params::{ParamFlags, ParamInfo, ParamRange, Params};
-use mui::input::{Button, Input};
+use mui::input::{Button, Input, PointerInput};
 use mui::layout::Id;
 use mui::prelude::Point;
 use mui::scene::{El, IntoEl};
@@ -58,6 +58,8 @@ pub struct Bridge<P: ?Sized = dyn Params> {
     building_context_menu: Option<(MenuTarget, i32, i32)>,
     /// Whether the secondary pointer button was held on the previous frame.
     prev_secondary_down: bool,
+    /// The pointer of the input the build in progress answers.
+    pub(crate) pointer: PointerInput,
     /// Scene position where the current secondary button press started.
     secondary_press_pos: Option<Point>,
     /// Resolved menu target under the pointer when the secondary press started.
@@ -100,6 +102,7 @@ impl<P: Params + ?Sized> Bridge<P> {
             last_hovered: None,
             building_context_menu: None,
             prev_secondary_down: false,
+            pointer: PointerInput::default(),
             secondary_press_pos: None,
             secondary_press_target: None,
             zoom: 1.0,
@@ -322,6 +325,13 @@ impl<P: Params + ?Sized> Bridge<P> {
     pub fn modulation_normalized(&self, id: impl Into<u32>) -> f64 {
         let id = id.into();
         self.modulated_value(id) - self.value(id)
+    }
+
+    /// The pointer of the input the build in progress answers: newer than
+    /// [`Ui::pointer`], the one the last frame laid out, so a drag can
+    /// follow it in this frame rather than the next.
+    pub fn pointer(&self) -> PointerInput {
+        self.pointer
     }
 
     /// Set the scene-to-logical zoom factor used to translate pointer

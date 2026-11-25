@@ -75,6 +75,7 @@ impl<P: Params> View for Session<P> {
         self.wake_pending.swap(false, Ordering::SeqCst);
         let zoom = f64::from_bits(self.last_zoom.load(Ordering::Relaxed));
         self.bridge.set_zoom(zoom);
+        self.bridge.pointer = input.pointer;
         let root = (self.build)(ui, &mut self.bridge);
         self.bridge.finish_frame(ui, input);
         root
