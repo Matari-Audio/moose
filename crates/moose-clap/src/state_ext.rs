@@ -44,6 +44,7 @@ pub(crate) unsafe extern "C" fn state_save<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_ostream,
 ) -> bool {
+    // SAFETY: Forwards the host's live `plugin` and `stream` unchanged.
     unsafe { state_save_with_context::<P>(plugin, stream, StateContext::Unknown) }
 }
 
@@ -55,6 +56,9 @@ unsafe fn state_save_with_context<P: PluginExport>(
     // Guard the user's `save_state()` against panics so a stray
     // `unwrap` in custom-state code degrades to "save failed" instead
     // of aborting the host across this `extern "C"` boundary.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `stream` to be a live
+    // `clap_ostream` for this call.
     run_extern_callback_with::<P, bool>("CLAP", "save_state", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         let Some(write_fn) = (*stream).write else {
@@ -145,6 +149,7 @@ pub(crate) unsafe extern "C" fn state_load<P: PluginExport>(
     plugin: *const clap_plugin,
     stream: *const clap_istream,
 ) -> bool {
+    // SAFETY: Forwards the host's live `plugin` and `stream` unchanged.
     unsafe { state_load_with_context::<P>(plugin, stream, StateContext::Unknown) }
 }
 
@@ -156,6 +161,9 @@ unsafe fn state_load_with_context<P: PluginExport>(
     // Guard the user's `load_state()` / custom deserialize against
     // panics so a malformed blob degrades to "load failed" instead of
     // aborting the host across this `extern "C"` boundary.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `stream` to be a live
+    // `clap_istream` for this call.
     run_extern_callback_with::<P, bool>("CLAP", "load_state", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
 
@@ -266,6 +274,7 @@ pub(crate) unsafe extern "C" fn state_context_save<P: PluginExport>(
     stream: *const clap_ostream,
     context: clap_plugin_state_context_type,
 ) -> bool {
+    // SAFETY: Forwards the host's live `plugin` and `stream` unchanged.
     unsafe { state_save_with_context::<P>(plugin, stream, clap_state_context(context)) }
 }
 
@@ -274,6 +283,7 @@ pub(crate) unsafe extern "C" fn state_context_load<P: PluginExport>(
     stream: *const clap_istream,
     context: clap_plugin_state_context_type,
 ) -> bool {
+    // SAFETY: Forwards the host's live `plugin` and `stream` unchanged.
     unsafe { state_load_with_context::<P>(plugin, stream, clap_state_context(context)) }
 }
 
@@ -322,6 +332,9 @@ pub(crate) unsafe extern "C" fn preset_load_from_location<P: PluginExport>(
     // `state_load` so a panic degrades to "load failed" instead of
     // unwinding across this `extern "C"` boundary and aborting the host
     // mid-preset-browse.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `location` is null-checked and
+    // NUL-terminated per CLAP.
     run_extern_callback_with::<P, bool>("CLAP", "preset_load", false, || unsafe {
         if location_kind != CLAP_PRESET_DISCOVERY_LOCATION_FILE || location.is_null() {
             return false;

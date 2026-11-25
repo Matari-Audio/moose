@@ -46,6 +46,8 @@ pub(crate) struct AuCtx(pub(crate) *mut std::ffi::c_void);
 // serialized against those closures: it closes signals and `begin_close`s
 // while one may still be running.)
 unsafe impl Send for AuCtx {}
+// SAFETY: Shared access is no different: `AuCtx` is a `Copy` address with no interior state, and
+// dereferences happen only inside `HostQueue::with_open` as described above.
 unsafe impl Sync for AuCtx {}
 
 impl AuCtx {
@@ -304,6 +306,8 @@ impl<P: PluginExport> AuInstance<P> {
             unsafe extern "C" {
                 fn pthread_main_np() -> std::os::raw::c_int;
             }
+            // SAFETY: `pthread_main_np` takes no arguments and only reads the calling thread's
+            // identity.
             unsafe { pthread_main_np() != 0 }
         }
         #[cfg(any(not(target_vendor = "apple"), test))]

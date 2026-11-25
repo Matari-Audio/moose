@@ -84,9 +84,13 @@ pub unsafe fn drain_host_queue_for_test<P: PluginExport>(ctx: *mut std::ffi::c_v
         return;
     }
     let queue = {
+        // SAFETY: The caller guarantees `ctx` is a live `AuInstance<P>` from `create_with_sink`
+        // (null was rejected above); only a shared reference is formed.
         let inst = unsafe { &*ctx.cast::<instance::AuInstance<P>>() };
         std::sync::Arc::clone(&inst.host_queue)
     };
+    // SAFETY: `ctx` is live (see above) and the caller is on the host main thread, which is
+    // `run_host_drain`'s contract; `queue` is that instance's own `HostQueue`.
     unsafe { host_drain::run_host_drain::<P>(&queue, ctx) };
 }
 
@@ -505,6 +509,8 @@ fn register_au_inner<P: PluginExport>(num_inputs: u32, num_outputs: u32) {
 
     let callbacks = Box::leak(Box::new(callbacks::<P>()));
 
+    // SAFETY: Both pointers come from `Box::leak` and stay valid for the process lifetime, which is
+    // what `moose_au_register_v3` requires (it stores them).
     unsafe {
         ffi::moose_au_register_v3(
             std::ptr::from_ref::<AuPluginDescriptor>(descriptor),
@@ -912,41 +918,61 @@ mod tests {
         }
 
         unsafe extern "C" fn on_begin(ud: *mut std::ffi::c_void, id: u32) {
+            // SAFETY: `ud` is the `user_data` of the sink built below, a `FakeAuHost` boxed in
+            // `host` that outlives the instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             h.edits.lock().unwrap().push(("begin", id, 0.0));
         }
         unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, id: u32, val: f32) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             h.edits.lock().unwrap().push(("set", id, val));
         }
         unsafe extern "C" fn on_end(ud: *mut std::ffi::c_void, id: u32) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             h.edits.lock().unwrap().push(("end", id, 0.0));
         }
         unsafe extern "C" fn on_latency(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             let ctx = *h.ctx.lock().unwrap() as *mut std::ffi::c_void;
             // AU hosts re-read latency synchronously inside the notification!
+            // SAFETY: `ctx` was stored right after `cb_create_with_sink` and this notification only
+            // fires from a drain of that live instance.
             let lat = unsafe { cb_latency_samples::<P>(ctx) };
             h.seen_latency_in_cb.store(lat as usize, Ordering::Relaxed);
             h.latency_notifs.fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_tail(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             let ctx = *h.ctx.lock().unwrap() as *mut std::ffi::c_void;
+            // SAFETY: `ctx` was stored right after `cb_create_with_sink` and this notification only
+            // fires from a drain of that live instance.
             let tail = unsafe { cb_tail_samples::<P>(ctx) };
             h.seen_tail_in_cb.store(tail as usize, Ordering::Relaxed);
             h.tail_notifs.fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_values(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             h.param_values_notifs.fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_pres(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             h.param_pres_notifs.fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_release(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `FakeAuHost` registered as `user_data`; `release_user_data`
+            // runs once inside `cb_destroy`, while `host` is still alive.
             let h = unsafe { &*ud.cast::<FakeAuHost>() };
             h.released.store(true, Ordering::Release);
         }
@@ -968,6 +994,9 @@ mod tests {
             ..MooseAuHostSink::default()
         };
 
+        // SAFETY: `sink` and `host` outlive `ctx`, which is used on this thread only between
+        // `cb_create_with_sink` and `cb_destroy` as the shim contract requires. Every buffer passed
+        // (`ids`, `info`, `clump_buf`, `track`) is live and sized as declared.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             assert!(!ctx.is_null());
@@ -1536,6 +1565,8 @@ mod tests {
         use crate::large_state_fixture::LargePlugin;
         use moose_params::{ParamCatalog, Params};
         type P = LargePlugin<16>;
+        // SAFETY: `ctx` is a fresh instance (null sink is allowed) used only on this thread until
+        // `cb_destroy`; `inst` is not used after that call.
         unsafe {
             let ctx = cb_create_with_sink::<P>(std::ptr::null());
             let inst = &*ctx.cast::<AuInstance<P>>();
@@ -1580,14 +1611,19 @@ mod tests {
         }
 
         unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, id: u32, val: f32) {
+            // SAFETY: `ud` is the boxed `ReentrantHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<ReentrantHost>() };
             h.received.lock().unwrap().push((id, val));
             // Simulate AUv2 AudioUnitSetParameter synchronously calling back
             // into cb_param_set_value during feedback drain.
             let ctx = *h.ctx.lock().unwrap() as *mut std::ffi::c_void;
             if h.intervening_edit.replace(false) {
+                // SAFETY: `ctx` is the live instance whose drain is invoking this callback;
+                // `cb_param_set_value` is a re-entrant main-thread call the shim allows.
                 unsafe { cb_param_set_value::<P>(ctx, id, 0.875) };
             }
+            // SAFETY: Same live, re-entrant `ctx` as the call above.
             unsafe { cb_param_set_value::<P>(ctx, id, f64::from(val)) };
         }
 
@@ -1600,6 +1636,8 @@ mod tests {
             ..MooseAuHostSink::default()
         };
 
+        // SAFETY: `sink` and `host` outlive `ctx`, which is used only on this thread until
+        // `cb_destroy`; `inst` and the audio guard are dropped before that call.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             *host.ctx.lock().unwrap() = ctx as usize;
@@ -1680,6 +1718,8 @@ mod tests {
         use moose_params::Params;
 
         type P = LargePlugin<16>;
+        // SAFETY: `ctx` is a fresh instance used only on this thread until `cb_destroy`; `inst` is
+        // not used after that call.
         unsafe {
             let ctx = cb_create_with_sink::<P>(std::ptr::null());
             let inst = &*ctx.cast::<AuInstance<P>>();
@@ -1704,6 +1744,8 @@ mod tests {
         use crate::large_state_fixture::LargePlugin;
 
         type P = LargePlugin<16>;
+        // SAFETY: `ctx` is a fresh instance used only on this thread until `cb_destroy`; `inst` is
+        // not used after that call.
         unsafe {
             let ctx = cb_create_with_sink::<P>(std::ptr::null());
             let inst = &*ctx.cast::<AuInstance<P>>();
@@ -1745,6 +1787,8 @@ mod tests {
             set_param: Some(dummy_set),
             ..MooseAuHostSink::default()
         };
+        // SAFETY: `raw` is a live local `MooseAuHostSink`; `from_raw` copies only the fields its
+        // `size` covers.
         let sink = unsafe { HostSink::from_raw(&raw const raw) };
         assert!(!sink.has_set_param());
 
@@ -1753,6 +1797,7 @@ mod tests {
             set_param: Some(dummy_set),
             ..MooseAuHostSink::default()
         };
+        // SAFETY: `full` is a live local `MooseAuHostSink` with the full default `size`.
         let sink_full = unsafe { HostSink::from_raw(&raw const full) };
         assert!(sink_full.has_set_param());
     }
@@ -1774,11 +1819,15 @@ mod tests {
             ports: AtomicUsize,
         }
         unsafe extern "C" fn on_state(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `Counts` registered as `user_data`; it outlives every sink
+            // copy.
             unsafe { &*ud.cast::<Counts>() }
                 .state
                 .fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_ports(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `Counts` registered as `user_data`; it outlives every sink
+            // copy.
             unsafe { &*ud.cast::<Counts>() }
                 .ports
                 .fetch_add(1, Ordering::Relaxed);
@@ -1801,12 +1850,19 @@ mod tests {
             size: v13_size as u32,
             ..sink
         };
+        // SAFETY: `v13` is a live local sink whose `size` deliberately stops before
+        // `state_changed`.
         let v13_sink = unsafe { crate::host_drain::HostSink::from_raw(&raw const v13) };
+        // SAFETY: `v13_sink` has no `state_changed` entry, so the call is a no-op; `user_data` is
+        // live regardless.
         unsafe { v13_sink.state_changed() };
+        // SAFETY: `v13_sink` has no `audio_ports_changed` entry, so the call is a no-op.
         unsafe { v13_sink.audio_ports_changed() };
         assert_eq!(counts.state.load(Ordering::Relaxed), 0);
         assert_eq!(counts.ports.load(Ordering::Relaxed), 0);
 
+        // SAFETY: `sink` and `counts` outlive `ctx`, which is used only on this thread until
+        // `cb_destroy`.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             let inst = &*ctx.cast::<AuInstance<P>>();
@@ -1838,11 +1894,15 @@ mod tests {
             pres: AtomicUsize,
         }
         unsafe extern "C" fn on_values(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `NotifCounts` registered as `user_data`; it outlives the
+            // instance.
             unsafe { &*ud.cast::<NotifCounts>() }
                 .values
                 .fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_pres(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `NotifCounts` registered as `user_data`; it outlives the
+            // instance.
             unsafe { &*ud.cast::<NotifCounts>() }
                 .pres
                 .fetch_add(1, Ordering::Relaxed);
@@ -1858,6 +1918,9 @@ mod tests {
             ..MooseAuHostSink::default()
         };
 
+        // SAFETY: `sink` and `counts` outlive `ctx`, used only on this thread until `cb_destroy`.
+        // The process call passes null event pointers with zero lengths and zero channels, which
+        // `cb_process_impl` accepts.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             let inst = &*ctx.cast::<AuInstance<P>>();
@@ -1940,19 +2003,26 @@ mod tests {
         }
 
         unsafe extern "C" fn on_latency(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `ReentrantTeardownHost` registered as `user_data`;
+            // `release_user_data` runs before the box drops.
             let h = unsafe { &*ud.cast::<ReentrantTeardownHost>() };
             h.latency_hits.fetch_add(1, Ordering::Relaxed);
             // Simulate a host dropping its last AU reference inside KVO ->
             // synchronous `deinit` -> `cb_destroy` on the same main queue.
             let ctx = h.ctx.load(Ordering::Acquire) as *mut std::ffi::c_void;
+            // SAFETY: `ctx` is live: this notification runs inside `run_host_drain`'s `with_open`,
+            // so `cb_destroy` defers finalization until the drain exits.
             unsafe { cb_destroy::<P>(ctx) };
         }
         unsafe extern "C" fn on_tail(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `ReentrantTeardownHost` registered as `user_data`.
             unsafe { &*ud.cast::<ReentrantTeardownHost>() }
                 .tail_hits
                 .fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_release(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `ReentrantTeardownHost`, still alive when the deferred
+            // destroy releases it.
             unsafe { &*ud.cast::<ReentrantTeardownHost>() }
                 .released
                 .store(true, Ordering::Release);
@@ -1969,6 +2039,9 @@ mod tests {
             ..MooseAuHostSink::default()
         };
 
+        // SAFETY: `sink` and `host` outlive `ctx`; the instance is only read before
+        // `run_host_drain`, which is the test's single (main-thread) drain and the place the
+        // re-entrant destroy happens.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             assert!(!ctx.is_null());
@@ -2004,11 +2077,15 @@ mod tests {
             released: Cell<bool>,
         }
         unsafe extern "C" fn begin(data: *mut std::ffi::c_void, _: u32) {
+            // SAFETY: `data` is `&raw mut host`, a stack local that outlives the instance.
             let host = unsafe { &*data.cast::<Host>() };
+            // SAFETY: `host.ctx` holds the live instance; `cb_destroy` from inside `begin_edit` is
+            // the re-entrant case this test covers.
             unsafe { cb_destroy::<P>(host.ctx.get()) };
             assert!(!host.released.get());
         }
         unsafe extern "C" fn release(data: *mut std::ffi::c_void) {
+            // SAFETY: `data` is `&raw mut host`, which outlives the instance.
             unsafe { &*data.cast::<Host>() }.released.set(true);
         }
         let mut host = Host {
@@ -2021,6 +2098,8 @@ mod tests {
             release_user_data: Some(release),
             ..MooseAuHostSink::default()
         };
+        // SAFETY: `sink` and `host` outlive `ctx`; the instance is destroyed re-entrantly inside
+        // `begin_edit` and not touched afterwards.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             host.ctx.set(ctx);
@@ -2059,6 +2138,8 @@ mod tests {
         }
 
         unsafe extern "C" fn on_begin(ud: *mut std::ffi::c_void, id: u32) {
+            // SAFETY: `ud` is the boxed `ThreadCaptureHost` registered as `user_data`; it outlives
+            // the instance.
             unsafe { &*ud.cast::<ThreadCaptureHost>() }
                 .calls
                 .lock()
@@ -2066,6 +2147,8 @@ mod tests {
                 .push(("begin", id, std::thread::current().id()));
         }
         unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, id: u32, _v: f32) {
+            // SAFETY: `ud` is the boxed `ThreadCaptureHost` registered as `user_data`; it outlives
+            // the instance.
             unsafe { &*ud.cast::<ThreadCaptureHost>() }
                 .calls
                 .lock()
@@ -2073,6 +2156,8 @@ mod tests {
                 .push(("set", id, std::thread::current().id()));
         }
         unsafe extern "C" fn on_end(ud: *mut std::ffi::c_void, id: u32) {
+            // SAFETY: `ud` is the boxed `ThreadCaptureHost` registered as `user_data`; it outlives
+            // the instance.
             unsafe { &*ud.cast::<ThreadCaptureHost>() }
                 .calls
                 .lock()
@@ -2094,6 +2179,8 @@ mod tests {
             ..MooseAuHostSink::default()
         };
 
+        // SAFETY: `sink` and `host` outlive `ctx`. The worker thread is joined before the drain,
+        // and `cb_destroy` runs last on this (owner) thread.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             let ed = editor_context::<P>(ctx);
@@ -2146,6 +2233,8 @@ mod tests {
 
         unsafe extern "C" fn dummy_set(_ud: *mut std::ffi::c_void, _id: u32, _v: f32) {}
 
+        // SAFETY: `sink` outlives `ctx`, which is used only on this thread until `cb_destroy`; the
+        // audio guard and `inst` are not used after that call.
         unsafe {
             // `cb_create_with_sink` starts known-inactive, flips active, and back.
             let sink = MooseAuHostSink {
@@ -2297,11 +2386,15 @@ mod tests {
         }
 
         unsafe extern "C" fn on_set(ud: *mut std::ffi::c_void, _id: u32, _v: f32) {
+            // SAFETY: `ud` is the boxed `BulkCounters` shared by every instance; it outlives all of
+            // them.
             unsafe { &*ud.cast::<BulkCounters>() }
                 .edits
                 .fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_release(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `BulkCounters`; each instance calls `release_user_data`
+            // once while the box is alive.
             unsafe { &*ud.cast::<BulkCounters>() }
                 .releases
                 .fetch_add(1, Ordering::AcqRel);
@@ -2322,6 +2415,8 @@ mod tests {
         };
 
         let mut ctxs = Vec::with_capacity(N);
+        // SAFETY: `sink` and `counters` outlive every `ctx`; each instance is used only on this
+        // thread and destroyed exactly once.
         unsafe {
             let main = moose_core::thread::MainThread::assume();
             for _ in 0..N {
@@ -2362,18 +2457,26 @@ mod tests {
         }
 
         unsafe extern "C" fn on_lat(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `DelayHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<DelayHost>() };
             let ctx = h.ctx.load(Ordering::Acquire) as *mut std::ffi::c_void;
             h.lat_seen.store(
+                // SAFETY: `ctx` was stored right after creation, and this notification only fires
+                // from a drain of that live instance.
                 unsafe { cb_latency_samples::<P>(ctx) } as usize,
                 Ordering::Relaxed,
             );
             h.lat_calls.fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn on_tail(ud: *mut std::ffi::c_void) {
+            // SAFETY: `ud` is the boxed `DelayHost` registered as `user_data`; it outlives the
+            // instance.
             let h = unsafe { &*ud.cast::<DelayHost>() };
             let ctx = h.ctx.load(Ordering::Acquire) as *mut std::ffi::c_void;
             h.tail_seen.store(
+                // SAFETY: `ctx` was stored right after creation, and this notification only fires
+                // from a drain of that live instance.
                 unsafe { cb_tail_samples::<P>(ctx) } as usize,
                 Ordering::Relaxed,
             );
@@ -2390,6 +2493,8 @@ mod tests {
             ..MooseAuHostSink::default()
         };
 
+        // SAFETY: `sink` and `host` outlive `ctx`, which is used only on this thread until
+        // `cb_destroy`.
         unsafe {
             let ctx = cb_create_with_sink::<P>(&raw const sink);
             assert!(!ctx.is_null());
@@ -2538,6 +2643,7 @@ mod tests {
             .clear();
         CONNECTED.store(false, Ordering::Release);
 
+        // SAFETY: `sink` outlives `ctx`, which is used only on this thread until `cb_destroy`.
         unsafe {
             let ctx = cb_create_with_sink::<HookPlugin>(&raw const sink);
             assert!(!ctx.is_null());
@@ -2600,6 +2706,9 @@ mod large_state_tests {
     type Large = LargePlugin<{ 64 * 1024 * 1024 }>;
     #[test]
     fn large_host_state_roundtrips_through_au_callbacks() {
+        // SAFETY: `ctx` is a fresh instance used only on this thread until `cb_destroy`.
+        // `ptr`/`len` come from `cb_state_save` (a `malloc` buffer of `len` bytes), are only read
+        // back with `len` or less, and are freed once with `cb_state_free`.
         unsafe {
             let ctx = cb_create_with_sink::<Large>(std::ptr::null());
             assert!(!ctx.is_null());
@@ -2671,6 +2780,8 @@ mod large_state_tests {
 
         type P = LargePlugin<16>;
 
+        // SAFETY: `sink` outlives `ctx`. The spawned render thread's buffers are its own 16-frame
+        // stereo locals, and it is joined before `held` drops and before `cb_destroy`.
         unsafe {
             let sink = MooseAuHostSink::default();
             let ctx = cb_create_with_sink::<P>(&raw const sink);

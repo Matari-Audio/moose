@@ -506,9 +506,9 @@ fn try_pin_current_module() -> bool {
     #[cfg(not(target_os = "linux"))]
     const FLAGS: c_int = 0x0010 | 0x0080;
 
+    let mut info = std::mem::MaybeUninit::<DlInfo>::uninit();
     // SAFETY: `dladdr` reads the address of a live function in this
     // module and writes loader-owned strings to the out parameter.
-    let mut info = std::mem::MaybeUninit::<DlInfo>::uninit();
     if unsafe { dladdr(try_pin_current_module as *const c_void, info.as_mut_ptr()) } == 0 {
         return false;
     }

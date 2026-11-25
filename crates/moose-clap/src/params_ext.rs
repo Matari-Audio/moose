@@ -31,6 +31,8 @@ use std::ptr;
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe extern "C" fn params_count<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         len_u32(catalog_sync::lock_exposed(&data.exposed).len())
@@ -44,6 +46,9 @@ pub(crate) unsafe extern "C" fn params_get_info<P: PluginExport>(
 ) -> bool {
     // Author `parameter_presentation` can panic; firewall it so a panic
     // cannot unwind across this `extern "C"` boundary.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `out` is null-checked before it is
+    // written.
     run_extern_callback_with::<P, bool>("CLAP", "params_get_info", false, || unsafe {
         if out.is_null() {
             return false;
@@ -142,6 +147,9 @@ pub(crate) unsafe extern "C" fn params_get_value<P: PluginExport>(
     param_id: clap_id,
     out_value: *mut f64,
 ) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `out_value` to be a valid
+    // out-pointer.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         let idx = catalog_sync::lock_exposed(&data.exposed).index_of(param_id);
@@ -167,6 +175,9 @@ pub(crate) unsafe extern "C" fn params_value_to_text<P: PluginExport>(
     out_buffer_capacity: u32,
 ) -> bool {
     // Author `format_value` can panic; firewall it (false = no display text).
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `out_buffer` is checked non-null with a
+    // non-zero capacity before `copy_c_str` writes at most `out_buffer_capacity` bytes.
     run_extern_callback_with::<P, bool>("CLAP", "value_to_text", false, || unsafe {
         // A zero capacity makes `cap - 1` underflow and a null `out_buffer`
         // plus non-zero capacity would still write the trailing NUL. Treat
@@ -199,6 +210,9 @@ pub(crate) unsafe extern "C" fn params_text_to_value<P: PluginExport>(
     out_value: *mut f64,
 ) -> bool {
     // Author `parse_value` can panic; firewall it (false = "not parsed").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `param_value_text` is null-checked and
+    // NUL-terminated per CLAP, and `out_value` is a valid out-pointer.
     run_extern_callback_with::<P, bool>("CLAP", "text_to_value", false, || unsafe {
         if param_value_text.is_null() {
             return false;
@@ -230,6 +244,9 @@ pub(crate) unsafe extern "C" fn params_flush<P: PluginExport>(
     // Event conversion + `set_plain` run here; firewall the whole sweep so a
     // panic (a hostile-host event, a param edge) can't unwind across the C ABI
     // - matching the other `clap_plugin_params` callbacks.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `in`/`out` are null or the host's event
+    // lists for this call.
     run_extern_callback_with::<P, ()>("CLAP", "params_flush", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         // `flush` is never concurrent with `process` (CLAP contract), and runs

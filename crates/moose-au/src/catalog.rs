@@ -175,10 +175,16 @@ impl AuExposedParams {
         self.entries.len()
     }
 
-    pub(crate) fn write_ids(&self, out_ids: *mut u32, cap: u32) -> u32 {
+    /// Write up to `cap` parameter IDs to `out_ids`; return the total count.
+    ///
+    /// # Safety
+    /// `out_ids` is null or valid for writes of `cap` `u32`s.
+    pub(crate) unsafe fn write_ids(&self, out_ids: *mut u32, cap: u32) -> u32 {
         if !out_ids.is_null() && cap > 0 {
             let n = self.entries.len().min(cap as usize);
             for (i, entry) in self.entries.iter().take(n).enumerate() {
+                // SAFETY: `i < n <= cap`, and the caller guarantees `out_ids`
+                // holds `cap` writable slots.
                 unsafe {
                     *out_ids.add(i) = self.catalog[entry.catalog_index].id;
                 }
@@ -230,6 +236,8 @@ impl AuExposedParams {
             unit: [0; 32],
             group: [0; 128],
         };
+        // SAFETY: each destination is a fixed, non-empty array owned by `out`,
+        // and its own length is passed as the capacity.
         unsafe {
             let _ = copy_c_str(out.name.as_mut_ptr(), out.name.len(), &entry.name);
             let _ = copy_c_str(out.unit.as_mut_ptr(), out.unit.len(), info.unit.as_str());
@@ -238,13 +246,24 @@ impl AuExposedParams {
         true
     }
 
-    pub(crate) fn write_clump_name(&self, clump_id: u32, out: *mut c_char, out_len: u32) -> u32 {
+    /// Copy clump `clump_id`'s name into `out` as a NUL-terminated string.
+    ///
+    /// # Safety
+    /// `out` is null or valid for writes of `out_len` bytes.
+    pub(crate) unsafe fn write_clump_name(
+        &self,
+        clump_id: u32,
+        out: *mut c_char,
+        out_len: u32,
+    ) -> u32 {
         if clump_id == 0 || out.is_null() || out_len == 0 {
             return 0;
         }
         let Some(name) = self.clump_names.get((clump_id - 1) as usize) else {
             return 0;
         };
+        // SAFETY: `out` is non-null with `out_len > 0` (checked above), and
+        // the caller guarantees it holds `out_len` writable bytes.
         len_u32(unsafe { copy_c_str(out, out_len as usize, name) })
     }
 }
@@ -381,10 +400,9 @@ mod tests {
         let ctx = std::ptr::from_ref(&exposed).cast();
         moose_au_rust_param_snapshot_begin(ctx);
         let mut ids = [u32::MAX];
-        assert_eq!(
-            control_snapshot(ctx, &exposed).write_ids(ids.as_mut_ptr(), 1),
-            1
-        );
+        // SAFETY: `ids` holds exactly the one slot requested.
+        let written = unsafe { control_snapshot(ctx, &exposed).write_ids(ids.as_mut_ptr(), 1) };
+        assert_eq!(written, 1);
         assert_eq!(ids, [id]);
 
         bind("Replacement", "Clean".into(), "Driven".into());

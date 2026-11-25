@@ -39,6 +39,8 @@ struct PluginHandle(*const clap_plugin);
 // and only reads/writes atomic fields (`floating_mode`, `window_scale`,
 // `host_scale`) on the underlying `ClapPluginData<P>`.
 unsafe impl Send for PluginHandle {}
+// SAFETY: Same as `Send`: shared use only reads and writes atomic fields of the plugin data, which
+// outlives every handle.
 unsafe impl Sync for PluginHandle {}
 
 impl PluginHandle {

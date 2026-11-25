@@ -237,6 +237,10 @@ unsafe extern "system" fn size_limits_proc(
     _id: usize,
     refdata: usize,
 ) -> LRESULT {
+    // SAFETY: `refdata` is the `SizeLimits` box registered with `SetWindowSubclass` in
+    // `install_size_limits`, live until the `WM_NCDESTROY` arm frees it as the window's last
+    // message. Each `lparam` is the message-specific struct Win32 documents for that message, valid
+    // for the call.
     unsafe {
         match msg {
             WM_GETMINMAXINFO => {

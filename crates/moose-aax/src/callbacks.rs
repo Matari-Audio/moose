@@ -81,6 +81,8 @@ pub(crate) fn aax_range_type(range: &ParamRange) -> u8 {
 fn fill_param_info(info: &moose_params::ParamInfo, out: &mut MooseAaxParamInfo) {
     *out = MooseAaxParamInfo::default();
     out.id = info.id;
+    // SAFETY: Each destination is a fixed, non-empty array in `out`, and its own length is passed
+    // as the capacity.
     unsafe {
         let _ = copy_c_str(out.name.as_mut_ptr(), out.name.len(), info.name);
         let _ = copy_c_str(out.unit.as_mut_ptr(), out.unit.len(), info.unit.as_str());
@@ -156,6 +158,8 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
         "create_with_sink",
         std::ptr::null_mut(),
         || {
+            // SAFETY: The shim passes null or a `MooseAaxHostSink` whose `size` prefix is readable,
+            // which is `AaxHostSink::from_raw`'s contract.
             let host_sink = unsafe { AaxHostSink::from_raw(raw_sink) };
             let mut plugin = P::create();
             plugin.init();
@@ -249,6 +253,10 @@ pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut c_void) {
         return;
     }
     run_extern_callback_with::<P, ()>("aax", "destroy", (), || {
+        // SAFETY: `ctx` is non-null and the shim calls `destroy` once with the pointer
+        // `create_with_sink` returned. `close()` waits for every `with_open` scope, so no other
+        // thread can still reach the instance when the box is freed, and `inst` is not used after
+        // that.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         if let Some(signal) = &inst.persist_signal {
             signal.close();
@@ -263,6 +271,8 @@ pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut c_void) {
             }
             gui.open = false;
         }
+        // SAFETY: `ctx` came from `Box::into_raw` in `create_with_sink` and is freed exactly once,
+        // after the queue closed.
         drop(unsafe { Box::from_raw(ctx.cast::<AaxInstance<P>>()) });
     });
 }
@@ -276,6 +286,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
         return;
     }
     run_extern_callback_with::<P, ()>("aax", "reset", (), || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; mutable state goes through
+        // `plugin`/`audio` cells.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         inst.panic_latch.clear();
         let mode = load_render_mode(&inst.render_mode);
@@ -319,6 +331,7 @@ pub(crate) unsafe extern "C" fn cb_set_render_mode<P: PluginExport>(ctx: *mut c_
     if ctx.is_null() {
         return;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; only an atomic is stored.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     let clamped = match mode {
         1 => ProcessMode::Buffered.as_u8(),
@@ -354,18 +367,26 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
     if nf == 0 {
         return MOOSE_AAX_EVENT_END;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; per-block state goes through
+    // `try_enter` cells.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     if inst.panic_latch.is_failed() {
+        // SAFETY: The shim passes `num_output_channels` channel pointers, each null or `nf` samples
+        // long; `zero_raw_outputs` skips nulls.
         unsafe { zero_raw_outputs(outputs, num_output_channels, nf) };
         return MOOSE_AAX_EVENT_INVALID;
     }
 
     let result = run_audio_block_latched::<P, u32>(&inst.panic_latch, "aax", || {
         let Some(mut plugin) = inst.plugin.try_enter() else {
+            // SAFETY: The shim passes `num_output_channels` channel pointers, each null or `nf`
+            // samples long.
             unsafe { zero_raw_outputs(outputs, num_output_channels, nf) };
             return MOOSE_AAX_EVENT_INVALID;
         };
         let Some(mut audio) = inst.audio.try_enter() else {
+            // SAFETY: The shim passes `num_output_channels` channel pointers, each null or `nf`
+            // samples long.
             unsafe { zero_raw_outputs(outputs, num_output_channels, nf) };
             return MOOSE_AAX_EVENT_INVALID;
         };
@@ -378,6 +399,8 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
         let _rt = RtSection::enter();
 
         if !audio.prepared || num_frames > audio.max_frames {
+            // SAFETY: The shim passes `num_output_channels` channel pointers, each null or `nf`
+            // samples long.
             unsafe { zero_raw_outputs(outputs, num_output_channels, nf) };
             audio.output_events.clear();
             audio.staging_status = MOOSE_AAX_EVENT_INVALID;
@@ -397,6 +420,9 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
                     MOOSE_AAX_EVENT_QUEUE_FULL
                 };
             } else {
+                // SAFETY: `events` is non-null and `num_events` is within
+                // `MOOSE_AAX_NATIVE_EVENT_CAP` (both checked above); the shim owns the array for
+                // this call.
                 let ev_slice = unsafe { slice::from_raw_parts(events, num_events as usize) };
                 for ev in ev_slice {
                     if ev.sample_offset >= num_frames {
@@ -453,6 +479,8 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
                                 stage_status = MOOSE_AAX_EVENT_INVALID;
                                 break;
                             } else {
+                                // SAFETY: `ev.sysex` is non-null (checked above) and points to
+                                // `data_len` bytes for this call.
                                 unsafe { slice::from_raw_parts(ev.sysex, len) }
                             };
                             let exact = ExactEvent::new(
@@ -488,6 +516,7 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
         let transport_info = if transport.is_null() {
             TransportInfo::default()
         } else {
+            // SAFETY: `transport` is non-null and points to the shim's snapshot for this call.
             build_transport(unsafe { &*transport }).unwrap_or_default()
         };
         inst.transport_slot.write(&transport_info);
@@ -530,6 +559,9 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
             automation: inst.automation,
             bus_routing,
         };
+        // SAFETY: `block` carries the shim's channel pointer arrays and counts unchanged, and
+        // `num_frames` was checked against the prepared `max_frames`, which is
+        // `run_c_abi_audio_block`'s contract.
         unsafe { run_c_abi_audio_block(&mut block) };
         inst.delay
             .observe_and_signal_no_wake(plugin.latency(), plugin.tail(), &inst.host_queue);
@@ -543,6 +575,8 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
     });
 
     if inst.panic_latch.is_failed() {
+        // SAFETY: The shim passes `num_output_channels` channel pointers, each null or `nf` samples
+        // long.
         unsafe { zero_raw_outputs(outputs, num_output_channels, nf) };
         return MOOSE_AAX_EVENT_INVALID;
     }
@@ -629,6 +663,7 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     if ctx.is_null() {
         return;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; state goes through `try_enter`.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     let Some(mut audio) = inst.audio.try_enter() else {
         return;
@@ -647,6 +682,7 @@ pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
     if ctx.is_null() || out_event.is_null() {
         return MOOSE_AAX_EVENT_INVALID;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; state goes through `try_enter`.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     let Some(mut audio) = inst.audio.try_enter() else {
         return MOOSE_AAX_EVENT_INVALID;
@@ -719,6 +755,8 @@ pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
             _ => return MOOSE_AAX_EVENT_UNSUPPORTED,
         },
     }
+    // SAFETY: `out_event` is non-null (checked on entry) and is the shim's event slot. Any `sysex`
+    // pointer borrows `output_events`, which stays untouched until `finish_output_events`.
     unsafe { *out_event = ev };
     MOOSE_AAX_EVENT_EMITTED
 }
@@ -730,6 +768,7 @@ pub(crate) unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
     if ctx.is_null() {
         return;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; state goes through `try_enter`.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     let Some(mut audio) = inst.audio.try_enter() else {
         return;
@@ -748,6 +787,8 @@ pub(crate) unsafe extern "C" fn cb_param_count<P: PluginExport>(ctx: *mut c_void
         return 0;
     }
     run_extern_callback_with::<P, u32>("aax", "param_count", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         let catalog = inst.catalog_snapshot();
         u32::try_from(catalog.len()).unwrap_or(u32::MAX)
@@ -763,6 +804,8 @@ pub(crate) unsafe extern "C" fn cb_param_ids<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, u32>("aax", "param_ids", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         let catalog = inst.catalog_snapshot();
         let total = u32::try_from(catalog.len()).unwrap_or(u32::MAX);
@@ -770,6 +813,8 @@ pub(crate) unsafe extern "C" fn cb_param_ids<P: PluginExport>(
             return total;
         }
         let n = (cap as usize).min(catalog.len());
+        // SAFETY: `out_ids` is non-null with `cap > 0`, the shim guarantees `cap` writable slots,
+        // and `n <= cap`.
         let out = unsafe { slice::from_raw_parts_mut(out_ids, n) };
         for (dst, info) in out.iter_mut().zip(catalog.iter()) {
             *dst = info.id;
@@ -787,12 +832,19 @@ pub(crate) unsafe extern "C" fn cb_param_info_by_id<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "param_info_by_id", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         let catalog = inst.catalog_snapshot();
         let Some(info) = catalog.iter().find(|p| p.id == param_id) else {
             return 0;
         };
-        fill_param_info(info, unsafe { &mut *out_info });
+        let mut local = MooseAaxParamInfo::default();
+        fill_param_info(info, &mut local);
+        // SAFETY: `out_info` is non-null (checked on entry) and is the shim's
+        // `MooseAaxParamInfo` slot. `write` never reads or drops whatever the
+        // host left there, so an uninitialized slot is fine.
+        unsafe { out_info.write(local) };
         1
     })
 }
@@ -804,6 +856,7 @@ pub(crate) unsafe extern "C" fn cb_param_get<P: PluginExport>(
     if ctx.is_null() {
         return 0.0;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; parameter reads are atomic.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     inst.params_arc.get_plain(param_id).unwrap_or(0.0)
 }
@@ -816,6 +869,7 @@ pub(crate) unsafe extern "C" fn cb_param_set<P: PluginExport>(
     if ctx.is_null() || !value.is_finite() {
         return;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; parameter writes are atomic.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     inst.params_arc.set_plain(param_id, value);
     if inst.params_arc.parameter_affects_presentation(param_id) {
@@ -834,7 +888,11 @@ pub(crate) unsafe extern "C" fn cb_param_format<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, u32>("aax", "param_format", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+        // SAFETY: `format_param_to_c_buf` null-checks `out` and `out_len`; otherwise the shim's
+        // `out` holds `out_len` bytes.
         unsafe { format_param_to_c_buf(inst.params_arc.as_ref(), param_id, value, out, out_len) }
     })
 }
@@ -849,7 +907,11 @@ pub(crate) unsafe extern "C" fn cb_param_parse<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "param_parse", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+        // SAFETY: `parse_param_from_c_str` null-checks both pointers; otherwise `text` is
+        // NUL-terminated and `out_plain` is the shim's out slot.
         unsafe { parse_param_from_c_str(inst.params_arc.as_ref(), param_id, text, out_plain) }
     })
 }
@@ -862,6 +924,7 @@ pub(crate) unsafe extern "C" fn cb_param_normalize<P: PluginExport>(
     if ctx.is_null() {
         return 0.0;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is formed.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     inst.catalog_snapshot()
         .by_id(param_id)
@@ -877,6 +940,7 @@ pub(crate) unsafe extern "C" fn cb_param_denormalize<P: PluginExport>(
     if ctx.is_null() {
         return 0.0;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is formed.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     inst.catalog_snapshot().by_id(param_id).map_or(0.0, |info| {
         info.range.denormalize(normalized.clamp(0.0, 1.0))
@@ -895,7 +959,11 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, u32>("aax", "state_save", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+        // SAFETY: `malloc`/`free` are the C allocator pair the shim uses to release the buffer
+        // through `state_free`.
         let Some((ptr, len)) = (unsafe {
             save_state_to_host_buf(
                 &inst.plugin,
@@ -908,9 +976,12 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
                 free,
             )
         }) else {
+            // SAFETY: `out_data` is non-null (checked on entry) and is the shim's out slot.
             unsafe { *out_data = std::ptr::null_mut() };
             return 0;
         };
+        // SAFETY: `out_data` is non-null (checked on entry); ownership of the `malloc` buffer moves
+        // to the shim, which frees it with `state_free`.
         unsafe { *out_data = ptr };
         len
     })
@@ -925,7 +996,11 @@ pub(crate) unsafe extern "C" fn cb_state_load<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "state_load", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+        // SAFETY: `data` is non-null with `len > 0` (checked on entry) and points to `len` bytes
+        // for this call.
         let blob = unsafe { slice::from_raw_parts(data, len as usize) };
         let Some((deserialized, backup)) = load_state_from_host_slice::<P>(
             blob,
@@ -966,7 +1041,11 @@ pub(crate) unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "state_load_foreign", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; only a shared reference is
+        // formed.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+        // SAFETY: `data` is non-null with `len > 0` (checked on entry) and points to `len` bytes
+        // for this call.
         let bytes = unsafe { slice::from_raw_parts(data, len as usize) };
         let key = format_fourcc_key(chunk_id);
         let Some((deserialized, backup)) = load_foreign_state_from_host_slice::<P>(
@@ -999,6 +1078,8 @@ pub(crate) unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
 
 pub(crate) unsafe extern "C" fn cb_state_free(data: *mut u8, _len: u32) {
     if !data.is_null() {
+        // SAFETY: `data` is non-null and is a buffer `state_save` allocated with `malloc`, returned
+        // here once.
         unsafe { free(data.cast()) };
     }
 }
@@ -1011,6 +1092,7 @@ pub(crate) unsafe extern "C" fn cb_latency_samples<P: PluginExport>(ctx: *mut c_
     if ctx.is_null() {
         return 0;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; only an atomic is read.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     inst.delay.latency()
 }
@@ -1019,6 +1101,7 @@ pub(crate) unsafe extern "C" fn cb_tail_samples<P: PluginExport>(ctx: *mut c_voi
     if ctx.is_null() {
         return 0;
     }
+    // SAFETY: `ctx` is non-null and is the shim's live instance; only an atomic is read.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
     inst.delay.tail()
 }
@@ -1027,6 +1110,8 @@ pub(crate) unsafe extern "C" fn cb_drain_host_queue<P: PluginExport>(ctx: *mut c
     if ctx.is_null() {
         return;
     }
+    // SAFETY: `ctx` is non-null and live, and the shim calls this from `TimerWakeup` on the host UI
+    // thread, which is `run_host_drain`'s contract.
     run_extern_callback_with::<P, ()>("aax", "drain_host_queue", (), || unsafe {
         run_host_drain::<P>(ctx);
     });
@@ -1049,6 +1134,8 @@ pub(crate) unsafe extern "C" fn cb_editor_has<P: PluginExport>(ctx: *mut c_void)
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "editor_has", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; the editor slot goes through
+        // `try_enter`.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         let Some(mut gui) = inst.gui.try_enter() else {
             return 0;
@@ -1066,6 +1153,8 @@ pub(crate) unsafe extern "C" fn cb_editor_get_size<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "editor_get_size", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; the editor slot goes through
+        // `try_enter`.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         let Some(mut gui) = inst.gui.try_enter() else {
             return 0;
@@ -1077,6 +1166,8 @@ pub(crate) unsafe extern "C" fn cb_editor_get_size<P: PluginExport>(
             return 0;
         };
         let (w, h) = editor.size();
+        // SAFETY: `width` and `height` are non-null (checked on entry) and are the shim's out
+        // slots.
         unsafe {
             *width = w;
             *height = h;
@@ -1094,6 +1185,8 @@ pub(crate) unsafe extern "C" fn cb_editor_open<P: PluginExport>(
         return 0;
     }
     run_extern_callback_with::<P, i32>("aax", "editor_open", 0, || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; the editor slot goes through
+        // `try_enter`.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         inst.record_ui_thread();
         let Some(mut gui) = inst.gui.try_enter() else {
@@ -1108,6 +1201,8 @@ pub(crate) unsafe extern "C" fn cb_editor_open<P: PluginExport>(
             _ => return 0,
         };
         if let Some(editor) = gui.editor.as_mut() {
+            // SAFETY: `ctx` is the live instance; the editor context only dereferences it later
+            // inside `with_open`.
             let context = unsafe { editor_context::<P>(ctx) };
             editor.open(handle, context);
             let opened = editor.is_open();
@@ -1124,6 +1219,8 @@ pub(crate) unsafe extern "C" fn cb_editor_close<P: PluginExport>(ctx: *mut c_voi
         return;
     }
     run_extern_callback_with::<P, ()>("aax", "editor_close", (), || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; the editor slot goes through
+        // `try_enter`.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         let Some(mut gui) = inst.gui.try_enter() else {
             return;
@@ -1140,6 +1237,8 @@ pub(crate) unsafe extern "C" fn cb_editor_idle<P: PluginExport>(ctx: *mut c_void
         return;
     }
     run_extern_callback_with::<P, ()>("aax", "editor_idle", (), || {
+        // SAFETY: `ctx` is non-null and is the shim's live instance; the editor slot goes through
+        // `try_enter`.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         if let Some(mut gui) = inst.gui.try_enter()
             && gui.open
@@ -1162,8 +1261,10 @@ pub(crate) unsafe extern "C" fn cb_editor_idle<P: PluginExport>(ctx: *mut c_void
 /// Panics if instance creation or `process_native` fails.
 pub fn rt_paranoid_smoke<P: PluginExport>() {
     let cbs = crate::callbacks::<P>();
+    // SAFETY: A null sink is accepted, and `create_with_sink` has no other precondition.
     let ctx = unsafe { (cbs.create_with_sink)(std::ptr::null()) };
     assert!(!ctx.is_null(), "aax create_with_sink returned null");
+    // SAFETY: `ctx` is the non-null instance created above.
     unsafe { (cbs.reset)(ctx, 48_000.0, 128) };
 
     let layout = primary_bus_layout::<P>();
@@ -1183,6 +1284,9 @@ pub fn rt_paranoid_smoke<P: PluginExport>() {
     };
 
     for _ in 0..2 {
+        // SAFETY: Live `ctx`; both pointer arrays hold one entry per declared channel, each a
+        // 64-sample buffer that outlives the call, within the 128-frame reset. Events are null with
+        // a zero count, and `snap` outlives the call.
         let status = unsafe {
             (cbs.process_native)(
                 ctx,
@@ -1200,6 +1304,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() {
             )
         };
         assert_eq!(status, MOOSE_AAX_EVENT_END);
+        // SAFETY: Live `ctx` on the thread that ran `process_native`; `ev` is a local out slot.
         unsafe {
             (cbs.begin_output_events)(ctx, 64);
             let mut ev = MooseAaxNativeEvent::default();
@@ -1208,5 +1313,6 @@ pub fn rt_paranoid_smoke<P: PluginExport>() {
         }
     }
 
+    // SAFETY: `ctx` was created above and is destroyed exactly once.
     unsafe { (cbs.destroy)(ctx) };
 }

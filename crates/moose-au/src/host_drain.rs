@@ -123,6 +123,9 @@ impl HostSink {
                 let end = std::mem::offset_of!(MooseAuHostSink, $field)
                     + std::mem::size_of_val(&copy.$field);
                 if declared >= end {
+                    // SAFETY: `declared >= end` proves this field lies entirely inside the caller's
+                    // initialized prefix, and `addr_of!` reads it without forming a reference to
+                    // the (possibly shorter) whole struct.
                     copy.$field = unsafe { std::ptr::addr_of!((*raw).$field).read() };
                 }
             }};
@@ -154,18 +157,25 @@ impl HostSink {
 
     pub(crate) unsafe fn begin_edit(&self, param_id: u32) {
         if let Some(f) = self.0.begin_edit {
+            // SAFETY: `f` and `user_data` come from the adapter's sink, which keeps `user_data`
+            // valid until `release_user_data` runs in `Drop`; `&self` proves that has not happened
+            // yet.
             unsafe { f(self.0.user_data, param_id) };
         }
     }
 
     pub(crate) unsafe fn set_param(&self, param_id: u32, plain_value: f32) {
         if let Some(f) = self.0.set_param {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data, param_id, plain_value) };
         }
     }
 
     pub(crate) unsafe fn end_edit(&self, param_id: u32) {
         if let Some(f) = self.0.end_edit {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data, param_id) };
         }
     }
@@ -179,6 +189,8 @@ impl HostSink {
     )]
     pub(crate) unsafe fn latency_changed(&self) {
         if let Some(f) = self.0.latency_changed {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data) };
         }
     }
@@ -192,6 +204,8 @@ impl HostSink {
     )]
     pub(crate) unsafe fn tail_changed(&self) {
         if let Some(f) = self.0.tail_changed {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data) };
         }
     }
@@ -205,6 +219,8 @@ impl HostSink {
     )]
     pub(crate) unsafe fn param_values_changed(&self) {
         if let Some(f) = self.0.param_values_changed {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data) };
         }
     }
@@ -218,6 +234,8 @@ impl HostSink {
     )]
     pub(crate) unsafe fn param_presentation_changed(&self) {
         if let Some(f) = self.0.param_presentation_changed {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data) };
         }
     }
@@ -231,6 +249,8 @@ impl HostSink {
     )]
     pub(crate) unsafe fn state_changed(&self) {
         if let Some(f) = self.0.state_changed {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data) };
         }
     }
@@ -244,12 +264,16 @@ impl HostSink {
     )]
     pub(crate) unsafe fn audio_ports_changed(&self) {
         if let Some(f) = self.0.audio_ports_changed {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data) };
         }
     }
 
     pub(crate) unsafe fn request_resize(&self, width: u32, height: u32) -> bool {
         if let Some(f) = self.0.request_resize {
+            // SAFETY: Adapter-supplied callback and `user_data`, valid until `release_user_data`
+            // runs in `Drop` (not yet, since `&self` is live).
             unsafe { f(self.0.user_data, width, height) };
             true
         } else {
@@ -263,6 +287,9 @@ impl Drop for HostSink {
         if let Some(release) = self.0.release_user_data.take() {
             let ud = self.0.user_data;
             self.0.user_data = std::ptr::null_mut();
+            // SAFETY: `release` is called exactly once: it was `take()`n, and `user_data` was
+            // nulled so no later call can reach it. `HostSink` is the last `AuInstance` field, so
+            // every other user of `user_data` has already dropped.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 release(ud);
             }));
@@ -295,6 +322,8 @@ mod apple {
     // `dispatch_source_merge_data`, and cancellation/release is serialized by
     // `HostQueue::close` before `Dispatcher::drop`.
     unsafe impl Send for DispatchSource {}
+    // SAFETY: Same invariant as `Send`: shared access only reaches `dispatch_source_merge_data`,
+    // which libdispatch documents as thread-safe, and the pointer is never mutated.
     unsafe impl Sync for DispatchSource {}
 
     impl DispatchSource {
@@ -383,6 +412,10 @@ mod apple {
                 && let Some(source) = timer.source.take()
             {
                 // The last dispatcher has already removed its registration.
+                // SAFETY: `reservations` reached zero under `TIMER`, so no `Dispatcher` is left to
+                // set or tick this timer; `active` is empty because each dispatcher unregisters in
+                // `Drop` before releasing its reservation. Cancel then release is the libdispatch
+                // teardown order for a resumed source.
                 unsafe {
                     dispatch_source_cancel(source.0);
                     dispatch_release(source.0);
@@ -420,6 +453,10 @@ mod apple {
         /// `DATA_OR` source with a thread-safe, allocation-free wake closure.
         pub(crate) unsafe fn new() -> Option<(Self, impl Fn() + Send + Sync + 'static)> {
             let timer = TimerReservation::new()?;
+            // SAFETY: `_dispatch_source_type_data_or` and `_dispatch_main_q` are libdispatch
+            // globals valid for the process lifetime. A null result is handled, and the new source
+            // stays suspended until `activate`, so `wake` only merges data into a live source
+            // (`HostQueue` runs it only while open, and the source is released after `close`).
             unsafe {
                 let raw = dispatch_source_create(
                     &raw const _dispatch_source_type_data_or,
@@ -456,6 +493,9 @@ mod apple {
                 queue,
                 ctx: AuCtx(ctx),
             }));
+            // SAFETY: `raw` is this dispatcher's suspended source, configured once before
+            // `dispatch_resume`. `drain_ctx` is a leaked box that `release_context` frees exactly
+            // once when the source is cancelled in `Drop`.
             unsafe {
                 dispatch_set_context(raw, drain_ctx.cast());
                 dispatch_source_set_event_handler_f(raw, drain::<P>);
@@ -471,6 +511,8 @@ mod apple {
                 && let Some(source) = timer.source
             {
                 // The dispatcher's reservation keeps the resumed timer live.
+                // SAFETY: `source` is the shared timer, kept alive by this dispatcher's
+                // `TimerReservation`, and `TIMER` is locked.
                 unsafe { dispatch_source_set_timer(source.0, 0, 33_333_333, 3_000_000) };
             }
             timer.active.push((self.source, Arc::clone(signals)));
@@ -486,6 +528,8 @@ mod apple {
                 && let Some(source) = timer.source
             {
                 // DISPATCH_TIME_FOREVER keeps the reserved source idle.
+                // SAFETY: `source` is the shared timer, kept alive by this dispatcher's
+                // `TimerReservation`, and `TIMER` is locked.
                 unsafe { dispatch_source_set_timer(source.0, u64::MAX, 0, 0) };
             }
         }
@@ -494,6 +538,9 @@ mod apple {
         /// thread, allocation-free).
         pub(crate) fn trigger_now(&self) {
             if self.activated.load(Ordering::Acquire) {
+                // SAFETY: `self.source` stays live until `Drop`, and merging data is thread-safe in
+                // libdispatch; the `activated` check ensures the source has been resumed and has a
+                // context.
                 unsafe {
                     dispatch_source_merge_data(self.source.0, 1);
                 }
@@ -505,6 +552,10 @@ mod apple {
         fn drop(&mut self) {
             self.stop_render_polling();
             let raw = self.source.0;
+            // SAFETY: Last use of this source: it was unregistered from the timer above. A source
+            // that was never resumed must be resumed before its final release (libdispatch traps on
+            // releasing a suspended source), and cancellation runs `release_context` for an
+            // activated one.
             unsafe {
                 dispatch_source_cancel(raw);
                 if !self.activated.load(Ordering::Acquire) {
@@ -516,6 +567,10 @@ mod apple {
     }
 
     unsafe extern "C" fn drain<P: PluginExport>(raw: *mut c_void) {
+        // SAFETY: `raw` is the `DrainContext` set in `activate`. libdispatch never runs the event
+        // handler after the cancel handler frees it, and `run_host_drain` only dereferences the
+        // instance inside `HostQueue::with_open`, which fails once `finalize_destroy` closed the
+        // queue.
         run_extern_callback_with::<P, ()>("au", "host_queue_drain", (), || unsafe {
             let context = &*raw.cast::<DrainContext>();
             super::run_host_drain::<P>(&context.queue, context.ctx.as_ptr());
@@ -524,6 +579,8 @@ mod apple {
 
     unsafe extern "C" fn release_context(raw: *mut c_void) {
         if !raw.is_null() {
+            // SAFETY: `raw` is the `Box<DrainContext>` leaked in `activate`; libdispatch calls the
+            // cancel handler exactly once.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 drop(Box::from_raw(raw.cast::<DrainContext>()));
             }));
@@ -580,6 +637,8 @@ pub(crate) unsafe fn run_host_drain<P: moose_core::export::PluginExport>(
     queue: &moose_core::host_queue::HostQueue,
     ctx: *mut std::ffi::c_void,
 ) {
+    // SAFETY: Forwarded contract: the caller guarantees `ctx` is the live `AuInstance<P>` that owns
+    // `queue`, and `with_host_open` only runs the drain while the queue is open.
     unsafe {
         crate::gui::with_host_open::<P, _>(queue, ctx, || {
             let main = moose_core::thread::MainThread::assume();

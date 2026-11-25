@@ -853,6 +853,9 @@ pub(crate) unsafe fn emit_exact_clap(
                 port_index: *port,
                 data: *message.storage(),
             };
+            // SAFETY: `out_events` is the host's output list for this block (or null in preflight,
+            // where `try_push` never dereferences it); `ev` is a local that outlives the push,
+            // which copies it.
             exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
         }
         ExactEventBody::Ump { port, packet } => {
@@ -875,6 +878,8 @@ pub(crate) unsafe fn emit_exact_clap(
                 port_index: *port,
                 data: *packet.storage(),
             };
+            // SAFETY: Same as above: `out_events` is the block's output list (or null in
+            // preflight), and `ev` is a local copied by the push.
             exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
         }
         ExactEventBody::SysEx { port } => {
@@ -896,6 +901,9 @@ pub(crate) unsafe fn emit_exact_clap(
                 buffer: bytes.as_ptr(),
                 size: len_u32(bytes.len()),
             };
+            // SAFETY: `out_events` is the block's output list (or null in preflight). `ev.buffer`
+            // borrows `bytes`, which outlives the push, and the host copies `SysEx` payloads during
+            // `try_push`.
             exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
         }
         ExactEventBody::Note {
@@ -943,6 +951,8 @@ pub(crate) unsafe fn emit_exact_clap(
                 key,
                 velocity: *velocity,
             };
+            // SAFETY: `out_events` is the block's output list (or null in preflight), and `ev` is a
+            // local copied by the push.
             exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
         }
         ExactEventBody::NoteExpression {
@@ -973,6 +983,8 @@ pub(crate) unsafe fn emit_exact_clap(
                 key,
                 value: *value,
             };
+            // SAFETY: `out_events` is the block's output list (or null in preflight), and `ev` is a
+            // local copied by the push.
             exact_push_result(unsafe { try_push(out_events, &raw const ev.header) })
         }
         _ => ExactEmit::Unsupported,
@@ -988,6 +1000,8 @@ pub(crate) fn preflight_clap_output(
     for replay in events.lossless_iter() {
         let event = match replay {
             LosslessEventRef::Exact(exact) => {
+                // SAFETY: Preflight passes a null list together with `accept_output_push`, which
+                // never dereferences it, so no host memory is touched.
                 let status = unsafe {
                     emit_exact_clap(
                         std::ptr::null(),
@@ -1282,6 +1296,8 @@ pub(crate) unsafe fn convert_input_events<P: PluginExport>(
     state_loaded: bool,
     frames_count: Option<u32>,
 ) {
+    // SAFETY: The caller passes `in_events` as null or the host's input list for this block (the
+    // `convert_input_events` contract); every event header it returns is read within that call.
     unsafe {
         scr.event_list.clear();
         // Process path only (`params_flush` passes no frame count):

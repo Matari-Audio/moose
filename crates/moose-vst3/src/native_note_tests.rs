@@ -173,6 +173,8 @@ fn process_block_populates_bus_routing_for_inputs_and_outputs() {
         transport: None,
         process_mode: 0,
     };
+    // SAFETY: Every channel pointer in `args` points at a local `f32` buffer of `num_frames`
+    // samples that outlives the call.
     assert!(unsafe { inst.process_block::<f32>(&mut args) });
 
     let routing = SEEN_ROUTING
@@ -603,6 +605,8 @@ fn process_panic_clears_output_and_input_event_lists() {
         transport: None,
     };
 
+    // SAFETY: Every channel pointer in `args` points at a local `f32` buffer of `num_frames`
+    // samples that outlives the call.
     let ok = unsafe { instance.process_block::<f32>(&mut args) };
     assert!(!ok, "panicking process must report failure");
     assert!(out_l.iter().all(|&s| s == 0.0));

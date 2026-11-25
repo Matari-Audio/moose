@@ -43,6 +43,8 @@ impl Class for Compatibility {
 
 impl IPluginCompatibilityTrait for Compatibility {
     unsafe fn getCompatibilityJSON(&self, stream: *mut IBStream) -> tresult {
+        // SAFETY: The host passes `stream` as null or a live `IBStream` for this call; `from_raw`
+        // maps null to `None`.
         let Some(stream) = (unsafe { ComRef::from_raw(stream) }) else {
             return kInvalidArgument;
         };
@@ -50,6 +52,9 @@ impl IPluginCompatibilityTrait for Compatibility {
         while written < self.json.len() {
             let chunk = (self.json.len() - written).min(i32::MAX as usize);
             let mut wrote: int32 = 0;
+            // SAFETY: `stream` is live for this call. The source pointer covers `chunk` readable
+            // bytes of `self.json` (the `*mut` cast only matches the C signature; `write` reads),
+            // and `wrote` is a writable local.
             let rc = unsafe {
                 stream.write(
                     self.json[written..].as_ptr().cast_mut().cast(),
@@ -114,9 +119,13 @@ pub(super) fn new_test_factory(reg: &'static Registration) -> ComWrapper<Factory
 
 impl IPluginFactoryTrait for Factory {
     unsafe fn getFactoryInfo(&self, info: *mut PFactoryInfo) -> tresult {
+        // SAFETY: The host passes `info` as null or a `PFactoryInfo` slot for this call; `as_mut`
+        // maps null to `None`.
         let (Some(info), Some(reg)) = (unsafe { info.as_mut() }, self.reg()) else {
             return kInvalidArgument;
         };
+        // SAFETY: `PFactoryInfo` is plain integers and char arrays, so all-zero is a valid value;
+        // the assignment drops nothing.
         *info = unsafe { std::mem::zeroed() };
         c8_into(&mut info.vendor, &reg.desc.vendor);
         c8_into(&mut info.url, &reg.desc.url);
@@ -133,6 +142,8 @@ impl IPluginFactoryTrait for Factory {
     }
 
     unsafe fn getClassInfo(&self, index: int32, info: *mut PClassInfo) -> tresult {
+        // SAFETY: The host passes `info` as null or a `PClassInfo` slot for this call; `as_mut`
+        // maps null to `None`.
         let (Some(info), Some(reg)) = (unsafe { info.as_mut() }, self.reg()) else {
             return kInvalidArgument;
         };
@@ -140,6 +151,7 @@ impl IPluginFactoryTrait for Factory {
         if index != 0 && !(index == 1 && has_compat) {
             return kInvalidArgument;
         }
+        // SAFETY: `PClassInfo` is plain integers and char arrays, so all-zero is a valid value.
         *info = unsafe { std::mem::zeroed() };
         info.cardinality = kManyInstances as i32;
         if index == 0 {
@@ -165,8 +177,11 @@ impl IPluginFactoryTrait for Factory {
         if cid.is_null() || iid.is_null() || obj.is_null() {
             return kInvalidArgument;
         }
+        // SAFETY: `obj` is non-null (checked above) and is the caller's out-slot.
         unsafe { *obj = std::ptr::null_mut() };
+        // SAFETY: `cid` is non-null, and a VST3 `FIDString` class id is a 16-byte TUID.
         let cid = unsafe { std::slice::from_raw_parts(cid.cast::<u8>(), 16) };
+        // SAFETY: `iid` is non-null and points at a 16-byte TUID; `[u8; 16]` has alignment 1.
         let iid = unsafe { &*iid.cast::<[u8; 16]>() };
         if let Some(json) = compatibility_json(reg)
             && cid == compatibility_cid(reg.desc.cid)
@@ -175,6 +190,8 @@ impl IPluginFactoryTrait for Factory {
             let Some(unknown) = compat.to_com_ptr::<FUnknown>() else {
                 return kNoInterface;
             };
+            // SAFETY: `unknown` is a live `ComPtr` we own, and `iid` is a valid 16-byte id. On
+            // success the returned pointer carries its own reference.
             return match unsafe {
                 <FUnknown as vst3::com_scrape_types::Unknown>::query_interface(
                     unknown.as_ptr(),
@@ -182,6 +199,8 @@ impl IPluginFactoryTrait for Factory {
                 )
             } {
                 Some(p) => {
+                    // SAFETY: `obj` is the non-null out-slot; ownership of the reference
+                    // `query_interface` added passes to the caller.
                     unsafe { *obj = p };
                     kResultOk
                 }
@@ -201,16 +220,22 @@ impl IPluginFactoryTrait for Factory {
         };
         #[cfg(target_os = "linux")]
         if let Some(context) = &*self.context.lock().unwrap_or_else(PoisonError::into_inner) {
-            host.set_host_context(context.as_ptr());
+            // SAFETY: `context` is a `ComPtr` retained by the factory and held
+            // under the lock for this call.
+            unsafe { host.set_host_context(context.as_ptr()) };
         }
         let component = ComWrapper::new(Component { host });
         let Some(unknown) = component.to_com_ptr::<FUnknown>() else {
             return kNoInterface;
         };
+        // SAFETY: `unknown` is a live `ComPtr` we own, and `iid` is a valid 16-byte id. On success
+        // the returned pointer carries its own reference.
         match unsafe {
             <FUnknown as vst3::com_scrape_types::Unknown>::query_interface(unknown.as_ptr(), iid)
         } {
             Some(p) => {
+                // SAFETY: `obj` is the non-null out-slot; ownership of the reference
+                // `query_interface` added passes to the caller.
                 unsafe { *obj = p };
                 kResultOk
             }
@@ -221,6 +246,8 @@ impl IPluginFactoryTrait for Factory {
 
 impl IPluginFactory2Trait for Factory {
     unsafe fn getClassInfo2(&self, index: int32, info: *mut PClassInfo2) -> tresult {
+        // SAFETY: The host passes `info` as null or a `PClassInfo2` slot for this call; `as_mut`
+        // maps null to `None`.
         let (Some(info), Some(reg)) = (unsafe { info.as_mut() }, self.reg()) else {
             return kInvalidArgument;
         };
@@ -229,6 +256,7 @@ impl IPluginFactory2Trait for Factory {
             return kInvalidArgument;
         }
         let d = &reg.desc;
+        // SAFETY: `PClassInfo2` is plain integers and char arrays, so all-zero is a valid value.
         *info = unsafe { std::mem::zeroed() };
         info.cardinality = kManyInstances as i32;
         if index == 0 {
@@ -250,6 +278,8 @@ impl IPluginFactory2Trait for Factory {
 
 impl IPluginFactory3Trait for Factory {
     unsafe fn getClassInfoUnicode(&self, index: int32, info: *mut PClassInfoW) -> tresult {
+        // SAFETY: The host passes `info` as null or a `PClassInfoW` slot for this call; `as_mut`
+        // maps null to `None`.
         let (Some(info), Some(reg)) = (unsafe { info.as_mut() }, self.reg()) else {
             return kInvalidArgument;
         };
@@ -258,6 +288,7 @@ impl IPluginFactory3Trait for Factory {
             return kInvalidArgument;
         }
         let d = &reg.desc;
+        // SAFETY: `PClassInfoW` is plain integers and char arrays, so all-zero is a valid value.
         *info = unsafe { std::mem::zeroed() };
         info.cardinality = kManyInstances as i32;
         if index == 0 {
@@ -280,8 +311,11 @@ impl IPluginFactory3Trait for Factory {
         #[cfg(target_os = "linux")]
         {
             *self.run_loop.lock().unwrap_or_else(PoisonError::into_inner) =
-                super::wake::linux::run_loop_of(context);
+                // SAFETY: `setHostContext`'s `context` is null or a host
+                // object live for this call; `run_loop_of` keeps its own ref.
+                unsafe { super::wake::linux::run_loop_of(context) };
             *self.context.lock().unwrap_or_else(PoisonError::into_inner) =
+                // SAFETY: Same live-or-null `context`; `retain` takes the factory's own reference.
                 unsafe { super::retain(context) };
         }
         kResultOk

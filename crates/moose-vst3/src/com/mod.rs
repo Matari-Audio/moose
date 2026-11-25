@@ -121,6 +121,8 @@ pub(crate) unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         ""
     } else {
+        // SAFETY: `p` is non-null, and the caller guarantees it is a NUL-terminated host string
+        // that outlives `'a`.
         unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
     }
 }
@@ -166,9 +168,13 @@ pub(crate) unsafe fn utf16_from(p: *const u16, max: usize) -> String {
         return String::new();
     }
     let mut len = 0;
+    // SAFETY: `len < max`, and the caller guarantees `p` is readable up to its NUL or `max` units,
+    // whichever comes first.
     while len < max && unsafe { *p.add(len) } != 0 {
         len += 1;
     }
+    // SAFETY: The loop stopped at the NUL or at `max`, so all `len` units were just read and are in
+    // bounds.
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
@@ -186,6 +192,8 @@ pub(crate) fn read_state_chunk(stream: ComRef<'_, IBStream>, dst: &mut [u8]) -> 
         return -1;
     }
     let mut count = 0;
+    // SAFETY: `stream` is a live host `IBStream`; `dst` is writable for `requested` bytes and
+    // `count` is a local out slot.
     let result = unsafe { stream.read(dst.as_mut_ptr().cast(), requested as i32, &raw mut count) };
     if count < 0 || count as u32 > requested || (result != kResultOk && result != kResultFalse) {
         return -1;
@@ -202,6 +210,8 @@ pub(crate) fn write_state_chunk(stream: ComRef<'_, IBStream>, src: &[u8]) -> i64
         return -1;
     }
     let mut count = 0;
+    // SAFETY: `stream` is a live host `IBStream`; `src` is readable for `requested` bytes (the SDK
+    // signature takes `*mut` but `write` only reads) and `count` is a local out slot.
     let result = unsafe {
         stream.write(
             src.as_ptr().cast_mut().cast(),
@@ -293,6 +303,8 @@ pub(crate) fn flush_host_queue(host_id: usize) {
 }
 
 pub(crate) unsafe fn wake_host_queue(host: *const Host) {
+    // SAFETY: Forwarded contract: the caller guarantees `host` is null or the opaque `HostWakes`
+    // token from `Host::new`, which is `component::wake_host_queue`'s contract.
     unsafe { component::wake_host_queue(host) };
 }
 
@@ -320,6 +332,8 @@ pub(crate) fn popup_context_menu(
 
 /// `ComPtr` from an incoming interface pointer, adding a reference.
 pub(crate) unsafe fn retain<I: vst3::Interface>(p: *mut I) -> Option<ComPtr<I>> {
+    // SAFETY: The caller guarantees `p` is null or a live interface pointer for the duration of
+    // this call; `to_com_ptr` adds the reference we keep.
     unsafe { ComRef::from_raw(p) }.map(|r| r.to_com_ptr())
 }
 

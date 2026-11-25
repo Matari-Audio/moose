@@ -324,6 +324,8 @@ mod host_value_tests {
             // SAFETY: tests that pass a non-null `ctx` point it at a live `AtomicU32`.
             let ctx = unsafe { (*out).ctx };
             if !ctx.is_null() {
+                // SAFETY: `ctx` is non-null, and the tests that set it point it at a live
+                // `AtomicU32`.
                 unsafe { (*ctx.cast::<AtomicU32>()).fetch_add(1, Ordering::Relaxed) };
             }
         }
@@ -514,6 +516,9 @@ mod host_value_tests {
 
     #[test]
     fn overflow_rescans_again_after_stale_values_drain() {
+        // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+        // filled in below. The host, plugin and buffers are locals that outlive every call the
+        // plugin makes through them.
         unsafe {
             let rescans = AtomicU32::new(0);
             let mut host: clap_host = std::mem::zeroed();
@@ -592,17 +597,23 @@ mod host_value_tests {
             unsafe { &*((*host).host_data.cast::<Calls>()) }
         }
         unsafe extern "C" fn callback(host: *const clap_host) {
+            // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live
+            // `Calls` local.
             unsafe { calls(host) }
                 .callbacks
                 .fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn flush(host: *const clap_host) {
+            // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live
+            // `Calls` local.
             unsafe { calls(host) }
                 .flushes
                 .fetch_add(1, Ordering::Relaxed);
         }
         unsafe extern "C" fn rescan(host: *const clap_host, flags: u32) {
             assert_eq!(flags, CLAP_PARAM_RESCAN_VALUES);
+            // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live
+            // `Calls` local.
             unsafe { calls(host) }
                 .rescans
                 .fetch_add(1, Ordering::Relaxed);
@@ -613,6 +624,7 @@ mod host_value_tests {
                 clear: None,
                 request_flush: Some(flush),
             };
+            // SAFETY: The plugin queries extensions with NUL-terminated static ids.
             if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PARAMS {
                 (&raw const PARAMS).cast()
             } else {
@@ -1174,6 +1186,7 @@ pub struct DescriptorHolder {
 // immutable after construction and never moved out while `DescriptorHolder`
 // lives inside its process-wide `OnceLock`.
 unsafe impl Send for DescriptorHolder {}
+// SAFETY: Same as `Send`: the pointed-to `CString`s are immutable after construction and only read.
 unsafe impl Sync for DescriptorHolder {}
 
 /// Plugin display-name in host browsers. Reads `moose.toml`'s
@@ -1294,6 +1307,8 @@ fn copy_str_to_buf(dst: &mut [c_char], src: &str) {
 unsafe fn data_from_plugin<P: PluginExport>(
     plugin: *const clap_plugin,
 ) -> &'static ClapPluginData<P> {
+    // SAFETY: The caller passes our live `clap_plugin`, whose `plugin_data` is the boxed
+    // `ClapPluginData<P>` freed only in `destroy`, after the last callback.
     unsafe { &*(*plugin).plugin_data.cast::<ClapPluginData<P>>() }
 }
 
@@ -1692,6 +1707,8 @@ mod channel_slice_tests {
         let copy = unsafe {
             input_overlaps_outputs(input_ptr.cast(), std::mem::size_of_val(&samples), &process)
         };
+        // SAFETY: `input_ptr` points at the local `samples` (`samples.len()` frames), and `copy`
+        // reports whether it aliases an output.
         let input = unsafe {
             input_channel_slice::<f32, f32>(input_ptr, samples.len(), &mut scratch, copy)
         };
@@ -2166,8 +2183,10 @@ mod host_state_tests {
             bytes: *const c_void,
             size: u64,
         ) -> i64 {
+            // SAFETY: the test sets `ctx` to a live, exclusively borrowed `Vec<u8>`.
             let out = unsafe { &mut *((*s).ctx.cast::<Vec<u8>>()) };
             let n = usize::try_from(size).expect("size fits usize");
+            // SAFETY: the plugin passes `size` readable bytes at `bytes`.
             out.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), n) });
             i64::try_from(n).expect("n fits i64")
         }
@@ -2199,6 +2218,8 @@ mod host_state_tests {
             }
         }
 
+        // SAFETY: this test owns the plugin, descriptor, host and stream buffers, and joins
+        // the audio worker before destroying the instance.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
             host.clap_version = CLAP_VERSION;
@@ -2400,23 +2421,33 @@ mod large_state_tests {
         offset: usize,
     }
     unsafe extern "C" fn write(s: *const clap_ostream, bytes: *const c_void, size: u64) -> i64 {
+        // SAFETY: `s` is the test's stream, whose `ctx` is the unique live `Stream` local; the
+        // plugin never re-enters the stream.
         let s = unsafe { &mut *((*s).ctx.cast::<Stream>()) };
         let n = (usize::try_from(size).expect("test buffer length fits usize")).min(317);
         s.bytes
+            // SAFETY: The plugin passes `size` readable bytes, and `n <= size`.
             .extend_from_slice(unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), n) });
         i64::try_from(n).expect("test byte count fits i64")
     }
     unsafe extern "C" fn read(s: *const clap_istream, dst: *mut c_void, size: u64) -> i64 {
+        // SAFETY: `s` is the test's stream, whose `ctx` is the unique live `Stream` local; the
+        // plugin never re-enters the stream.
         let s = unsafe { &mut *((*s).ctx.cast::<Stream>()) };
         let n = (usize::try_from(size).expect("test buffer length fits usize"))
             .min(311)
             .min(s.bytes.len() - s.offset);
+        // SAFETY: `n` is at most both the bytes left after `offset` and `size`, and `dst` is the
+        // plugin's buffer of `size` bytes, separate from `s.bytes`.
         unsafe { std::ptr::copy_nonoverlapping(s.bytes.as_ptr().add(s.offset), dst.cast(), n) };
         s.offset += n;
         i64::try_from(n).expect("test byte count fits i64")
     }
     #[test]
     fn large_host_state_roundtrips_and_default_bound_rejects() {
+        // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+        // filled in below. The host, plugin and buffers are locals that outlive every call the
+        // plugin makes through them.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
             host.clap_version = CLAP_VERSION;
@@ -2513,6 +2544,9 @@ mod surround_tests {
 
     #[test]
     fn host_reads_selected_canonical_surround_maps() {
+        // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+        // filled in below. The host, plugin and buffers are locals that outlive every call the
+        // plugin makes through them.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
             host.clap_version = CLAP_VERSION;
@@ -2641,6 +2675,9 @@ mod ambisonic_tests {
 
     #[test]
     fn host_queries_and_configures_ambisonic_ports() {
+        // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+        // filled in below. The host, plugin and buffers are locals that outlive every call the
+        // plugin makes through them.
         unsafe {
             let mut host: clap_host = std::mem::zeroed();
             host.clap_version = CLAP_VERSION;

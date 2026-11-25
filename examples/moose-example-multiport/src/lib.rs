@@ -423,6 +423,9 @@ mod tests {
             let mut r = vec![0.0f32; 64];
             let (a, b) = (&mut l[..], &mut r[..]);
             let mut out_refs: Vec<&mut [f32]> = vec![a, b];
+            // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at
+            // least `num_samples` long, and no input to alias an output. These are distinct local
+            // `Vec`s/arrays of exactly that length.
             let mut buffer = unsafe { AudioBuffer::from_slices(&in_refs, &mut out_refs, 64) };
             let transport = TransportInfo::default();
             let mut out_ev = EventList::default();
@@ -475,6 +478,9 @@ mod tests {
         let mut r = vec![0.0f32; 64];
         let (a, b) = (&mut l[..], &mut r[..]);
         let mut out_refs: Vec<&mut [f32]> = vec![a, b];
+        // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at
+        // least `num_samples` long, and no input to alias an output. These are distinct local
+        // `Vec`s/arrays of exactly that length.
         let mut buffer = unsafe { AudioBuffer::from_slices(&in_refs, &mut out_refs, 64) };
 
         let mut events = EventList::default();

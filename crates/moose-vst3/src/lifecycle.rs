@@ -584,10 +584,14 @@ impl<P: PluginExport> Vst3Backend for Vst3Instance<P> {
     }
 
     unsafe fn process_f32(&self, args: &mut ProcessArgs<'_>) -> bool {
+        // SAFETY: `process_f32`'s contract is `process_block`'s: the channel pointers in `args`
+        // cover `num_frames` samples.
         unsafe { self.process_block::<f32>(args) }
     }
 
     unsafe fn process_f64(&self, args: &mut ProcessArgs<'_>) -> bool {
+        // SAFETY: `process_f64`'s contract is `process_block`'s: the channel pointers in `args`
+        // cover `num_frames` samples.
         unsafe { self.process_block::<f64>(args) }
     }
 

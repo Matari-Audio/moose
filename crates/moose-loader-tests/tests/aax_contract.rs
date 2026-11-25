@@ -186,39 +186,58 @@ fn aax_and_au_state_blobs_interoperate_identically() {
     let aax = moose_aax::callbacks::<AaxContractPlugin>();
     let au = moose_au::callbacks::<AaxContractPlugin>();
 
+    // SAFETY: A null sink is accepted, and `create_with_sink` returns an owned context released by
+    // `destroy` below.
     let aax_ctx = unsafe { (aax.create_with_sink)(std::ptr::null()) };
+    // SAFETY: A null sink is accepted, and `create_with_sink` returns an owned context released by
+    // `destroy` below.
     let au_ctx = unsafe { (au.create_with_sink)(std::ptr::null()) };
     assert!(!aax_ctx.is_null() && !au_ctx.is_null());
 
     // Save from AAX with gain=1.25 -> restore in AU.
+    // SAFETY: `aax_ctx` is live until `destroy`.
     unsafe { (aax.param_set)(aax_ctx, 1, 1.25) };
     let mut ptr: *mut u8 = std::ptr::null_mut();
+    // SAFETY: `aax_ctx` is live, and `ptr` is a writable local.
     let len = unsafe { (aax.state_save)(aax_ctx, &raw mut ptr) };
     assert!(len > 0 && !ptr.is_null());
+    // SAFETY: `state_save` returned `len` bytes at the non-null `ptr`, which stay valid until
+    // `state_free`.
     let aax_blob = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
+    // SAFETY: Frees the blob `state_save` returned, exactly once, with its length.
     unsafe { (aax.state_free)(ptr, len) };
 
     assert_eq!(
+        // SAFETY: `au_ctx` is live, and `aax_blob` holds `len` bytes.
         unsafe { (au.state_load)(au_ctx, aax_blob.as_ptr(), len) },
         1
     );
+    // SAFETY: `au_ctx` is live until `destroy`.
     assert!((unsafe { (au.param_get_value)(au_ctx, 1) } - 1.25).abs() < 1e-5);
 
     // Save from AU with gain=1.75 -> restore in AAX.
+    // SAFETY: `au_ctx` is live until `destroy`.
     unsafe { (au.param_set_value)(au_ctx, 1, 1.75) };
     let mut au_ptr: *mut u8 = std::ptr::null_mut();
     let mut au_len: u32 = 0;
+    // SAFETY: `au_ctx` is live; both out-pointers are writable locals.
     unsafe { (au.state_save)(au_ctx, &raw mut au_ptr, &raw mut au_len) };
     assert!(au_len > 0 && !au_ptr.is_null());
+    // SAFETY: `state_save` returned `au_len` bytes at the non-null `au_ptr`, which stay valid until
+    // `state_free`.
     let au_blob = unsafe { std::slice::from_raw_parts(au_ptr, au_len as usize) }.to_vec();
+    // SAFETY: Frees the blob `state_save` returned, exactly once, with its length.
     unsafe { (au.state_free)(au_ptr, au_len) };
 
     assert_eq!(
+        // SAFETY: `aax_ctx` is live, and `au_blob` holds `au_len` bytes.
         unsafe { (aax.state_load)(aax_ctx, au_blob.as_ptr(), au_len) },
         1
     );
+    // SAFETY: `aax_ctx` is live until `destroy`.
     assert!((unsafe { (aax.param_get)(aax_ctx, 1) } - 1.75).abs() < 1e-5);
 
+    // SAFETY: Each context is destroyed exactly once and is not used afterwards.
     unsafe {
         (aax.destroy)(aax_ctx);
         (au.destroy)(au_ctx);
@@ -232,6 +251,7 @@ fn aax_render_offline_mode_latency_drain_and_zero_audio_allocations() {
         last_latency: AtomicU32,
     }
     unsafe extern "C" fn on_latency(ud: *mut c_void, samples: u32) {
+        // SAFETY: `ud` is the sink's `user_data`, which points at the live `SinkState` local.
         unsafe { &*ud.cast::<SinkState>() }
             .last_latency
             .store(samples, Ordering::SeqCst);
@@ -246,7 +266,10 @@ fn aax_render_offline_mode_latency_drain_and_zero_audio_allocations() {
     };
 
     let cbs = moose_aax::callbacks::<AaxContractPlugin>();
+    // SAFETY: `sink` is a local that outlives `ctx` (destroyed at the end of this test); its
+    // `user_data` points at `state`.
     let ctx = unsafe { (cbs.create_with_sink)(&raw const sink) };
+    // SAFETY: `ctx` is live until `destroy`.
     unsafe {
         (cbs.set_render_mode)(ctx, 2); // Offline
         (cbs.reset)(ctx, 48_000.0, 256);
@@ -285,9 +308,12 @@ fn aax_render_offline_mode_latency_drain_and_zero_audio_allocations() {
     };
 
     // Trigger latency bump to 128 and measure audio-thread allocations.
+    // SAFETY: `ctx` is live until `destroy`.
     unsafe { (cbs.param_set)(ctx, 1, 1.8) };
 
     let ((), allocs) = audit(|| {
+        // SAFETY: `ctx` is live, and every channel pointer addresses a local 64-sample buffer that
+        // outlives the call.
         let status = unsafe {
             (cbs.process_native)(
                 ctx,
@@ -305,6 +331,7 @@ fn aax_render_offline_mode_latency_drain_and_zero_audio_allocations() {
             )
         };
         assert_eq!(status, MOOSE_AAX_EVENT_END);
+        // SAFETY: `ctx` is live, and output events are drained on the thread that just processed.
         unsafe {
             (cbs.begin_output_events)(ctx, 64);
             let mut out_ev = MooseAaxNativeEvent::default();
@@ -319,16 +346,21 @@ fn aax_render_offline_mode_latency_drain_and_zero_audio_allocations() {
     assert_eq!(allocs, 0, "AAX audio thread allocated {allocs} times");
     assert!((out_l[0] - 0.9).abs() < 1e-5);
 
+    // SAFETY: `ctx` is live; the drain calls back into `sink`, which is still alive.
     unsafe { (cbs.drain_host_queue)(ctx) };
     assert_eq!(state.last_latency.load(Ordering::SeqCst), 128);
+    // SAFETY: `ctx` is live until `destroy`.
     assert_eq!(unsafe { (cbs.latency_samples)(ctx) }, 128);
 
     // Confirm Offline render mode was observed by checking saved custom_state[1].
     let mut ptr: *mut u8 = std::ptr::null_mut();
+    // SAFETY: `ctx` is live, and `ptr` is a writable local.
     let len = unsafe { (cbs.state_save)(ctx, &raw mut ptr) };
     assert!(len > 0 && !ptr.is_null());
+    // SAFETY: Frees the blob `state_save` returned, exactly once, with its length.
     unsafe { (cbs.state_free)(ptr, len) };
 
+    // SAFETY: `ctx` is destroyed exactly once and not used afterwards; `sink` outlives it.
     unsafe { (cbs.destroy)(ctx) };
 }
 

@@ -204,12 +204,16 @@ struct ParamCursor {
 impl ParamCursor {
     /// A cursor over `queue`, or `None` when the host gave a null queue.
     unsafe fn new(host: &Host, queue: *mut IParamValueQueue, will_process: bool) -> Option<Self> {
+        // SAFETY: The caller passes `queue` from the host's `IParameterChanges` for this `process`
+        // call: null (handled by `from_raw`) or a live queue for the call's duration.
         let q = unsafe { ComRef::from_raw(queue) }?;
+        // SAFETY: `q` is the live host queue checked just above.
         let id = unsafe { q.getParameterId() };
         let prev = host.backend().param_get_value(id);
         Some(Self {
             queue,
             id,
+            // SAFETY: `q` is the live host queue checked just above.
             count: unsafe { q.getPointCount() },
             next: 0,
             prev,
@@ -223,6 +227,8 @@ impl ParamCursor {
     /// Read the next valid point into `pending`; false when exhausted.
     /// Points the host refuses to return are skipped.
     unsafe fn advance(&mut self) -> bool {
+        // SAFETY: `self.queue` was non-null at construction and the host keeps it alive for the
+        // rest of this `process` call, which is the cursor's whole lifetime.
         let Some(q) = (unsafe { ComRef::from_raw(self.queue) }) else {
             return false;
         };
@@ -230,6 +236,7 @@ impl ParamCursor {
             let j = self.next;
             self.next += 1;
             let (mut offset, mut value) = (0, 0.0);
+            // SAFETY: `q` is the live host queue; `j < count` and both out-pointers are locals.
             if unsafe { q.getPoint(j, &raw mut offset, &raw mut value) } == kResultOk {
                 self.pending = (offset, value);
                 return true;
@@ -278,6 +285,7 @@ impl ParamCursor {
     /// Walk the whole queue at once (no merge). Returns true on overflow.
     unsafe fn drain(&mut self, host: &Host) -> bool {
         let mut dropped = false;
+        // SAFETY: Same contract as `advance`: the queue outlives this `process` call.
         while unsafe { self.advance() } {
             dropped |= self.emit(host);
         }
@@ -299,13 +307,17 @@ struct NoteCursor<'a> {
 
 impl<'a> NoteCursor<'a> {
     unsafe fn new(list: *mut IEventList) -> Self {
+        // SAFETY: The caller passes the host's `IEventList` for this `process` call: null (handled
+        // by `from_raw`) or live for the call's duration (`'a`).
         let list = unsafe { ComRef::from_raw(list) };
         let mut cursor = Self {
+            // SAFETY: `l` is the live host event list.
             count: list.map_or(0, |l| unsafe { l.getEventCount() }),
             list,
             next: 0,
             pending: None,
         };
+        // SAFETY: `list` is null or live for `'a`, which is `advance`'s contract.
         unsafe { cursor.advance() };
         cursor
     }
@@ -322,7 +334,9 @@ impl<'a> NoteCursor<'a> {
         }
         let i = self.next;
         self.next += 1;
+        // SAFETY: `Event` is a plain C struct/union for which all-zero bytes are a valid value.
         let mut ev: Event = unsafe { std::mem::zeroed() };
+        // SAFETY: `list` is live for `'a`, `i < count`, and `ev` is a local out slot.
         if unsafe { list.getEvent(i, &raw mut ev) } != kResultOk {
             self.count = self.next;
             return;
@@ -337,6 +351,8 @@ impl<'a> NoteCursor<'a> {
             ..Vst3NativeEvent::default()
         };
         let mut data: Option<&'a [u8]> = None;
+        // SAFETY: Each union arm read matches the event `type` the host set (`n.kind`), which is
+        // the SDK's tagging rule; the `DataEvent` byte slice is justified inline.
         unsafe {
             match n.kind {
                 NOTE_ON => {
@@ -666,6 +682,8 @@ pub(crate) struct Host {
 // and `setupProcessing`, which the host never overlaps. The view slot's raw
 // pointer is only dereferenced on the UI thread.
 unsafe impl Send for Host {}
+// SAFETY: Same reasoning as `Send`: every shared-access path reaches `backend` (itself `Sync`),
+// atomics, mutexes, or the `UnsafeCell`s whose access the VST3 threading contract serializes.
 unsafe impl Sync for Host {}
 
 thread_local! {
@@ -684,8 +702,9 @@ pub(super) fn mark_restart(host_id: usize, flags: i32) {
         host.presentation_check.store(true, Ordering::Release);
         host.wake_ui();
     };
-    // SAFETY: set only for the duration of `Host::process`.
     let on_audio = PROCESSING.with(|current| {
+        // SAFETY: `PROCESSING` holds a non-null pointer only while `Host::process` runs on this
+        // thread and borrows that `Host`, so it is valid here.
         unsafe { current.get().as_ref() }
             .filter(|h| h.id == host_id)
             .map(flag)
@@ -711,6 +730,8 @@ pub(super) fn mark_restart(host_id: usize, flags: i32) {
 /// `*const Host` by `Host::new`; `Host::drop` closes `HostQueue` (joining
 /// every in-flight call) before mutating or dropping `HostWakes` / OS wakes.
 pub(super) unsafe fn wake_host_queue(host: *const Host) {
+    // SAFETY: The caller guarantees `host` is null or the `Arc<HostWakes>` pointer bound in
+    // `Host::new`; `Host::drop` closes the queue (joining this call) before the `Arc` can drop.
     let Some(wakes) = (unsafe { host.cast::<HostWakes>().as_ref() }) else {
         return;
     };
@@ -720,8 +741,9 @@ pub(super) unsafe fn wake_host_queue(host: *const Host) {
 /// Drain the instance's `HostQueue` on the UI thread, or wake the UI thread
 /// when called off it. Lock-free on the audio thread.
 pub(super) fn flush_host_queue(host_id: usize) {
-    // SAFETY: set only for the duration of `Host::process`.
     let on_audio = PROCESSING.with(|current| {
+        // SAFETY: `PROCESSING` holds a non-null pointer only while `Host::process` runs on this
+        // thread and borrows that `Host`, so it is valid here.
         unsafe { current.get().as_ref() }
             .filter(|h| h.id == host_id)
             .map(Host::wake_ui)
@@ -996,11 +1018,16 @@ impl Host {
     }
 
     fn config(&self) -> &Config {
+        // SAFETY: VST3 writes `Config` only from `setupProcessing`/`setBusArrangements`, which
+        // hosts never overlap with any other call on this component, so no `&mut` exists while this
+        // shared borrow is live.
         unsafe { &*self.config.get() }
     }
 
     #[allow(clippy::mut_from_ref)]
     unsafe fn config_mut(&self) -> &mut Config {
+        // SAFETY: The caller guarantees the VST3 inactive-state exclusivity described on `config`,
+        // so this is the only live borrow of `Config`.
         unsafe { &mut *self.config.get() }
     }
 
@@ -1192,6 +1219,8 @@ impl Host {
         match op {
             EditOp::Begin(id) => {
                 if let Some(h) = self.handler() {
+                    // SAFETY: `h` is the host's retained `IComponentHandler`, called on the UI
+                    // thread (`run_op` runs only where `may_deliver` holds).
                     unsafe { h.beginEdit(id) };
                     lock(&self.edits).open_gestures.push(id);
                 }
@@ -1200,6 +1229,8 @@ impl Host {
             EditOp::Perform(id, value) => {
                 if let Some(h) = self.handler() {
                     self.in_perform_edit.store(true, Ordering::Relaxed);
+                    // SAFETY: `h` is the host's retained `IComponentHandler`, called on the UI
+                    // thread.
                     unsafe { h.performEdit(id, value) };
                     self.in_perform_edit.store(false, Ordering::Relaxed);
                     self.note_param_change(id);
@@ -1209,6 +1240,8 @@ impl Host {
             }
             EditOp::End(id) => {
                 if let Some(h) = self.handler() {
+                    // SAFETY: `h` is the host's retained `IComponentHandler`, called on the UI
+                    // thread.
                     unsafe { h.endEdit(id) };
                     let mut e = lock(&self.edits);
                     if let Some(at) = e.open_gestures.iter().position(|&g| g == id) {
@@ -1223,6 +1256,8 @@ impl Host {
             EditOp::Dirty => {
                 if let Some(h2) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) {
                     self.dirty_pending.store(false, Ordering::Release);
+                    // SAFETY: `h2` is a retained `IComponentHandler2` from `cast`, called on the UI
+                    // thread.
                     unsafe { h2.setDirty(1) };
                 } else {
                     self.dirty_pending.store(true, Ordering::Release);
@@ -1232,7 +1267,11 @@ impl Host {
             EditOp::Group(edge) => {
                 if let Some(h) = self.handler().and_then(|h| h.cast::<IComponentHandler2>()) {
                     match edge {
+                        // SAFETY: `h` is a retained `IComponentHandler2` from `cast`, called on the
+                        // UI thread.
                         EditGroup::Begin => unsafe { h.startGroupEdit() },
+                        // SAFETY: `h` is a retained `IComponentHandler2` from `cast`, called on the
+                        // UI thread.
                         EditGroup::End => unsafe { h.finishGroupEdit() },
                     };
                     lock(&self.edits).group_open = edge == EditGroup::Begin;
@@ -1256,6 +1295,9 @@ impl Host {
             right: w as i32,
             bottom: h as i32,
         };
+        // SAFETY: `frame` is a retained `IPlugFrame`; `view` is the current view, which unregisters
+        // itself in `forget_view` (UI thread) before it is destroyed, and this also runs on the UI
+        // thread. `rect` is a local.
         i32::from(unsafe { frame.resizeView(view, &raw mut rect) } == kResultOk)
     }
 
@@ -1291,7 +1333,11 @@ impl Host {
         let param_ptr = param_id
             .as_ref()
             .map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: `handler3` is a retained `IComponentHandler3` and `view` is the current,
+        // still-registered view (UI thread). `param_ptr` is null or points to the local `param_id`.
         let raw_menu = unsafe { handler3.createContextMenu(view, param_ptr) };
+        // SAFETY: `createContextMenu` returns a new reference that we own, so `from_raw` takes it
+        // without an extra `addRef`.
         let Some(menu) = (unsafe { ComPtr::from_raw(raw_menu) }) else {
             return;
         };
@@ -1366,8 +1412,11 @@ impl Host {
             } else {
                 std::ptr::null_mut()
             };
+            // SAFETY: `menu` is live; `raw_item` is a local the host copies, and `target_ptr` is
+            // null or our retained `IContextMenuTarget`, which the menu `addRef`s.
             unsafe { menu.addItem(&raw const raw_item, target_ptr) };
         }
+        // SAFETY: `menu` is the live context menu created above.
         unsafe { menu.popup(x, y) };
     }
 
@@ -1406,6 +1455,8 @@ impl Host {
         }
         let flags = self.pending_restart.swap(0, Ordering::AcqRel);
         if flags != 0 {
+            // SAFETY: `handler` is the host's retained `IComponentHandler`, called on the UI
+            // thread.
             unsafe { handler.restartComponent(flags) };
         }
     }
@@ -1439,6 +1490,7 @@ impl Host {
         if !self.dirty_pending.swap(false, Ordering::AcqRel) {
             return;
         }
+        // SAFETY: `h2` is a retained `IComponentHandler2` from `cast`, called on the UI thread.
         unsafe { h2.setDirty(1) };
     }
 
@@ -1459,6 +1511,8 @@ impl Host {
         let Some((id, value)) = self.backend().take_persist_change() else {
             return;
         };
+        // SAFETY: `handler` is the host's retained `IComponentHandler`, called on the UI thread;
+        // begin/perform/end form one complete gesture.
         unsafe {
             handler.beginEdit(id);
             self.in_perform_edit.store(true, Ordering::Relaxed);
@@ -1498,10 +1552,18 @@ impl Host {
 
     /// Bind (or with `None`, unbind) the edit wake and restart timer to a
     /// plug frame's run loop. UI thread.
+    ///
+    /// # Safety
+    ///
+    /// `frame`, when `Some`, is null or a live COM object for this call.
     #[cfg(target_os = "linux")]
-    pub(super) fn update_run_loop_registration(self: &Arc<Self>, frame: Option<*mut FUnknown>) {
+    pub(super) unsafe fn update_run_loop_registration(
+        self: &Arc<Self>,
+        frame: Option<*mut FUnknown>,
+    ) {
         use super::wake::linux::{FdWake, TimerWake, run_loop_of};
-        let run_loop = frame.and_then(run_loop_of);
+        // SAFETY: the caller guarantees `frame` is null or live for this call.
+        let run_loop = frame.and_then(|f| unsafe { run_loop_of(f) });
         if self.persist_wanted
             && let Some(rl) = &run_loop
         {
@@ -1537,10 +1599,15 @@ impl Host {
     }
 
     /// Keep the first host context offered; later ones are ignored.
+    ///
+    /// # Safety
+    ///
+    /// `context` is null or a live COM object for this call.
     #[cfg(target_os = "linux")]
-    pub(super) fn set_host_context(&self, context: *mut FUnknown) {
-        // SAFETY: `context` is null or a live host object for this call.
+    pub(super) unsafe fn set_host_context(&self, context: *mut FUnknown) {
         if self.context.get().is_none()
+            // SAFETY: the caller guarantees `context` is null or live; `retain`
+            // takes our own reference before the call returns.
             && let Some(c) = unsafe { super::retain(context) }
         {
             let _ = self.context.set(c);
@@ -1617,15 +1684,21 @@ impl Host {
         changes: *mut IParameterChanges,
         will_process: bool,
     ) -> bool {
+        // SAFETY: The caller passes the host's `IParameterChanges` for this `process` call: null
+        // (handled by `from_raw`) or live for the call's duration.
         let changes = unsafe { ComRef::from_raw(changes) };
+        // SAFETY: `c` is the live host change list.
         let queue_count = changes.map_or(0, |c| unsafe { c.getParameterCount() });
         let mut dropped = false;
         if !will_process {
             // A flush: nothing is queued, every final value commits now.
             for i in 0..queue_count {
                 let queue =
+                    // SAFETY: `c` is the live host change list and `i` is below its count.
                     changes.map_or(std::ptr::null_mut(), |c| unsafe { c.getParameterData(i) });
+                // SAFETY: `queue` comes from the live change list for this `process` call.
                 if let Some(mut cursor) = unsafe { ParamCursor::new(self, queue, false) } {
+                    // SAFETY: The queue outlives this `process` call.
                     dropped |= unsafe { cursor.drain(self) };
                 }
             }
@@ -1641,15 +1714,18 @@ impl Host {
         heap.clear();
         let mut overflow_from = queue_count;
         for i in 0..queue_count {
+            // SAFETY: `c` is the live host change list and `i` is below its count.
             let queue = changes.map_or(std::ptr::null_mut(), |c| unsafe { c.getParameterData(i) });
             if cursors.len() == cursors.capacity() {
                 overflow_from = i;
                 break;
             }
+            // SAFETY: `queue` comes from the live change list for this `process` call.
             let Some(mut cursor) = (unsafe { ParamCursor::new(self, queue, true) }) else {
                 continue;
             };
             // A queue without a readable point changes nothing.
+            // SAFETY: The queue outlives this `process` call.
             if unsafe { cursor.advance() } {
                 #[allow(clippy::cast_possible_truncation)]
                 heap.push(Reverse((cursor.pending.0, cursors.len() as u32)));
@@ -1657,6 +1733,8 @@ impl Host {
             }
         }
 
+        // SAFETY: The caller passes the host's `IEventList` for this `process` call (null or live
+        // for its duration).
         let mut notes = unsafe { NoteCursor::new(events) };
         loop {
             let note_offset = notes.pending.as_ref().map(|(n, _)| n.sample_offset);
@@ -1676,11 +1754,13 @@ impl Host {
                 // Parameter points continue using their reserved headroom.
                 let status = self.backend().push_input_event(&event, data);
                 if status != OUTPUT_QUEUE_FULL {
+                    // SAFETY: The event list outlives this `process` call.
                     unsafe { notes.advance() };
                 }
             } else if let Some(Reverse((_, index))) = heap.pop() {
                 let cursor = &mut cursors[index as usize];
                 dropped |= cursor.emit(self);
+                // SAFETY: The cursor's queue outlives this `process` call.
                 if unsafe { cursor.advance() } {
                     heap.push(Reverse((cursor.pending.0, index)));
                 } else {
@@ -1689,8 +1769,11 @@ impl Host {
             }
         }
         for i in overflow_from..queue_count {
+            // SAFETY: `c` is the live host change list and `i` is below its count.
             let queue = changes.map_or(std::ptr::null_mut(), |c| unsafe { c.getParameterData(i) });
+            // SAFETY: `queue` comes from the live change list for this `process` call.
             if let Some(mut cursor) = unsafe { ParamCursor::new(self, queue, true) } {
+                // SAFETY: The queue outlives this `process` call.
                 dropped |= unsafe { cursor.drain(self) };
             }
         }
@@ -1699,20 +1782,28 @@ impl Host {
 
     /// The last point of every queue, committed after an overflowed block.
     unsafe fn commit_final_values(&self, changes: *mut IParameterChanges) {
+        // SAFETY: The caller passes the host's `IParameterChanges` for this `process` call (null or
+        // live for its duration).
         let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
             return;
         };
         let backend = self.backend();
+        // SAFETY: `changes` is the live host change list.
         for i in 0..unsafe { changes.getParameterCount() } {
+            // SAFETY: `i` is below the live list's count; a null queue is handled by `from_raw`.
             let Some(queue) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else {
                 continue;
             };
+            // SAFETY: `queue` is the live host queue.
             let count = unsafe { queue.getPointCount() };
             let (mut offset, mut value) = (0, 0.0);
             if count > 0
+                // SAFETY: `queue` is live, `count - 1` is in range (`count > 0`), and both
+                // out-pointers are locals.
                 && unsafe { queue.getPoint(count - 1, &raw mut offset, &raw mut value) }
                     == kResultOk
             {
+                // SAFETY: `queue` is the live host queue.
                 let id = unsafe { queue.getParameterId() };
                 let plain = backend.param_denormalize(id, value);
                 backend.param_set_value(id, plain);
@@ -1752,6 +1843,8 @@ impl Host {
     /// Note-id bookkeeping is committed only after the host accepted each.
     unsafe fn drain_output_events(&self, list: *mut IEventList) -> u32 {
         let backend = self.backend();
+        // SAFETY: The caller passes the host's output `IEventList` for this `process` call (null or
+        // live for its duration).
         let list = unsafe { ComRef::from_raw(list) };
         let mut result = OUTPUT_END;
         backend.begin_output_events();
@@ -1766,6 +1859,7 @@ impl Host {
             let Some(list) = list else {
                 return OUTPUT_UNSUPPORTED;
             };
+            // SAFETY: `Event` is a plain C struct/union for which all-zero bytes are a valid value.
             let mut ev: Event = unsafe { std::mem::zeroed() };
             ev.busIndex = n.bus_index;
             ev.sampleOffset = n.sample_offset;
@@ -1824,6 +1918,8 @@ impl Host {
                 },
                 _ => return OUTPUT_INVALID,
             };
+            // SAFETY: `list` is the live host output list; `ev` is a local the host copies (a
+            // `DataEvent`'s bytes stay owned by the backend until the next `begin_output_events`).
             if unsafe { list.addEvent(&raw mut ev) } != kResultOk {
                 return OUTPUT_QUEUE_FULL;
             }
@@ -1840,6 +1936,8 @@ impl Host {
         count: u32,
         mut result: u32,
     ) -> u32 {
+        // SAFETY: The caller passes the host's output `IParameterChanges` for this call (null or
+        // live for its duration).
         let Some(changes) = (unsafe { ComRef::from_raw(changes) }) else {
             return result;
         };
@@ -1849,10 +1947,13 @@ impl Host {
                 continue;
             };
             let mut index = 0;
+            // SAFETY: `changes` is the live output list; `id` and `index` are locals.
             let queue = unsafe { changes.addParameterData(&raw const id, &raw mut index) };
+            // SAFETY: `queue` is null or a queue owned by the live output list.
             let Some(queue) = (unsafe { ComRef::from_raw(queue) }) else {
                 return OUTPUT_QUEUE_FULL;
             };
+            // SAFETY: `queue` is the live output queue; `index` is a local out slot.
             if unsafe { queue.addPoint(offset, value, &raw mut index) } != kResultOk {
                 return OUTPUT_QUEUE_FULL;
             }
@@ -1881,14 +1982,19 @@ impl Host {
         if will_process {
             backend.begin_input_events(frames);
         }
+        // SAFETY: `data`'s event and parameter pointers are the host's for this `process` call,
+        // which is `ingest_inputs`'s contract.
         let dropped = unsafe {
             self.ingest_inputs(data.inputEvents, data.inputParameterChanges, will_process)
         };
         if !will_process {
             return kResultOk;
         }
+        // SAFETY: `processContext` is null or the host's context for this call.
         let transport = unsafe { data.processContext.as_ref() }.map(Self::transport);
 
+        // SAFETY: Only `process` and `setupProcessing` touch `scratch`, and the host never overlaps
+        // them; `ingest_inputs`'s borrow has ended.
         let scratch = unsafe { &mut *self.scratch.get() };
         let use64 = cfg.sample_size == SymbolicSampleSizes_::kSample64 as i32;
         let in_active = self.in_active.load(Ordering::Acquire);
@@ -1932,6 +2038,8 @@ impl Host {
             if !scratch.trash.is_empty() && max_frames > 0 {
                 let trash = scratch.trash.as_mut_ptr();
                 let blocks = scratch.trash.len() / max_frames;
+                // SAFETY: `c.min(blocks - 1) * max_frames` stays inside `trash`, which holds
+                // `blocks >= 1` (non-empty) blocks of `max_frames` samples.
                 let block = |c: usize| unsafe {
                     trash.add(c.min(blocks - 1) * max_frames).cast::<c_void>()
                 };
@@ -1953,6 +2061,9 @@ impl Host {
         for c in 0..num_in.min(num_out) {
             let (src, dst) = (scratch.in_ptrs[c], scratch.out_ptrs[c]);
             if !src.is_null() && !dst.is_null() && src != dst.cast_const() {
+                // SAFETY: `src` and `dst` are non-null channel buffers of at least `frames` samples
+                // at the negotiated width (host buffers by contract, or our `silence`/`trash`,
+                // sized to `max_frames >= frames`); `ptr::copy` tolerates overlap.
                 unsafe { std::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), bytes) };
             }
         }
@@ -1970,12 +2081,17 @@ impl Host {
         };
         PROCESSING.with(|p| p.set(self));
         let ok = if use64 {
+            // SAFETY: `args` holds `num_in`/`num_out` channel pointers, each null or `frames`
+            // 64-bit samples long, which is `process_f64`'s contract.
             unsafe { backend.process_f64(&mut args) }
         } else {
+            // SAFETY: `args` holds `num_in`/`num_out` channel pointers, each null or `frames`
+            // 32-bit samples long, which is `process_f32`'s contract.
             unsafe { backend.process_f32(&mut args) }
         };
         PROCESSING.with(|p| p.set(std::ptr::null()));
         if dropped {
+            // SAFETY: Same live host parameter list as above, still within this `process` call.
             unsafe { self.commit_final_values(data.inputParameterChanges) };
         }
 
@@ -1989,17 +2105,21 @@ impl Host {
                 (desc.num_output_buses().min(32) as usize).min(data.numOutputs.max(0) as usize);
             for b in 0..buses {
                 if out_active & (1 << b) != 0 {
+                    // SAFETY: `data.outputs` is non-null and `b < numOutputs`, so this is one of
+                    // the host's output bus structs.
                     unsafe { (*data.outputs.add(b)).silenceFlags = 0 };
                 }
             }
         }
 
         let out_params = backend.output_param_count();
+        // SAFETY: `outputEvents` is the host's list for this `process` call (null or live).
         let mut result = unsafe { self.drain_output_events(data.outputEvents) };
         if out_params > 0 && matches!(result, OUTPUT_END | OUTPUT_EMITTED) {
             result = if data.outputParameterChanges.is_null() {
                 OUTPUT_UNSUPPORTED
             } else {
+                // SAFETY: `outputParameterChanges` is non-null (checked) and live for this call.
                 unsafe { self.write_output_params(data.outputParameterChanges, out_params, result) }
             };
         }
@@ -2032,8 +2152,12 @@ fn gather<T>(
     let mut n = 0;
     for (b, &declared) in widths.iter().enumerate() {
         let bus =
+            // SAFETY: `buses` is non-null and `b < count`, so this is one of the host's bus
+            // structs.
             (!buses.is_null() && b < count.max(0) as usize).then(|| unsafe { &*buses.add(b) });
         let on = b < 32 && active & (1 << b) != 0;
+        // SAFETY: The union arm read matches the negotiated sample size (`use64`), as the SDK
+        // requires.
         let channels = bus.and_then(|bus| unsafe {
             let p = if use64 {
                 bus.__field0.channelBuffers64.cast::<*mut c_void>()
@@ -2047,6 +2171,8 @@ fn gather<T>(
                 return n;
             };
             *slot = conv(match channels {
+                // SAFETY: `p` is non-null and `c < supplied` (the bus's `numChannels`), so the read
+                // stays inside the host's channel array.
                 Some((p, supplied)) if on && c < supplied => unsafe { *p.add(c as usize) },
                 _ => std::ptr::null_mut(),
             });
@@ -2071,6 +2197,8 @@ impl Drop for Host {
             }
             // Closes `HostQueue` and joins any in-flight `wake_host_queue` while
             // `self` and its OS wakes are still alive.
+            // SAFETY: Unbinding with `None` has no pointer precondition; it closes `HostQueue`
+            // while `self` is still whole.
             unsafe { backend.bind_host_queue(0, None) };
         }
         // Queued editor calls go out while the handler is still held, if
@@ -2289,16 +2417,26 @@ fn is_dir(dir: BusDirection) -> Option<bool> {
 impl IPluginBaseTrait for Component {
     unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
         #[cfg(target_os = "linux")]
-        if let Some(rl) = super::wake::linux::run_loop_of(context) {
+        // SAFETY: `initialize`'s `context` is null or the host application
+        // object, live for this call.
+        if let Some(rl) = unsafe { super::wake::linux::run_loop_of(context) } {
             self.host.bind_persist_run_loop(rl);
         }
+        // SAFETY: as above; `set_host_context` retains it before returning.
         #[cfg(target_os = "linux")]
-        self.host.set_host_context(context);
+        unsafe {
+            self.host.set_host_context(context);
+        }
         if let Some(app) =
+            // SAFETY: `context` is null (handled by `from_raw`) or the host's live context for this
+            // call.
             unsafe { ComRef::from_raw(context) }.and_then(|c| c.cast::<IHostApplication>())
         {
             let mut name: String128 = [0; 128];
+            // SAFETY: `app` is the live `IHostApplication`; `name` is a local `String128`.
             if unsafe { app.getName(&raw mut name) } == kResultOk {
+                // SAFETY: `name` is a local array of `name.len()` units; the read stops at its NUL
+                // or end.
                 let name = unsafe { utf16_from(name.as_ptr(), name.len()) };
                 self.host
                     .set_dynamic_support(DynamicSupport::for_host(&name));
@@ -2352,6 +2490,7 @@ impl IComponentTrait for Component {
         index: int32,
         bus: *mut BusInfo,
     ) -> tresult {
+        // SAFETY: `bus` is null (rejected) or the host's `BusInfo` out slot for this call.
         let (Some(bus), Some(input)) = (unsafe { bus.as_mut() }, is_dir(dir)) else {
             return kInvalidArgument;
         };
@@ -2488,9 +2627,11 @@ impl IComponentTrait for Component {
     }
 
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        // SAFETY: `state` is null (rejected) or the host's live stream for this call.
         let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
             return kResultFalse;
         };
+        // SAFETY: `stream` is the host's live stream for this call.
         let context = unsafe { stream_state_context(stream) };
         if self
             .host
@@ -2506,9 +2647,11 @@ impl IComponentTrait for Component {
     }
 
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
+        // SAFETY: `state` is null (rejected) or the host's live stream for this call.
         let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
             return kResultFalse;
         };
+        // SAFETY: `stream` is the host's live stream for this call.
         let context = unsafe { stream_state_context(stream) };
         if self
             .host
@@ -2534,10 +2677,13 @@ unsafe fn stream_state_context(stream: ComRef<'_, IBStream>) -> moose_core::stat
     // SAFETY: `IStreamAttributes::getAttributes()` returns a borrowed
     // `*mut IAttributeList` (no extra AddRef) valid while `attrs` is alive.
     let list_ptr = unsafe { attrs.getAttributes() };
+    // SAFETY: `list_ptr` is null (rejected) or a borrowed list live while `attrs` is.
     let Some(list) = (unsafe { ComRef::from_raw(list_ptr) }) else {
         return moose_core::state::StateContext::Unknown;
     };
     let mut buf = [0 as TChar; 64];
+    // SAFETY: `list` is live; `kStateType` is a static C string and `buf` is a local
+    // buffer whose byte size is passed as the capacity.
     let res = unsafe {
         list.getString(
             PresetAttributes::kStateType,
@@ -2548,6 +2694,7 @@ unsafe fn stream_state_context(stream: ComRef<'_, IBStream>) -> moose_core::stat
     if res != kResultOk {
         return moose_core::state::StateContext::Unknown;
     }
+    // SAFETY: `buf` is a local, fully initialised array of `buf.len()` UTF-16 units.
     let state_type = unsafe { utf16_from(buf.as_ptr(), buf.len()) };
     parse_vst3_state_type(&state_type)
 }
@@ -2555,7 +2702,9 @@ unsafe fn stream_state_context(stream: ComRef<'_, IBStream>) -> moose_core::stat
 fn parse_vst3_state_type(state_type: &str) -> moose_core::state::StateContext {
     // SAFETY: `StateType::k*` constants in `vst3` are static NUL-terminated ASCII C strings.
     let k_project = unsafe { cstr(StateType::kProject) };
+    // SAFETY: As above, a static NUL-terminated C string.
     let k_default = unsafe { cstr(StateType::kDefault) };
+    // SAFETY: As above, a static NUL-terminated C string.
     let k_track_preset = unsafe { cstr(StateType::kTrackPreset) };
     if state_type == k_project {
         moose_core::state::StateContext::Project
@@ -2590,6 +2739,7 @@ impl IAudioProcessorTrait for Component {
                     if arr.is_null() {
                         0
                     } else {
+                        // SAFETY: `arr` is non-null and `i < n`, the array length the host passed.
                         unsafe { *arr.add(i) }.count_ones()
                     }
                 })
@@ -2598,8 +2748,10 @@ impl IAudioProcessorTrait for Component {
         let ins = widths(inputs, num_ins);
         let outs = widths(outputs, num_outs);
         if ins.iter().enumerate().any(|(i, &width)| {
+            // SAFETY: `inputs` is non-null (checked above when `num_ins > 0`) and `i < num_ins`.
             width == 0 || unsafe { *inputs.add(i) } != speaker_arrangement(width)
         }) || outs.iter().enumerate().any(|(i, &width)| {
+            // SAFETY: `outputs` is non-null (checked above when `num_outs > 0`) and `i < num_outs`.
             width == 0 || unsafe { *outputs.add(i) } != speaker_arrangement(width)
         }) {
             return kResultFalse;
@@ -2607,6 +2759,8 @@ impl IAudioProcessorTrait for Component {
         let Some(layout) = h.reg.factory.match_bus_layout_perbus(&ins, &outs) else {
             return kResultFalse;
         };
+        // SAFETY: `setBusArrangements` is only legal while inactive, when no other call touches
+        // `Config`.
         let cfg = unsafe { h.config_mut() };
         cfg.layout = layout;
         refresh_bus_channels(h.reg, cfg);
@@ -2634,6 +2788,7 @@ impl IAudioProcessorTrait for Component {
         if ch == 0 || ch > 64 {
             return kInvalidArgument;
         }
+        // SAFETY: `arr` is non-null (checked above) and is the host's out slot.
         unsafe { *arr = speaker_arrangement(ch) };
         kResultOk
     }
@@ -2649,13 +2804,17 @@ impl IAudioProcessorTrait for Component {
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        // SAFETY: `setup` is null (rejected) or the host's `ProcessSetup` for this call.
         let Some(setup) = (unsafe { setup.as_ref() }) else {
             return kInvalidArgument;
         };
+        // SAFETY: `canProcessSampleSize` has no preconditions.
         if unsafe { self.canProcessSampleSize(setup.symbolicSampleSize) } != kResultOk {
             return kResultFalse;
         }
         let h = &self.host;
+        // SAFETY: `setupProcessing` is only legal while inactive, when no other call touches
+        // `Config`.
         let cfg = unsafe { h.config_mut() };
         cfg.sample_size = setup.symbolicSampleSize;
         cfg.sample_rate = setup.sampleRate;
@@ -2663,6 +2822,7 @@ impl IAudioProcessorTrait for Component {
         cfg.process_mode = setup.processMode;
         let frames = cfg.max_frames as usize;
         let d = &h.reg.desc;
+        // SAFETY: `setupProcessing` never overlaps `process`, the only other user of `scratch`.
         let scratch = unsafe { &mut *h.scratch.get() };
         scratch.silence = if d.max_inputs > 0 {
             vec![0.0; frames]
@@ -2686,7 +2846,11 @@ impl IAudioProcessorTrait for Component {
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        // SAFETY: `data` is null (handled) or the host's `ProcessData`, exclusively ours for this
+        // call.
         match unsafe { data.as_mut() } {
+            // SAFETY: `data` holds the host's buffers, event lists and parameter changes for this
+            // call, which is `Host::process`'s contract.
             Some(data) => unsafe { self.host.process(data) },
             None => kResultOk,
         }
@@ -2719,6 +2883,7 @@ impl IEditControllerTrait for Component {
     unsafe fn getParameterInfo(&self, index: int32, info: *mut ParameterInfo) -> tresult {
         let reg = self.host.reg;
         let backend = self.host.backend();
+        // SAFETY: `info` is null (rejected) or the host's out slot for this call.
         let Some(info) = (unsafe { info.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -2775,6 +2940,7 @@ impl IEditControllerTrait for Component {
         normalized: ParamValue,
         string: *mut String128,
     ) -> tresult {
+        // SAFETY: `string` is null (rejected) or the host's `String128` out slot.
         let Some(string) = (unsafe { string.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -2810,18 +2976,22 @@ impl IEditControllerTrait for Component {
         }
         let h = &self.host;
         let backend = h.backend();
+        // SAFETY: `string` is non-null (checked) and NUL-terminated within the host's `String128`
+        // (256 bytes covers it).
         let raw_text = unsafe { utf16_from(string, 256) };
         if id == h.program_change_id {
             let programs = backend.program_list();
             let Some(idx) = programs.iter().position(|p| p.name == raw_text) else {
                 return kResultFalse;
             };
+            // SAFETY: `normalized` is non-null (checked) and is the host's out slot.
             unsafe { *normalized = program_normalized_from_index(idx, programs.len()) };
             return kResultOk;
         }
         let Some(plain) = backend.param_parse(id, &raw_text) else {
             return kResultFalse;
         };
+        // SAFETY: `normalized` is non-null (checked) and is the host's out slot.
         unsafe { *normalized = backend.param_normalize(id, plain) };
         kResultOk
     }
@@ -2900,6 +3070,8 @@ impl IEditControllerTrait for Component {
 
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
         let h = &self.host;
+        // SAFETY: `handler` is null or the host's live handler; `retain` adds the reference we
+        // keep.
         let handler = unsafe { retain(handler) };
         let has_handler = handler.is_some();
         let has_handler3 = handler
@@ -2958,6 +3130,7 @@ impl IMidiMappingTrait for Component {
         controller: CtrlNumber,
         id: *mut ParamID,
     ) -> tresult {
+        // SAFETY: `id` is null (rejected) or the host's out slot.
         let Some(out) = (unsafe { id.as_mut() }) else {
             return kResultFalse;
         };
@@ -3055,6 +3228,7 @@ impl IMidiMapping2Trait for Component {
         direction: BusDirections,
         list: *const Midi2ControllerParamIDAssignmentList,
     ) -> tresult {
+        // SAFETY: `list` is null (rejected) or the host's assignment list for this call.
         let Some(list) = (unsafe { list.as_ref() }) else {
             return kInvalidArgument;
         };
@@ -3114,6 +3288,7 @@ impl IMidiMapping2Trait for Component {
         direction: BusDirections,
         list: *const Midi1ControllerParamIDAssignmentList,
     ) -> tresult {
+        // SAFETY: `list` is null (rejected) or the host's assignment list for this call.
         let Some(list) = (unsafe { list.as_ref() }) else {
             return kInvalidArgument;
         };
@@ -3126,6 +3301,7 @@ impl IMidiMapping2Trait for Component {
         let mut n = 0;
         self.midi1_assignments(|a| {
             if n < list.count {
+                // SAFETY: `map` is non-null whenever `count > 0` (checked above) and `n < count`.
                 unsafe { list.map.add(n as usize).write(a) };
                 n += 1;
             }
@@ -3146,6 +3322,7 @@ impl IParameterFunctionNameTrait for Component {
         }
         let h = &self.host;
         let backend = h.backend();
+        // SAFETY: `name` is non-null (checked) and is the host's NUL-terminated function name.
         let want = unsafe { CStr::from_ptr(name) };
         let found = h
             .reg
@@ -3155,6 +3332,7 @@ impl IParameterFunctionNameTrait for Component {
             .filter(|&(_, &u)| unit == kRootUnitId || u == unit)
             .map(|(p, _)| p.id)
             .find(|&pid| backend.param_function_name(pid) == Some(want));
+        // SAFETY: `id` is non-null (checked) and is the host's out slot.
         unsafe { *id = found.unwrap_or(kNoParamId) };
         if found.is_some() {
             kResultTrue
@@ -3175,13 +3353,17 @@ impl IRemapParamIDTrait for Component {
             return kInvalidArgument;
         }
         let mut cid = [0u8; 16];
+        // SAFETY: `plugin_to_replace_uid` is non-null (checked) and is a 16-byte `TUID`; `cid` is a
+        // local of the same size.
         unsafe {
             std::ptr::copy_nonoverlapping(plugin_to_replace_uid.cast::<u8>(), cid.as_mut_ptr(), 16);
         }
         if let Some(out_id) = self.host.backend().remap_param_id(cid, old_param_id) {
+            // SAFETY: `new_param_id` is non-null (checked) and is the host's out slot.
             unsafe { *new_param_id = out_id };
             kResultOk
         } else {
+            // SAFETY: `new_param_id` is non-null (checked) and is the host's out slot.
             unsafe { *new_param_id = kNoParamId };
             kResultFalse
         }
@@ -3190,10 +3372,12 @@ impl IRemapParamIDTrait for Component {
 
 impl IInfoListenerTrait for Component {
     unsafe fn setChannelContextInfos(&self, list: *mut IAttributeList) -> tresult {
+        // SAFETY: `list` is null (rejected) or the host's live attribute list for this call.
         let Some(list) = (unsafe { ComRef::from_raw(list) }) else {
             return kInvalidArgument;
         };
         let mut name = [0 as TChar; 256];
+        // SAFETY: `list` is live; `name` is a local buffer whose byte size is passed.
         let name = (unsafe {
             list.getString(
                 kChannelNameKey,
@@ -3201,8 +3385,11 @@ impl IInfoListenerTrait for Component {
                 size_of_val(&name) as u32,
             )
         } == kResultOk)
+            // SAFETY: `name` is a local array of `name.len()` units; the read stops at its NUL or
+            // end.
             .then(|| unsafe { utf16_from(name.as_ptr(), name.len()) });
         let mut color = 0i64;
+        // SAFETY: `list` is live and `color` is a local.
         let color_argb = (unsafe { list.getInt(kChannelColorKey, &raw mut color) } == kResultOk)
             .then_some(color as u32);
         let info = Vst3TrackInfo { name, color_argb };
@@ -3293,6 +3480,7 @@ impl IUnitInfoTrait for Component {
         let unit = usize::try_from(index)
             .ok()
             .and_then(|i| self.host.reg.units.get(i));
+        // SAFETY: `info` is null (rejected) or the host's out slot.
         let (Some(info), Some(unit)) = (unsafe { info.as_mut() }, unit) else {
             return kInvalidArgument;
         };
@@ -3313,6 +3501,7 @@ impl IUnitInfoTrait for Component {
     }
 
     unsafe fn getProgramListInfo(&self, index: int32, info: *mut ProgramListInfo) -> tresult {
+        // SAFETY: `info` is null (rejected) or the host's out slot.
         let Some(info) = (unsafe { info.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -3335,6 +3524,7 @@ impl IUnitInfoTrait for Component {
         index: int32,
         name: *mut String128,
     ) -> tresult {
+        // SAFETY: `name` is null (rejected) or the host's `String128` out slot.
         let Some(name) = (unsafe { name.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -3356,6 +3546,7 @@ impl IUnitInfoTrait for Component {
         attribute: vst3::Steinberg::Vst::CString,
         value: *mut String128,
     ) -> tresult {
+        // SAFETY: `value` is null (rejected) or the host's `String128` out slot.
         let Some(value) = (unsafe { value.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -3366,6 +3557,7 @@ impl IUnitInfoTrait for Component {
         let Some(preset) = usize::try_from(index).ok().and_then(|i| programs.get(i)) else {
             return kInvalidArgument;
         };
+        // SAFETY: `attribute` is null or the host's NUL-terminated attribute name for this call.
         let attr = unsafe { cstr(attribute) };
         if matches!(attr, "Style" | "Category" | "Instrument") && !preset.category.is_empty() {
             utf16_into(value, &preset.category);
@@ -3409,6 +3601,8 @@ impl IUnitInfoTrait for Component {
     }
 
     unsafe fn setUnitProgramData(&self, list: int32, index: int32, data: *mut IBStream) -> tresult {
+        // SAFETY: Forwarded unchanged: `data` is null or the host's live stream, `setProgramData`'s
+        // contract.
         unsafe { self.setProgramData(list, index, data) }
     }
 }
@@ -3428,6 +3622,7 @@ impl IProgramListDataTrait for Component {
         program_index: int32,
         data: *mut IBStream,
     ) -> tresult {
+        // SAFETY: `data` is null (rejected) or the host's live stream for this call.
         let Some(stream) = (unsafe { ComRef::from_raw(data) }) else {
             return kInvalidArgument;
         };
@@ -3446,6 +3641,8 @@ impl IProgramListDataTrait for Component {
         while written < bytes.len() {
             let chunk = (bytes.len() - written).min(i32::MAX as usize);
             let mut wrote: int32 = 0;
+            // SAFETY: `stream` is live; the source range is `chunk` readable bytes of `bytes` (the
+            // SDK takes `*mut`, but `write` only reads) and `wrote` is a local.
             let rc = unsafe {
                 stream.write(
                     bytes[written..].as_ptr().cast_mut().cast(),
@@ -3467,6 +3664,7 @@ impl IProgramListDataTrait for Component {
         program_index: int32,
         data: *mut IBStream,
     ) -> tresult {
+        // SAFETY: `data` is null (rejected) or the host's live stream for this call.
         let Some(stream) = (unsafe { ComRef::from_raw(data) }) else {
             return kInvalidArgument;
         };
@@ -3574,13 +3772,16 @@ impl INoteExpressionControllerTrait for Component {
             .ok()
             .and_then(|i| NOTE_EXPRESSIONS.get(i));
         let (Some(info), Some(&(id, title, short, default, bipolar))) =
+            // SAFETY: `info` is null (rejected) or the host's out slot.
             (unsafe { info.as_mut() }, entry)
         else {
             return kInvalidArgument;
         };
+        // SAFETY: `getNoteExpressionCount` only reads its integer arguments.
         if unsafe { self.getNoteExpressionCount(bus, channel) } == 0 {
             return kInvalidArgument;
         }
+        // SAFETY: `NoteExpressionTypeInfo` is a plain C struct for which all-zero bytes are valid.
         *info = unsafe { std::mem::zeroed() };
         info.typeId = id;
         utf16_into(&mut info.title, title);
@@ -3608,6 +3809,7 @@ impl INoteExpressionControllerTrait for Component {
         value: NoteExpressionValue,
         string: *mut String128,
     ) -> tresult {
+        // SAFETY: `string` is null (rejected) or the host's `String128` out slot.
         let Some(string) = (unsafe { string.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -3626,8 +3828,10 @@ impl INoteExpressionControllerTrait for Component {
         if string.is_null() || value.is_null() {
             return kResultFalse;
         }
+        // SAFETY: `string` is non-null (checked) and NUL-terminated within the host's `String128`.
         match note_expression_value(id, &unsafe { utf16_from(string, 64) }) {
             Some(v) => {
+                // SAFETY: `value` is non-null (checked) and is the host's out slot.
                 unsafe { *value = v };
                 kResultOk
             }
@@ -3646,6 +3850,7 @@ impl INoteExpressionPhysicalUIMappingTrait for Component {
         if bus < 0 || bus >= self.host.reg.desc.midi_input_ports {
             return kInvalidArgument;
         }
+        // SAFETY: `list` is null (rejected) or the host's mapping list for this call.
         let Some(list) = (unsafe { list.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -3654,8 +3859,11 @@ impl INoteExpressionPhysicalUIMappingTrait for Component {
         }
         let entries = if list.count == 0 {
             &mut [][..]
+        } else if list.map.is_null() {
+            return kInvalidArgument;
         } else {
-            // SAFETY: caller supplies `list.count` writable `PhysicalUIMap` items.
+            // SAFETY: `map` is non-null and the caller supplies `list.count`
+            // writable `PhysicalUIMap` items for this call.
             unsafe { std::slice::from_raw_parts_mut(list.map, list.count as usize) }
         };
         for entry in entries {
@@ -3697,6 +3905,7 @@ impl IKeyswitchControllerTrait for Component {
         if bus < 0 || bus >= self.host.reg.desc.midi_input_ports || !(0..16).contains(&channel) {
             return kInvalidArgument;
         }
+        // SAFETY: `info` is null (rejected) or the host's out slot.
         let Some(info) = (unsafe { info.as_mut() }) else {
             return kInvalidArgument;
         };
@@ -3707,6 +3916,7 @@ impl IKeyswitchControllerTrait for Component {
         else {
             return kInvalidArgument;
         };
+        // SAFETY: `KeyswitchInfo` is a plain C struct for which all-zero bytes are valid.
         *info = unsafe { std::mem::zeroed() };
         info.typeId = match ks.kind {
             moose_core::main_thread::KeyswitchKind::NoteOn => {

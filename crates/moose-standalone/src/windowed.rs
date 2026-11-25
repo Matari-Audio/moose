@@ -689,6 +689,8 @@ where
         #[cfg(target_os = "macos")]
         if let Some(h) = appkit(window)
             && let Some(os_size) =
+                // SAFETY: `h.ns_window` is the live `NSWindow` baseview owns for this window, and
+                // `on_frame` runs on the main (event-loop) thread.
                 unsafe { crate::windowed_macos::content_logical_size(h.ns_window) }
             && os_size.0 > 0
             && os_size.1 > 0
@@ -932,6 +934,8 @@ where
             unsafe extern "C" {
                 fn _exit(status: i32) -> !;
             }
+            // SAFETY: `_exit` takes an int and never returns. Skipping atexit handlers and
+            // destructors is the intent here (see above).
             unsafe { _exit(0) };
         }
 

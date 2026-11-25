@@ -117,6 +117,9 @@ fn background_task_runs_when_scheduled_from_process() {
     let mut output = vec![0.0f32; 64];
     let inputs: Vec<&[f32]> = vec![&input];
     let mut outputs: Vec<&mut [f32]> = vec![&mut output];
+    // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at least
+    // `num_samples` long, and no input to alias an output. These are distinct local `Vec`s/arrays
+    // of exactly that length.
     let mut buffer = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
     let transport = TransportInfo::default();
     let mut output_events = EventList::default();

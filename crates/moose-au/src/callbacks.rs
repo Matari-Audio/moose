@@ -108,6 +108,8 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
         "create",
         std::ptr::null_mut(),
         || {
+            // SAFETY: The adapter passes null or a `MooseAuHostSink` prefix whose `size` word is
+            // readable, which is `HostSink::from_raw`'s contract.
             let host_sink = unsafe { HostSink::from_raw(sink) };
             let mut plugin = P::create();
             plugin.init();
@@ -124,6 +126,8 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
 
             let render_signals = Arc::new(RenderSignals::default());
             let (host_dispatch, host_queue) =
+                // SAFETY: `Dispatcher::new` has no preconditions beyond running inside `create`; a
+                // `None` result fails instantiation below.
                 if let Some((dispatch, wake)) = unsafe { host_drain::Dispatcher::new() } {
                     let signals = Arc::clone(&render_signals);
                     let queue = HostQueue::with_deferred_wake(wake, move || signals.defer());
@@ -251,6 +255,10 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
                 host_sink,
             });
             let raw = Box::into_raw(instance);
+            // SAFETY: `raw` came from `Box::into_raw` above and nothing else has seen it yet.
+            // `activate` binds it to the dispatch source, whose drains dereference it only inside
+            // `HostQueue::with_open`, and `finalize_destroy` closes that queue before freeing the
+            // box.
             unsafe {
                 if let Some(dispatch) = &(*raw).host_dispatch {
                     dispatch.activate::<P>(
@@ -268,6 +276,9 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
 }
 
 pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    // SAFETY: The shim calls `destroy` once, with the non-null pointer `create_with_sink` returned.
+    // Only shared references are formed before `finalize_destroy`, and finalization is deferred
+    // when a drain on this thread still holds the instance open.
     unsafe {
         if !ctx.is_null() {
             let raw = ctx.cast::<AuInstance<P>>();
@@ -293,6 +304,9 @@ pub(crate) unsafe extern "C" fn cb_destroy<P: PluginExport>(ctx: *mut std::ffi::
 /// Complete instance teardown after any enclosing `HostQueue::with_open` drain
 /// on the current thread has exited.
 pub(crate) unsafe fn finalize_destroy<P: PluginExport>(raw: *mut AuInstance<P>) {
+    // SAFETY: `raw` is the live instance from `cb_destroy`, finalized once. `close()` waits for
+    // every `with_open` drain to return, so `Box::from_raw` frees memory no other thread can still
+    // reach.
     unsafe {
         #[cfg(target_os = "macos")]
         {
@@ -315,6 +329,8 @@ pub(crate) unsafe extern "C" fn cb_set_active<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     active: u32,
 ) {
+    // SAFETY: `ctx` is null-checked and otherwise the live instance (module contract); only a
+    // shared `&AuInstance` is formed and its mutable parts go through their own cells and locks.
     run_extern_callback_with::<P, ()>("au", "set_active", (), || unsafe {
         if ctx.is_null() {
             return;
@@ -371,6 +387,8 @@ pub(crate) unsafe extern "C" fn cb_set_context_name<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     name_utf8: *const c_char,
 ) {
+    // SAFETY: `ctx` is null-checked and otherwise live. `name_utf8` is null-checked, and the shim
+    // passes a NUL-terminated string valid for this call.
     run_extern_callback_with::<P, ()>("au", "set_context_name", (), || unsafe {
         if ctx.is_null() {
             return;
@@ -402,6 +420,8 @@ pub(crate) unsafe extern "C" fn cb_param_ids<P: PluginExport>(
     out_ids: *mut u32,
     cap: u32,
 ) -> u32 {
+    // SAFETY: `ctx` is null-checked and otherwise live. The shim passes `out_ids` as null (count
+    // query) or an array of `cap` ids, which is `write_ids`'s contract.
     run_extern_callback_with::<P, u32>("au", "param_ids", 0, || unsafe {
         if ctx.is_null() {
             return 0;
@@ -416,6 +436,8 @@ pub(crate) unsafe extern "C" fn cb_param_info_by_id<P: PluginExport>(
     id: u32,
     out: *mut AuParamInfoOut,
 ) -> i32 {
+    // SAFETY: `ctx` and `out` are null-checked; `out` is the shim's `AuParamInfoOut`, written once
+    // with `ptr::write`.
     run_extern_callback_with::<P, i32>("au", "param_info_by_id", 0, || unsafe {
         if ctx.is_null() || out.is_null() {
             return 0;
@@ -436,6 +458,8 @@ pub(crate) unsafe extern "C" fn cb_param_clump_name<P: PluginExport>(
     out: *mut c_char,
     out_len: u32,
 ) -> u32 {
+    // SAFETY: `ctx` and `out` are null-checked, and the shim's `out` holds `out_len` bytes, which
+    // is `write_clump_name`'s contract.
     run_extern_callback_with::<P, u32>("au", "param_clump_name", 0, || unsafe {
         if ctx.is_null() || out.is_null() || out_len == 0 {
             return 0;
@@ -452,6 +476,9 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
 ) {
     // Author `reset` runs here; firewall it so a panic can't unwind across
     // the C ABI.
+    // SAFETY: The shim calls `reset` only with a live context (`au_v2_shim.c` checks `rustCtx`
+    // first); mutable state is reached through `audio`/`plugin` cells, with `try_enter` on the
+    // render thread.
     run_extern_callback_with::<P, ()>("au", "reset", (), || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         // Clamp host-supplied max_frames to a sane minimum.
@@ -552,6 +579,8 @@ pub(crate) unsafe extern "C" fn cb_set_render_mode<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     mode: u32,
 ) {
+    // SAFETY: The shim passes its live context; only an atomic is stored through the shared
+    // reference.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         // Normalize through `from_u8` so an out-of-range discriminant
@@ -689,6 +718,8 @@ pub(crate) fn push_native_input<P: PluginExport>(
             let bytes = if ev.data_len == 0 {
                 &[][..]
             } else {
+                // SAFETY: `ev.sysex` was checked non-null for a non-zero `data_len`, and the shim
+                // guarantees it points to `data_len` bytes for this render call.
                 unsafe { slice::from_raw_parts(ev.sysex, ev.data_len as usize) }
             };
             let Some(bytes) = bytes.strip_prefix(&[0xF0]) else {
@@ -1217,6 +1248,9 @@ pub(crate) unsafe extern "C" fn cb_process<P: PluginExport>(
     num_param_events: u32,
     transport_ptr: *const AuTransportSnapshot,
 ) {
+    // SAFETY: Every argument is forwarded unchanged from the shim's render call, which guarantees
+    // `cb_process_impl`'s contract (live `ctx`, channel pointer arrays sized to the channel counts,
+    // each buffer `num_frames` long, event pointers null or sized to their counts).
     unsafe {
         let _ = cb_process_impl::<P>(
             ctx,
@@ -1257,6 +1291,8 @@ pub(crate) unsafe extern "C" fn cb_process_native<P: PluginExport>(
     param_overflow: u32,
     transport_ptr: *const AuTransportSnapshot,
 ) -> u32 {
+    // SAFETY: Arguments forwarded unchanged from the shim's render call, which meets
+    // `cb_process_impl`'s contract.
     unsafe {
         cb_process_impl::<P>(
             ctx,
@@ -1298,6 +1334,8 @@ pub(crate) unsafe extern "C" fn cb_process_native_v11<P: PluginExport>(
     param_overflow: u32,
     transport_ptr: *const AuTransportSnapshot,
 ) -> u32 {
+    // SAFETY: Arguments forwarded unchanged from the shim's render call, which meets
+    // `cb_process_impl`'s contract.
     unsafe {
         cb_process_impl::<P>(
             ctx,
@@ -1339,6 +1377,8 @@ pub(crate) unsafe extern "C" fn cb_process_native_v13<P: PluginExport>(
     param_overflow: u32,
     transport_ptr: *const AuTransportSnapshot,
 ) -> u32 {
+    // SAFETY: Arguments forwarded unchanged from the shim's render call, which meets
+    // `cb_process_impl`'s contract.
     unsafe {
         cb_process_impl::<P>(
             ctx,
@@ -1380,6 +1420,11 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
     let mut process_status = AU_PROCESS_OK;
     // SAFETY: `ctx` is this wrapper's live instance.
     let latch = unsafe { &(*ctx.cast::<AuInstance<P>>()).panic_latch };
+    // SAFETY: `ctx` is the live instance and only a shared reference is formed; per-block state
+    // goes through `try_enter` cells. Each `outputs.add(ch)` stays below `num_output_channels`, and
+    // each non-null channel holds `num_frames` samples. Every event slice is built only after its
+    // pointer was null-checked against a non-zero length, and `transport_ptr` is read only when
+    // non-null.
     let ok = run_audio_block_latched::<P, ()>(latch, "AU", || unsafe {
         // Shared `&AuInstance` (never a whole-struct `&mut`) - the audio
         // scratch is reached through its ownership cell, so a concurrent
@@ -1798,6 +1843,8 @@ pub(crate) unsafe fn cb_process_impl<P: PluginExport>(
         process_status = AU_PROCESS_INVALID;
     }
     if !ok || process_status != AU_PROCESS_OK {
+        // SAFETY: `outputs` holds `num_output_channels` channel pointers, each `nf` frames long or
+        // null (the shim's render contract), and `zero_raw_outputs` skips null entries.
         unsafe {
             moose_core::c_abi_driver::zero_raw_outputs(outputs, num_output_channels, nf);
         }
@@ -1864,6 +1911,7 @@ pub fn rt_paranoid_smoke<P: PluginExport>() -> u32 {
 }
 
 pub(crate) unsafe extern "C" fn cb_param_count<P: PluginExport>(ctx: *mut std::ffi::c_void) -> u32 {
+    // SAFETY: The shim passes its live context; only a shared reference is formed.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         len_u32(catalog::control_snapshot(ctx, &inst.exposed).len())
@@ -1874,6 +1922,7 @@ pub(crate) unsafe extern "C" fn cb_param_get_value<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     id: u32,
 ) -> f64 {
+    // SAFETY: The shim passes its live context; parameter reads are atomic through `params_arc`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         inst.params_arc.get_plain(id).unwrap_or(0.0)
@@ -1885,6 +1934,8 @@ pub(crate) unsafe extern "C" fn cb_param_set_value<P: PluginExport>(
     id: u32,
     value: f64,
 ) {
+    // SAFETY: The shim passes its live context; the write goes through atomics and `edit_param`'s
+    // sequence slot.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         // Process feedback is already committed. Replaying its host echo here
@@ -1905,6 +1956,8 @@ pub(crate) unsafe extern "C" fn cb_param_format_value<P: PluginExport>(
     out: *mut c_char,
     out_len: u32,
 ) -> u32 {
+    // SAFETY: The shim passes its live context. `out` is null-checked against `out_len` before
+    // `copy_c_str`, which writes at most `out_len` bytes.
     run_extern_callback_with::<P, u32>("au", "format_value", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         if let Some(snapshot) = catalog::scoped_snapshot(ctx, &inst.exposed)
@@ -1931,6 +1984,8 @@ pub(crate) unsafe extern "C" fn cb_param_parse_value<P: PluginExport>(
     text: *const c_char,
     out_plain: *mut f64,
 ) -> i32 {
+    // SAFETY: The shim passes its live context; `parse_param_from_c_str` null-checks `text` and
+    // `out_plain`.
     run_extern_callback_with::<P, i32>("au", "parse_value", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         moose_core::c_abi_driver::parse_param_from_c_str(
@@ -1947,10 +2002,13 @@ pub(crate) unsafe extern "C" fn cb_state_save<P: PluginExport>(
     out_data: *mut *mut u8,
     out_len: *mut u32,
 ) {
+    // SAFETY: The shim always passes valid out-pointers for the saved bytes and their length.
     unsafe {
         *out_data = std::ptr::null_mut();
         *out_len = 0;
     }
+    // SAFETY: The shim passes its live context and the out-pointers written just above; ownership
+    // of the `malloc` buffer transfers to the caller, who returns it through `cb_state_free`.
     run_extern_callback_with::<P, ()>("au", "save_state", (), || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         if let Some((ptr, len)) = moose_core::c_abi_driver::save_state_to_host_buf(
@@ -1974,6 +2032,8 @@ pub(crate) unsafe extern "C" fn cb_state_load<P: PluginExport>(
     data: *const u8,
     len: u32,
 ) -> i32 {
+    // SAFETY: The shim passes its live context, and `data` (null-checked) points to `len` bytes for
+    // this call.
     run_extern_callback_with::<P, i32>("au", "load_state", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         if data.is_null() || len == 0 {
@@ -2002,6 +2062,7 @@ pub(crate) unsafe extern "C" fn cb_state_load<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_legacy_state_key_count<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
+    // SAFETY: The shim passes its live context; only a shared reference is formed.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         len_u32(inst.legacy_key_cstrings.len())
@@ -2012,6 +2073,8 @@ pub(crate) unsafe extern "C" fn cb_legacy_state_key_at<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     index: u32,
 ) -> *const c_char {
+    // SAFETY: The shim passes its live context. The returned pointer borrows a `CString` owned by
+    // the instance, valid until `destroy`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         inst.legacy_key_cstrings
@@ -2030,6 +2093,8 @@ pub(crate) unsafe extern "C" fn cb_state_load_foreign<P: PluginExport>(
     data: *const u8,
     len: u32,
 ) -> i32 {
+    // SAFETY: The shim passes its live context. `key` and `data` are null-checked; `key` is
+    // NUL-terminated and `data` holds `len` bytes for this call.
     run_extern_callback_with::<P, i32>("au", "migrate_state", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         if key.is_null() || data.is_null() || len == 0 {
@@ -2133,6 +2198,8 @@ pub(crate) fn load_custom_state<P: PluginExport>(
 }
 
 pub(crate) unsafe extern "C" fn cb_state_free(data: *mut u8, _len: u32) {
+    // SAFETY: `data` is null or a buffer `cb_state_save` allocated with `malloc` and handed to the
+    // shim, which returns it here once.
     unsafe {
         if !data.is_null() {
             free(data.cast::<std::ffi::c_void>());

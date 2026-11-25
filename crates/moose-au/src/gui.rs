@@ -67,6 +67,9 @@ impl Drop for DrainCtxGuard {
 
 /// Run a host callback under the queue lifetime gate. Only the outermost
 /// registration for this instance can take ownership of deferred teardown.
+///
+/// # Safety
+/// `ctx` is the `AuInstance<P>` that owns `queue`, live until `queue` closes.
 pub(crate) unsafe fn with_host_open<P: PluginExport, R>(
     queue: &HostQueue,
     ctx: *mut std::ffi::c_void,
@@ -81,6 +84,10 @@ pub(crate) unsafe fn with_host_open<P: PluginExport, R>(
         result
     });
     if finalize {
+        // SAFETY: `finalize` is set only when a re-entrant `cb_destroy` marked this registration
+        // for deferral, so this is that destroy's single deferred teardown. `with_open` has
+        // returned, so `close()` inside `finalize_destroy` cannot wait on this thread's own
+        // registration.
         unsafe { crate::callbacks::finalize_destroy::<P>(ctx.cast()) };
     }
     result
@@ -121,6 +128,8 @@ pub(crate) struct AuHost<P: PluginExport> {
 impl<P: PluginExport> AuHost<P> {
     fn send_gesture(&self, gesture: EditorGesture) {
         self.with_open(|| {
+            // SAFETY: Runs inside `with_open`: the queue is open, so `finalize_destroy` (which
+            // closes it first) has not freed the instance; only a shared reference is formed.
             let inst = unsafe { &*self.ctx.as_ptr().cast::<AuInstance<P>>() };
             Self::queue_gesture(inst, gesture);
         });
@@ -150,12 +159,16 @@ impl<P: PluginExport> AuHost<P> {
     }
 
     fn with_open<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        // SAFETY: `self.ctx` is the instance that owns `self.queue` (both captured in `new`), which
+        // is `with_host_open`'s contract.
         unsafe { with_host_open::<P, R>(&self.queue, self.ctx.as_ptr(), f) }
     }
 
     /// # Safety
     /// `ctx` is a live `AuInstance<P>` pointer.
     unsafe fn new(ctx: *mut std::ffi::c_void) -> Self {
+        // SAFETY: The caller guarantees `ctx` is a live `AuInstance<P>`; the fields are cloned out
+        // and the reference is not kept.
         let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
         Self {
             ctx: AuCtx(ctx),
@@ -185,8 +198,14 @@ fn drain_editor_gestures<P: PluginExport>(inst: &AuInstance<P>) {
             return;
         }
         match gesture {
+            // SAFETY: Called on the host main thread (UI-thread check or the main-queue drain)
+            // while the queue is open, so the sink's `user_data` has not been released.
             EditorGesture::BeginEdit(id) => unsafe { inst.host_sink.begin_edit(id) },
+            // SAFETY: Main thread with the queue open; the sink's `user_data` has not been
+            // released.
             EditorGesture::SetParam(id, plain) => unsafe { inst.host_sink.set_param(id, plain) },
+            // SAFETY: Main thread with the queue open; the sink's `user_data` has not been
+            // released.
             EditorGesture::EndEdit(id) => unsafe { inst.host_sink.end_edit(id) },
         }
     }
@@ -212,9 +231,14 @@ fn apply_pending_resize<P: PluginExport>(inst: &AuInstance<P>) {
     if let Some(mut gui) = inst.gui.try_enter() {
         let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
         if resized && let Some((aw, ah)) = gui.editor.as_ref().map(|e| e.size()) {
+            // SAFETY: Main-thread drain with the queue open (checked above), so the sink's
+            // `user_data` has not been released.
             let handled = unsafe { inst.host_sink.request_resize(aw, ah) };
             #[cfg(target_os = "macos")]
             if !handled && gui.view != 0 {
+                // SAFETY: `gui.view` is non-zero only while `gui_open` holds the host's `NSView`,
+                // and `finalize_destroy` detaches it before the view can go away; this runs on the
+                // main thread as `moose_au_view_fit` requires.
                 unsafe { moose_au_view_fit(gui.view as *mut std::ffi::c_void, aw, ah) };
             }
             #[cfg(not(target_os = "macos"))]
@@ -235,6 +259,8 @@ impl<P: PluginExport> EditorBridge for AuHost<P> {
 
     fn set_param(&self, id: u32, normalized: f64) {
         self.with_open(|| {
+            // SAFETY: Runs inside `with_open`, so the instance has not been finalized; only a
+            // shared reference is formed.
             let inst = unsafe { &*self.ctx.as_ptr().cast::<AuInstance<P>>() };
             let plain = inst.edit_param(id, || {
                 self.params.set_normalized_returning_plain(id, normalized)
@@ -265,9 +291,13 @@ impl<P: PluginExport> EditorBridge for AuHost<P> {
             if let Some(mut gui) = inst.gui.try_enter() {
                 let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
                 if resized && let Some((aw, ah)) = gui.editor.as_ref().map(|e| e.size()) {
+                    // SAFETY: UI thread (checked above) inside `with_open`, so the sink's
+                    // `user_data` has not been released.
                     let handled = unsafe { inst.host_sink.request_resize(aw, ah) };
                     #[cfg(target_os = "macos")]
                     if !handled && gui.view != 0 {
+                        // SAFETY: `gui.view` is the host `NSView` recorded by `gui_open` and still
+                        // attached; UI thread as `moose_au_view_fit` requires.
                         unsafe { moose_au_view_fit(gui.view as *mut std::ffi::c_void, aw, ah) };
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -337,7 +367,10 @@ impl<P: PluginExport> HostContext for AuHost<P> {
 /// # Safety
 /// `ctx` is a live `AuInstance<P>` pointer.
 pub(crate) unsafe fn editor_context<P: PluginExport>(ctx: *mut std::ffi::c_void) -> PluginContext {
+    // SAFETY: The caller guarantees `ctx` is a live `AuInstance<P>`.
     let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
+    // SAFETY: Same live `ctx`. `AuHost` only dereferences it later inside `with_open`, which fails
+    // once the instance is closed.
     let host: Arc<dyn HostContext> = Arc::new(unsafe { AuHost::<P>::new(ctx) });
     PluginContext::from_host(host, Arc::clone(&inst.params_arc) as Arc<dyn Params>)
         .with_tasks(inst.task_spawner.clone())
@@ -461,9 +494,13 @@ impl<P: PluginExport> HostSink for AuSink<'_, P> {
                 }
             }
             if presentation_changed && !self.inst.host_queue.is_closed() {
+                // SAFETY: Main-thread drain with the queue still open (checked just above), so the
+                // sink's `user_data` has not been released.
                 unsafe { self.inst.host_sink.param_presentation_changed() };
             }
             if (self.param_rescan || catalog_values) && !self.inst.host_queue.is_closed() {
+                // SAFETY: Main-thread drain with the queue still open (checked just above), so the
+                // sink's `user_data` has not been released.
                 unsafe { self.inst.host_sink.param_values_changed() };
             }
         }
@@ -479,6 +516,8 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     main: &MainThread,
 ) {
+    // SAFETY: The caller guarantees `ctx` is a live `AuInstance<P>`; only a shared reference is
+    // formed.
     let inst = unsafe { &*ctx.cast::<AuInstance<P>>() };
 
     inst.render_catalog.reclaim();
@@ -522,6 +561,9 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
             continue;
         }
         let _guard = FeedbackDrainGuard::enter(ctx, id, value);
+        // SAFETY: Main-thread drain with the queue open (checked at the top of this iteration), so
+        // the sink's `user_data` has not been released. A re-entrant destroy from the callback is
+        // deferred by `with_host_open`.
         unsafe { inst.host_sink.set_param(id, value) };
     }
 
@@ -547,6 +589,8 @@ pub(crate) unsafe fn drain_host_queue<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> i32 {
+    // SAFETY: `ctx` is null-checked and otherwise the shim's live instance; the editor slot goes
+    // through the `gui` cell.
     run_extern_callback_with::<P, i32>("au", "gui_has_editor", 0, || unsafe {
         if ctx.is_null() {
             return 0;
@@ -563,6 +607,7 @@ pub(crate) unsafe extern "C" fn cb_gui_has_editor<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_gui_can_resize<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> i32 {
+    // SAFETY: `ctx` is null-checked and otherwise the shim's live instance.
     run_extern_callback_with::<P, i32>("au", "gui_can_resize", 0, || unsafe {
         if ctx.is_null() {
             return 0;
@@ -583,6 +628,7 @@ pub(crate) unsafe extern "C" fn cb_gui_set_size<P: PluginExport>(
     w: u32,
     h: u32,
 ) {
+    // SAFETY: `ctx` is null-checked and otherwise the shim's live instance.
     run_extern_callback_with::<P, ()>("au", "gui_set_size", (), || unsafe {
         if ctx.is_null() || w == 0 || h == 0 {
             return;
@@ -605,6 +651,8 @@ pub(crate) unsafe extern "C" fn cb_gui_get_size<P: PluginExport>(
     w: *mut u32,
     h: *mut u32,
 ) {
+    // SAFETY: `ctx` is null-checked and otherwise the shim's live instance; the shim always passes
+    // valid `w`/`h` out-pointers.
     run_extern_callback_with::<P, ()>("au", "gui_get_size", (), || unsafe {
         if ctx.is_null() {
             return;
@@ -649,11 +697,15 @@ pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
         {
             let _ = parent;
             if !ctx.is_null() {
+                // SAFETY: `ctx` is non-null and is the shim's live instance.
                 let _ = unsafe { editor_context::<P>(ctx) };
             }
             0
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // SAFETY: The view container calls `gui_open` only with its live instance and the host
+        // `NSView`/`UIView` that will hold the editor; that view stays valid until
+        // `moose_au_view_detach` in `finalize_destroy`.
         unsafe {
             let inst = &*ctx.cast::<AuInstance<P>>();
             let mut gui = inst.gui.enter();
@@ -674,6 +726,8 @@ pub(crate) unsafe extern "C" fn cb_gui_open<P: PluginExport>(
 }
 
 pub(crate) unsafe extern "C" fn cb_gui_close<P: PluginExport>(ctx: *mut std::ffi::c_void) {
+    // SAFETY: The view container calls `gui_close` only with its live instance. `editor_ptr` comes
+    // from the `gui` guard held across the call, so it is the only access to the editor.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let mut gui = inst.gui.enter();
@@ -712,6 +766,8 @@ mod tests {
 
     #[test]
     fn au_host_context_routes_state_and_signals_through_host_queue() {
+        // SAFETY: `ctx` is a fresh instance used only on this thread; `context` is a cloned handle
+        // and `inst` is not used after `cb_destroy`.
         unsafe {
             let ctx = cb_create_with_sink::<TestPlugin>(std::ptr::null());
             assert!(!ctx.is_null());

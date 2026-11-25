@@ -105,19 +105,28 @@ fn raw_component_id(reg: &'static Registration) -> (*mut IComponent, usize) {
     )
 }
 fn create_view(com: *mut IComponent) -> *mut IPlugView {
+    // SAFETY: `com` is a live COM object owned by this test and outlives the borrow; `from_raw`
+    // maps null to `None`.
     let controller = unsafe { ComRef::from_raw(com) }
         .unwrap()
         .cast::<IEditController>()
         .unwrap();
+    // SAFETY: `controller` is a live interface owned by this test; every pointer argument is a
+    // local or a test-owned object that outlives the call (or null, which `createView` must reject
+    // or accept).
     unsafe { controller.createView(c"editor".as_ptr()) }
 }
 
 fn release<I: Unknown>(p: *mut I) -> usize {
+    // SAFETY: Test helper: callers pass a live COM pointer that holds a reference they own, and
+    // this gives that reference up.
     unsafe { I::release(p) }
 }
 
 /// Current reference count of a COM object.
 fn refs<I: Unknown>(p: *mut I) -> usize {
+    // SAFETY: Test helper: callers pass a live COM pointer. The add-ref/release pair leaves the
+    // count unchanged and only reads it.
     unsafe {
         I::add_ref(p);
         I::release(p)
@@ -164,6 +173,8 @@ impl FrameCore {
         if let Some(st) = &self.threads {
             st.record('r');
         }
+        // SAFETY: The component under test calls `resizeView` with a valid `ViewRect` that lives
+        // for the call.
         let r = unsafe { &*rect };
         if (r.right, r.bottom) != self.expect {
             self.bad.store(true, SeqCst);
@@ -172,6 +183,8 @@ impl FrameCore {
         #[cfg(target_os = "linux")]
         if let Some(st) = &self.threads
             && st.emit_on_resize.swap(false, SeqCst)
+            // SAFETY: `view` is a live COM object owned by this test and outlives the borrow;
+            // `from_raw` maps null to `None`.
             && unsafe { ComRef::from_raw(view).unwrap().onSize(rect) } != kResultOk
         {
             self.bad.store(true, SeqCst);
@@ -225,6 +238,8 @@ impl LoopFrame {
             .unwrap()
             .clone()
             .expect("event handler registered");
+        // SAFETY: `handler` is a retained `IEventHandler`. Calling it on this thread mirrors the
+        // host run loop.
         unsafe { Linux::IEventHandlerTrait::onFDIsSet(&handler, self.fd.load(SeqCst)) };
     }
 }
@@ -248,6 +263,8 @@ impl Linux::IRunLoopTrait for LoopFrame {
         handler: *mut Linux::IEventHandler,
         fd: Linux::FileDescriptor,
     ) -> tresult {
+        // SAFETY: The plugin passes `handler` as a live `IEventHandler`; `retain` takes the frame's
+        // own reference.
         *self.handler.lock().unwrap() = unsafe { super::retain(handler) };
         self.fd.store(fd, SeqCst);
         kResultOk
@@ -321,6 +338,8 @@ mod lifecycle {
             RESETS.store(0, SeqCst);
             PROCESSING_CALLS.store(0, SeqCst);
             let com = component(reg);
+            // SAFETY: `com` is a live component owned by this test; `setActive`/`setProcessing`
+            // take no pointers.
             unsafe {
                 assert_eq!(com.setActive(1), kResultOk);
                 assert_eq!(RESETS.load(SeqCst), 1);
@@ -408,6 +427,8 @@ mod editor_attach {
     impl IBStreamTrait for OneByte {
         unsafe fn read(&self, buffer: *mut c_void, _: int32, count: *mut int32) -> tresult {
             let first = !self.0.swap(true, SeqCst);
+            // SAFETY: `OneByte` is fed only to `setState`, which passes a writable count and a
+            // buffer of at least one byte.
             unsafe {
                 *count = i32::from(first);
                 if first {
@@ -431,10 +452,14 @@ mod editor_attach {
     fn editor_attachment() {
         let reg = registration::<B>(descriptor(), Vec::new());
         let com = component(reg);
+        // SAFETY: `com` is a live component owned by this test, and `createView` returns null or an
+        // owned view reference, which `from_raw` adopts.
         let view = unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("view");
         let mut parent_token = 0u8;
         let parent: *mut c_void = (&raw mut parent_token).cast();
         let counts = || (OPENS.load(SeqCst), CLOSES.load(SeqCst));
+        // SAFETY: `view` is a live view owned by this test. `parent` is a local token that outlives
+        // the editor session, and every kind string is a static C string or null.
         unsafe {
             // Reject native representation mismatches before changing
             // attachment state or forwarding the pointer to the plugin.
@@ -574,6 +599,8 @@ mod editor_lifetime {
     }
 
     fn view_call<R>(view: *mut IPlugView, f: impl FnOnce(&ComRef<'_, IPlugView>) -> R) -> R {
+        // SAFETY: `view` is a live COM object owned by this test and outlives the borrow;
+        // `from_raw` maps null to `None`.
         f(&unsafe { ComRef::from_raw(view) }.unwrap())
     }
 
@@ -583,7 +610,11 @@ mod editor_lifetime {
         let reg = registration_with(descriptor(), make, no_bus, Vec::new());
         let mut parent_token = 0u8;
         let parent: *mut c_void = (&raw mut parent_token).cast();
+        // SAFETY: `v` is a live interface owned by this test; every pointer argument is a local or
+        // a test-owned object that outlives the call (or null, which `attached` must reject or
+        // accept).
         let attach = |v| view_call(v, |v| unsafe { v.attached(parent, PLATFORM.as_ptr()) });
+        // SAFETY: `v` is a live interface owned by this test, and `removed` takes no pointers here.
         let remove = |v| view_call(v, |v| unsafe { v.removed() });
 
         for iteration in 0..100 {
@@ -592,6 +623,8 @@ mod editor_lifetime {
             let first = create_view(com);
             let current = create_view(com);
             assert!(!first.is_null() && !current.is_null());
+            // SAFETY: `current` is a live COM object owned by this test and outlives the borrow;
+            // `from_raw` maps null to `None`.
             let scale = unsafe { ComRef::from_raw(current) }
                 .unwrap()
                 .cast::<IPlugViewContentScaleSupport>()
@@ -612,6 +645,8 @@ mod editor_lifetime {
             assert_eq!(remove(current), kResultOk);
             assert_eq!(release(current), 1);
             // The secondary scale interface keeps the same view and owner.
+            // SAFETY: `scale` is a live COM object owned by this test and outlives the borrow;
+            // `from_raw` maps null to `None`.
             let view = unsafe { ComRef::from_raw(scale) }
                 .unwrap()
                 .cast::<IPlugView>()
@@ -622,6 +657,9 @@ mod editor_lifetime {
                 right: 0,
                 bottom: 0,
             };
+            // SAFETY: `view` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `getSize` must
+            // reject or accept).
             assert_eq!(unsafe { view.getSize(&raw mut size) }, kResultOk);
             assert_eq!(size.right, 1180);
             drop(view);
@@ -640,6 +678,8 @@ mod editor_lifetime {
         // until replacement, clear or teardown.
         let frames = [0; 3].map(|_| ComWrapper::new(Frame(FrameCore::new(1180, 760))));
         let fp = |i: usize| frames[i].as_com_ref::<IPlugFrame>().unwrap().as_ptr();
+        // SAFETY: `v` is a live `IPlugView` owned by this test, and callers pass a live
+        // `IPlugFrame` pointer from `frames` (or null) that remains valid for the call.
         let set_frame = |v, f| view_call(v, |v| unsafe { v.setFrame(f) });
         let base = refs(fp(0));
         let com = raw_component(reg);
@@ -772,8 +812,14 @@ fn parameter_units() {
     let ids: Vec<u32> = params.iter().map(|p| p.id).collect();
     let reg = registration::<Fake>(descriptor(), params);
     let com = component(reg);
+    // SAFETY: `ParameterInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+    // so all-zero is a valid value.
     let zero_info = || -> ParameterInfo { unsafe { std::mem::zeroed() } };
+    // SAFETY: `UnitInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers), so
+    // all-zero is a valid value.
     let zero_unit = || -> UnitInfo { unsafe { std::mem::zeroed() } };
+    // SAFETY: `com` is a live component owned by this test; the only pointer arguments are the
+    // `info`/`child`/`parent` locals, which outlive each call.
     unsafe {
         assert_eq!(com.getUnitCount(), 197); // root + 98 parents/children
         for index in [0, 4095, 4096, 5000] {
@@ -827,6 +873,8 @@ mod output_silence {
         for &out in args.outputs.iter() {
             let out = out.cast::<S>();
             for i in 0..args.num_frames as usize {
+                // SAFETY: `synthesize` requires each output channel to hold `num_frames` writable
+                // samples of `S`, so `i` stays in bounds.
                 unsafe { *out.add(i) = S::QUARTER };
             }
         }
@@ -838,9 +886,13 @@ mod output_silence {
 
     impl Vst3Backend for B {
         unsafe fn process_f32(&self, args: &mut ProcessArgs<'_>) -> bool {
+            // SAFETY: `process_f32`'s contract (valid channel pointers for `num_frames`) is
+            // `synthesize`'s.
             unsafe { synthesize::<f32>(args) }
         }
         unsafe fn process_f64(&self, args: &mut ProcessArgs<'_>) -> bool {
+            // SAFETY: `process_f64`'s contract (valid channel pointers for `num_frames`) is
+            // `synthesize`'s.
             unsafe { synthesize::<f64>(args) }
         }
     }
@@ -856,15 +908,22 @@ mod output_silence {
             maxSamplesPerBlock: 16,
             sampleRate: 48000.0,
         };
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `setupProcessing` must
+        // reject or accept).
         if unsafe { com.setupProcessing(&raw mut setup) } != kResultOk {
             return false;
         }
         let mut samples = [[S::ZERO; 16]; 2];
         let [a, b] = &mut samples;
         let mut channels = [a.as_mut_ptr(), b.as_mut_ptr()];
+        // SAFETY: `AudioBusBuffers` is a plain-old-data SDK struct (integers, arrays and raw
+        // pointers), so all-zero is a valid value.
         let mut output: AudioBusBuffers = unsafe { std::mem::zeroed() };
         output.numChannels = 2;
         output.__field0.channelBuffers32 = channels.as_mut_ptr().cast();
+        // SAFETY: `ProcessData` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+        // so all-zero is a valid value.
         let mut data: ProcessData = unsafe { std::mem::zeroed() };
         data.symbolicSampleSize = sample_size;
         data.numSamples = 16;
@@ -874,6 +933,9 @@ mod output_silence {
         // publishes its own silence state.
         for _ in 0..2 {
             output.silenceFlags = 3;
+            // SAFETY: `com` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `process` must
+            // reject or accept).
             if unsafe { com.process(&raw mut data) } != kResultOk {
                 return false;
             }
@@ -950,6 +1012,7 @@ mod output_events {
         }
         unsafe fn addEvent(&self, event: *mut Event) -> tresult {
             assert_eq!(
+                // SAFETY: The component passes `addEvent` a valid `Event` that lives for the call.
                 unsafe { (*event).r#type },
                 Event_::EventTypes_::kNoteOnEvent as u16
             );
@@ -964,9 +1027,14 @@ mod output_events {
         let reg = registration::<B>(descriptor(), Vec::new());
         let com = component(reg);
         let events = ComWrapper::new(Events(AtomicU32::new(0)));
+        // SAFETY: `ProcessData` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+        // so all-zero is a valid value.
         let mut data: ProcessData = unsafe { std::mem::zeroed() };
         data.numSamples = 1;
         data.outputEvents = events.as_com_ref::<IEventList>().unwrap().as_ptr();
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `process` must reject or
+        // accept).
         assert_eq!(unsafe { com.process(&raw mut data) }, kResultOk);
         assert_eq!(events.0.load(SeqCst), 1);
         assert_eq!(RESULT.load(SeqCst), 2);
@@ -994,16 +1062,25 @@ mod arrangements {
         let com = component(reg);
         let mut cine: SpeakerArrangement = 0xff;
         assert_eq!(
+            // SAFETY: `com` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which
+            // `setBusArrangements` must reject or accept).
             unsafe { com.setBusArrangements(std::ptr::null_mut(), 0, &raw mut cine, 1) },
             kResultFalse
         );
         let mut actual = 0;
         assert_eq!(
+            // SAFETY: `com` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which
+            // `getBusArrangement` must reject or accept).
             unsafe { com.getBusArrangement(BusDirections_::kOutput as i32, 0, &raw mut actual) },
             kResultOk
         );
         assert_eq!(actual, 0x63f);
         assert_eq!(
+            // SAFETY: `com` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which
+            // `setBusArrangements` must reject or accept).
             unsafe { com.setBusArrangements(std::ptr::null_mut(), 0, &raw mut actual, 1) },
             kResultOk
         );
@@ -1198,6 +1275,8 @@ mod threads {
     /// The eventfd has a pending wake (left pending for the host loop).
     fn readable(fd: i32) -> bool {
         let mut v = 0u64;
+        // SAFETY: `fd` is the component's live eventfd, and `v` is an 8-byte local, the size
+        // eventfd I/O requires.
         unsafe {
             libc::read(fd, (&raw mut v).cast(), 8) > 0 && {
                 libc::write(fd, (&raw const v).cast(), 8);
@@ -1232,11 +1311,15 @@ mod threads {
         let ctx = com.host.id;
         st.ctx.store(ctx, SeqCst);
         let ctx_u = ctx;
+        // SAFETY: `c` is a live `IEditController` owned by this test, and callers pass a live
+        // `IComponentHandler` pointer (or null) that remains valid for the call.
         let set_handler = |h: *mut IComponentHandler| unsafe { c.setComponentHandler(h) };
         set_handler(hp(&normal));
         // No wake yet: worker edits wait for the next UI-thread operation.
         off_ui(move || begin_edit(ctx_u, 7));
         assert_eq!(st.calls(), "");
+        // SAFETY: `c` is a live interface owned by this test, and `getParamNormalized` takes no
+        // pointers here.
         unsafe { c.getParamNormalized(7) };
         assert_eq!(st.calls(), "b");
         end_edit(ctx, 7);
@@ -1249,7 +1332,11 @@ mod threads {
         assert_eq!(st.calls(), "beBE");
         set_handler(hp(&normal));
         st.clear();
+        // SAFETY: `c` is a live component owned by this test, and `createView` returns null or an
+        // owned view reference, which `from_raw` adopts.
         let view = unsafe { ComPtr::from_raw(c.createView(c"editor".as_ptr())) }.unwrap();
+        // SAFETY: `view` is a live `IPlugView` owned by this test, and callers pass a live
+        // `IPlugFrame` pointer (or null) that remains valid for the call.
         let set_frame = |f: *mut IPlugFrame| unsafe { view.setFrame(f) };
         assert!(
             set_frame(fp) == kResultOk && frame.has_handler() && frame.timers.load(SeqCst) == 0
@@ -1425,15 +1512,21 @@ mod threads {
             let (other, other_ctx) = raw_component_id(reg);
             let other_host = pin(other_ctx).unwrap();
             WATCH.store(other_ctx, SeqCst);
+            // SAFETY: `other` is a live COM object owned by this test and outlives the borrow;
+            // `from_raw` maps null to `None`.
             let controller = unsafe { ComRef::from_raw(other) }
                 .unwrap()
                 .cast::<IEditController>()
                 .unwrap();
+            // SAFETY: `controller` is a live interface owned by this test; every pointer argument
+            // is a local or a test-owned object that outlives the call (or null, which
+            // `setComponentHandler` must reject or accept).
             unsafe { controller.setComponentHandler(hp(&normal)) };
             drop(controller);
             let loop2 = ComWrapper::new(LoopFrame::new(FrameCore::new(640, 480)));
             // A bound wake, and no view to unbind it.
-            other_host.update_run_loop_registration(Some(frame_ptr(&loop2).cast()));
+            // SAFETY: `loop2` is a live frame wrapper owned by this test.
+            unsafe { other_host.update_run_loop_registration(Some(frame_ptr(&loop2).cast())) };
             drop(other_host);
             assert!(loop2.has_handler());
             st.clear();
@@ -1519,10 +1612,15 @@ mod threads {
             let slow = handler(&st, Kind::Slow);
             let (other, other_ctx) = raw_component_id(reg);
             WATCH.store(other_ctx, SeqCst);
+            // SAFETY: `other` is a live COM object owned by this test and outlives the borrow;
+            // `from_raw` maps null to `None`.
             let controller = unsafe { ComRef::from_raw(other) }
                 .unwrap()
                 .cast::<IEditController>()
                 .unwrap();
+            // SAFETY: `controller` is a live interface owned by this test; every pointer argument
+            // is a local or a test-owned object that outlives the call (or null, which
+            // `setComponentHandler` must reject or accept).
             unsafe { controller.setComponentHandler(hp(&slow)) };
             drop(controller);
             let other_u = other as usize;
@@ -1549,10 +1647,15 @@ mod threads {
             let (victim, victim_ctx) = raw_component_id(reg);
             WATCH.store(victim_ctx, SeqCst);
             dropper.victim.store(victim as usize, SeqCst);
+            // SAFETY: `victim` is a live COM object owned by this test and outlives the borrow;
+            // `from_raw` maps null to `None`.
             let controller = unsafe { ComRef::from_raw(victim) }
                 .unwrap()
                 .cast::<IEditController>()
                 .unwrap();
+            // SAFETY: `controller` is a live interface owned by this test; every pointer argument
+            // is a local or a test-owned object that outlives the call (or null, which
+            // `setComponentHandler` must reject or accept).
             unsafe { controller.setComponentHandler(hp(&dropper)) };
             drop(controller);
             perform_edit(victim_ctx, 3, 0.5); // no frame: called in place
@@ -1579,6 +1682,9 @@ mod threads {
             host: Host::new(reg, Some(run_loop)).unwrap(),
         });
         let handler = handler(&st, Kind::Normal);
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `setComponentHandler` must
+        // reject or accept).
         assert_eq!(unsafe { com.setComponentHandler(hp(&handler)) }, kResultOk);
         let ctx = com.host.id;
         off_ui(move || crate::com::mark_restart(ctx, 4));
@@ -1659,6 +1765,8 @@ mod host_features {
     fn attach(com: &ComWrapper<Component>) -> ComWrapper<Recorder> {
         let recorder = ComWrapper::new(Recorder::default());
         let handler = recorder.as_com_ref::<IComponentHandler>().unwrap().as_ptr();
+        // SAFETY: `com` is a live `IEditController` owned by this test, and `handler` is a live
+        // `IComponentHandler` owned by `recorder` that remains valid for the call.
         assert_eq!(unsafe { com.setComponentHandler(handler) }, kResultOk);
         recorder
     }
@@ -1682,6 +1790,7 @@ mod host_features {
 
     impl IHostApplicationTrait for App {
         unsafe fn getName(&self, name: *mut String128) -> tresult {
+            // SAFETY: The component passes `getName` a writable `String128`.
             super::super::utf16_into(unsafe { &mut *name }, self.0);
             kResultOk
         }
@@ -1698,6 +1807,9 @@ mod host_features {
     fn initialize_in(com: &ComWrapper<Component>, host: &'static str) {
         let app = ComWrapper::new(App(host));
         let context = app.as_com_ref::<FUnknown>().unwrap().as_ptr();
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `initialize` must reject or
+        // accept).
         assert_eq!(unsafe { com.initialize(context) }, kResultOk);
     }
 
@@ -1813,9 +1925,16 @@ mod host_features {
     }
 
     fn listed(com: &Component) -> Vec<(u32, i32)> {
+        // SAFETY: `com` is a live interface owned by this test, and `getParameterCount` takes no
+        // pointers here.
         (0..unsafe { com.getParameterCount() })
             .map(|i| {
+                // SAFETY: `ParameterInfo` is a plain-old-data SDK struct (integers, arrays and raw
+                // pointers), so all-zero is a valid value.
                 let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                // SAFETY: `com` is a live interface owned by this test; every pointer argument is a
+                // local or a test-owned object that outlives the call (or null, which
+                // `getParameterInfo` must reject or accept).
                 assert_eq!(unsafe { com.getParameterInfo(i, &raw mut info) }, kResultOk);
                 (info.id, info.flags)
             })
@@ -1840,8 +1959,13 @@ mod host_features {
         let reload = component(reg);
         initialize_in(&reload, "Cubase 14");
         assert_eq!(listed(&reload), [(10, automate), (12, automate)]);
+        // SAFETY: `ParameterInfo` is a plain-old-data SDK struct (integers, arrays and raw
+        // pointers), so all-zero is a valid value.
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
         assert_eq!(
+            // SAFETY: `reload` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which
+            // `getParameterInfo` must reject or accept).
             unsafe { reload.getParameterInfo(2, &raw mut info) },
             kInvalidArgument
         );
@@ -1853,6 +1977,8 @@ mod host_features {
         reload.host.on_ui_tick();
         assert_eq!(recorder.take(), Vec::<String>::new());
         // A host write to a parameter that renames others is the event.
+        // SAFETY: `reload` is a live interface owned by this test, and `setParamNormalized` takes
+        // no pointers here.
         assert_eq!(unsafe { reload.setParamNormalized(10, 0.5) }, kResultOk);
         reload.host.on_ui_tick();
         assert_eq!(
@@ -1875,6 +2001,7 @@ mod host_features {
 
     impl Vst3Backend for Mix {
         fn param_function_name(&self, id: u32) -> Option<&'static CStr> {
+            // SAFETY: `kDryWetMix` is a static NUL-terminated string from the SDK bindings.
             (id == 11).then(|| unsafe { CStr::from_ptr(FunctionNameType::kDryWetMix) })
         }
     }
@@ -1887,6 +2014,8 @@ mod host_features {
             .as_com_ref::<IParameterFunctionName>()
             .expect("IParameterFunctionName");
         let mut id = 0;
+        // SAFETY: `finder` is a live interface owned by this test; the names are static C strings
+        // and `id` is a writable local.
         unsafe {
             assert_eq!(
                 finder.getParameterIDFromFunctionName(
@@ -1929,6 +2058,8 @@ mod host_features {
         let cid_match: TUID = [0xABu8 as std::ffi::c_char; 16];
         let cid_other: TUID = [0x01u8 as std::ffi::c_char; 16];
         let mut new_id = 0;
+        // SAFETY: `remap` is a live interface owned by this test; the TUIDs and `new_id` are locals
+        // that outlive each call.
         unsafe {
             assert_eq!(
                 remap.getCompatibleParamID(&raw const cid_match, 7, &raw mut new_id),
@@ -1961,6 +2092,8 @@ mod host_features {
     }
 
     fn key_is(id: *const c_char, key: *const c_char) -> bool {
+        // SAFETY: The component passes attribute ids as NUL-terminated SDK key strings; the keys
+        // are static SDK constants.
         unsafe { CStr::from_ptr(id) == CStr::from_ptr(key) }
     }
 
@@ -1972,6 +2105,7 @@ mod host_features {
             if !key_is(id, kChannelColorKey) {
                 return kResultFalse;
             }
+            // SAFETY: `getInt` callers pass a writable `int64`.
             unsafe { *value = 0x80FF_2010 };
             kResultOk
         }
@@ -1993,6 +2127,8 @@ mod host_features {
             if !key_is(id, kChannelNameKey) {
                 return kResultFalse;
             }
+            // SAFETY: `getString` callers pass a writable buffer of `bytes` bytes, i.e. `bytes / 2`
+            // `TChar`s.
             let dst = unsafe { std::slice::from_raw_parts_mut(string, bytes as usize / 2) };
             super::super::utf16_into(dst, "Lead \u{b5}");
             kResultOk
@@ -2034,6 +2170,8 @@ mod host_features {
         let channel = ComWrapper::new(Channel);
         let list = channel.as_com_ref::<IAttributeList>().unwrap().as_ptr();
         assert_eq!(
+            // SAFETY: `listener` is a live `IInfoListener` owned by this test, and `list` is a
+            // live `IAttributeList` owned by `channel` that remains valid for the call.
             unsafe { listener.setChannelContextInfos(list) },
             kResultTrue
         );
@@ -2042,6 +2180,9 @@ mod host_features {
             Some((Some("Lead \u{b5}".to_owned()), Some(0x80FF_2010)))
         );
         assert_eq!(
+            // SAFETY: `listener` is a live interface owned by this test; every pointer argument is
+            // a local or a test-owned object that outlives the call (or null, which
+            // `setChannelContextInfos` must reject or accept).
             unsafe { listener.setChannelContextInfos(std::ptr::null_mut()) },
             kInvalidArgument
         );
@@ -2078,6 +2219,8 @@ mod host_features {
         let com = component(reg);
         let learn = com.as_com_ref::<IMidiLearn>().expect("IMidiLearn");
         let learn2 = com.as_com_ref::<IMidiLearn2>().expect("IMidiLearn2");
+        // SAFETY: `learn`/`learn2` are live interfaces owned by this test; the calls take only
+        // values.
         unsafe {
             assert_eq!(learn.onLiveMIDIControllerInput(0, 3, 74), kResultTrue);
             assert_eq!(
@@ -2186,6 +2329,9 @@ mod host_features {
         // Dropping the handler finishes the group and reopens nothing.
         crate::com::group_edit(ctx, EditGroup::Begin);
         assert_eq!(
+            // SAFETY: `com` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which
+            // `setComponentHandler` must reject or accept).
             unsafe { com.setComponentHandler(std::ptr::null_mut()) },
             kResultOk
         );
@@ -2268,6 +2414,9 @@ mod wayland_embed {
                         right: 512,
                         bottom: 384,
                     };
+                    // SAFETY: `REENTRANT_VIEW` is set to `v3`, which the test keeps alive across
+                    // this attach. `rect` is a local, and `onSize` is called through the view's own
+                    // vtable.
                     unsafe { ((*(*ptr).vtbl).onSize)(ptr, &raw mut rect) };
                 }
             } else {
@@ -2334,12 +2483,15 @@ mod wayland_embed {
             obj: *mut *mut c_void,
         ) -> tresult {
             let want = IWaylandHost_iid;
+            // SAFETY: The component calls `createInstance` with valid 16-byte TUIDs.
             if unsafe { *cid != want || *iid != want } {
                 return kNoInterface;
             }
             let host = ComWrapper::new(WaylandHost)
                 .to_com_ptr::<IWaylandHost>()
                 .unwrap();
+            // SAFETY: `obj` is the caller's out-slot; the reference from `into_raw` passes to the
+            // caller.
             unsafe { *obj = host.into_raw().cast() };
             kResultOk
         }
@@ -2384,6 +2536,8 @@ mod wayland_embed {
         ) -> tresult {
             let name = format!("fd {}", if fd == EDITOR_FD { "editor" } else { "wake" });
             if fd == EDITOR_FD {
+                // SAFETY: The plugin passes `handler` as a live `IEventHandler`; `retain` takes the
+                // frame's own reference.
                 *self.fd_handler.lock().unwrap() = unsafe { super::super::retain(handler) };
                 log(format!("register {name}"));
             }
@@ -2397,6 +2551,8 @@ mod wayland_embed {
         unsafe fn registerTimer(&self, handler: *mut ITimerHandler, ms: TimerInterval) -> tresult {
             let name = format!("timer {ms}");
             if ms == 16 {
+                // SAFETY: The plugin passes `handler` as a live `ITimerHandler`; `retain` takes the
+                // frame's own reference.
                 *self.timer.lock().unwrap() = unsafe { super::super::retain(handler) };
                 log(format!("register {name}"));
             }
@@ -2413,13 +2569,18 @@ mod wayland_embed {
         inner: Frame,
         surface: *mut vst3::wl_surface,
     }
+    // SAFETY: `surface` is an opaque token that this test never dereferences; `inner` is `Frame`,
+    // whose state sits behind mutexes.
     unsafe impl Send for WaylandFrame {}
+    // SAFETY: Same as `Send`: the raw `surface` token is never dereferenced, and `Frame`
+    // synchronises its own state.
     unsafe impl Sync for WaylandFrame {}
     impl Class for WaylandFrame {
         type Interfaces = (IPlugFrame, IRunLoop, IWaylandFrame);
     }
     impl IPlugFrameTrait for WaylandFrame {
         unsafe fn resizeView(&self, view: *mut IPlugView, size: *mut ViewRect) -> tresult {
+            // SAFETY: Forwards the caller's arguments unchanged under the same contract.
             unsafe { self.inner.resizeView(view, size) }
         }
     }
@@ -2429,15 +2590,19 @@ mod wayland_embed {
             handler: *mut IEventHandler,
             fd: FileDescriptor,
         ) -> tresult {
+            // SAFETY: Forwards the caller's arguments unchanged under the same contract.
             unsafe { self.inner.registerEventHandler(handler, fd) }
         }
         unsafe fn unregisterEventHandler(&self, handler: *mut IEventHandler) -> tresult {
+            // SAFETY: Forwards the caller's arguments unchanged under the same contract.
             unsafe { self.inner.unregisterEventHandler(handler) }
         }
         unsafe fn registerTimer(&self, handler: *mut ITimerHandler, ms: TimerInterval) -> tresult {
+            // SAFETY: Forwards the caller's arguments unchanged under the same contract.
             unsafe { self.inner.registerTimer(handler, ms) }
         }
         unsafe fn unregisterTimer(&self, handler: *mut ITimerHandler) -> tresult {
+            // SAFETY: Forwards the caller's arguments unchanged under the same contract.
             unsafe { self.inner.unregisterTimer(handler) }
         }
     }
@@ -2475,11 +2640,16 @@ mod wayland_embed {
         let com = component(reg);
         let app = ComWrapper::new(App);
         let context = app.as_com_ref::<FUnknown>().unwrap().as_ptr();
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `initialize` must reject or
+        // accept).
         assert_eq!(unsafe { com.initialize(context) }, kResultOk);
         let frame = ComWrapper::new(Frame::default());
         let frame_ptr = frame.as_com_ref::<IPlugFrame>().unwrap().as_ptr();
         let mut surface_token = 0u8;
         let surface: *mut c_void = (&raw mut surface_token).cast();
+        // SAFETY: `kPlatformTypeWaylandSurfaceID` is a static NUL-terminated string from the SDK
+        // bindings.
         let wayland = unsafe { CStr::from_ptr(kPlatformTypeWaylandSurfaceID) };
         let opened = format!("open {:p} {surface:p}", display());
         let teardown = [
@@ -2491,11 +2661,18 @@ mod wayland_embed {
 
         let new_view = || {
             let view =
+                // SAFETY: `com` is a live component owned by this test, and `createView` returns
+                // null or an owned view reference, which `from_raw` adopts.
                 unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("view");
+            // SAFETY: `view` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `setFrame` must
+            // reject or accept).
             assert_eq!(unsafe { view.setFrame(frame_ptr) }, kResultOk);
             view
         };
         let view = new_view();
+        // SAFETY: `view` is a live view owned by this test. `surface` is a local token that
+        // outlives the session, and the kind strings are static C strings.
         unsafe {
             // The editor decides; the native type is unaffected.
             SUPPORTS.store(false, SeqCst);
@@ -2558,6 +2735,9 @@ mod wayland_embed {
         // A view released while still attached tears down in the same order.
         let view = new_view();
         assert_eq!(
+            // SAFETY: `view` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `attached` must
+            // reject or accept).
             unsafe { view.attached(surface, wayland.as_ptr()) },
             kResultOk
         );
@@ -2584,15 +2764,31 @@ mod wayland_embed {
             no_bus,
             Vec::new(),
         ));
+        // SAFETY: `com2` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `initialize` must reject or
+        // accept).
         assert_eq!(unsafe { com2.initialize(context) }, kResultOk);
 
+        // SAFETY: `com` is a live component owned by this test, and `createView` returns null or an
+        // owned view reference, which `from_raw` adopts.
         let v1 = unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("v1");
+        // SAFETY: `com2` is a live component owned by this test, and `createView` returns null or
+        // an owned view reference, which `from_raw` adopts.
         let v2 = unsafe { ComPtr::from_raw(com2.createView(c"editor".as_ptr())) }.expect("v2");
+        // SAFETY: `v1` is a live interface owned by this test; every pointer argument is a local or
+        // a test-owned object that outlives the call (or null, which `setFrame` must reject or
+        // accept).
         assert_eq!(unsafe { v1.setFrame(wframe_ptr) }, kResultOk);
+        // SAFETY: `v2` is a live interface owned by this test; every pointer argument is a local or
+        // a test-owned object that outlives the call (or null, which `setFrame` must reject or
+        // accept).
         assert_eq!(unsafe { v2.setFrame(wframe_ptr) }, kResultOk);
         take_log();
 
         assert_eq!(
+            // SAFETY: `v1` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `attached` must
+            // reject or accept).
             unsafe { v1.attached(std::ptr::null_mut(), wayland.as_ptr()) },
             kResultOk
         );
@@ -2608,6 +2804,9 @@ mod wayland_embed {
         );
         // Second view on the same host context reuses the open connection.
         assert_eq!(
+            // SAFETY: `v2` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `attached` must
+            // reject or accept).
             unsafe { v2.attached(std::ptr::null_mut(), wayland.as_ptr()) },
             kResultOk
         );
@@ -2644,12 +2843,23 @@ mod wayland_embed {
                 no_bus,
                 Vec::new(),
             ));
+            // SAFETY: `com3` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `initialize` must
+            // reject or accept).
             assert_eq!(unsafe { com3.initialize(context) }, kResultOk);
+            // SAFETY: `com3` is a live component owned by this test, and `createView` returns null
+            // or an owned view reference, which `from_raw` adopts.
             let v3 = unsafe { ComPtr::from_raw(com3.createView(c"editor".as_ptr())) }.expect("v3");
+            // SAFETY: `v3` is a live interface owned by this test; every pointer argument is a
+            // local or a test-owned object that outlives the call (or null, which `setFrame` must
+            // reject or accept).
             assert_eq!(unsafe { v3.setFrame(wframe_ptr) }, kResultOk);
             REENTRANT_VIEW.store(v3.as_ptr() as usize, SeqCst);
             take_log();
             assert_eq!(
+                // SAFETY: `v3` is a live interface owned by this test; every pointer argument is a
+                // local or a test-owned object that outlives the call (or null, which `attached`
+                // must reject or accept).
                 unsafe { v3.attached(std::ptr::null_mut(), wayland.as_ptr()) },
                 kResultOk
             );
@@ -2702,14 +2912,19 @@ mod input_merge {
     unsafe impl GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             note_heap_op();
+            // SAFETY: Forwards `GlobalAlloc::alloc`'s caller contract to `System` unchanged.
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             note_heap_op();
+            // SAFETY: Forwards `GlobalAlloc::dealloc`'s caller contract to `System`, which
+            // allocated `ptr`.
             unsafe { System.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             note_heap_op();
+            // SAFETY: Forwards `GlobalAlloc::realloc`'s caller contract to `System`, which
+            // allocated `ptr`.
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
@@ -2858,6 +3073,7 @@ mod input_merge {
                 }
             });
             drop(audio);
+            // SAFETY: Forwards `process_f32`'s caller contract unchanged.
             unsafe { self.0.process_f32(args) }
         }
     }
@@ -2890,6 +3106,8 @@ mod input_merge {
             LAST_READ.with(|last| last.set(index));
             match self.0.get(index as usize) {
                 Some(event) => {
+                    // SAFETY: The component passes `getEvent` a writable `Event` slot; `write`
+                    // never reads it.
                     unsafe { out.write(*event) };
                     kResultOk
                 }
@@ -2935,6 +3153,7 @@ mod input_merge {
             let Some(&(o, v)) = self.points.get(index as usize) else {
                 return kResultFalse;
             };
+            // SAFETY: The component passes `getPoint` writable `offset`/`value` slots.
             unsafe {
                 offset.write(o);
                 value.write(v);
@@ -2987,15 +3206,25 @@ mod input_merge {
         frames: i32,
     ) -> (Snapshot, u32) {
         let com = component(plugin_registration());
+        // SAFETY: `com` is a live interface owned by this test, and `setActive` takes no pointers
+        // here.
         assert_eq!(unsafe { com.setActive(1) }, kResultOk);
         let events = ComWrapper::new(Events(events));
         let changes = changes(queues);
+        // SAFETY: `ProcessData` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+        // so all-zero is a valid value.
         let mut data: ProcessData = unsafe { std::mem::zeroed() };
         data.numSamples = frames;
         data.inputEvents = events.as_com_ref::<IEventList>().unwrap().as_ptr();
         data.inputParameterChanges = changes.as_com_ref::<IParameterChanges>().unwrap().as_ptr();
         // Warm-up block: any lazy first-use initialisation happens here.
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `process` must reject or
+        // accept).
         assert_eq!(unsafe { com.process(&raw mut data) }, kResultOk);
+        // SAFETY: `com` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `process` must reject or
+        // accept).
         let (result, ops) = heap_ops(|| unsafe { com.process(&raw mut data) });
         assert_eq!(result, kResultOk);
         let snapshot = SNAPSHOT.with(|s| {
@@ -3336,6 +3565,9 @@ fn construction_time_mark_dirty_delivers_on_set_component_handler() {
     })
     .to_com_ptr::<IComponentHandler>()
     .unwrap();
+    // SAFETY: `c` is a live interface owned by this test; every pointer argument is a local or a
+    // test-owned object that outlives the call (or null, which `setComponentHandler` must reject or
+    // accept).
     assert_eq!(unsafe { c.setComponentHandler(h.as_ptr()) }, kResultOk);
     assert_eq!(
         dirty_calls.load(Ordering::Acquire),
@@ -3344,6 +3576,9 @@ fn construction_time_mark_dirty_delivers_on_set_component_handler() {
     );
 
     // Re-attaching a handler must not replay an already-delivered dirty bit.
+    // SAFETY: `c` is a live interface owned by this test; every pointer argument is a local or a
+    // test-owned object that outlives the call (or null, which `setComponentHandler` must reject or
+    // accept).
     assert_eq!(unsafe { c.setComponentHandler(h.as_ptr()) }, kResultOk);
     assert_eq!(dirty_calls.load(Ordering::Acquire), 1);
 }
@@ -3387,26 +3622,38 @@ fn parameter_finder_and_audio_presentation_latency_interfaces() {
         .to_com_ptr::<IAudioPresentationLatency>()
         .expect("Component exposes IAudioPresentationLatency");
     assert_eq!(
+        // SAFETY: `pres` is a live interface owned by this test, and
+        // `setAudioPresentationLatencySamples` takes no pointers here.
         unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kOutput as i32, 0, 512) },
         kResultOk
     );
     assert_eq!(
+        // SAFETY: `pres` is a live interface owned by this test, and
+        // `setAudioPresentationLatencySamples` takes no pointers here.
         unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kInput as i32, 1, 64) },
         kResultOk
     );
     assert_eq!(
+        // SAFETY: `pres` is a live interface owned by this test, and
+        // `setAudioPresentationLatencySamples` takes no pointers here.
         unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kOutput as i32, 1, 128) },
         kInvalidArgument
     );
     assert_eq!(
+        // SAFETY: `pres` is a live interface owned by this test, and
+        // `setAudioPresentationLatencySamples` takes no pointers here.
         unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kInput as i32, 2, 128) },
         kInvalidArgument
     );
     assert_eq!(
+        // SAFETY: `pres` is a live interface owned by this test, and
+        // `setAudioPresentationLatencySamples` takes no pointers here.
         unsafe { pres.setAudioPresentationLatencySamples(99, 0, 128) },
         kInvalidArgument
     );
     assert_eq!(
+        // SAFETY: `pres` is a live interface owned by this test, and
+        // `setAudioPresentationLatencySamples` takes no pointers here.
         unsafe { pres.setAudioPresentationLatencySamples(BusDirections_::kOutput as i32, -1, 128) },
         kInvalidArgument
     );
@@ -3415,21 +3662,32 @@ fn parameter_finder_and_audio_presentation_latency_interfaces() {
     // IParameterFinder on View
     let raw_view = super::view::View::create(&host);
     assert!(!raw_view.is_null());
+    // SAFETY: `View::create` returned a non-null owned reference (asserted above), which `from_raw`
+    // adopts.
     let view = unsafe { ComPtr::from_raw(raw_view) }.expect("view");
     let finder = view
         .cast::<IParameterFinder>()
         .expect("View exposes IParameterFinder");
     let mut found: ParamID = 0;
     assert_eq!(
+        // SAFETY: `finder` is a live interface owned by this test; every pointer argument is a
+        // local or a test-owned object that outlives the call (or null, which `findParameter` must
+        // reject or accept).
         unsafe { finder.findParameter(120, 80, &raw mut found) },
         kResultOk
     );
     assert_eq!(found, 42);
     assert_eq!(
+        // SAFETY: `finder` is a live interface owned by this test; every pointer argument is a
+        // local or a test-owned object that outlives the call (or null, which `findParameter` must
+        // reject or accept).
         unsafe { finder.findParameter(10, 10, &raw mut found) },
         kResultFalse
     );
     assert_eq!(
+        // SAFETY: `finder` is a live interface owned by this test; every pointer argument is a
+        // local or a test-owned object that outlives the call (or null, which `findParameter` must
+        // reject or accept).
         unsafe { finder.findParameter(120, 80, std::ptr::null_mut()) },
         kInvalidArgument
     );
@@ -3474,8 +3732,13 @@ fn get_parameter_info_prefers_live_step_count_when_present() {
     let comp = ComWrapper::new(Component { host });
     let ctrl = comp.to_com_ptr::<IEditController>().expect("controller");
 
+    // SAFETY: `ParameterInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+    // so all-zero is a valid value.
     let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
     assert_eq!(
+        // SAFETY: `ctrl` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getParameterInfo` must
+        // reject or accept).
         unsafe { ctrl.getParameterInfo(0, &raw mut info) },
         kResultOk
     );
@@ -3484,6 +3747,9 @@ fn get_parameter_info_prefers_live_step_count_when_present() {
 
     LIVE_STEPS.store(4, Ordering::Release);
     assert_eq!(
+        // SAFETY: `ctrl` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getParameterInfo` must
+        // reject or accept).
         unsafe { ctrl.getParameterInfo(0, &raw mut info) },
         kResultOk
     );
@@ -3494,6 +3760,9 @@ fn get_parameter_info_prefers_live_step_count_when_present() {
     );
 
     assert_eq!(
+        // SAFETY: `ctrl` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getParameterInfo` must
+        // reject or accept).
         unsafe { ctrl.getParameterInfo(1, &raw mut info) },
         kResultOk
     );
@@ -3533,12 +3802,16 @@ impl IBStreamTrait for MemStream {
         let avail = data.len().saturating_sub(*pos);
         let n = (num_bytes as usize).min(avail);
         if n > 0 {
+            // SAFETY: `buffer` is non-null and holds at least `num_bytes >= n` bytes. The source
+            // has `n` bytes left after `pos`, and a host buffer cannot overlap our `Vec`.
             unsafe {
                 std::ptr::copy_nonoverlapping(data[*pos..].as_ptr(), buffer.cast::<u8>(), n);
             }
             *pos += n;
         }
         if !num_read.is_null() {
+            // SAFETY: `num_read` is non-null (checked above) and writable per the `IBStream`
+            // contract.
             unsafe { *num_read = n as int32 };
         }
         kResultOk
@@ -3554,9 +3827,13 @@ impl IBStreamTrait for MemStream {
             return kInvalidArgument;
         }
         let n = num_bytes as usize;
+        // SAFETY: `buffer` is non-null and holds `num_bytes` readable bytes per the `IBStream`
+        // contract.
         let slice = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), n) };
         self.data.lock().unwrap().extend_from_slice(slice);
         if !num_written.is_null() {
+            // SAFETY: `num_written` is non-null (checked above) and writable per the `IBStream`
+            // contract.
             unsafe { *num_written = n as int32 };
         }
         kResultOk
@@ -3568,6 +3845,8 @@ impl IBStreamTrait for MemStream {
 
     unsafe fn tell(&self, result: *mut int64) -> tresult {
         if !result.is_null() {
+            // SAFETY: `result` is non-null (checked above) and writable per the `IBStream`
+            // contract.
             unsafe { *result = *self.pos.lock().unwrap() as int64 };
         }
         kResultOk
@@ -3713,6 +3992,9 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
         map: maps.as_mut_ptr(),
     };
     assert_eq!(
+        // SAFETY: `pui` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getPhysicalUIMapping` must
+        // reject or accept).
         unsafe { pui.getPhysicalUIMapping(0, 0, &raw mut list) },
         kResultOk
     );
@@ -3733,7 +4015,21 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
         NoteExpressionTypeIDs_::kInvalidTypeID as u32
     );
     assert_eq!(
+        // SAFETY: `pui` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getPhysicalUIMapping` must
+        // reject or accept).
         unsafe { pui.getPhysicalUIMapping(1, 0, &raw mut list) },
+        kInvalidArgument
+    );
+    // A non-empty list without its array is rejected, not dereferenced.
+    let mut no_map = PhysicalUIMapList {
+        count: 2,
+        map: std::ptr::null_mut(),
+    };
+    assert_eq!(
+        // SAFETY: `pui` is a live interface on the component; `no_map` is a
+        // local list whose null `map` is exactly the input under test.
+        unsafe { pui.getPhysicalUIMapping(0, 0, &raw mut no_map) },
         kInvalidArgument
     );
 
@@ -3741,16 +4037,28 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     let ks = comp_unk
         .cast::<IKeyswitchController>()
         .expect("IKeyswitchController");
+    // SAFETY: `ks` is a live interface owned by this test, and `getKeyswitchCount` takes no
+    // pointers here.
     assert_eq!(unsafe { ks.getKeyswitchCount(0, 0) }, 2);
+    // SAFETY: `ks` is a live interface owned by this test, and `getKeyswitchCount` takes no
+    // pointers here.
     assert_eq!(unsafe { ks.getKeyswitchCount(0, 1) }, 0);
+    // SAFETY: `ks` is a live interface owned by this test, and `getKeyswitchCount` takes no
+    // pointers here.
     assert_eq!(unsafe { ks.getKeyswitchCount(1, 0) }, 0);
+    // SAFETY: `KeyswitchInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+    // so all-zero is a valid value.
     let mut ks_info: KeyswitchInfo = unsafe { std::mem::zeroed() };
     assert_eq!(
+        // SAFETY: `ks` is a live interface owned by this test; every pointer argument is a local or
+        // a test-owned object that outlives the call (or null, which `getKeyswitchInfo` must reject
+        // or accept).
         unsafe { ks.getKeyswitchInfo(0, 0, 1, &raw mut ks_info) },
         kResultOk
     );
     assert_eq!(ks_info.typeId, KeyswitchTypeIDs_::kKeyRangeTypeID as u32);
     assert_eq!(
+        // SAFETY: `ks_info` holds a local 128-unit UTF-16 buffer.
         unsafe { super::utf16_from(ks_info.title.as_ptr(), 128) },
         "Staccato"
     );
@@ -3758,46 +4066,76 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     assert_eq!(ks_info.keyswitchMax, 27);
     assert_eq!(ks_info.keyRemapped, 36);
     assert_eq!(
+        // SAFETY: `ks` is a live interface owned by this test; every pointer argument is a local or
+        // a test-owned object that outlives the call (or null, which `getKeyswitchInfo` must reject
+        // or accept).
         unsafe { ks.getKeyswitchInfo(0, 0, 2, &raw mut ks_info) },
         kInvalidArgument
     );
 
     // 3. IUnitInfo + IProgramListData
     let units = comp_unk.cast::<IUnitInfo>().expect("IUnitInfo");
+    // SAFETY: `units` is a live interface owned by this test, and `getProgramListCount` takes no
+    // pointers here.
     assert_eq!(unsafe { units.getProgramListCount() }, 1);
+    // SAFETY: `UnitInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers), so
+    // all-zero is a valid value.
     let mut unit_info: UnitInfo = unsafe { std::mem::zeroed() };
     assert_eq!(
+        // SAFETY: `units` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getUnitInfo` must reject
+        // or accept).
         unsafe { units.getUnitInfo(0, &raw mut unit_info) },
         kResultOk
     );
     assert_eq!(unit_info.programListId, 0);
+    // SAFETY: `ProgramListInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+    // so all-zero is a valid value.
     let mut pl_info: ProgramListInfo = unsafe { std::mem::zeroed() };
     assert_eq!(
+        // SAFETY: `units` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getProgramListInfo` must
+        // reject or accept).
         unsafe { units.getProgramListInfo(0, &raw mut pl_info) },
         kResultOk
     );
     assert_eq!(pl_info.programCount, 2);
     let mut pname: String128 = [0; 128];
     assert_eq!(
+        // SAFETY: `units` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getProgramName` must
+        // reject or accept).
         unsafe { units.getProgramName(0, 0, &raw mut pname) },
         kResultOk
     );
     assert_eq!(
+        // SAFETY: `pname` holds a local 128-unit UTF-16 buffer.
         unsafe { super::utf16_from(pname.as_ptr(), 128) },
         "Init Pad"
     );
     let mut pcat: String128 = [0; 128];
     assert_eq!(
+        // SAFETY: `units` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getProgramInfo` must
+        // reject or accept).
         unsafe { units.getProgramInfo(0, 0, c"Category".as_ptr(), &raw mut pcat) },
         kResultOk
     );
+    // SAFETY: `pcat` holds a local 128-unit UTF-16 buffer.
     assert_eq!(unsafe { super::utf16_from(pcat.as_ptr(), 128) }, "Pads");
 
     // Root unit must also export a `kIsProgramChange` selector parameter.
     let ctrl = comp_unk.cast::<IEditController>().expect("IEditController");
+    // SAFETY: `ctrl` is a live interface owned by this test, and `getParameterCount` takes no
+    // pointers here.
     assert_eq!(unsafe { ctrl.getParameterCount() }, 1);
+    // SAFETY: `ParameterInfo` is a plain-old-data SDK struct (integers, arrays and raw pointers),
+    // so all-zero is a valid value.
     let mut pinfo: ParameterInfo = unsafe { std::mem::zeroed() };
     assert_eq!(
+        // SAFETY: `ctrl` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getParameterInfo` must
+        // reject or accept).
         unsafe { ctrl.getParameterInfo(0, &raw mut pinfo) },
         kResultOk
     );
@@ -3809,30 +4147,49 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     );
     let mut label: String128 = [0; 128];
     assert_eq!(
+        // SAFETY: `ctrl` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getParamStringByValue`
+        // must reject or accept).
         unsafe { ctrl.getParamStringByValue(pinfo.id, 1.0, &raw mut label) },
         kResultOk
     );
     assert_eq!(
+        // SAFETY: `label` holds a local 128-unit UTF-16 buffer.
         unsafe { super::utf16_from(label.as_ptr(), 128) },
         "Bright Lead"
     );
+    // SAFETY: `ctrl` is a live interface owned by this test, and `setParamNormalized` takes no
+    // pointers here.
     assert_eq!(unsafe { ctrl.setParamNormalized(pinfo.id, 1.0) }, kResultOk);
+    // SAFETY: `ctrl` is a live interface owned by this test, and `getParamNormalized` takes no
+    // pointers here.
     assert!((unsafe { ctrl.getParamNormalized(pinfo.id) } - 1.0).abs() < 1e-12);
     assert_eq!(
+        // SAFETY: `ctrl` is a live interface owned by this test, and `setParamNormalized` takes no
+        // pointers here.
         unsafe { ctrl.setParamNormalized(pinfo.id, 0.0) },
         kResultFalse
     );
+    // SAFETY: `ctrl` is a live interface owned by this test, and `getParamNormalized` takes no
+    // pointers here.
     assert!((unsafe { ctrl.getParamNormalized(pinfo.id) } - 1.0).abs() < 1e-12);
     assert_eq!(*LOADED_PROGRAM.lock().unwrap(), b"MOOSE_STATE_B");
 
     let pdata = comp_unk
         .cast::<IProgramListData>()
         .expect("IProgramListData");
+    // SAFETY: `pdata` is a live interface owned by this test, and `programDataSupported` takes no
+    // pointers here.
     assert_eq!(unsafe { pdata.programDataSupported(0) }, kResultTrue);
+    // SAFETY: `pdata` is a live interface owned by this test, and `programDataSupported` takes no
+    // pointers here.
     assert_eq!(unsafe { pdata.programDataSupported(1) }, kResultFalse);
     let out_stream = ComWrapper::new(MemStream::new(Vec::new()));
     let out_ptr = out_stream.to_com_ptr::<IBStream>().expect("IBStream");
     assert_eq!(
+        // SAFETY: `pdata` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getProgramData` must
+        // reject or accept).
         unsafe { pdata.getProgramData(0, 0, out_ptr.as_ptr()) },
         kResultOk
     );
@@ -3843,6 +4200,9 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     let in_stream = ComWrapper::new(MemStream::new(b"MOOSE_STATE_B_UPDATED".to_vec()));
     let in_ptr = in_stream.to_com_ptr::<IBStream>().expect("IBStream");
     assert_eq!(
+        // SAFETY: `pdata` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `setProgramData` must
+        // reject or accept).
         unsafe { pdata.setProgramData(0, 1, in_ptr.as_ptr()) },
         kResultOk
     );
@@ -3850,6 +4210,9 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     let updated_stream = ComWrapper::new(MemStream::new(Vec::new()));
     let updated_ptr = updated_stream.to_com_ptr::<IBStream>().expect("IBStream");
     assert_eq!(
+        // SAFETY: `pdata` is a live interface owned by this test; every pointer argument is a local
+        // or a test-owned object that outlives the call (or null, which `getProgramData` must
+        // reject or accept).
         unsafe { pdata.getProgramData(0, 1, updated_ptr.as_ptr()) },
         kResultOk
     );
@@ -3869,6 +4232,9 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     let ro_in = ComWrapper::new(MemStream::new(b"NEW".to_vec()));
     let ro_in_ptr = ro_in.to_com_ptr::<IBStream>().expect("IBStream");
     assert_eq!(
+        // SAFETY: `ro_pdata` is a live interface owned by this test; every pointer argument is a
+        // local or a test-owned object that outlives the call (or null, which `setProgramData` must
+        // reject or accept).
         unsafe { ro_pdata.setProgramData(0, 0, ro_in_ptr.as_ptr()) },
         kResultFalse
     );
@@ -3878,10 +4244,18 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     let f2 = factory
         .to_com_ptr::<IPluginFactory2>()
         .expect("IPluginFactory2");
+    // SAFETY: `f2` is a live interface owned by this test, and `countClasses` takes no pointers
+    // here.
     assert_eq!(unsafe { f2.countClasses() }, 2);
+    // SAFETY: `PClassInfo2` is a plain-old-data SDK struct (integers, arrays and raw pointers), so
+    // all-zero is a valid value.
     let mut cls: PClassInfo2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `f2` is a live interface owned by this test; every pointer argument is a local or a
+    // test-owned object that outlives the call (or null, which `getClassInfo2` must reject or
+    // accept).
     assert_eq!(unsafe { f2.getClassInfo2(1, &raw mut cls) }, kResultOk);
     assert_eq!(
+        // SAFETY: `getClassInfo2` filled `category` with `c8_into`, which always NUL-terminates.
         unsafe { super::cstr(cls.category.as_ptr()) },
         "Plugin Compatibility Class"
     );
@@ -3891,6 +4265,9 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
     let mut raw_compat: *mut c_void = std::ptr::null_mut();
     let compat_iid = <IPluginCompatibility as vst3::com_scrape_types::Interface>::IID;
     assert_eq!(
+        // SAFETY: `f2` is a live `IPluginFactory2` owned by this test. `expected_cid` and
+        // `compat_iid` are local 16-byte identifiers that remain readable for the call, and
+        // `&raw mut raw_compat` is a writable output slot.
         unsafe {
             f2.createInstance(
                 expected_cid.as_ptr().cast(),
@@ -3901,11 +4278,16 @@ fn physical_ui_keyswitch_program_list_and_compatibility_interfaces_round_trip() 
         kResultOk
     );
     assert!(!raw_compat.is_null());
+    // SAFETY: `createInstance` returned a non-null owned `IPluginCompatibility` reference (asserted
+    // above), which `from_raw` adopts.
     let compat = unsafe { ComPtr::<IPluginCompatibility>::from_raw(raw_compat.cast()) }
         .expect("IPluginCompatibility");
     let json_stream = ComWrapper::new(MemStream::new(Vec::new()));
     let json_ptr = json_stream.to_com_ptr::<IBStream>().expect("IBStream");
     assert_eq!(
+        // SAFETY: `compat` is a live interface owned by this test; every pointer argument is a
+        // local or a test-owned object that outlives the call (or null, which
+        // `getCompatibilityJSON` must reject or accept).
         unsafe { compat.getCompatibilityJSON(json_ptr.as_ptr()) },
         kResultOk
     );
@@ -4029,6 +4411,7 @@ mod wave4a {
         let com = component(reg);
         let map2 = com.as_com_ref::<IMidiMapping2>().expect("IMidiMapping2");
 
+        // SAFETY: `map2` is a live interface on `com`, and every list passed is a local.
         unsafe {
             assert_eq!(
                 map2.getNumMidi2ControllerAssignments(BusDirections_::kInput as BusDirections),
@@ -4188,7 +4571,9 @@ mod wave4a {
             if id.is_null() || string.is_null() || size_in_bytes < 2 {
                 return kInvalidArgument;
             }
+            // SAFETY: `id` was null-checked above and is a NUL-terminated attribute id from the caller.
             let key = unsafe { CStr::from_ptr(id) };
+            // SAFETY: `kStateType` is a static NUL-terminated C string.
             let want = unsafe { CStr::from_ptr(PresetAttributes::kStateType) };
             if key != want {
                 return kResultFalse;
@@ -4197,6 +4582,7 @@ mod wave4a {
                 return kResultFalse;
             };
             let max_chars = (size_in_bytes as usize) / size_of::<TChar>();
+            // SAFETY: `string` was null-checked and the caller gives `size_in_bytes` writable bytes.
             let slice = unsafe { std::slice::from_raw_parts_mut(string, max_chars) };
             super::super::utf16_into(slice, val);
             kResultOk
@@ -4236,6 +4622,7 @@ mod wave4a {
             num_bytes: int32,
             num_read: *mut int32,
         ) -> tresult {
+            // SAFETY: Forwards the caller's `read` contract to the in-memory stream.
             unsafe { self.mem.read(buffer, num_bytes, num_read) }
         }
         unsafe fn write(
@@ -4244,12 +4631,15 @@ mod wave4a {
             num_bytes: int32,
             num_written: *mut int32,
         ) -> tresult {
+            // SAFETY: Forwards the caller's `write` contract to the in-memory stream.
             unsafe { self.mem.write(buffer, num_bytes, num_written) }
         }
         unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
+            // SAFETY: Forwards the caller's `seek` contract to the in-memory stream.
             unsafe { self.mem.seek(pos, mode, result) }
         }
         unsafe fn tell(&self, pos: *mut int64) -> tresult {
+            // SAFETY: Forwards the caller's `tell` contract to the in-memory stream.
             unsafe { self.mem.tell(pos) }
         }
     }
@@ -4309,6 +4699,7 @@ mod wave4a {
             (None, StateContext::Unknown),
         ];
 
+        // SAFETY: `com` is a live component and every stream passed is a local `ComWrapper`.
         unsafe {
             for &(attr, expected) in cases {
                 let save_stream = ComWrapper::new(AttrStream::new(Vec::new(), attr));
@@ -4399,6 +4790,7 @@ mod deferred_scale_resize {
             drop(busy);
         }
         unsafe fn bind_host_queue(&self, id: usize, host: Option<*const Host>) {
+            // SAFETY: Forwards the caller's `bind_host_queue` contract unchanged.
             unsafe { self.0.bind_host_queue(id, host) };
         }
     }
@@ -4413,13 +4805,16 @@ mod deferred_scale_resize {
     fn host_set_size_drops_superseded_deferred_scale_resize() {
         let reg = registration_with(descriptor(), make, no_bus, Vec::new());
         let com = component(reg);
+        // SAFETY: `com` is live; the returned view pointer is owned by `ComPtr`.
         let view = unsafe { ComPtr::from_raw(com.createView(c"editor".as_ptr())) }.expect("view");
         let frame = ComWrapper::new(Frame(FrameCore::new(1000, 700)));
         let fp = frame.as_com_ref::<IPlugFrame>().unwrap().as_ptr();
+        // SAFETY: `view` is live and `fp` points at the local frame, which outlives the view.
         assert_eq!(unsafe { view.setFrame(fp) }, kResultOk);
         let scale = view
             .cast::<IPlugViewContentScaleSupport>()
             .expect("content scale");
+        // SAFETY: `scale` is a live interface on `view`.
         assert_eq!(unsafe { scale.setContentScaleFactor(2.0) }, kResultOk);
 
         let mut rect = ViewRect {
@@ -4428,6 +4823,7 @@ mod deferred_scale_resize {
             right: 1000,
             bottom: 700,
         };
+        // SAFETY: `view` is live and `rect` is a local.
         assert_eq!(unsafe { view.onSize(&raw mut rect) }, kResultOk);
         assert_eq!(
             frame.0.resizes.load(SeqCst),
@@ -4440,8 +4836,10 @@ mod deferred_scale_resize {
             right: 0,
             bottom: 0,
         };
+        // SAFETY: `view` is live and `got` is a local.
         assert_eq!(unsafe { view.getSize(&raw mut got) }, kResultOk);
         assert_eq!((got.right, got.bottom), (1000, 700));
+        // SAFETY: `view` is live; a null frame detaches it.
         assert_eq!(unsafe { view.setFrame(std::ptr::null_mut()) }, kResultOk);
     }
 }

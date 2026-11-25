@@ -461,6 +461,9 @@ pub(crate) unsafe fn input_channel_slice<S: Sample, H: Sample>(
         // 'static convention as the non-null path).
         return unsafe { std::slice::from_raw_parts(scratch.as_ptr(), num_frames) };
     }
+    // SAFETY: The caller guarantees a non-null `host_ptr` holds `num_frames` readable `H` samples
+    // for this block. Equal `IS_F64` flags mean `S == H` (sealed `Sample`), and `copy` forces a
+    // snapshot when the input aliases an output.
     unsafe {
         if S::IS_F64 == H::IS_F64 && !copy {
             // SAFETY: sealed traits - equal IS_F64 means S == H.
@@ -492,15 +495,19 @@ pub(crate) unsafe fn input_overlaps_outputs(
     let start = input as usize;
     let end = start.saturating_add(len);
     for bus in 0..process.audio_outputs_count {
+        // SAFETY: `process` is the host's live `clap_process`, whose `audio_outputs` holds
+        // `audio_outputs_count` buses.
         let output = unsafe { &*process.audio_outputs.add(bus as usize) };
         for channel in 0..output.channel_count {
             let (ptr, bytes) = if !output.data64.is_null() {
                 (
+                    // SAFETY: `data64` is non-null and holds `channel_count` channel pointers.
                     unsafe { *output.data64.add(channel as usize) } as usize,
                     size_of::<f64>(),
                 )
             } else if !output.data32.is_null() {
                 (
+                    // SAFETY: `data32` is non-null and holds `channel_count` channel pointers.
                     unsafe { *output.data32.add(channel as usize) } as usize,
                     size_of::<f32>(),
                 )
@@ -540,6 +547,8 @@ pub(crate) unsafe fn output_channel_slice<S: Sample, H: Sample>(
         // SAFETY: `scratch` outlives the returned slice.
         return unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr(), num_frames) };
     }
+    // SAFETY: The caller guarantees a non-null `host_ptr` holds `num_frames` writable `H` samples
+    // for this block, and equal `IS_F64` flags mean `S == H`.
     unsafe {
         if S::IS_F64 == H::IS_F64 {
             // SAFETY: sealed traits - equal IS_F64 means S == H.

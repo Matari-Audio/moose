@@ -144,6 +144,8 @@ pub(crate) fn remote_controls_page_id(group: &str, chunk_index: usize) -> clap_i
 pub(crate) unsafe extern "C" fn remote_controls_count<P: PluginExport>(
     plugin: *const clap_plugin,
 ) -> u32 {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         len_u32(
@@ -160,6 +162,14 @@ pub(crate) unsafe extern "C" fn remote_controls_get<P: PluginExport>(
     page_index: u32,
     out: *mut clap_remote_controls_page,
 ) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires non-null `out` to be
+    // aligned and valid for writes of `clap_remote_controls_page`; we build the struct locally
+    // and write it via `ptr::write` so potentially uninitialized host memory is never turned into
+    // `&mut`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         let pages = data
@@ -182,17 +192,19 @@ pub(crate) unsafe extern "C" fn remote_controls_get<P: PluginExport>(
 
         let (section_name, page_name) = split_group(group);
 
-        let out = &mut *out;
-        out.section_name = [0; CLAP_NAME_SIZE];
-        copy_str_to_buf(&mut out.section_name, section_name);
-        out.page_id = remote_controls_page_id(group, chunk_index);
-        out.page_name = [0; CLAP_NAME_SIZE];
-        copy_str_to_buf(&mut out.page_name, page_name);
-        out.param_ids = [CLAP_INVALID_ID; CLAP_REMOTE_CONTROLS_COUNT];
-        for (slot, &id) in out.param_ids.iter_mut().zip(ids.iter()) {
+        let mut page = clap_remote_controls_page {
+            section_name: [0; CLAP_NAME_SIZE],
+            page_id: remote_controls_page_id(group, chunk_index),
+            page_name: [0; CLAP_NAME_SIZE],
+            param_ids: [CLAP_INVALID_ID; CLAP_REMOTE_CONTROLS_COUNT],
+            is_for_preset: false,
+        };
+        copy_str_to_buf(&mut page.section_name, section_name);
+        copy_str_to_buf(&mut page.page_name, page_name);
+        for (slot, &id) in page.param_ids.iter_mut().zip(ids.iter()) {
             *slot = id;
         }
-        out.is_for_preset = false;
+        std::ptr::write(out, page);
 
         true
     }

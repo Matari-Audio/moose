@@ -471,6 +471,8 @@ mod plugin_cell {
     // guard at a time - the same guarantee `Mutex<T>` gives, so
     // `Send`/`Sync` need only `T: Send`.
     unsafe impl<T: Send> Send for PluginCell<T> {}
+    // SAFETY: Same as `Send`: shared access to `T` goes through a single guard at a time, so
+    // `&PluginCell<T>` across threads only needs `T: Send`, like `Mutex<T>`.
     unsafe impl<T: Send> Sync for PluginCell<T> {}
 
     impl<T> PluginCell<T> {

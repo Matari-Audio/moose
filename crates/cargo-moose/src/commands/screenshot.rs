@@ -177,9 +177,13 @@ pub(crate) fn cmd_screenshot(args: &[String]) -> Res {
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new(&fallback_name)),
         );
+        // SAFETY: `lib_path` is the cdylib that `cargo-moose` just built from a `moose::plugin!`
+        // crate, so it exports `__moose_screenshot` with the expected signature.
         unsafe { call_screenshot(&lib_path, state_bytes.as_deref(), &render_path, scale)? };
         check_against_reference(&render_path, &resolved_out, &plugin.crate_name)?;
     } else {
+        // SAFETY: `lib_path` is the cdylib that `cargo-moose` just built from a `moose::plugin!`
+        // crate, so it exports `__moose_screenshot` with the expected signature.
         unsafe { call_screenshot(&lib_path, state_bytes.as_deref(), &resolved_out, scale)? };
         eprintln!("Wrote {}", resolved_out.display());
     }
@@ -215,6 +219,9 @@ unsafe fn call_screenshot(
     out_path: &Path,
     scale: f64,
 ) -> Result<(), crate::CargoMooseError> {
+    // SAFETY: Per this function's contract, the library exports `__moose_screenshot` with the
+    // `ScreenshotFn` signature. `lib` stays loaded across the call, and every pointer/length pair
+    // borrows a live slice.
     unsafe {
         let lib = libloading::Library::new(lib_path)
             .map_err(|e| format!("failed to dlopen {}: {e}", lib_path.display()))?;

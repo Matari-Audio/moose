@@ -110,6 +110,9 @@ pub fn install(
     qwerty: &Arc<AtomicBool>,
     bus_layouts: &[(u16, u16)],
 ) {
+    // SAFETY: `install` runs on the main thread before the run loop starts. Every message sent here
+    // exists on `NSApplication`/`NSMenu`/`NSMenuItem` with the declared types, and each object is
+    // created here and retained by the menu tree for the process lifetime.
     unsafe {
         let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
 
@@ -374,6 +377,9 @@ pub fn install(
 }
 
 unsafe fn make_menu(title: &str) -> *mut AnyObject {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given.
     unsafe {
         let title = ns_string(title);
         let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
@@ -383,6 +389,9 @@ unsafe fn make_menu(title: &str) -> *mut AnyObject {
 }
 
 unsafe fn make_menu_item(title: &str) -> *mut AnyObject {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given.
     unsafe {
         let title = ns_string(title);
         let empty = ns_string("");
@@ -403,6 +412,10 @@ unsafe fn make_toggle_item(
     action: Sel,
     target: *mut AnyObject,
 ) -> *mut AnyObject {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `target` is our live
+    // `MooseMenuTarget`.
     unsafe {
         let title = ns_string(title);
         let key = ns_string(key_equiv);
@@ -421,6 +434,9 @@ unsafe fn make_toggle_item(
 /// Add the standard App-menu items. macOS does NOT auto-fill the
 /// app name here - we have to spell out `Quit <App>` ourselves.
 unsafe fn add_app_menu_items(menu: *mut AnyObject, app_name: &str) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`.
     unsafe {
         let title = ns_string(&format!("Quit {app_name}"));
         let key = ns_string("q");
@@ -446,6 +462,9 @@ unsafe fn populate_preset_load_menu(
     target: *mut AnyObject,
     entries: &[crate::presets::PresetMenuEntry],
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`.
     unsafe {
         let empty = ns_string("");
         if entries.is_empty() {
@@ -483,6 +502,10 @@ unsafe fn populate_device_menu(
     current: Option<&str>,
     action: Sel,
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`,
+    // and `target` is our live `MooseMenuTarget`.
     unsafe {
         let _: () = msg_send![menu, removeAllItems];
 
@@ -530,6 +553,10 @@ unsafe fn populate_channel_menu(
     current: ChannelRoute,
     action: Sel,
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`,
+    // and `target` is our live `MooseMenuTarget`.
     unsafe {
         let _: () = msg_send![menu, removeAllItems];
         let current_tag = encoded_tag(current);
@@ -592,6 +619,10 @@ unsafe fn populate_bus_layout_menu(
     current_index: usize,
     action: Sel,
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`,
+    // and `target` is our live `MooseMenuTarget`.
     unsafe {
         let current_tag = i64::try_from(current_index).unwrap_or(-1);
         for (idx, (in_ch, out_ch)) in layouts.iter().enumerate() {
@@ -617,6 +648,9 @@ unsafe fn add_tagged_item(
     tag: i64,
     current_tag: i64,
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`.
     unsafe {
         let t = ns_string(title);
         let empty = ns_string("");
@@ -638,6 +672,8 @@ unsafe fn add_tagged_item(
 /// `selected_tag`. Skips separators (whose default tag is 0 and would
 /// otherwise collide with the "direct" item).
 unsafe fn update_channel_checkmarks(menu: *mut AnyObject, selected_tag: i64) {
+    // SAFETY: `menu` is null-checked; otherwise it is a live `NSMenu`, and
+    // `itemArray`/`count`/`objectAtIndex:`/`tag`/`setState:` have the declared types.
     unsafe {
         if menu.is_null() {
             return;
@@ -689,6 +725,10 @@ unsafe fn populate_midi_input_menu(
     devices: &[String],
     current: Option<&str>,
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`,
+    // and `target` is our live `MooseMenuTarget`.
     unsafe {
         let _: () = msg_send![menu, removeAllItems];
 
@@ -738,6 +778,10 @@ unsafe fn populate_midi_channel_menu(
     target: *mut AnyObject,
     current: MidiChannel,
 ) {
+    // SAFETY: Main-thread AppKit construction. Every message sent here exists on the receiving
+    // class (`NSMenu`/`NSMenuItem`/`NSString`) with the declared argument and return types, and
+    // every object argument is a live object we created or were given. `menu` is a live `NSMenu`,
+    // and `target` is our live `MooseMenuTarget`.
     unsafe {
         let _: () = msg_send![menu, removeAllItems];
         let cur = i64::from(current.encode());
@@ -768,6 +812,8 @@ unsafe fn populate_midi_channel_menu(
 }
 
 unsafe fn ns_string(s: &str) -> *mut AnyObject {
+    // SAFETY: `initWithBytes:length:encoding:` copies `bytes.len()` bytes of valid UTF-8 from the
+    // live `&str` (encoding 4 = UTF-8) and returns a +1 `NSString` owned by the caller.
     unsafe {
         let bytes = s.as_bytes();
         let cls = class!(NSString);
@@ -787,6 +833,9 @@ unsafe fn item_title(item: *mut AnyObject) -> Option<String> {
     if item.is_null() {
         return None;
     }
+    // SAFETY: `item` is null-checked above and is a live `NSMenuItem`. `title` returns an
+    // `NSString` borrowed from it, and `UTF8String` is copied into an owned `String` before the
+    // item can change.
     unsafe {
         let nsstr: *mut AnyObject = msg_send![item, title];
         if nsstr.is_null() {
@@ -817,6 +866,9 @@ const STATE_IVAR: &CStr = c"_moose_menu_state";
 // `items_after_statements` allow.
 #[allow(clippy::items_after_statements, clippy::too_many_lines)]
 fn ensure_class() -> &'static AnyClass {
+    // SAFETY: Runs once (`Once`) to declare `MooseMenuTarget` on `NSObject`. `add_method` derives
+    // each type encoding from its `extern "C"` fn signature, and the ivar is the `*mut c_void` that
+    // `STATE_IVAR` readers load.
     REGISTER_CLASS.call_once(|| unsafe {
         let superclass = class!(NSObject);
         let mut decl = ClassBuilder::new(c"MooseMenuTarget", superclass)
@@ -826,6 +878,10 @@ fn ensure_class() -> &'static AnyClass {
 
         // Mic toggle.
         extern "C" fn toggle_input_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -846,6 +902,10 @@ fn ensure_class() -> &'static AnyClass {
 
         // Output mute toggle.
         extern "C" fn toggle_output_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -866,6 +926,10 @@ fn ensure_class() -> &'static AnyClass {
 
         // Computer-keyboard-to-MIDI toggled from the menu (⌘K).
         extern "C" fn toggle_keyboard_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -890,6 +954,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -911,6 +979,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -932,6 +1004,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -955,6 +1031,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -979,6 +1059,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1004,6 +1088,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1030,6 +1118,10 @@ fn ensure_class() -> &'static AnyClass {
             _: Sel,
             sender: *mut AnyObject,
         ) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1052,6 +1144,9 @@ fn ensure_class() -> &'static AnyClass {
         // we know whether to refresh the mic checkmark or
         // repopulate a device submenu.
         extern "C" fn menu_will_open(this: *mut AnyObject, _: Sel, menu: *mut AnyObject) {
+            // SAFETY: AppKit sends `menuWillOpen:` on the main thread to our delegate `this`, whose
+            // ivar points at the leaked `MenuState`. `menu` is the live `NSMenu` that is about to
+            // open, and the menu pointers in `MenuState` are retained by the menu bar.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1158,6 +1253,10 @@ fn ensure_class() -> &'static AnyClass {
         // title (its display label) so re-enumeration can't desync a
         // stale index.
         extern "C" fn load_preset_action(this: *mut AnyObject, _: Sel, sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 let Some(state) = state_from(this) else {
                     return;
@@ -1174,6 +1273,10 @@ fn ensure_class() -> &'static AnyClass {
 
         // Preset: step to the next entry, wrapping.
         extern "C" fn next_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.step(1);
@@ -1187,6 +1290,10 @@ fn ensure_class() -> &'static AnyClass {
 
         // Preset: step to the previous entry, wrapping.
         extern "C" fn prev_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.step(-1);
@@ -1201,6 +1308,10 @@ fn ensure_class() -> &'static AnyClass {
         // Preset: save the current state - overwrites the loaded
         // user preset, or routes to Save As for factory / none.
         extern "C" fn save_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.save();
@@ -1214,6 +1325,10 @@ fn ensure_class() -> &'static AnyClass {
 
         // Preset: save under a chosen name / location.
         extern "C" fn save_as_preset_action(this: *mut AnyObject, _: Sel, _sender: *mut AnyObject) {
+            // SAFETY: AppKit sends this action on the main thread with `this` set to our
+            // `MooseMenuTarget`. Its ivar points at the `MenuState` leaked in `make_menu_target`
+            // (never freed), and `sender` is the clicked `NSMenuItem`. Every message here exists on
+            // `NSMenuItem`/`NSMenu` with the declared argument and return types.
             unsafe {
                 if let Some(state) = state_from(this) {
                     state.presets.save_as();
@@ -1234,6 +1349,9 @@ unsafe fn state_from<'a>(this: *mut AnyObject) -> Option<&'a MenuState> {
     if this.is_null() {
         return None;
     }
+    // SAFETY: `this` is non-null and, per the caller, a live `MooseMenuTarget` whose `STATE_IVAR`
+    // holds a `*mut c_void`. That pointer is null or the leaked `MenuState`, which is never freed,
+    // so the returned borrow is valid for any `'a`.
     unsafe {
         let this = &*this;
         let ivar = this.class().instance_variable(STATE_IVAR)?;
@@ -1253,6 +1371,9 @@ unsafe fn make_menu_target(
     presets: PresetController,
     keyboard: Arc<AtomicBool>,
 ) -> *mut AnyObject {
+    // SAFETY: `MooseMenuTarget` is registered by `ensure_class`, so `alloc`/`init` yield a live
+    // instance whose `STATE_IVAR` is a `*mut c_void`. The `MenuState` box is leaked into it for the
+    // process lifetime.
     unsafe {
         let cls = ensure_class();
         let target: *mut AnyObject = msg_send![cls, alloc];
@@ -1295,6 +1416,9 @@ unsafe fn update_menu_state(
     midi_input_menus: Vec<*mut AnyObject>,
     target_self: *mut AnyObject,
 ) {
+    // SAFETY: `target` is our live `MooseMenuTarget`, and its ivar is null or the leaked
+    // `MenuState`. `install` calls this on the main thread before any menu action can run, so this
+    // `&mut` is unique.
     unsafe {
         let Some(ivar) = (*target).class().instance_variable(STATE_IVAR) else {
             return;
@@ -1322,6 +1446,9 @@ unsafe fn set_preset_menu(
     preset_load_menu: *mut AnyObject,
     preset_save_item: *mut AnyObject,
 ) {
+    // SAFETY: `target` is our live `MooseMenuTarget`, and its ivar is null or the leaked
+    // `MenuState`. `install` calls this on the main thread before any menu action can run, so this
+    // `&mut` is unique.
     unsafe {
         let Some(ivar) = (*target).class().instance_variable(STATE_IVAR) else {
             return;

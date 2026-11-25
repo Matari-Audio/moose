@@ -49,6 +49,7 @@ pub unsafe fn set_plugin_path(plugin_path: *const c_char) {
     if plugin_path.is_null() {
         return;
     }
+    // SAFETY: `plugin_path` is non-null (checked above) and NUL-terminated per CLAP.
     let path = unsafe { CStr::from_ptr(plugin_path) };
     if let Ok(s) = path.to_str()
         && !s.is_empty()
@@ -89,6 +90,7 @@ struct ProviderDescHolder {
 // `CString`s above, which are immutable after construction; the
 // holder is only ever read once initialized.
 unsafe impl Send for ProviderDescHolder {}
+// SAFETY: Same as `Send`: the holder is immutable after initialisation and only read.
 unsafe impl Sync for ProviderDescHolder {}
 
 /// One per shared library, like every other CLAP static here - a
@@ -163,6 +165,7 @@ unsafe extern "C" fn factory_create<P: PluginExport>(
     if indexer.is_null() || provider_id.is_null() {
         return ptr::null();
     }
+    // SAFETY: `provider_id` is non-null (checked above) and NUL-terminated per CLAP.
     let requested = unsafe { CStr::from_ptr(provider_id) };
     let ours = provider_descriptor::<P>();
     // SAFETY: `desc.id` points into the holder's owned CString.
@@ -196,9 +199,13 @@ unsafe extern "C" fn provider_init<P: PluginExport>(
     // `P::info()`; firewall so a panic degrades to "init failed" instead of
     // unwinding across this `extern "C"` boundary and aborting the host.
     run_extern_callback_with::<P, bool>("CLAP", "preset_provider_init", false, || {
+        // SAFETY: `provider` is null or the `clap_preset_discovery_provider` we allocated, whose
+        // first field is `ProviderHandle`'s; `as_ref` maps null to `None`.
         let Some(handle) = (unsafe { provider.cast::<ProviderHandle>().as_ref() }) else {
             return false;
         };
+        // SAFETY: `handle.indexer` is null or the host's indexer, which outlives the provider;
+        // `as_ref` maps null to `None`.
         let indexer = unsafe { handle.indexer.as_ref() };
         let Some(indexer) = indexer else {
             return false;
@@ -213,6 +220,8 @@ unsafe extern "C" fn provider_init<P: PluginExport>(
                 description: description.as_ptr(),
                 file_extension: extension.as_ptr(),
             };
+            // SAFETY: `handle.indexer` is the live host indexer, and `filetype` and its strings are
+            // locals that outlive the call.
             if !unsafe { declare_filetype(handle.indexer, &raw const filetype) } {
                 return false;
             }
@@ -282,6 +291,8 @@ fn declare_dir(
         kind: CLAP_PRESET_DISCOVERY_LOCATION_FILE,
         location: location.as_ptr(),
     };
+    // SAFETY: `indexer` is the live host indexer, and `loc` and its strings are locals that outlive
+    // the call.
     unsafe { declare_location(indexer, &raw const loc) }
 }
 
@@ -317,10 +328,12 @@ unsafe extern "C" fn provider_get_metadata<P: PluginExport>(
         {
             return false;
         }
+        // SAFETY: `location` is non-null (checked above) and NUL-terminated per CLAP.
         let Ok(location) = (unsafe { CStr::from_ptr(location) }).to_str() else {
             return false;
         };
         let path = Path::new(location);
+        // SAFETY: `metadata_receiver` is non-null (checked above) and live for this call.
         let receiver = unsafe { &*metadata_receiver };
         let info = P::info();
 
@@ -380,6 +393,8 @@ fn report_preset<P: PluginExport>(
         return true; // skip this preset, keep scanning
     };
     let load_key = CString::new(preset.uuid.as_str()).unwrap_or_default();
+    // SAFETY: `receiver_ptr` is the live receiver, and both C strings are locals that outlive the
+    // call.
     if !unsafe { begin_preset(receiver_ptr, name.as_ptr(), load_key.as_ptr()) } {
         // Host not interested in this preset; keep going.
         return true;
@@ -392,18 +407,22 @@ fn report_preset<P: PluginExport>(
                 abi: c"clap".as_ptr(),
                 id: id.as_ptr(),
             };
+            // SAFETY: `receiver_ptr` is the live receiver, and `universal` and its strings are
+            // locals that outlive the call.
             unsafe { add_plugin_id(receiver_ptr, &raw const universal) };
         }
     }
     if let (Some(add_creator), Some(author)) = (receiver.add_creator, preset.author.as_deref())
         && let Ok(author) = CString::new(author)
     {
+        // SAFETY: `receiver_ptr` is the live receiver, and `author` outlives the call.
         unsafe { add_creator(receiver_ptr, author.as_ptr()) };
     }
     if let (Some(set_description), Some(comment)) =
         (receiver.set_description, preset.comment.as_deref())
         && let Ok(comment) = CString::new(comment)
     {
+        // SAFETY: `receiver_ptr` is the live receiver, and `comment` outlives the call.
         unsafe { set_description(receiver_ptr, comment.as_ptr()) };
     }
     true

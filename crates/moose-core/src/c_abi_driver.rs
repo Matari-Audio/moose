@@ -225,8 +225,10 @@ pub unsafe fn zero_raw_outputs(
         return;
     }
     for ch in 0..num_output_channels as usize {
+        // SAFETY: `outputs` is non-null and holds `num_output_channels` pointers (caller contract).
         let ptr = unsafe { *outputs.add(ch) };
         if !ptr.is_null() {
+            // SAFETY: Non-null output channels hold `num_frames` writable `f32`s (caller contract).
             unsafe { std::ptr::write_bytes(ptr, 0, num_frames) };
         }
     }
@@ -260,6 +262,8 @@ pub struct CAbiAudioBlock<'a, P: PluginExport> {
 /// `block.inputs` and `block.outputs` must be valid for the declared channel
 /// and frame counts for the duration of the call.
 pub unsafe fn run_c_abi_audio_block<P: PluginExport>(block: &mut CAbiAudioBlock<'_, P>) {
+    // SAFETY: The caller guarantees `block.inputs`/`block.outputs` are valid for the declared
+    // channel and frame counts for this call, which outlives `audio_buffer`.
     let mut audio_buffer = unsafe {
         block.scratch.build(
             block.inputs,
@@ -293,6 +297,8 @@ pub unsafe fn run_c_abi_audio_block<P: PluginExport>(block: &mut CAbiAudioBlock<
         block.catalog,
     );
     let _ = audio_buffer;
+    // SAFETY: The same `outputs`/counts as the `build` above, still valid for this call;
+    // `audio_buffer` is gone.
     unsafe {
         block
             .scratch
@@ -323,6 +329,8 @@ pub unsafe fn format_param_to_c_buf(
         return 0;
     }
     match params.format_value(id, value) {
+        // SAFETY: `out` is non-null, `out_len > 0` (checked above), and it holds `out_len` writable
+        // bytes (caller contract).
         Some(text) => len_u32(unsafe { copy_c_str(out, out_len as usize, &text) }),
         None => 0,
     }
@@ -344,11 +352,13 @@ pub unsafe fn parse_param_from_c_str(
     if text.is_null() || out_plain.is_null() {
         return 0;
     }
+    // SAFETY: `text` is non-null (checked above) and NUL-terminated (caller contract).
     let Ok(text) = unsafe { CStr::from_ptr(text) }.to_str() else {
         return 0;
     };
     match params.parse_value(id, text) {
         Some(v) => {
+            // SAFETY: `out_plain` is non-null (checked above) and writable (caller contract).
             unsafe { *out_plain = v };
             1
         }
@@ -385,6 +395,8 @@ pub unsafe fn save_state_to_host_buf<P: PluginExport>(
     impl Drop for Guard {
         fn drop(&mut self) {
             if !self.ptr.is_null() {
+                // SAFETY: `ptr` came from `alloc_fn` and is non-null; ownership passes back to the
+                // paired `free_fn` exactly once (the guard is disarmed on success).
                 unsafe { (self.free_fn)(self.ptr.cast()) };
             }
         }
@@ -403,6 +415,7 @@ pub unsafe fn save_state_to_host_buf<P: PluginExport>(
     )?;
     let host_len = u32::try_from(len).ok()?;
     let mut guard = Guard {
+        // SAFETY: The caller guarantees `alloc_fn` returns null or `len` writable bytes.
         ptr: unsafe { alloc_fn(len) }.cast::<u8>(),
         free_fn,
     };
@@ -423,6 +436,9 @@ pub unsafe fn save_state_to_host_buf<P: PluginExport>(
             if bytes.len() > len - offset {
                 return -1;
             }
+            // SAFETY: `bytes.len() <= len - offset` (checked above), so the destination stays
+            // inside the `len`-byte `alloc_fn` buffer, which cannot overlap the serializer's
+            // `bytes`.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), guard.ptr.add(offset), bytes.len());
             }
@@ -561,12 +577,14 @@ mod tests {
 
     #[test]
     fn zero_raw_outputs_handles_null_and_fills_zero() {
+        // SAFETY: A null `outputs` is accepted and returns early.
         unsafe {
             zero_raw_outputs(std::ptr::null_mut(), 2, 8);
         }
         let mut ch0 = [1.0f32; 4];
         let mut ch1 = [2.0f32; 4];
         let mut ptrs = [ch0.as_mut_ptr(), ch1.as_mut_ptr()];
+        // SAFETY: `ptrs` holds two pointers to local 4-sample arrays.
         unsafe {
             zero_raw_outputs(ptrs.as_mut_ptr(), 2, 4);
         }
