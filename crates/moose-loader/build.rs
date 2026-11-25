@@ -7,7 +7,11 @@ fn main() {
     let version = String::from_utf8_lossy(&output.stdout);
     let hash = fnv1a_64(version.as_bytes());
     println!("cargo:rustc-env=MOOSE_RUSTC_HASH={hash}");
-    println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
+    // Cargo already rebuilds every crate when the rustc version changes, so
+    // only this script is an input. Naming a file that may not exist (the
+    // monorepo has no frameworks/moose/rust-toolchain.toml) reran this script
+    // on every build and recompiled moose and all its dependents.
+    println!("cargo:rerun-if-changed=build.rs");
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {

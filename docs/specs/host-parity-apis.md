@@ -71,7 +71,7 @@ evidence_freshness_days: 180
 
 ## API / Data / File Contract
 
-- **Supported cases and deviations from the migration-bindings request.** This section amends GAP-1..3 of the BUFFR migration-bindings spec; where they differ, this contract wins:
+- **Supported cases and deviations from the migration-bindings request.** This section amends GAP-1..3 of a host plugin's migration-bindings spec; where they differ, this contract wins:
   - **Spec:** `HostIdentity { format: HostFormat, name, version }` with a required identity.
     **Shipped:** `HostFormat` is `#[non_exhaustive]` (Clap/Vst3/Au/Aax/Lv2/Standalone). `InitContext::host()` and `PreparationConfig::host` are `Option`.
     **Why `Option`:** every wrapper and both shells (static and hot reload) always set it. `None` only occurs for an `InitContext` / `PreparationConfig` built outside a wrapper, such as test drivers or offline rendering. A required field would break every direct constructor.
