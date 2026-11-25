@@ -161,14 +161,14 @@ impl<T, I: SliceIndex<[T]>, const N: usize> Index<I> for HeapArray<T, N> {
 
     #[inline]
     fn index(&self, index: I) -> &Self::Output {
-        index.index(&self.0[..])
+        Index::index(self.0.as_slice(), index)
     }
 }
 
 impl<T, I: SliceIndex<[T]>, const N: usize> IndexMut<I> for HeapArray<T, N> {
     #[inline]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        index.index_mut(&mut self.0[..])
+        IndexMut::index_mut(self.0.as_mut_slice(), index)
     }
 }
 
