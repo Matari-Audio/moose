@@ -19,6 +19,36 @@ use moose_params::MidiSource;
 use crate::host_queue::{HostQueue, HostSignal};
 use crate::thread::MainThread;
 
+/// Plugin-held handle asking the host to resume calling `process` on an
+/// instance the host may have put to sleep (CLAP `host.request_process`).
+/// Obtained from [`crate::tasks::InitContext::process_waker`]; `None` for
+/// formats with no such request (they keep processing anyway).
+///
+/// `Clone + Send + Sync`. [`Self::wake`] is lock- and allocation-free and
+/// callable from any thread, including the audio thread and background
+/// tasks; after the instance is destroyed it is a no-op.
+#[derive(Clone)]
+pub struct ProcessWaker(Arc<dyn Fn() + Send + Sync>);
+
+impl ProcessWaker {
+    /// Wrap a wrapper's wake hook. `wake` runs on the caller's thread and
+    /// must not lock or allocate.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    /// Ask the host to process this instance again.
+    pub fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for ProcessWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessWaker")
+    }
+}
+
 bitflags::bitflags! {
     /// What the plugin tells the host changed, so it re-reads it.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

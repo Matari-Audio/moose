@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::tasks::InstanceContext;
+
 use crate::plugin::PluginRuntime;
 use moose_params::{ParamInfo, Params};
 
@@ -84,6 +86,18 @@ pub trait PluginExport: PluginRuntime + Sized {
 
     /// Construct a new instance of the plugin.
     fn create() -> Self;
+
+    /// Construct an instance for a format wrapper, handing it the wrapper's
+    /// [`InstanceContext`] (host identity, process waker) for the plugin's
+    /// `init`. Every wrapper calls this; the `moose::plugin!` shells forward
+    /// `instance` into the `InitContext`. The default ignores it, so a
+    /// hand-written export that builds its own `InitContext` should
+    /// override this instead of `create`.
+    #[must_use]
+    fn create_for(instance: InstanceContext) -> Self {
+        let _ = instance;
+        Self::create()
+    }
 
     /// Immutable access to the parameter struct.
     fn params(&self) -> &Self::Params;

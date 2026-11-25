@@ -5,6 +5,7 @@
 //! with object-safe Rust traits and owned descriptors. Every audio-thread method
 //! on [`Vst3Backend`] operates on borrowed stack data with zero heap allocations.
 
+use moose_core::info::HostIdentity;
 use std::ffi::{CStr, c_void};
 
 use moose_core::main_thread::{
@@ -159,7 +160,8 @@ pub(crate) type WakerFn = Box<dyn Fn() + Send + Sync>;
 /// Factory-level plugin metadata and instantiation hooks.
 pub(crate) trait Vst3FactoryBackend: Send + Sync + 'static {
     /// Instantiate a new plugin backend, or `None` if construction failed/panicked.
-    fn create(&self) -> Option<Box<dyn Vst3Backend>>;
+    /// `host` is the identity known at instantiation (`init` sees it).
+    fn create(&self, host: &HostIdentity) -> Option<Box<dyn Vst3Backend>>;
 
     /// Per-bus channel width of a declared layout, or `0` when out of range.
     fn layout_bus_channels(&self, _layout_index: u32, _is_output: bool, _bus_index: u32) -> u32 {
@@ -179,6 +181,10 @@ pub(crate) trait Vst3FactoryBackend: Send + Sync + 'static {
 /// `com::native_tests` can override only the methods relevant to each scenario.
 pub(crate) trait Vst3Backend: Send + Sync + 'static {
     // --- Lifecycle ---
+
+    /// `IHostApplication::getName` from `IComponent::initialize`, for
+    /// [`moose_core::plugin::PreparationConfig::host`].
+    fn set_host_name(&self, _name: &str) {}
 
     fn prepare(&self, _sample_rate: f64, _max_frames: u32, _process_mode: i32) -> bool {
         true

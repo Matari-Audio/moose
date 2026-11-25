@@ -206,6 +206,7 @@ fn real_static_runtime_requirement_is_forwarded_and_refusal_does_not_reset_dsp_s
     let mut legacy = StaticShell::<FxParams, reload_fixture_common::CounterLogic>::from_parts(
         Arc::clone(&params),
         None,
+        None,
     );
     assert!(!legacy.requires_fallible_preparation());
     legacy.prepare(&request).unwrap();
@@ -215,7 +216,7 @@ fn real_static_runtime_requirement_is_forwarded_and_refusal_does_not_reset_dsp_s
     // prepare; the actual runtime classification remains false after restore.
     assert!(!legacy.requires_fallible_preparation());
     assert_eq!(legacy.state_ref().counter, 71);
-    let mut required = StaticShell::<FxParams, RequiredStatic>::from_parts(params, None);
+    let mut required = StaticShell::<FxParams, RequiredStatic>::from_parts(params, None, None);
     required.state_ref_mut().counter = 71;
     assert!(required.requires_fallible_preparation());
     let fallback = PreparationConfig::new(

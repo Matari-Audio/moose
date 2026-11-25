@@ -22,10 +22,10 @@ use moose_core::buffer::AudioBuffer;
 use moose_core::bus::BusLayout;
 use moose_core::config::{AudioConfig, ProcessMode};
 use moose_core::events::{EventBody, EventList};
-use moose_core::info::PluginInfo;
-use moose_core::plugin::PluginRuntime;
+use moose_core::info::{HostIdentity, PluginInfo};
+use moose_core::plugin::{PluginRuntime, PreparationConfig, PreparationFrameBound};
 use moose_core::process::{ProcessContext, ProcessStatus};
-use moose_core::tasks::AnyTaskSpawner;
+use moose_core::tasks::{AnyTaskSpawner, InstanceContext};
 use moose_params::Params;
 use moose_params::sample::Sample;
 use parking_lot::Mutex;
@@ -81,6 +81,10 @@ pub struct HotShell<P: Params, S: Sample = f32> {
     snapshots: Arc<moose_core::snapshot::SnapshotSlot>,
     sample_rate: f64,
     max_block_size: usize,
+    /// Frame-bound provenance and host identity of the last `prepare`,
+    /// replayed when a reload re-prepares fresh state.
+    frame_bound: PreparationFrameBound,
+    host: Option<HostIdentity>,
     /// Processing mode from the last `reset`. Replayed when the audio
     /// thread re-resets a freshly hot-swapped dylib so the new instance
     /// prepares for the same render mode.
@@ -123,13 +127,21 @@ unsafe impl<P: Params, S: Sample> Send for HotShell<P, S> {}
 
 impl<P: Params + 'static, S: Sample> HotShell<P, S> {
     pub fn new(params: P, dylib_path: PathBuf) -> Self {
-        Self::new_with_tasks(params, dylib_path, None)
+        Self::new_with_tasks(params, dylib_path, None, None)
     }
 
-    pub fn new_with_tasks(params: P, dylib_path: PathBuf, tasks: Option<AnyTaskSpawner>) -> Self {
+    /// `instance` is the format wrapper's context; every loaded generation's
+    /// `init` and `prepare` see it.
+    pub fn new_with_tasks(
+        params: P,
+        dylib_path: PathBuf,
+        tasks: Option<AnyTaskSpawner>,
+        instance: Option<InstanceContext>,
+    ) -> Self {
         let params = Arc::new(params);
         let params_ptr = Arc::as_ptr(&params).cast::<()>();
-        let loader = NativeLoader::new_with_tasks(dylib_path, params_ptr, tasks.clone());
+        let host = instance.as_ref().map(|i| i.host().clone());
+        let loader = NativeLoader::new_with_tasks(dylib_path, params_ptr, tasks.clone(), instance);
         let initial_swap = loader.swap_generation();
         // Allocate the initial DSP state from the freshly loaded dylib
         // (before wrapping the loader in the mutex - no contention yet).
@@ -152,12 +164,27 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
             snapshots: moose_core::snapshot::SnapshotSlot::new(),
             sample_rate: 44100.0,
             max_block_size: 1024,
+            frame_bound: PreparationFrameBound::NegotiatedHost,
+            host,
             process_mode: ProcessMode::Realtime,
             state_generation: initial_swap,
             reset_pending: false,
             latency_cache: AtomicU32::new(0),
             tail_cache: AtomicU32::new(0),
         }
+    }
+
+    /// The last activation's config, for re-preparing a reloaded state.
+    /// ponytail: a swap seen by `process` prepares (may allocate) on the
+    /// audio thread; hot reload is dev-only.
+    fn preparation_config(&self) -> PreparationConfig {
+        let mut config = PreparationConfig::new(
+            AudioConfig::new(self.sample_rate, self.max_block_size)
+                .with_process_mode(self.process_mode),
+            self.frame_bound,
+        );
+        config.host.clone_from(&self.host);
+        config
     }
 
     /// Ensure `self.state` is a live allocation from the current dylib,
@@ -218,11 +245,7 @@ impl<P: Params + 'static, S: Sample> HotShell<P, S> {
                          starting fresh: {e}"
                     );
                 }
-                let config = AudioConfig::new(self.sample_rate, self.max_block_size)
-                    .with_process_mode(self.process_mode);
-                // ponytail: a swap seen by `process` prepares (may allocate)
-                // on the audio thread; hot reload is dev-only.
-                let _ = loader.prepare(self.state, &config);
+                let _ = loader.prepare(self.state, &self.preparation_config());
                 // The fresh state is prepared for the current config, so a
                 // reset missed under lock contention is satisfied.
                 self.reset_pending = false;
@@ -312,7 +335,13 @@ impl<P: Params + 'static, S: Sample> PluginRuntime for HotShell<P, S> {
         }
         self.params.set_sample_rate(config.audio.sample_rate);
         self.params.snap_smoothers();
-        if !loader.prepare(self.state, &config.audio) {
+        self.frame_bound = config.frame_bound;
+        if let Some(host) = &config.host {
+            self.host = Some(host.clone());
+        }
+        let mut config = PreparationConfig::new(config.audio, config.frame_bound);
+        config.host.clone_from(&self.host);
+        if !loader.prepare(self.state, &config) {
             return Err(PreparationError::NotReady);
         }
         self.sample_rate = config.audio.sample_rate;

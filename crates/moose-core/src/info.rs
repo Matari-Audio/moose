@@ -1,3 +1,79 @@
+use std::sync::Arc;
+
+/// The format wrapper (or runner) that instantiated a plugin. Distinct from
+/// [`crate::state::PluginFormat`], which names where foreign state came
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HostFormat {
+    Clap,
+    Vst3,
+    Au,
+    Aax,
+    Lv2,
+    /// The `moose-standalone` runner.
+    Standalone,
+}
+
+/// Which wrapper loaded this instance and, when the format reports it, the
+/// host application's product name and version. Filled by every format
+/// wrapper; read through [`crate::tasks::InitContext::host`] and
+/// [`crate::plugin::PreparationConfig::host`]. Diagnostic and labelling
+/// data only: never branch DSP on a host name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostIdentity {
+    pub format: HostFormat,
+    /// Host product name (CLAP `clap_host.name`, VST3
+    /// `IHostApplication::getName`, the host process name for AU / AAX).
+    pub name: Option<Arc<str>>,
+    /// Host product version, when the format reports one (CLAP only).
+    pub version: Option<Arc<str>>,
+}
+
+impl HostIdentity {
+    /// An identity with only the wrapper format known.
+    #[must_use]
+    pub fn new(format: HostFormat) -> Self {
+        Self {
+            format,
+            name: None,
+            version: None,
+        }
+    }
+
+    /// Set the host name. Empty strings are treated as unknown.
+    #[must_use]
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = non_empty(name);
+        self
+    }
+
+    /// Set the host version. Empty strings are treated as unknown.
+    #[must_use]
+    pub fn with_version(mut self, version: &str) -> Self {
+        self.version = non_empty(version);
+        self
+    }
+
+    /// `format` with the host named after the current process executable,
+    /// for formats with no host-name query (AU, AAX). Inside an
+    /// out-of-process AU host service this names the service, not the DAW.
+    #[must_use]
+    pub fn from_process(format: HostFormat) -> Self {
+        let name = std::env::current_exe().ok().and_then(|exe| {
+            exe.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+        });
+        Self::new(format).with_name(name.as_deref().unwrap_or(""))
+    }
+}
+
+fn non_empty(s: &str) -> Option<Arc<str>> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| Arc::from(s))
+}
+
 /// Wire dialect a MIDI port speaks. `Midi1` is the default and covers
 /// every format today; `Midi2` opts a port into MIDI 2.0 / UMP so the
 /// plugin receives the native 16/32-bit + per-note + group-addressed
@@ -241,4 +317,31 @@ pub const fn category_from_str(s: &str) -> PluginCategory {
 pub const fn fourcc(s: &[u8]) -> [u8; 4] {
     assert!(s.len() == 4, "FourCC must be exactly 4 bytes");
     [s[0], s[1], s[2], s[3]]
+}
+
+#[cfg(test)]
+mod host_identity_tests {
+    use super::*;
+
+    #[test]
+    fn empty_strings_are_unknown() {
+        let host = HostIdentity::new(HostFormat::Clap)
+            .with_name("  ")
+            .with_version("");
+        assert_eq!(host, HostIdentity::new(HostFormat::Clap));
+        let host = HostIdentity::new(HostFormat::Vst3)
+            .with_name(" Host ")
+            .with_version("1.2");
+        assert_eq!(host.name.as_deref(), Some("Host"));
+        assert_eq!(host.version.as_deref(), Some("1.2"));
+    }
+
+    #[test]
+    fn from_process_names_the_running_executable() {
+        let host = HostIdentity::from_process(HostFormat::Au);
+        assert_eq!(host.format, HostFormat::Au);
+        let exe = std::env::current_exe().expect("test exe path");
+        let stem = exe.file_stem().and_then(|s| s.to_str()).expect("utf8 stem");
+        assert_eq!(host.name.as_deref(), Some(stem));
+    }
 }

@@ -14,7 +14,19 @@ struct Loop {
     fd: Cell<i32>,
     thread: std::thread::ThreadId,
 }
-unsafe extern "C" fn qi(raw: *mut c_void, _: *const u8, out: *mut *mut c_void) -> i32 {
+/// Answers only `FUnknown` / `IRunLoop`, like a real run-loop context (the
+/// factory also asks it for `IHostApplication`).
+unsafe extern "C" fn qi(raw: *mut c_void, iid: *const u8, out: *mut *mut c_void) -> i32 {
+    use vst3::com_scrape_types::Interface;
+    let iid = unsafe { std::slice::from_raw_parts(iid, 16) };
+    let known = [
+        <vst3::Steinberg::FUnknown as Interface>::IID,
+        <vst3::Steinberg::Linux::IRunLoop as Interface>::IID,
+    ];
+    if !known.iter().any(|k| k.as_slice() == iid) {
+        unsafe { *out = std::ptr::null_mut() };
+        return vst3::Steinberg::kNoInterface;
+    }
     unsafe {
         *out = raw;
         add(raw);

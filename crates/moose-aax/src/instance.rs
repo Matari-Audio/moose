@@ -96,6 +96,8 @@ pub(crate) struct AaxGui {
 
 /// Per-instance AAX runtime state.
 pub(crate) struct AaxInstance<P: PluginExport> {
+    /// Wrapper format and host process name, for every `prepare`.
+    pub(crate) host_identity: moose_core::info::HostIdentity,
     /// Keep persist-change hook registered for the instance lifetime.
     pub(crate) persist_signal: Option<Arc<PersistChangeSignal>>,
     /// Keep catalog-change hook registered for the instance lifetime.

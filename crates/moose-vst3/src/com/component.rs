@@ -808,9 +808,14 @@ impl Host {
             allow(unused_variables, clippy::needless_pass_by_value)
         )]
         factory_run_loop: Option<ComPtr<vst3::Steinberg::Linux::IRunLoop>>,
+        host_name: Option<&str>,
     ) -> Option<Arc<Self>> {
         let desc = &reg.desc;
-        let backend = reg.factory.create()?;
+        let mut identity = moose_core::info::HostIdentity::new(moose_core::info::HostFormat::Vst3);
+        if let Some(name) = host_name {
+            identity = identity.with_name(name);
+        }
+        let backend = reg.factory.create(&identity)?;
         let id = NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed);
         let mut config = Config {
             sample_rate: 44100.0,
@@ -2294,15 +2299,10 @@ impl IPluginBaseTrait for Component {
         }
         #[cfg(target_os = "linux")]
         self.host.set_host_context(context);
-        if let Some(app) =
-            unsafe { ComRef::from_raw(context) }.and_then(|c| c.cast::<IHostApplication>())
-        {
-            let mut name: String128 = [0; 128];
-            if unsafe { app.getName(&raw mut name) } == kResultOk {
-                let name = unsafe { utf16_from(name.as_ptr(), name.len()) };
-                self.host
-                    .set_dynamic_support(DynamicSupport::for_host(&name));
-            }
+        if let Some(name) = unsafe { super::host_app_name(context) } {
+            self.host
+                .set_dynamic_support(DynamicSupport::for_host(&name));
+            self.host.backend().set_host_name(&name);
         }
         kResultOk
     }

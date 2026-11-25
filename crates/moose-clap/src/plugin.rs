@@ -149,6 +149,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
             .store(voice_info::query(data, &main).is_some(), Ordering::Relaxed);
         crate::context_menu::refresh_capability(data, &main);
         track_info::notify(data, &main);
+        // GAP-2: the plugin's process waker may call the host from now on.
+        data.process_wake.open();
         true
     })
 }
@@ -171,6 +173,7 @@ pub(crate) unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *co
         let data_ptr = (*plugin).plugin_data.cast::<ClapPluginData<P>>();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Gate workers before any host/instance handle can be released.
+            (*data_ptr).process_wake.close();
             if let Some(signal) = &(*data_ptr).persist_signal {
                 signal.close();
             }
@@ -249,7 +252,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
             let config = PreparationConfig::new(
                 AudioConfig::new(sample_rate, max_block).with_process_mode(mode),
                 PreparationFrameBound::NegotiatedHost,
-            );
+            )
+            .with_host(data.host_identity.clone());
             if instance.prepare(&config).is_err() {
                 return false;
             }

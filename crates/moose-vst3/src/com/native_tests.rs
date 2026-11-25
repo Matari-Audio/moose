@@ -39,7 +39,7 @@ struct Factory {
 }
 
 impl Vst3FactoryBackend for Factory {
-    fn create(&self) -> Option<Box<dyn Vst3Backend>> {
+    fn create(&self, _host: &moose_core::info::HostIdentity) -> Option<Box<dyn Vst3Backend>> {
         Some((self.make)())
     }
 
@@ -86,7 +86,7 @@ fn registration<B: Vst3Backend + Default>(
 
 fn component(reg: &'static Registration) -> ComWrapper<Component> {
     ComWrapper::new(Component {
-        host: Host::new(reg, None).expect("create"),
+        host: Host::new(reg, None, None).expect("create"),
     })
 }
 
@@ -1576,7 +1576,7 @@ mod threads {
         let run_loop = frame.as_com_ref::<Linux::IRunLoop>().unwrap().to_com_ptr();
         let reg = registration::<Fake>(descriptor(), Vec::new());
         let com = ComWrapper::new(Component {
-            host: Host::new(reg, Some(run_loop)).unwrap(),
+            host: Host::new(reg, Some(run_loop), None).unwrap(),
         });
         let handler = handler(&st, Kind::Normal);
         assert_eq!(unsafe { com.setComponentHandler(hp(&handler)) }, kResultOk);
@@ -1718,6 +1718,74 @@ mod host_features {
         );
         initialize_in(&com, "Nuendo 13");
         assert_eq!(com.host.dynamic_support(), DynamicSupport::Reload);
+    }
+
+    /// GAP-1: the host name from `setHostContext` reaches instantiation and
+    /// the one from `initialize` reaches the backend (for `prepare`).
+    #[test]
+    fn host_name_reaches_create_and_backend() {
+        use std::sync::Mutex;
+        static CREATED: Mutex<Vec<moose_core::info::HostIdentity>> = Mutex::new(Vec::new());
+        static NAMED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        #[derive(Default)]
+        struct NameProbe;
+        impl Vst3Backend for NameProbe {
+            fn set_host_name(&self, name: &str) {
+                NAMED.lock().unwrap().push(name.to_owned());
+            }
+        }
+        struct NamedFactory;
+        impl Vst3FactoryBackend for NamedFactory {
+            fn create(
+                &self,
+                host: &moose_core::info::HostIdentity,
+            ) -> Option<Box<dyn Vst3Backend>> {
+                CREATED.lock().unwrap().push(host.clone());
+                Some(Box::new(NameProbe))
+            }
+        }
+
+        let params = Vec::new();
+        let (units, param_unit) = build_units(&params);
+        let reg: &'static Registration = Box::leak(Box::new(Registration {
+            desc: descriptor(),
+            factory: Box::new(NamedFactory),
+            params,
+            units,
+            param_unit,
+        }));
+
+        let factory = super::super::factory::new_test_factory(reg);
+        let f3 = factory
+            .to_com_ptr::<IPluginFactory3>()
+            .expect("IPluginFactory3");
+        let app = ComWrapper::new(App("Bitwig Studio"));
+        let context = app.as_com_ref::<FUnknown>().unwrap().as_ptr();
+        assert_eq!(unsafe { f3.setHostContext(context) }, kResultOk);
+        let mut obj: *mut c_void = std::ptr::null_mut();
+        let iid = <IComponent as vst3::com_scrape_types::Interface>::IID;
+        assert_eq!(
+            unsafe {
+                f3.createInstance(
+                    reg.desc.cid.as_ptr().cast(),
+                    iid.as_ptr().cast(),
+                    &raw mut obj,
+                )
+            },
+            kResultOk
+        );
+        drop(unsafe { ComPtr::<IComponent>::from_raw(obj.cast()) });
+        let created = CREATED.lock().unwrap().pop().expect("created");
+        assert_eq!(created.format, moose_core::info::HostFormat::Vst3);
+        assert_eq!(created.name.as_deref(), Some("Bitwig Studio"));
+
+        let com = component(reg);
+        initialize_in(&com, "Nuendo 13");
+        assert_eq!(
+            NAMED.lock().unwrap().last().map(String::as_str),
+            Some("Nuendo 13")
+        );
     }
 
     // --- catalog wake ---------------------------------------------------------
@@ -2864,7 +2932,7 @@ mod input_merge {
 
     fn make() -> Box<dyn Vst3Backend> {
         Box::new(SnapshotBackend(
-            Vst3Instance::<Probe>::create().expect("create"),
+            Vst3Instance::<Probe>::create(crate::lifecycle::vst3_test_host()).expect("create"),
         ))
     }
 
@@ -3221,7 +3289,7 @@ fn host_queue_wake_during_com_teardown_never_deadlocks_or_destroys_off_thread() 
     WAKE_COUNT.store(0, Ordering::Release);
 
     let reg = registration_with(descriptor(), make, no_bus, Vec::new());
-    let host = Host::new(reg, None).expect("host");
+    let host = Host::new(reg, None, None).expect("host");
     let queue = ACTIVE_QUEUE
         .lock()
         .unwrap()
@@ -3379,7 +3447,7 @@ fn parameter_finder_and_audio_presentation_latency_interfaces() {
         ..descriptor()
     };
     let reg = registration::<B>(desc, Vec::new());
-    let host = Host::new(reg, None).expect("host");
+    let host = Host::new(reg, None, None).expect("host");
 
     // IAudioPresentationLatency on Component
     let comp = ComWrapper::new(Component { host: host.clone() });
@@ -3470,7 +3538,7 @@ fn get_parameter_info_prefers_live_step_count_when_present() {
         },
     ];
     let reg = registration::<LiveStep>(descriptor(), params);
-    let host = Host::new(reg, None).expect("host");
+    let host = Host::new(reg, None, None).expect("host");
     let comp = ComWrapper::new(Component { host });
     let ctrl = comp.to_com_ptr::<IEditController>().expect("controller");
 
@@ -4404,7 +4472,8 @@ mod deferred_scale_resize {
     }
 
     fn make() -> Box<dyn Vst3Backend> {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         inst.gui.enter().editor = Some(Box::new(Fixed((400, 300))));
         Box::new(B(inst))
     }

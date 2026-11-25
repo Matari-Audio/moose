@@ -24,7 +24,7 @@ use moose_core::editor::{Editor, EditorBuilder, EditorFeedback};
 use moose_core::events::EventList;
 use moose_core::export::PluginExport;
 use moose_core::host_queue::HostQueue;
-use moose_core::info::PluginInfo;
+use moose_core::info::{HostIdentity, PluginInfo};
 use moose_core::main_thread::{HostNotifier, MainThreadHooks, NoteName};
 use moose_core::meters::MeterStore;
 use moose_core::plugin::PluginRuntime;
@@ -177,6 +177,11 @@ pub(crate) struct ClapPluginData<P: PluginExport> {
     /// Phase-gated host handle (`[thread-safe]` subset; narrow with
     /// `on_main_thread(&main)` for `[main-thread]` host extension calls).
     pub(crate) host: HostHandle<Any>,
+    /// Wrapper format plus `clap_host.name` / `version`, read at create.
+    pub(crate) host_identity: HostIdentity,
+    /// Gate for the plugin's `ProcessWaker`: opened at the end of a
+    /// successful `init`, closed first thing in `destroy`.
+    pub(crate) process_wake: Arc<crate::process_wake::WakeGate>,
     /// Host params extension (for `request_flush`).
     pub(crate) host_params: *const clap_host_params,
     /// Host latency extension (for `changed`). Null if the host doesn't

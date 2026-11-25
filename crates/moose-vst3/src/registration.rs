@@ -13,7 +13,7 @@ use crate::midi_proxy::{
 use moose_core::bus::{BusConfig, BusLayout};
 use moose_core::bus_routing::bus_layouts_fit_routing;
 use moose_core::export::PluginExport;
-use moose_core::info::{PluginCategory, PluginInfo, resolve_name_override};
+use moose_core::info::{HostIdentity, PluginCategory, PluginInfo, resolve_name_override};
 use moose_core::plugin::PluginRuntime;
 use moose_core::state;
 use moose_core::wrapper::{default_io_channels, log_missing_bus_layout, run_register};
@@ -51,8 +51,8 @@ pub(crate) fn vst3_bus_widths_supported(layouts: &[BusLayout]) -> bool {
 struct PluginFactory<P: PluginExport>(PhantomData<fn() -> P>);
 
 impl<P: PluginExport> Vst3FactoryBackend for PluginFactory<P> {
-    fn create(&self) -> Option<Box<dyn Vst3Backend>> {
-        Vst3Instance::<P>::create().map(|inst| Box::new(inst) as Box<dyn Vst3Backend>)
+    fn create(&self, host: &HostIdentity) -> Option<Box<dyn Vst3Backend>> {
+        Vst3Instance::<P>::create(host.clone()).map(|inst| Box::new(inst) as Box<dyn Vst3Backend>)
     }
 
     fn layout_bus_channels(&self, layout_index: u32, is_output: bool, bus_index: u32) -> u32 {

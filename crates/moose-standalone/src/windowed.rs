@@ -1030,7 +1030,9 @@ impl Shortcuts {
         if kb.code == Code::KeyI && self.is_effect && is_mod_pressed(kb.modifiers) {
             if kb.state == KeyState::Down {
                 let want = !self.input_ctrl.is_enabled();
-                self.input_ctrl.set_enabled(want);
+                if let Err(e) = self.input_ctrl.set_enabled(want) {
+                    eprintln!("audio: {e}");
+                }
                 vlog!("mic: {} (request)", if want { "ON" } else { "OFF" });
             }
             return EventStatus::Captured;

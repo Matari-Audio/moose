@@ -41,11 +41,13 @@ use moose_core::events::{
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostQueue, HostSignal};
 use moose_core::info::{Automation, MidiDialect};
+use moose_core::info::{HostFormat, HostIdentity};
 use moose_core::main_thread::{HostNotifier, TrackInfo};
 use moose_core::midi::decode_short_message;
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::{RtSection, audit};
 use moose_core::state;
+use moose_core::tasks::InstanceContext;
 use moose_core::thread::MainThreadCell;
 use moose_core::ump::{
     SysExAssembler, SysExFeed, decode_ump_channel_voice_2, encode_ump_channel_voice_1,
@@ -109,7 +111,9 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
         std::ptr::null_mut(),
         || {
             let host_sink = unsafe { HostSink::from_raw(sink) };
-            let mut plugin = P::create();
+            // GAP-1: Au has no host-name query; name the host process.
+            let host_identity = HostIdentity::from_process(HostFormat::Au);
+            let mut plugin = P::create_for(InstanceContext::new(host_identity.clone()));
             plugin.init();
             let info = P::info();
             let layouts = P::bus_layouts();
@@ -171,6 +175,7 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
             let delay = moose_core::delay::ReportedDelay::new(plugin.latency(), plugin.tail());
             let (sysex_ready_q, sysex_free_q) = crate::instance::new_sysex_queues();
             let instance = Box::new(AuInstance::<P> {
+                host_identity,
                 persist_signal,
                 catalog_signal,
                 host_queue,
@@ -521,7 +526,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
             let config = PreparationConfig::new(
                 AudioConfig::new(sample_rate, max_frames).with_process_mode(mode),
                 PreparationFrameBound::NegotiatedHost,
-            );
+            )
+            .with_host(inst.host_identity.clone());
             if plugin.prepare(&config).is_err() {
                 // Stays unprepared: `cb_process` outputs silence.
                 return;

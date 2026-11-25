@@ -65,7 +65,11 @@ use moose_core::process::{ProcessContext, ProcessStatus};
 /// `moose_build_editor`. Shell and logic must be rebuilt together.
 /// Epoch 12: removed retired `moose-gui-types` size fields from `AbiCanary`
 /// (paired with `moose_abi_canary_v3` symbol bump).
-pub const ABI_EPOCH: u32 = 12;
+/// Epoch 13: `moose_init_state` takes the wrapper's `InstanceContext` and
+/// `moose_prepare_v2(&PreparationConfig)` replaces `moose_prepare_v1(&AudioConfig)`,
+/// so hot-reloaded logic sees the host identity, process waker and frame
+/// bound. A stale epoch-12 dylib has the old init signature.
+pub const ABI_EPOCH: u32 = 13;
 
 /// ABI fingerprint. Compared between shell and dylib before loading.
 ///

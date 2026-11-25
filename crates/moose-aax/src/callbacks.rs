@@ -28,11 +28,13 @@ use moose_core::events::{
 };
 use moose_core::export::PluginExport;
 use moose_core::host_queue::{HostQueue, HostSignal};
+use moose_core::info::{HostFormat, HostIdentity};
 use moose_core::main_thread::HostNotifier;
 use moose_core::midi::{decode_short_message, event_to_midi1};
 use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
 use moose_core::rt::RtSection;
 use moose_core::state::{self, PluginFormat, StateLoadQueue};
+use moose_core::tasks::InstanceContext;
 use moose_core::thread::MainThreadCell;
 use moose_core::wrapper::{
     PanicLatch, PluginCell, apply_or_queue_state, apply_queued_state, copy_c_str, enter_plugin,
@@ -157,7 +159,9 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
         std::ptr::null_mut(),
         || {
             let host_sink = unsafe { AaxHostSink::from_raw(raw_sink) };
-            let mut plugin = P::create();
+            // GAP-1: Aax has no host-name query; name the host process.
+            let host_identity = HostIdentity::from_process(HostFormat::Aax);
+            let mut plugin = P::create_for(InstanceContext::new(host_identity.clone()));
             plugin.init();
             let info = P::info();
 
@@ -211,6 +215,7 @@ pub(crate) unsafe extern "C" fn cb_create_with_sink<P: PluginExport>(
             let audio = AaxAudio::new(Arc::clone(&initial_catalog), info.emits_midi, layout);
 
             let inst = Box::new(AaxInstance::<P> {
+                host_identity,
                 persist_signal,
                 catalog_signal,
                 host_queue,
@@ -299,7 +304,8 @@ pub(crate) unsafe extern "C" fn cb_reset<P: PluginExport>(
         let prep = PreparationConfig::new(
             AudioConfig::new(sr, mf as usize).with_process_mode(mode),
             PreparationFrameBound::NegotiatedHost,
-        );
+        )
+        .with_host(inst.host_identity.clone());
         if plugin.prepare(&prep).is_err() {
             return;
         }

@@ -55,6 +55,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
+use crate::info::HostIdentity;
+use crate::main_thread::ProcessWaker;
 use crate::snapshot::SnapshotPublisher;
 
 /// Preallocated inbound-queue capacity per instance. Mirrors
@@ -1343,7 +1345,7 @@ impl TaskSpawnerBundle {
 /// work before the first block. Concrete (not generic over the task
 /// type) because `init`'s signature lives on the leaf trait; recover the
 /// typed spawner with [`Self::tasks`]. Params arrive as the separate
-/// `init` argument. Cheap to clone (two `Arc`s).
+/// `init` argument. Cheap to clone (a few `Arc`s).
 #[derive(Clone, Default)]
 pub struct InitContext {
     tasks: Option<AnyTaskSpawner>,
@@ -1351,6 +1353,46 @@ pub struct InitContext {
     /// the shell wired one. `None` in `--shell` hot-reload builds, where the
     /// off-thread snapshot path is not threaded across the dylib boundary.
     snapshot: Option<SnapshotPublisher>,
+    instance: Option<InstanceContext>,
+}
+
+/// What a format wrapper knows about the host when it instantiates a
+/// plugin. Handed to `PluginExport::create_for` and from there into the
+/// [`InitContext`] the plugin's `init` receives. Cheap to clone.
+#[derive(Clone, Debug)]
+pub struct InstanceContext {
+    host: HostIdentity,
+    process_waker: Option<ProcessWaker>,
+}
+
+impl InstanceContext {
+    /// A context for a plugin instantiated by `host`.
+    #[must_use]
+    pub fn new(host: HostIdentity) -> Self {
+        Self {
+            host,
+            process_waker: None,
+        }
+    }
+
+    /// Attach the wrapper's process waker (CLAP).
+    #[must_use]
+    pub fn with_process_waker(mut self, waker: ProcessWaker) -> Self {
+        self.process_waker = Some(waker);
+        self
+    }
+
+    /// The instantiating wrapper and host application.
+    #[must_use]
+    pub fn host(&self) -> &HostIdentity {
+        &self.host
+    }
+
+    /// The wrapper's process waker, if the format has one.
+    #[must_use]
+    pub fn process_waker(&self) -> Option<&ProcessWaker> {
+        self.process_waker.as_ref()
+    }
 }
 
 impl InitContext {
@@ -1359,6 +1401,24 @@ impl InitContext {
         Self {
             tasks,
             snapshot: None,
+            instance: None,
+        }
+    }
+
+    /// Attach the instantiating wrapper's context (see [`InstanceContext`]).
+    /// `None` leaves [`Self::host`] and [`Self::process_waker`] empty.
+    #[must_use]
+    pub fn with_instance(mut self, instance: Option<InstanceContext>) -> Self {
+        self.instance = instance;
+        self
+    }
+
+    /// Replace the host identity with the one a later activation reported
+    /// (a VST3 host may name itself only at `IComponent::initialize`).
+    pub fn set_host(&mut self, host: HostIdentity) {
+        match &mut self.instance {
+            Some(instance) => instance.host = host,
+            None => self.instance = Some(InstanceContext::new(host)),
         }
     }
 
@@ -1383,6 +1443,27 @@ impl InitContext {
     #[must_use]
     pub fn snapshot_publisher(&self) -> Option<SnapshotPublisher> {
         self.snapshot.clone()
+    }
+
+    /// The format wrapper and host application that instantiated this
+    /// plugin. Set through every wrapper and both shells (static and
+    /// hot-reload); `None` only for a context built outside a wrapper
+    /// (tests, offline drivers). VST3 learns the host name at `init` only
+    /// when the factory received a host context; the name from
+    /// `IComponent::initialize` arrives in
+    /// [`crate::plugin::PreparationConfig::host`].
+    #[must_use]
+    pub fn host(&self) -> Option<&HostIdentity> {
+        self.instance.as_ref().map(InstanceContext::host)
+    }
+
+    /// Handle that asks the host to resume processing a sleeping instance
+    /// (CLAP `request_process`). `None` where the format has no such
+    /// request: those hosts keep calling `process`. Call it after `init`
+    /// returns, e.g. from a background task that queued audio-thread work.
+    #[must_use]
+    pub fn process_waker(&self) -> Option<ProcessWaker> {
+        self.instance.as_ref().and_then(|i| i.process_waker.clone())
     }
 }
 
@@ -1410,6 +1491,36 @@ mod tests {
         assert_eq!(slot.read(), Some(vec![1, 2, 3]));
         // No snapshot wired (the `--shell` / no-slot case) yields None.
         assert!(InitContext::new(None).snapshot_publisher().is_none());
+    }
+
+    #[test]
+    fn init_context_carries_explicit_instance_context() {
+        use crate::info::HostFormat;
+        let woke = Arc::new(AtomicU32::new(0));
+        let waker = ProcessWaker::new({
+            let woke = Arc::clone(&woke);
+            move || {
+                woke.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let host = HostIdentity::new(HostFormat::Clap)
+            .with_name("Host")
+            .with_version("2.0");
+        let mut cx = InitContext::new(None).with_instance(Some(
+            InstanceContext::new(host.clone()).with_process_waker(waker),
+        ));
+        assert_eq!(cx.host(), Some(&host));
+        cx.process_waker().expect("waker").wake();
+        assert_eq!(woke.load(Ordering::Relaxed), 1);
+        // A later activation can rename the host; the waker stays.
+        let renamed = HostIdentity::new(HostFormat::Clap).with_name("Later");
+        cx.set_host(renamed.clone());
+        assert_eq!(cx.host(), Some(&renamed));
+        assert!(cx.process_waker().is_some());
+        // No implicit inheritance: a fresh context is empty.
+        let bare = InitContext::new(None);
+        assert!(bare.host().is_none());
+        assert!(bare.process_waker().is_none());
     }
 
     fn wait_until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {

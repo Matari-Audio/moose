@@ -56,7 +56,8 @@ impl PluginRuntime for Probe {
 
 #[test]
 fn signed_note_lengths_survive_input_and_output_callbacks() {
-    let instance = Vst3Instance::<Probe>::create().expect("create");
+    let instance =
+        Vst3Instance::<Probe>::create(crate::lifecycle::vst3_test_host()).expect("create");
     for note_id in [-1, 73] {
         for length in [0, 512, -1, i32::MIN] {
             instance.begin_input_events_impl(64);
@@ -143,7 +144,8 @@ impl PluginRuntime for RoutingProbe {
 #[test]
 fn process_block_populates_bus_routing_for_inputs_and_outputs() {
     *SEEN_ROUTING.lock().unwrap() = None;
-    let inst = Vst3Instance::<RoutingProbe>::create().expect("create");
+    let inst =
+        Vst3Instance::<RoutingProbe>::create(crate::lifecycle::vst3_test_host()).expect("create");
     assert!(inst.prepare_impl(48_000.0, 64, 0));
 
     let in_ch = [[0.0f32; 16]; 3];
@@ -255,7 +257,8 @@ impl PluginRuntime for ConnectNoticePlugin {
 #[test]
 fn notice_raised_during_connect_is_drained_when_catalog_waker_binds() {
     *CONNECT_NOTIFIER.lock().unwrap() = None;
-    let inst = Vst3Instance::<ConnectNoticePlugin>::create().expect("create");
+    let inst = Vst3Instance::<ConnectNoticePlugin>::create(crate::lifecycle::vst3_test_host())
+        .expect("create");
     assert!(
         inst.host_queue
             .pending()
@@ -354,7 +357,7 @@ fn anonymous_note_expression_prefers_active_retriggered_slot_and_overlapping_not
 fn output_param_count_and_getter_filter_invalid_and_unknown_param_changes() {
     use moose_core::events::Event;
 
-    let inst = Vst3Instance::<Probe>::create().expect("create");
+    let inst = Vst3Instance::<Probe>::create(crate::lifecycle::vst3_test_host()).expect("create");
     {
         let mut audio = inst.audio.enter();
         audio.input_num_frames = 64;
@@ -575,7 +578,8 @@ fn process_panic_clears_output_and_input_event_lists() {
     use crate::backend::ProcessArgs;
     use crate::input_events::VST3_EVENT_END;
 
-    let instance = Vst3Instance::<PanicAfterEmitPlugin>::create().expect("create");
+    let instance = Vst3Instance::<PanicAfterEmitPlugin>::create(crate::lifecycle::vst3_test_host())
+        .expect("create");
     assert!(instance.prepare_impl(48_000.0, 32, 0));
 
     let in_l = [0.25f32; 32];
@@ -641,7 +645,8 @@ fn panicking_editor_state_changed_does_not_fail_accepted_load_or_skip_rescan() {
     use moose_core::host_queue::HostSignal;
     use moose_core::thread::MainThread;
 
-    let instance = Vst3Instance::<TestPlugin>::create().expect("create");
+    let instance =
+        Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
     let blob = instance.save_state_bytes();
 
     // Install an open editor whose `state_changed` panics.

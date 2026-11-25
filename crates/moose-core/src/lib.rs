@@ -49,12 +49,14 @@ pub use events::{
     RawUmp, SYSEX_POOL_PREALLOC, TransportInfo, Vst3EventMetadata,
 };
 pub use export::PluginExport;
-pub use info::{Automation, MidiDialect, PluginCategory, PluginInfo};
+pub use info::{Automation, HostFormat, HostIdentity, MidiDialect, PluginCategory, PluginInfo};
+pub use main_thread::ProcessWaker;
 pub use meters::MeterStore;
 pub use plugin::PluginRuntime;
 pub use process::{ProcessContext, ProcessStatus};
 pub use rt::{RtSection, allow_alloc};
 pub use snapshot::SnapshotSlot;
+pub use tasks::InstanceContext;
 
 #[cfg(feature = "rt-paranoid")]
 pub use rt::RtCheckAlloc;

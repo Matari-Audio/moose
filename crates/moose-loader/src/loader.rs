@@ -35,9 +35,10 @@ use crate::canary::AbiCanary;
 use moose_core::buffer::AudioBuffer;
 use moose_core::config::AudioConfig;
 use moose_core::events::EventList;
+use moose_core::plugin::PreparationConfig;
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::state::StateLoadError;
-use moose_core::tasks::AnyTaskSpawner;
+use moose_core::tasks::{AnyTaskSpawner, InstanceContext};
 use moose_params::sample::Sample;
 
 /// Handlers are contractually short/nonblocking. A reload closes admission
@@ -88,12 +89,10 @@ struct LogicSymbols<S: Sample> {
     quiesce_tasks: fn(Duration) -> bool,
     shutdown_tasks: fn(),
     build_tasks: fn(*const ()) -> Option<AnyTaskSpawner>,
-    init_state: fn(*const (), Option<AnyTaskSpawner>) -> *mut (),
+    init_state: fn(*const (), Option<AnyTaskSpawner>, Option<InstanceContext>) -> *mut (),
     drop_state: StateDropFn,
     reset: fn(*mut (), *const (), &AudioConfig),
-    /// `moose_prepare_v1`; absent in dylibs built before it existed, which
-    /// get `reset` instead.
-    prepare: Option<fn(*mut (), *const (), &AudioConfig) -> bool>,
+    prepare: fn(*mut (), *const (), &PreparationConfig) -> bool,
     process: ProcessFn<S>,
     latency: fn(*const ()) -> u32,
     tail: fn(*const ()) -> u32,
@@ -145,15 +144,14 @@ impl<S: Sample> LogicSymbols<S> {
             ),
             init_state: sym!(
                 b"moose_init_state",
-                fn(*const (), Option<AnyTaskSpawner>) -> *mut ()
+                fn(*const (), Option<AnyTaskSpawner>, Option<InstanceContext>) -> *mut ()
             ),
             drop_state: sym!(b"moose_drop_state", fn(*mut ())),
             reset: sym!(b"moose_reset", fn(*mut (), *const (), &AudioConfig)),
-            prepare: unsafe {
-                lib.get::<fn(*mut (), *const (), &AudioConfig) -> bool>(b"moose_prepare_v1")
-            }
-            .ok()
-            .map(|s| *s),
+            prepare: sym!(
+                b"moose_prepare_v2",
+                fn(*mut (), *const (), &PreparationConfig) -> bool
+            ),
             process: sym!(b"moose_process", ProcessFn<S>),
             latency: sym!(b"moose_latency", fn(*const ()) -> u32),
             tail: sym!(b"moose_tail", fn(*const ()) -> u32),
@@ -195,6 +193,8 @@ struct RetiredGeneration {
 /// into [`AbiCanary::sample_precision`] so a mismatch fails the canary
 /// check rather than silently binding to a wrong-shape vtable.
 pub struct NativeLoader<S: Sample = f32> {
+    /// Wrapper context for every generation's `init` (see `new_with_tasks`).
+    instance: Option<InstanceContext>,
     dylib_path: PathBuf,
     library: Option<Library>,
     /// Resolved flat-ABI function table for the currently loaded dylib.
@@ -243,16 +243,20 @@ impl<S: Sample> NativeLoader<S> {
     /// itself, off the audio thread.
     #[must_use]
     pub fn new(dylib_path: PathBuf, params_ptr: *const ()) -> Self {
-        Self::new_with_tasks(dylib_path, params_ptr, None)
+        Self::new_with_tasks(dylib_path, params_ptr, None, None)
     }
 
+    /// `instance` is the format wrapper's context, handed to every loaded
+    /// generation's `init` (so a reload keeps the host identity and waker).
     #[must_use]
     pub fn new_with_tasks(
         dylib_path: PathBuf,
         params_ptr: *const (),
         task_route: Option<AnyTaskSpawner>,
+        instance: Option<InstanceContext>,
     ) -> Self {
         let mut loader = Self {
+            instance,
             dylib_path,
             library: None,
             symbols: None,
@@ -564,7 +568,7 @@ impl<S: Sample> NativeLoader<S> {
     pub fn init_state(&self) -> Option<(*mut (), StateOrigin)> {
         let s = self.symbols.as_ref()?;
         Some((
-            (s.init_state)(self.params_ptr, self.tasks.clone()),
+            (s.init_state)(self.params_ptr, self.tasks.clone(), self.instance.clone()),
             StateOrigin {
                 drop: s.drop_state,
                 save: s.save_state,
@@ -603,21 +607,18 @@ impl<S: Sample> NativeLoader<S> {
     }
 
     /// Run the current dylib's `prepare` on `state` (may allocate; off the
-    /// audio thread). `false` when the logic refused the config. A dylib
-    /// without `moose_prepare_v1` gets `reset`.
+    /// audio thread). `false` when the logic refused the config.
     #[must_use]
-    pub fn prepare(&self, state: *mut (), config: &AudioConfig) -> bool {
-        match self.symbols.as_ref() {
-            Some(LogicSymbols {
-                prepare: Some(prepare),
-                ..
-            }) => prepare(state, self.params_ptr, config),
-            Some(s) => {
-                (s.reset)(state, self.params_ptr, config);
-                true
-            }
-            None => true,
-        }
+    pub fn prepare(&self, state: *mut (), config: &PreparationConfig) -> bool {
+        self.symbols
+            .as_ref()
+            .is_none_or(|s| (s.prepare)(state, self.params_ptr, config))
+    }
+
+    /// The wrapper context every generation's `init` receives.
+    #[must_use]
+    pub fn instance(&self) -> Option<&InstanceContext> {
+        self.instance.as_ref()
     }
 
     /// Run the current dylib's `reset` on `state`.

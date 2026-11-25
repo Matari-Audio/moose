@@ -583,7 +583,8 @@ mod state_tests {
     #[test]
     fn load_then_save_while_not_processing_returns_loaded_custom_state() {
         for phase in ["inactive", "activated", "stopped"] {
-            let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+            let inst = Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host())
+                .expect("create");
             let hash = inst.plugin_id_hash;
             if phase != "inactive" {
                 assert!(inst.prepare_impl(48_000., 512, 0));
@@ -605,7 +606,8 @@ mod state_tests {
     fn rejected_load_fails_and_keeps_the_previous_state() {
         use moose_params::Params;
         for phase in ["inactive", "stopped"] {
-            let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+            let inst = Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host())
+                .expect("create");
             let hash = inst.plugin_id_hash;
             if phase == "stopped" {
                 assert!(inst.prepare_impl(48_000., 512, 0));
@@ -722,7 +724,10 @@ mod state_tests {
             }
         }
 
-        let inst = Arc::new(Vst3Instance::<ContextActivePlugin>::create().expect("create"));
+        let inst = Arc::new(
+            Vst3Instance::<ContextActivePlugin>::create(crate::lifecycle::vst3_test_host())
+                .expect("create"),
+        );
         let hash = inst.plugin_id_hash;
         assert!(inst.prepare_impl(48_000.0, 64, 0));
         inst.set_active_impl(true);
@@ -848,7 +853,8 @@ mod main_thread_tests {
 
     #[test]
     fn host_info_and_midi_learn_reach_the_hooks() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         let seen = Seen::default();
         // SAFETY: test thread acts as host UI thread.
         *inst
@@ -903,7 +909,9 @@ mod main_thread_tests {
 
     #[test]
     fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
-        let inst = Arc::new(Vst3Instance::<TestPlugin>::create().expect("create"));
+        let inst = Arc::new(
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create"),
+        );
         assert!(inst.prepare_impl(48_000.0, 64, 0));
 
         let held = inst.plugin.enter();
@@ -958,7 +966,8 @@ mod host_value_tests {
         reason = "unchanged storage values must compare exactly"
     )]
     fn ffi_text_hooks_preserve_static_plain_and_normalized_storage() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         let params = inst.params_arc.clone();
         let normalized = 49. / 96.;
         let plain = inst.param_denormalize_impl(1, normalized);
@@ -992,7 +1001,8 @@ mod large_state_tests {
 
     #[test]
     fn large_host_state_roundtrips_through_stream_callback() {
-        let inst = Vst3Instance::<Large>::create().expect("create");
+        let inst =
+            Vst3Instance::<Large>::create(crate::lifecycle::vst3_test_host()).expect("create");
         *inst.params_arc.payload.lock().unwrap() = payload();
         let bytes = inst.save_state_bytes();
         assert!(bytes.len() > 32 * 1024 * 1024);

@@ -82,7 +82,7 @@ fn plain_param_not_double_denormalized() {
     let params = Arc::new(TestParams::new());
     let mut shell =
         moose_loader::static_shell::StaticShell::<TestParams, Lifecycle<TestPlugin>>::from_parts(
-            params, None,
+            params, None, None,
         );
     shell
         .prepare(&PreparationConfig::new(

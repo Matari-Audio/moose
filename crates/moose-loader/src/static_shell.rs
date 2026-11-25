@@ -15,7 +15,7 @@ use moose_core::plugin::PluginRuntime;
 use moose_core::process::{ProcessContext, ProcessStatus};
 use moose_core::snapshot::{SnapshotPublisher, SnapshotSlot};
 use moose_core::state::{DecodedState, ForeignState, MigratedState, StateContext, StateLoadError};
-use moose_core::tasks::{AnyTaskSpawner, InitContext, warm_pool};
+use moose_core::tasks::{AnyTaskSpawner, InitContext, InstanceContext, warm_pool};
 use moose_params::Params;
 use moose_params::sample::Sample;
 use moose_plugin::PluginLogicCore;
@@ -65,7 +65,13 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
     /// the plugin's background-task spawner (`Some` only when the plugin
     /// wired `tasks:` on `plugin!`); it reaches `init` through the
     /// `InitContext` and each block through the `ProcessContext`.
-    pub fn from_parts(params: Arc<P>, tasks: Option<AnyTaskSpawner>) -> Self {
+    /// `instance` is the format wrapper's [`InstanceContext`] (`None`
+    /// outside a wrapper); it reaches `init` through the `InitContext`.
+    pub fn from_parts(
+        params: Arc<P>,
+        tasks: Option<AnyTaskSpawner>,
+        instance: Option<InstanceContext>,
+    ) -> Self {
         // A wired spawner means the plugin may schedule background work,
         // possibly first from `process()` (a filter that only rebuilds on a
         // knob move, with nothing in `init` to warm the pool). Start the
@@ -79,8 +85,9 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         // Build the snapshot slot before `init` so the plugin can capture
         // a publisher for the off-thread (large-state) lane.
         let snapshots = SnapshotSlot::new();
-        let init_ctx =
-            InitContext::new(tasks.clone()).with_snapshot(SnapshotPublisher::new(&snapshots));
+        let init_ctx = InitContext::new(tasks.clone())
+            .with_snapshot(SnapshotPublisher::new(&snapshots))
+            .with_instance(instance);
         let state = Box::new(L::init(&params, &init_ctx));
         let mut shell = Self {
             params,
@@ -401,6 +408,51 @@ macro_rules! export_static {
             inner: $crate::static_shell::StaticShell<$params, $logic, Sample>,
         }
 
+        impl __HotShellWrapper {
+            fn __moose_create(
+                instance: ::core::option::Option<
+                    $crate::__macro_deps::moose_core::tasks::InstanceContext,
+                >,
+            ) -> Self {
+                let params = std::sync::Arc::new(<$params>::new());
+                // Each `tasks: [..]` type gets its own lane (queue + mode).
+                // The bundle collapses to `None` when no types were listed,
+                // so a plugin with no tasks runs with no pool.
+                #[allow(unused_mut)]
+                let mut __task_bundle =
+                    $crate::__macro_deps::moose_core::tasks::TaskSpawnerBundle::new();
+                $(
+                    $({
+                        let __task_run = {
+                            let params = std::sync::Arc::clone(&params);
+                            move |task| {
+                                <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::run_once(
+                                    task, &params,
+                                )
+                            }
+                        };
+                        // `SERIALIZED` picks one-slot vs concurrent draining
+                        // for this lane; the const folds the branch at
+                        // compile time.
+                        let __spawner = if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::WAKE_ON_SCHEDULE {
+                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed_waking(__task_run, <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED)
+                        } else if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED {
+                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed_serialized(__task_run)
+                        } else {
+                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed(__task_run)
+                        };
+                        __task_bundle.push(__spawner);
+                    })+
+                )?
+                let tasks = __task_bundle.into_any();
+                // The descriptor `$logic` is stateless; `from_parts`
+                // builds the DSP state via `<$logic>::init(&params, &cx)`.
+                Self {
+                    inner: $crate::static_shell::StaticShell::from_parts(params, tasks, instance),
+                }
+            }
+        }
+
         impl $crate::__macro_deps::moose_core::plugin::PluginRuntime for __HotShellWrapper {
             type Sample = Sample;
 
@@ -612,42 +664,13 @@ macro_rules! export_static {
 
 
             fn create() -> Self {
-                let params = std::sync::Arc::new(<$params>::new());
-                // Each `tasks: [..]` type gets its own lane (queue + mode).
-                // The bundle collapses to `None` when no types were listed,
-                // so a plugin with no tasks runs with no pool.
-                #[allow(unused_mut)]
-                let mut __task_bundle =
-                    $crate::__macro_deps::moose_core::tasks::TaskSpawnerBundle::new();
-                $(
-                    $({
-                        let __task_run = {
-                            let params = std::sync::Arc::clone(&params);
-                            move |task| {
-                                <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::run_once(
-                                    task, &params,
-                                )
-                            }
-                        };
-                        // `SERIALIZED` picks one-slot vs concurrent draining
-                        // for this lane; the const folds the branch at
-                        // compile time.
-                        let __spawner = if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::WAKE_ON_SCHEDULE {
-                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed_waking(__task_run, <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED)
-                        } else if <$task as $crate::__macro_deps::moose_plugin::BackgroundTask>::SERIALIZED {
-                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed_serialized(__task_run)
-                        } else {
-                            $crate::__macro_deps::moose_core::tasks::TaskSpawner::<$task>::new_managed(__task_run)
-                        };
-                        __task_bundle.push(__spawner);
-                    })+
-                )?
-                let tasks = __task_bundle.into_any();
-                // The descriptor `$logic` is stateless; `from_parts`
-                // builds the DSP state via `<$logic>::init(&params, &cx)`.
-                Self {
-                    inner: $crate::static_shell::StaticShell::from_parts(params, tasks),
-                }
+                Self::__moose_create(None)
+            }
+
+            fn create_for(
+                instance: $crate::__macro_deps::moose_core::tasks::InstanceContext,
+            ) -> Self {
+                Self::__moose_create(Some(instance))
             }
 
             fn params(&self) -> &$params {

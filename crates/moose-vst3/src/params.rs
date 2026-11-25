@@ -135,7 +135,8 @@ mod dense_index_tests {
 
     #[test]
     fn vst3_callbacks_resolve_params_via_sorted_dense_index_and_fallback() {
-        let inst = Vst3Instance::<TestPlugin>::create().expect("create");
+        let inst =
+            Vst3Instance::<TestPlugin>::create(crate::lifecycle::vst3_test_host()).expect("create");
         let param_id = inst.param_infos[0].id;
         assert_eq!(inst.param_index_of(param_id), Some(0));
         assert_eq!(inst.param_index_of(999_999), None);
