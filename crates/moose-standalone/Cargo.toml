@@ -1,15 +1,15 @@
 [package]
 name = "moose-standalone"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "Standalone host wrapper for moose plugins"
 
 [dependencies]
-moose-core = { workspace = true }
-moose-utils = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
+moose-utils = { version = "7.0.0", path = "../moose-utils" }
 moose-params = { workspace = true }
 moose-driver = { workspace = true, optional = true }
 cpal = "0.17"
@@ -79,5 +79,10 @@ jack = ["cpal/jack"]
 rt-paranoid = ["moose-core/rt-paranoid"]
 playback = ["dep:hound", "dep:moose-driver", "moose-driver/wav", "dep:ctrlc"]
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

@@ -1,16 +1,16 @@
 [package]
 name = "moose"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "Audio plugin framework - write once, build CLAP, VST3, AU v2, AU v3, and a standalone host binary"
 keywords = ["audio", "plugin", "vst", "clap", "midi"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 # `moose-plugin` carries the `Plugin` trait. Neither pulls a renderer —
 # enable `moose`'s `mui` feature for `moose::mui::MuiEditor`.
 moose-plugin = { workspace = true }
@@ -36,11 +36,13 @@ hot-debug = ["moose-loader/hot-debug"]
 rt-paranoid = ["moose-core/rt-paranoid"]
 
 [dependencies.moose-clap]
-workspace = true
+version = "7.0.0"
+path = "../moose-clap"
 optional = true
 
 [dependencies.moose-vst3]
-workspace = true
+version = "7.0.0"
+path = "../moose-vst3"
 optional = true
 
 [dependencies.moose-mui]
@@ -48,7 +50,8 @@ workspace = true
 optional = true
 
 [dependencies.moose-au]
-workspace = true
+version = "7.0.0"
+path = "../moose-au"
 optional = true
 
 [dependencies.moose-aax]
@@ -56,8 +59,13 @@ workspace = true
 optional = true
 
 [dev-dependencies]
-moose-dsp = { workspace = true }
-moose-test = { workspace = true }
+moose-dsp = { version = "7.0.0", path = "../moose-dsp" }
+moose-test = { version = "7.0.0", path = "../moose-test" }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

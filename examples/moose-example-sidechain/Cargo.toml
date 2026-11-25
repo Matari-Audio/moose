@@ -2,11 +2,11 @@
 name = "moose-example-sidechain"
 # Internal-only - workspace demonstrations not for crates.io.
 publish = false
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -26,21 +26,26 @@ shell = ["moose/shell"]
 rt-paranoid = ["moose/rt-paranoid"]
 
 [dependencies]
-moose = { workspace = true }
-moose-core = { workspace = true }
+moose = { version = "7.0.0", path = "../../crates/moose", default-features = false }
+moose-core = { version = "7.0.0", path = "../../crates/moose-core" }
 moose-params = { workspace = true }
-moose-clap = { workspace = true, optional = true }
-moose-vst3 = { workspace = true, optional = true }
-moose-au = { workspace = true, optional = true }
+moose-clap = { version = "7.0.0", path = "../../crates/moose-clap", optional = true }
+moose-vst3 = { version = "7.0.0", path = "../../crates/moose-vst3", optional = true }
+moose-au = { version = "7.0.0", path = "../../crates/moose-au", optional = true }
 clap-sys = { version = "0.5", optional = true }
 # `playback` so `cargo moose run --input-file x.wav` can feed the file
 # into the sidechain input (the mic stays on the main input).
-moose-standalone = { workspace = true, features = ["gui", "playback"], optional = true }
+moose-standalone = { version = "7.0.0", path = "../../crates/moose-standalone", features = ["gui", "playback"], optional = true }
 moose-loader = { workspace = true }
 
 
 [dev-dependencies]
-moose-test = { workspace = true }
+moose-test = { version = "7.0.0", path = "../../crates/moose-test" }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

@@ -1,9 +1,9 @@
 [package]
 name = "moose-loader-tests"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
 description = "Integration tests for moose-loader. Lives in its own crate so the test deps (umbrella `moose` + `moose-derive`) can be normal deps without forming a `moose <-> moose-loader` cycle in cargo metadata."
 # Internal-only — never published. The `release.sh` filter excludes
 # `publish = false` crates from the workspace publish set.
@@ -15,8 +15,8 @@ publish = false
 cc = "1"
 
 [dev-dependencies]
-moose = { workspace = true, features = ["mui"] }
-moose-core = { workspace = true }
+moose = { version = "7.0.0", path = "../moose", default-features = false, features = ["mui"] }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-derive = { workspace = true }
 moose-font = { workspace = true }
 moose-loader = { workspace = true }
@@ -25,9 +25,9 @@ moose-params = { workspace = true }
 # through their real C ABIs. `clap-sys` / `vst3` pin the exact versions the
 # wrappers already lock, so no new crate enters Cargo.lock.
 moose-aax = { workspace = true }
-moose-au = { workspace = true }
-moose-clap = { workspace = true }
-moose-vst3 = { workspace = true }
+moose-au = { version = "7.0.0", path = "../moose-au" }
+moose-clap = { version = "7.0.0", path = "../moose-clap" }
+moose-vst3 = { version = "7.0.0", path = "../moose-vst3" }
 clap-sys = "0.5"
 vst3 = "0.3.0"
 # Shared params / state / logic for the reload-transition fixtures. A
@@ -45,5 +45,10 @@ shell = ["moose-loader/shell"]
 # `moose::enable_rt_paranoid!()`, so the allocation audits count.
 rt-paranoid = ["moose/rt-paranoid"]
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

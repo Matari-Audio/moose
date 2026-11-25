@@ -1,14 +1,19 @@
 [package]
 name = "reload-fixture-common"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
 description = "Shared params / DSP-state / logic types for moose-loader's reload-transition fixtures. Internal test-only."
 publish = false
 
 [dependencies]
-moose = { workspace = true }
+moose = { version = "7.0.0", path = "../../../moose", default-features = false }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

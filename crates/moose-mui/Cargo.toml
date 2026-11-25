@@ -1,11 +1,11 @@
 [package]
 name = "moose-mui"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "7.0.0"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
 # MUI needs 1.98.
 rust-version = "1.98"
-repository.workspace = true
+repository = "https://github.com/Matari-Audio/moose"
 description = "MUI editors for moose plugins: MuiEditor and the parameter Bridge"
 keywords = ["audio", "plugin", "gui", "mui"]
 categories = ["multimedia::audio", "gui"]
@@ -13,16 +13,21 @@ categories = ["multimedia::audio", "gui"]
 publish = false
 
 [dependencies]
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-params = { workspace = true }
-mui = { workspace = true }
-mui-baseview = { workspace = true }
+mui = { git = "https://github.com/Matari-Audio/MUI", features = ["gpu-quad", "cpu"] }
+mui-baseview = { git = "https://github.com/Matari-Audio/MUI" }
 # baseview's parent handle is raw-window-handle 0.6.
 raw-window-handle = "0.6"
 
 [dev-dependencies]
-moose = { workspace = true }
+moose = { version = "7.0.0", path = "../moose", default-features = false }
 keyboard-types = { version = "0.8", default-features = false }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

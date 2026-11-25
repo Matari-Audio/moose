@@ -1,9 +1,9 @@
 [package]
 name = "reload-fixture-reset"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
 description = "Reload-transition fixture (ResetState). Distinct fingerprint from keep-a/keep-b, so a reload to it must drop + re-init state. Internal test-only."
 publish = false
 
@@ -11,9 +11,14 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-moose = { workspace = true }
+moose = { version = "7.0.0", path = "../../../moose", default-features = false }
 moose-loader = { workspace = true }
 reload-fixture-common = { path = "../reload-fixture-common" }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

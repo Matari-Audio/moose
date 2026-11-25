@@ -1,14 +1,14 @@
 [package]
 name = "moose-test"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "Test utilities for moose plugins (render, state, params, GUI snapshots)"
 
 [dependencies]
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-params = { workspace = true }
 moose-plugin = { workspace = true }
 moose-driver = { workspace = true }
@@ -16,5 +16,10 @@ moose-build = { workspace = true }
 png = "0.18"
 toml = { workspace = true }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"
