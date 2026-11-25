@@ -12,8 +12,7 @@
 //! in place via `into_boxed_slice().try_into()`, keeping stack usage `O(size_of::<T>())`.
 
 use core::fmt;
-use core::ops::{Deref, DerefMut, Index, IndexMut};
-use core::slice::SliceIndex;
+use core::ops::{Deref, DerefMut};
 
 /// A fixed-size array `[T; N]` stored on the heap (`Box<[T; N]>`), constructed
 /// element-by-element directly on the heap so `[T; N]` never touches the stack.
@@ -153,22 +152,6 @@ impl<T, const N: usize> AsMut<[T; N]> for HeapArray<T, N> {
     #[inline]
     fn as_mut(&mut self) -> &mut [T; N] {
         &mut self.0
-    }
-}
-
-impl<T, I: SliceIndex<[T]>, const N: usize> Index<I> for HeapArray<T, N> {
-    type Output = I::Output;
-
-    #[inline]
-    fn index(&self, index: I) -> &Self::Output {
-        index.index(&self.0[..])
-    }
-}
-
-impl<T, I: SliceIndex<[T]>, const N: usize> IndexMut<I> for HeapArray<T, N> {
-    #[inline]
-    fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        index.index_mut(&mut self.0[..])
     }
 }
 
