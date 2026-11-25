@@ -33,6 +33,9 @@ fn readme_minimal_example_compiles_and_processes_audio() {
     let mut output = [0.0_f32; 64];
     let inputs: [&[f32]; 1] = [&input];
     let mut outputs: [&mut [f32]; 1] = [&mut output];
+    // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at least
+    // `num_samples` long, and no input to alias an output. These are distinct local `Vec`s/arrays
+    // of exactly that length.
     let mut buffer = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
     let events = EventList::default();
     let transport = TransportInfo::default();

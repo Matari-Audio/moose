@@ -54,6 +54,8 @@ readme = "README.md"
 # Workspace-wide lint config. Crates opt in with `lints.workspace = true`.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Every `unsafe` block and `unsafe impl` states the invariant it relies on.
+undocumented_unsafe_blocks = "deny"
 # New in clippy 1.98 (style); `as_chunks` would churn every SIMD kernel.
 chunks_exact_to_as_chunks = "allow"
 

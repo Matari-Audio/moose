@@ -50,6 +50,7 @@ pub(crate) unsafe fn selected_layout_index<P: PluginExport>(
     if layouts_len <= 1 || plugin.is_null() {
         return 0;
     }
+    // SAFETY: `plugin` is non-null (checked above) and is our live instance.
     let data = unsafe { data_from_plugin::<P>(plugin) };
     (data.selected_config.load(Ordering::Relaxed) as usize).min(layouts_len - 1)
 }
@@ -71,6 +72,7 @@ pub(crate) unsafe extern "C" fn audio_ports_count<P: PluginExport>(
     is_input: bool,
 ) -> u32 {
     let layouts = P::bus_layouts();
+    // SAFETY: Forwards the caller's live `plugin`; null is handled inside.
     let idx = unsafe { selected_layout_index::<P>(plugin, layouts.len()) };
     let Some(layout) = layouts.get(idx) else {
         return 0;
@@ -99,6 +101,9 @@ pub(crate) unsafe extern "C" fn audio_ports_get<P: PluginExport>(
     is_input: bool,
     info: *mut clap_audio_port_info,
 ) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `info` to be a valid
+    // out-pointer.
     unsafe {
         let layouts = P::bus_layouts();
         let idx = selected_layout_index::<P>(plugin, layouts.len());
@@ -292,6 +297,8 @@ pub(crate) unsafe extern "C" fn audio_ports_config_get<P: PluginExport>(
     index: u32,
     config: *mut clap_audio_ports_config,
 ) -> bool {
+    // SAFETY: CLAP requires `config` to be a valid out-pointer. The struct is plain integers and
+    // char arrays, so writing through `&mut` drops nothing.
     unsafe {
         let layouts = P::bus_layouts();
         let Some(layout) = layouts.get(index as usize) else {
@@ -334,6 +341,8 @@ pub(crate) unsafe extern "C" fn audio_ports_config_select<P: PluginExport>(
     plugin: *const clap_plugin,
     config_id: clap_id,
 ) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         if (config_id as usize) >= P::bus_layouts().len() {
             return false;
@@ -601,6 +610,8 @@ pub(crate) unsafe extern "C" fn note_ports_get<P: PluginExport>(
     is_input: bool,
     info: *mut clap_note_port_info,
 ) -> bool {
+    // SAFETY: CLAP requires `info` to be a valid out-pointer; the struct is plain integers and char
+    // arrays.
     unsafe {
         let ports = if is_input {
             u32::from(P::info().midi_input_ports)

@@ -108,6 +108,9 @@ pub(crate) unsafe extern "C" fn gui_is_api_supported<P: PluginExport>(
     if api.is_null() {
         return false;
     }
+    // SAFETY: `api` is non-null (checked above) and, per CLAP, a NUL-terminated string. The host
+    // calls this with the live `clap_plugin` from `create_plugin_instance`, so `data_from_plugin`
+    // yields its `ClapPluginData<P>`.
     run_extern_callback_with::<P, bool>("CLAP", "gui_is_api_supported", false, || unsafe {
         let api = CStr::from_ptr(api);
         #[cfg(target_os = "linux")]
@@ -181,6 +184,9 @@ pub(crate) unsafe extern "C" fn gui_get_preferred_api<P: PluginExport>(
     if api.is_null() || is_floating.is_null() {
         return false;
     }
+    // SAFETY: `api`/`is_floating` are non-null (checked above) and valid for writes. The host calls
+    // this with the live `clap_plugin` from `create_plugin_instance`, so `data_from_plugin` yields
+    // its `ClapPluginData<P>`.
     unsafe {
         #[cfg(target_os = "macos")]
         {
@@ -227,13 +233,19 @@ unsafe fn resolve_create_api<P: PluginExport>(
     api: *const c_char,
     is_floating: bool,
 ) -> Option<*const c_char> {
+    // SAFETY: `api` is non-null, and a CLAP API id is NUL-terminated, so its first byte is
+    // readable.
     if !api.is_null() && unsafe { *api } != 0 {
+        // SAFETY: Same live `plugin` and a non-empty NUL-terminated `api`.
         return unsafe { gui_is_api_supported::<P>(plugin, api, is_floating) }.then_some(api);
     }
     if !is_floating {
         return None;
     }
     #[cfg(target_os = "linux")]
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`; `api` is null here, and each candidate is
+    // a static C string.
     unsafe {
         let candidates = if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
             [
@@ -264,6 +276,8 @@ pub(crate) unsafe extern "C" fn gui_create<P: PluginExport>(
 ) -> bool {
     // The editor builder is author code; firewall its construction so a
     // panic can't unwind across the C ABI (false = "no editor created").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `api` is null or NUL-terminated, per CLAP.
     run_extern_callback_with::<P, bool>("CLAP", "gui_create", false, || unsafe {
         let Some(api) = resolve_create_api::<P>(plugin, api, is_floating) else {
             return false;
@@ -314,6 +328,9 @@ pub(crate) unsafe extern "C" fn gui_create<P: PluginExport>(
 }
 
 pub(crate) unsafe extern "C" fn gui_destroy<P: PluginExport>(plugin: *const clap_plugin) {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. The host destroys the GUI on the main
+    // thread.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         // Take the editor out under the cell guard, then release the guard
@@ -347,6 +364,8 @@ pub(crate) unsafe extern "C" fn gui_set_scale<P: PluginExport>(
 ) -> bool {
     // `Editor::set_scale_factor` is author code; firewall it so a panic
     // can't unwind across the C ABI (false = "scale not applied").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     run_extern_callback_with::<P, bool>("CLAP", "gui_set_scale", false, || unsafe {
         // macOS: the Cocoa GUI API is in logical points and AppKit applies
         // the backing scale, so refuse (the spec's answer for "the OS
@@ -384,6 +403,9 @@ pub(crate) unsafe extern "C" fn gui_get_size<P: PluginExport>(
 ) -> bool {
     // `Editor::size` is author code; firewall it so a panic can't unwind
     // across the C ABI (false = "size unavailable").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `width`/`height` to be valid
+    // out-pointers.
     run_extern_callback_with::<P, bool>("CLAP", "gui_get_size", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         // Re-entered while an outer GUI callback holds the cell (mid-resize):
@@ -453,6 +475,8 @@ pub(crate) unsafe extern "C" fn gui_can_resize<P: PluginExport>(
     plugin: *const clap_plugin,
 ) -> bool {
     // `Editor::can_resize` is author code; firewall it (false = "not resizable").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     run_extern_callback_with::<P, bool>("CLAP", "gui_can_resize", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.gui
@@ -469,6 +493,9 @@ pub(crate) unsafe extern "C" fn gui_set_parent<P: PluginExport>(
 ) -> bool {
     // `editor.open` is author GUI-construction code; firewall it so a panic
     // can't unwind across the C ABI (false = "parenting failed").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `window` is null-checked by
+    // `gui_set_parent_inner`.
     run_extern_callback_with::<P, bool>("CLAP", "gui_set_parent", false, || unsafe {
         gui_set_parent_inner::<P>(plugin, window)
     })
@@ -478,6 +505,9 @@ pub(crate) unsafe fn gui_set_parent_inner<P: PluginExport>(
     plugin: *const clap_plugin,
     window: *const clap_window,
 ) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `window` is null-checked before
+    // `(*window).api` is read, and the host keeps the parent window alive until `gui_destroy`.
     unsafe {
         if window.is_null() || !gui_is_api_supported::<P>(plugin, (*window).api, false) {
             return false;
@@ -552,6 +582,10 @@ pub(crate) unsafe fn gui_set_parent_inner<P: PluginExport>(
 /// repositions it as the parent resizes.
 ///
 /// Mirrors the non-resizable top-anchor behaviour via `objc2::msg_send!`.
+///
+/// # Safety
+///
+/// `parent` is null or a live `NSView`, and this runs on the main thread.
 #[cfg(target_os = "macos")]
 pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
     use objc2::runtime::AnyObject;
@@ -568,6 +602,8 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
         x: f64,
         y: f64,
     }
+    // SAFETY: `NsPoint` is `#[repr(C)]` with two `f64`s, exactly the layout of `CGPoint` that this
+    // encoding names.
     unsafe impl Encode for NsPoint {
         const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
     }
@@ -577,6 +613,8 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
         width: f64,
         height: f64,
     }
+    // SAFETY: `NsSize` is `#[repr(C)]` with two `f64`s, exactly the layout of `CGSize` that this
+    // encoding names.
     unsafe impl Encode for NsSize {
         const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
     }
@@ -586,6 +624,8 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
         origin: NsPoint,
         size: NsSize,
     }
+    // SAFETY: `NsRect` is `#[repr(C)]` with an `NsPoint` then an `NsSize`, exactly `CGRect`'s
+    // layout.
     unsafe impl Encode for NsRect {
         const ENCODING: Encoding =
             Encoding::Struct("CGRect", &[NsPoint::ENCODING, NsSize::ENCODING]);
@@ -593,6 +633,10 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
     if parent.is_null() {
         return;
     }
+    // SAFETY: `parent` is non-null and, per the caller's contract, the host's live `NSView`, used
+    // on the main thread. Every message sent here (`frame`, `subviews`, `count`, `objectAtIndex:`,
+    // `setFrameOrigin:`, `setAutoresizingMask:`) exists on `NSView`/`NSArray` with the declared
+    // return types, and the null results are checked.
     unsafe {
         let parent_obj = parent.cast::<AnyObject>();
         let parent_frame: NsRect = msg_send![parent_obj, frame];
@@ -619,6 +663,8 @@ pub(crate) unsafe fn anchor_child_to_top(parent: *mut c_void) {
 }
 
 pub(crate) unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_plugin) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     run_extern_callback_with::<P, bool>("CLAP", "gui_show", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
@@ -662,6 +708,8 @@ pub(crate) unsafe extern "C" fn gui_show<P: PluginExport>(plugin: *const clap_pl
 }
 
 pub(crate) unsafe extern "C" fn gui_hide<P: PluginExport>(plugin: *const clap_plugin) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     run_extern_callback_with::<P, bool>("CLAP", "gui_hide", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
@@ -688,6 +736,9 @@ pub(crate) unsafe extern "C" fn gui_get_resize_hints<P: PluginExport>(
 ) -> bool {
     // `Editor::can_resize` / `aspect_ratio` are author code; firewall them
     // (false = "no hints").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `hints` to be a valid
+    // out-pointer.
     run_extern_callback_with::<P, bool>("CLAP", "gui_get_resize_hints", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         let gui = data.gui.enter();
@@ -731,6 +782,9 @@ pub(crate) unsafe extern "C" fn gui_suggest_title<P: PluginExport>(
     if title.is_null() {
         return;
     }
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `title` is non-null (checked above) and
+    // NUL-terminated per CLAP.
     run_extern_callback_with::<P, ()>("CLAP", "gui_suggest_title", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         let mut gui = data.gui.enter();
@@ -754,6 +808,8 @@ pub(crate) unsafe fn request_host_resize(
     lw: u32,
     lh: u32,
 ) -> bool {
+    // SAFETY: The caller passes a `HostHandle` for a live host; `clap_host_gui` comes from that
+    // host's `get_extension` and lives as long as it.
     unsafe {
         let Some(host_gui) = host.extension::<clap_host_gui>(CLAP_EXT_GUI) else {
             return false;
@@ -777,6 +833,9 @@ pub(crate) unsafe extern "C" fn gui_set_size<P: PluginExport>(
 ) -> bool {
     // `Editor::set_size` / `can_resize` / `size` are author code; firewall
     // them (false = "size rejected").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. The width/height out-pointers are valid
+    // per CLAP.
     run_extern_callback_with::<P, bool>("CLAP", "gui_set_size", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         // A host answering a plugin `request_resize` (`request_host_resize`)
@@ -842,6 +901,9 @@ pub(crate) unsafe extern "C" fn gui_adjust_size<P: PluginExport>(
 ) -> bool {
     // `Editor::can_resize` / `size` are author code; firewall them
     // (false = "no adjustment").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. CLAP requires `width`/`height` to be valid
+    // in/out pointers.
     run_extern_callback_with::<P, bool>("CLAP", "gui_adjust_size", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         // `try_enter`, not `enter`: a host may query the nearest valid size
@@ -975,6 +1037,8 @@ pub(crate) struct Extensions<P: PluginExport> {
 }
 
 pub(crate) unsafe extern "C" fn latency_get<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.delay.latency()
@@ -982,6 +1046,8 @@ pub(crate) unsafe extern "C" fn latency_get<P: PluginExport>(plugin: *const clap
 }
 
 pub(crate) unsafe extern "C" fn tail_get<P: PluginExport>(plugin: *const clap_plugin) -> u32 {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.delay.tail()
@@ -1003,6 +1069,8 @@ pub(crate) unsafe extern "C" fn render_set<P: PluginExport>(
     plugin: *const clap_plugin,
     mode: clap_plugin_render_mode,
 ) -> bool {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         let pm = if mode == CLAP_RENDER_OFFLINE {
@@ -1077,6 +1145,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_get_extension<P: PluginExport>(
     plugin: *const clap_plugin,
     id: *const c_char,
 ) -> *const c_void {
+    // SAFETY: Both pointers are null-checked; otherwise `plugin` is our live instance and `id` is a
+    // NUL-terminated extension id.
     unsafe {
         if id.is_null() || plugin.is_null() {
             return ptr::null();

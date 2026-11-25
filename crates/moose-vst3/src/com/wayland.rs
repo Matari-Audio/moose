@@ -81,6 +81,7 @@ pub(super) fn parent_xdg_surface(
     display: *mut wl_display,
 ) -> Option<*mut c_void> {
     let wf = frame?;
+    // SAFETY: `ViewRect` is four `i32`s, so all-zero is a valid value.
     let mut size: vst3::Steinberg::ViewRect = unsafe { std::mem::zeroed() };
     // SAFETY: `wf` and `display` are live host Wayland interfaces on the UI thread.
     let surface = unsafe { wf.getParentSurface(&raw mut size, display) };

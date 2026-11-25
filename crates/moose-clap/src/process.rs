@@ -67,6 +67,8 @@ pub(crate) unsafe fn flush_gui_changes<P: PluginExport>(
     data: &ClapPluginData<P>,
     out_events: *const clap_output_events,
 ) -> bool {
+    // SAFETY: `out_events` is null-checked; otherwise it is the host's output list for this block
+    // and `try_push` copies each event.
     unsafe {
         if out_events.is_null() {
             return true;
@@ -205,6 +207,8 @@ pub(crate) unsafe extern "C" fn thread_pool_exec<P: PluginExport>(
     // Route worker panics through the same silent latched audio boundary as
     // `clap_plugin_process` so a panicking worker records to `panic_latch`
     // without printing on a host RT thread.
+    // SAFETY: `data` is our live plugin data during `request_exec`. `raw` is null-checked, and the
+    // `PoolTask` it points to stays pinned until every worker `exec` joins.
     let _ = run_audio_block_latched::<P, ()>(&data.panic_latch, "CLAP", || unsafe {
         let raw = data.active_pool_task.load(Ordering::Acquire);
         if raw.is_null() {
@@ -252,6 +256,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
     let mut audio_buffers_valid = false;
     // SAFETY: the host passes its live plugin instance.
     let latch = unsafe { &data_from_plugin::<P>(plugin).panic_latch };
+    // SAFETY: The host calls `process` with our live instance on the audio thread. `process` is
+    // null-checked, and its buffers and event lists are valid for this call.
     let result = run_audio_block_latched::<P, i32>(latch, "CLAP", || unsafe {
         if process.is_null() {
             return CLAP_PROCESS_ERROR;
@@ -1017,6 +1023,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_process<P: PluginExport>(
     // garbage for a block before it reacts to the error, matching VST3 / VST2
     // / AAX. An invalid host shape has no validated storage to clear.
     if result == CLAP_PROCESS_ERROR && audio_buffers_valid {
+        // SAFETY: `audio_buffers_valid` means `process` passed validation, so its output buffers
+        // hold `frames_count` samples.
         unsafe { zero_clap_output_buffers(process) };
     }
     result
@@ -1033,6 +1041,8 @@ pub(crate) unsafe fn zero_clap_output_buffers(process: *const clap_process) {
     if process.is_null() {
         return;
     }
+    // SAFETY: `process` is non-null and, by the caller's contract, its output buses and channels
+    // are sized to `frames_count`.
     unsafe {
         let proc = &*process;
         let num_frames = proc.frames_count as usize;
@@ -1308,6 +1318,8 @@ mod thread_pool_tests {
     }
 
     unsafe extern "C" fn host_request_exec(host: *const clap_host, num_tasks: u32) -> bool {
+        // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live
+        // `HostState`.
         unsafe {
             let state = &*(*host).host_data.cast::<HostState>();
             state.requests.fetch_add(1, Ordering::Relaxed);
@@ -1332,6 +1344,7 @@ mod thread_pool_tests {
         _host: *const clap_host,
         ext_id: *const c_char,
     ) -> *const c_void {
+        // SAFETY: The plugin queries extensions with NUL-terminated static ids.
         if unsafe { CStr::from_ptr(ext_id) } == CLAP_EXT_THREAD_POOL {
             (&raw const HOST_POOL).cast()
         } else {
@@ -1375,6 +1388,8 @@ mod thread_pool_tests {
             request_callback: Some(nop_host),
         };
 
+        // SAFETY: `desc` and `host` are locals that outlive the instance, which is destroyed before
+        // this block ends.
         unsafe {
             let plugin = create_plugin_instance::<PoolPlugin>(&raw const desc, &raw const host);
             assert!(!plugin.is_null());
@@ -1533,6 +1548,8 @@ mod thread_pool_tests {
             request_callback: Some(nop_host),
         };
 
+        // SAFETY: `desc` and `host` are locals that outlive the instance, which is destroyed before
+        // this block ends.
         unsafe {
             let plugin =
                 create_plugin_instance::<PanicPoolPlugin>(&raw const desc, &raw const host);

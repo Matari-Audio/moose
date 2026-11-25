@@ -37,7 +37,13 @@ pub(super) mod linux {
 
     /// The host run loop of a context object (factory context, `initialize`
     /// context or plug frame), if it offers one.
-    pub(in super::super) fn run_loop_of(context: *mut FUnknown) -> Option<ComPtr<IRunLoop>> {
+    ///
+    /// # Safety
+    ///
+    /// `context` is null or a live COM object for the duration of the call.
+    pub(in super::super) unsafe fn run_loop_of(context: *mut FUnknown) -> Option<ComPtr<IRunLoop>> {
+        // SAFETY: the caller guarantees `context` is null or live; `from_raw`
+        // maps null to `None` and `cast` takes its own reference.
         unsafe { ComRef::from_raw(context) }?.cast::<IRunLoop>()
     }
 
@@ -55,6 +61,9 @@ pub(super) mod linux {
         unsafe fn onFDIsSet(&self, _fd: vst3::Steinberg::Linux::FileDescriptor) {
             let mut value = 0u64;
             loop {
+                // SAFETY: `self.fd` is the eventfd this handler owns (closed only in
+                // `FdWake::drop`, after unregistering), and `value` is a writable 8-byte local, the
+                // size eventfd reads require.
                 let r = unsafe { libc::read(self.fd, (&raw mut value).cast(), 8) };
                 if r >= 0
                     || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
@@ -82,13 +91,18 @@ pub(super) mod linux {
             host: Weak<Host>,
             on_fd: fn(&Host),
         ) -> Option<Self> {
+            // SAFETY: `eventfd` takes no pointers; the result is checked before use.
             let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if fd < 0 {
                 return None;
             }
             let handler =
                 ComWrapper::new(FdHandler { host, fd, on_fd }).to_com_ptr::<IEventHandler>()?;
+            // SAFETY: `run_loop` and `handler` are retained `ComPtr`s and `fd` is the eventfd just
+            // created; the run loop keeps its own reference to the handler.
             if unsafe { run_loop.registerEventHandler(handler.as_ptr(), fd) } != kResultOk {
+                // SAFETY: Registration failed, so nothing else refers to `fd`; it is closed exactly
+                // once here.
                 unsafe { libc::close(fd) };
                 return None;
             }
@@ -112,6 +126,8 @@ pub(super) mod linux {
         pub fn notify_fd(fd: libc::c_int) {
             let one = 1u64;
             loop {
+                // SAFETY: `one` is a readable 8-byte local, as eventfd writes require. A stale or
+                // `-1` fd only makes `write` fail with `EBADF`, which ends the loop.
                 let r = unsafe { libc::write(fd, (&raw const one).cast(), 8) };
                 if r >= 0
                     || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
@@ -124,6 +140,9 @@ pub(super) mod linux {
 
     impl Drop for FdWake {
         fn drop(&mut self) {
+            // SAFETY: `run_loop` and `handler` are the retained pointers registered in `bind`. The
+            // handler is unregistered before `fd` is closed, so the run loop never polls a closed
+            // (or reused) fd, and `fd` is closed exactly once.
             unsafe {
                 self.run_loop.unregisterEventHandler(self.handler.as_ptr());
                 libc::close(self.fd);
@@ -157,6 +176,8 @@ pub(super) mod linux {
         pub fn bind(run_loop: ComPtr<IRunLoop>, host: Weak<Host>) -> Option<Self> {
             let handler = ComWrapper::new(TimerHandler { host }).to_com_ptr::<ITimerHandler>()?;
             let ms = u64::from(super::RESTART_TIMER_MS);
+            // SAFETY: `run_loop` and `handler` are retained `ComPtr`s; the run loop takes its own
+            // reference to the handler.
             if unsafe { run_loop.registerTimer(handler.as_ptr(), ms) } != kResultOk {
                 return None;
             }
@@ -166,6 +187,7 @@ pub(super) mod linux {
 
     impl Drop for TimerWake {
         fn drop(&mut self) {
+            // SAFETY: The same retained run loop and handler registered in `bind`.
             unsafe { self.run_loop.unregisterTimer(self.handler.as_ptr()) };
         }
     }
@@ -205,6 +227,8 @@ pub(super) mod macos {
 
     // SAFETY: libdispatch objects are thread-safe.
     unsafe impl Send for MainQueueWake {}
+    // SAFETY: Every libdispatch entry point used on the source (`merge_data`, `cancel`, `release`)
+    // is documented thread-safe.
     unsafe impl Sync for MainQueueWake {}
 
     impl MainQueueWake {
@@ -213,6 +237,10 @@ pub(super) mod macos {
             context: *mut c_void,
             handler: unsafe extern "C" fn(*mut c_void),
         ) -> Option<Self> {
+            // SAFETY: The source is created on the main queue from the exported `DATA_OR` type and
+            // checked for null. `context` is stored as an opaque word and only handed back to
+            // `handler`, which the caller chose for it. The source is resumed before it is wrapped,
+            // so `Drop` may release it.
             unsafe {
                 let source = dispatch_source_create(
                     &raw const _dispatch_source_type_data_or,
@@ -231,6 +259,8 @@ pub(super) mod macos {
         }
 
         pub fn signal(&self) {
+            // SAFETY: `self.0` is the live source created in `new` and released only in `Drop`;
+            // `merge_data` is thread-safe and allocation-free.
             unsafe { dispatch_source_merge_data(self.0, 1) };
         }
     }
@@ -239,6 +269,8 @@ pub(super) mod macos {
         fn drop(&mut self) {
             // A handler already running keeps the source alive; it resolves
             // its instance through the registry, which no longer has it.
+            // SAFETY: `self.0` is the resumed source from `new`. It is cancelled, so no new handler
+            // runs, then our only reference is released exactly once.
             unsafe {
                 dispatch_source_cancel(self.0);
                 dispatch_release(self.0);
@@ -247,6 +279,7 @@ pub(super) mod macos {
     }
 
     pub(in super::super) fn on_main_thread() -> bool {
+        // SAFETY: `pthread_main_np` takes no arguments and only reads thread state.
         unsafe { pthread_main_np() != 0 }
     }
 }
@@ -363,6 +396,8 @@ pub(super) mod windows {
         lparam: isize,
     ) -> isize {
         if msg == WM_MOOSE_WAKE {
+            // SAFETY: `hwnd` is the window this procedure was called for; reading its user data has
+            // no other preconditions.
             let ctx = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut c_void;
             if !ctx.is_null()
                 && let Some(handler) = HANDLER.get()
@@ -372,13 +407,19 @@ pub(super) mod windows {
             return 0;
         }
         if msg == WM_CLOSE {
+            // SAFETY: `WM_CLOSE` is delivered on the window's owning thread (via
+            // `SendMessageTimeoutW` from `Drop`), the only thread that may destroy it.
             return unsafe { DestroyWindow(hwnd) } as isize;
         }
+        // SAFETY: Forwards the unchanged message for the window it was sent to.
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
     fn retain_module() -> *mut c_void {
         let mut hmod = std::ptr::null_mut();
+        // SAFETY: `wnd_proc` is an address inside this module and `hmod` is a writable local.
+        // Without `UNCHANGED_REFCOUNT` the call takes a module reference, released later through
+        // `FreeLibrary`.
         unsafe {
             GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -408,6 +449,8 @@ pub(super) mod windows {
                 lpsz_class_name: CLASS_NAME.as_ptr(),
                 h_icon_sm: std::ptr::null_mut(),
             };
+            // SAFETY: `wc` is a fully initialised `WNDCLASSEXW` with its own size. `CLASS_NAME` is
+            // a static NUL-terminated UTF-16 string, and `hinst` is the module holding `wnd_proc`.
             if unsafe { RegisterClassExW(&raw const wc) } == 0 {
                 return false;
             }
@@ -421,12 +464,16 @@ pub(super) mod windows {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *users -= 1;
+        // SAFETY: The last user is gone, so no window of this class remains; `CLASS_NAME` and
+        // `hinst` match the registration.
         if *users == 0 && unsafe { UnregisterClassW(CLASS_NAME.as_ptr(), hinst) } == 0 {
             // The class still refers to wnd_proc. Pin this registration.
             *users = 1;
             return;
         }
         drop(users);
+        // SAFETY: Releases the module reference taken by this user's `retain_module` exactly once,
+        // after the class no longer needs `wnd_proc`.
         unsafe { FreeLibrary(hinst) };
     }
 
@@ -446,6 +493,8 @@ pub(super) mod windows {
     // Win32; `DestroyWindow` runs on the owning thread (directly when dropped
     // on it, or synchronously via `SendMessageTimeoutW(..., WM_CLOSE, ...)`).
     unsafe impl Send for MessageWake {}
+    // SAFETY: `signal` is the only `&self` method that touches Win32, through the thread-safe
+    // `PostMessageW`; the coalescing state is atomic.
     unsafe impl Sync for MessageWake {}
 
     impl MessageWake {
@@ -456,9 +505,14 @@ pub(super) mod windows {
                 return None;
             }
             if !acquire_class(hinst) {
+                // SAFETY: Class registration failed, so this releases the module reference
+                // `retain_module` just took, exactly once.
                 unsafe { FreeLibrary(hinst) };
                 return None;
             }
+            // SAFETY: The class was registered for `hinst` just above, `CLASS_NAME` is static and
+            // NUL-terminated, and every other pointer argument is null as allowed for a
+            // message-only (`HWND_MESSAGE`) window.
             let hwnd = unsafe {
                 CreateWindowExW(
                     0,
@@ -479,6 +533,8 @@ pub(super) mod windows {
                 release_class_and_module(hinst);
                 return None;
             }
+            // SAFETY: `hwnd` was just created by this thread; the user data word only stores the
+            // caller's opaque context.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize) };
             Some(Self {
                 hwnd,
@@ -509,6 +565,9 @@ pub(super) mod windows {
                         {
                             continue;
                         }
+                        // SAFETY: `self.hwnd` stays valid until `Drop`, and `PostMessageW` is
+                        // callable from any thread. A window already destroyed only makes the post
+                        // fail.
                         let posted = unsafe { PostMessageW(self.hwnd, WM_MOOSE_WAKE, 0, 0) } != 0;
                         if posted {
                             // The UI may already have cleared this attempt and started
@@ -550,13 +609,18 @@ pub(super) mod windows {
 
     impl Drop for MessageWake {
         fn drop(&mut self) {
+            // SAFETY: `self.hwnd` is still live. Clearing the user data first means a wake still
+            // queued sees null and skips the handler.
             unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) };
             let destroyed = if std::thread::current().id() == self.thread {
+                // SAFETY: This is the window's owning thread, so it may destroy it directly.
                 unsafe { DestroyWindow(self.hwnd) != 0 }
             } else {
                 // Synchronously dispatch `WM_CLOSE` to the owner thread (bounded
                 // by `DROP_CLOSE_TIMEOUT_MS`). Check both dispatch and destruction.
                 let mut result = 0usize;
+                // SAFETY: `SendMessageTimeoutW` is thread-safe and runs `WM_CLOSE` (hence
+                // `DestroyWindow`) on the owning thread. `result` is a writable local.
                 unsafe {
                     SendMessageTimeoutW(
                         self.hwnd,

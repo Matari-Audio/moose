@@ -126,9 +126,9 @@ impl Drop for DenormalGuard {
     fn drop(&mut self) {
         #[cfg(all(target_arch = "x86_64", not(miri)))]
         {
-            // SAFETY: see `new()`.
             #[allow(clippy::cast_possible_truncation)]
             let restore: u32 = self.saved as u32;
+            // SAFETY: see `new()`; this restores the MXCSR value saved there.
             unsafe {
                 std::arch::asm!(
                     "ldmxcsr [{0}]",

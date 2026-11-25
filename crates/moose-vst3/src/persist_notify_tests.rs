@@ -15,6 +15,8 @@ struct Loop {
     thread: std::thread::ThreadId,
 }
 unsafe extern "C" fn qi(raw: *mut c_void, _: *const u8, out: *mut *mut c_void) -> i32 {
+    // SAFETY: The plugin calls this `queryInterface` with a writable out-slot. Handing back `raw`
+    // without an add-ref is fine because this fake ignores reference counts for its lifetime.
     unsafe {
         *out = raw;
         add(raw);
@@ -22,16 +24,20 @@ unsafe extern "C" fn qi(raw: *mut c_void, _: *const u8, out: *mut *mut c_void) -
     0
 }
 unsafe extern "C" fn add(raw: *mut c_void) -> u32 {
+    // SAFETY: `raw` is the `Loop` this test passed as the host context; it lives until the test
+    // ends, and only shared `Cell` access happens through it.
     let host = unsafe { &*raw.cast::<Loop>() };
     host.refs.set(host.refs.get() + 1);
     host.refs.get()
 }
 unsafe extern "C" fn release(raw: *mut c_void) -> u32 {
+    // SAFETY: `raw` is the test's live `Loop`; shared `Cell` access only.
     let host = unsafe { &*raw.cast::<Loop>() };
     host.refs.set(host.refs.get() - 1);
     host.refs.get()
 }
 unsafe extern "C" fn register(raw: *mut c_void, event: *mut c_void, fd: i32) -> i32 {
+    // SAFETY: `raw` is the test's live `Loop`; shared `Cell` access only.
     let host = unsafe { &*raw.cast::<Loop>() };
     assert_eq!(std::thread::current().id(), host.thread);
     assert!(host.event.get().is_null());
@@ -40,6 +46,7 @@ unsafe extern "C" fn register(raw: *mut c_void, event: *mut c_void, fd: i32) -> 
     0
 }
 unsafe extern "C" fn unregister(raw: *mut c_void, event: *mut c_void) -> i32 {
+    // SAFETY: `raw` is the test's live `Loop`; shared `Cell` access only.
     let host = unsafe { &*raw.cast::<Loop>() };
     assert_eq!(host.event.replace(std::ptr::null_mut()), event);
     host.fd.set(-1);
@@ -59,6 +66,7 @@ struct Handler {
 }
 /// The handler implements no extra interface (no `IComponentHandler2/3`).
 unsafe extern "C" fn handler_qi(_: *mut c_void, _: *const u8, out: *mut *mut c_void) -> i32 {
+    // SAFETY: The plugin calls `queryInterface` with a writable out-slot.
     unsafe { out.write(std::ptr::null_mut()) };
     vst3::Steinberg::kNoInterface
 }
@@ -66,18 +74,24 @@ unsafe extern "C" fn handler_add(_: *mut c_void) -> u32 {
     1
 }
 unsafe extern "C" fn begin(raw: *mut c_void, id: u32) -> i32 {
+    // SAFETY: `raw` is the test's `Handler`. The plugin calls it only on this thread (asserted
+    // below) and never re-entrantly, so this `&mut` is unique.
     let handler = unsafe { &mut *raw.cast::<Handler>() };
     assert_eq!(std::thread::current().id(), handler.thread);
     handler.events.push((0, id, 0.));
     0
 }
 unsafe extern "C" fn perform(raw: *mut c_void, id: u32, value: f64) -> i32 {
+    // SAFETY: `raw` is the test's `Handler`, called only on this thread and never re-entrantly, so
+    // this `&mut` is unique.
     let handler = unsafe { &mut *raw.cast::<Handler>() };
     assert_eq!(std::thread::current().id(), handler.thread);
     handler.events.push((1, id, value));
     0
 }
 unsafe extern "C" fn end(raw: *mut c_void, id: u32) -> i32 {
+    // SAFETY: `raw` is the test's `Handler`, called only on this thread and never re-entrantly, so
+    // this `&mut` is unique.
     let handler = unsafe { &mut *raw.cast::<Handler>() };
     assert_eq!(std::thread::current().id(), handler.thread);
     handler.events.push((2, id, 0.));
@@ -87,6 +101,8 @@ unsafe extern "C" fn restart(_: *mut c_void, _: i32) -> i32 {
     0
 }
 unsafe fn slot(raw: *mut c_void, index: usize) -> *const c_void {
+    // SAFETY: The caller passes a COM object whose first word is a vtable with more than `index`
+    // entries.
     unsafe { *(*raw.cast::<*const *const c_void>()).add(index) }
 }
 #[repr(C)]
@@ -105,18 +121,24 @@ unsafe fn dispatch(host: &Loop) {
         revents: 0,
     };
     assert_eq!(
+        // SAFETY: `fd` is a local `pollfd`-layout struct and the count is 1.
         unsafe { poll(&raw mut fd, 1, 0) },
         1,
         "worker must wake host fd"
     );
     let event = host.event.get();
     let callback: unsafe extern "C" fn(*mut c_void, i32) =
+        // SAFETY: `event` is the plugin's registered `IEventHandler`. Slot 3 is `onFDIsSet(self,
+        // fd)` (after the three `FUnknown` slots), and this pointer type matches that ABI.
         unsafe { std::mem::transmute(slot(event, 3)) };
+    // SAFETY: `event` is still registered (and so retained by the plugin), and `onFDIsSet` is
+    // invoked on the registering thread as the run-loop contract requires.
     unsafe {
         callback(event, host.fd.get());
     }
     fd.revents = 0;
     assert_eq!(
+        // SAFETY: `fd` is a local `pollfd`-layout struct and the count is 1.
         unsafe { poll(&raw mut fd, 1, 0) },
         0,
         "idle fd must be drained"
@@ -126,6 +148,9 @@ unsafe fn dispatch(host: &Loop) {
 fn factory_host_runloop_delivers_closed_editor_completion_without_polling_or_uaf() {
     // This is the only test registering the global shim factory. Ordinary FFI
     // tests use cb_create directly and do not access its global callback table.
+    // SAFETY: This is the only test that touches the global shim factory. The fake vtables match
+    // the VST3 `IRunLoop` and `IComponentHandler` slot order, and `Loop`/`Handler` outlive every
+    // call the plugin makes through them.
     unsafe {
         register_vst3::<TestPlugin>();
         let factory = ffi::moose_vst3_get_factory();

@@ -313,6 +313,8 @@ mod tests {
             let i = self.calls.get();
             self.calls.set(i + 1);
             let (rc, count) = self.replies.get(i).copied().unwrap_or((kResultOk, 0));
+            // SAFETY: Test double: every `IBStream` caller in this crate passes a writable local
+            // out-count.
             unsafe {
                 *num_bytes_read = if count == i32::MAX { num_bytes } else { count };
             }
@@ -325,6 +327,8 @@ mod tests {
             num_bytes: int32,
             num_bytes_written: *mut int32,
         ) -> tresult {
+            // SAFETY: Same arguments, forwarded unchanged under `read`'s contract (it never touches
+            // the buffer).
             unsafe { self.read(buffer, num_bytes, num_bytes_written) }
         }
 
@@ -850,9 +854,10 @@ mod main_thread_tests {
     fn host_info_and_midi_learn_reach_the_hooks() {
         let inst = Vst3Instance::<TestPlugin>::create().expect("create");
         let seen = Seen::default();
-        // SAFETY: test thread acts as host UI thread.
         *inst
             .main_thread
+            // SAFETY: This test thread is the only thread touching the instance, so it plays the
+            // host UI thread.
             .borrow_mut(&unsafe { MainThread::assume() }) = Box::new(seen.clone());
         let info = Vst3TrackInfo {
             name: Some(String::from("Bass")),
@@ -933,6 +938,8 @@ mod main_thread_tests {
                 transport: None,
                 process_mode: 0,
             };
+            // SAFETY: `in_ptrs`/`out_ptrs` point at local 16-sample `f32` arrays that outlive the
+            // call.
             unsafe { worker_inst.process_block::<f32>(&mut args) };
             (out_l, out_r)
         })

@@ -35,6 +35,8 @@ pub(crate) struct AaxCtx(pub(crate) *mut c_void);
 // `cb_destroy` calls `HostQueue::close()` (waiting for all active scopes)
 // before freeing the instance.
 unsafe impl Send for AaxCtx {}
+// SAFETY: Shared access adds nothing: `AaxCtx` is a `Copy` address with no interior state,
+// dereferenced only inside `HostQueue::with_open` as described above.
 unsafe impl Sync for AaxCtx {}
 
 impl AaxCtx {

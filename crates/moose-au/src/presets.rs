@@ -164,6 +164,8 @@ pub(crate) unsafe extern "C" fn cb_factory_preset_load<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     index: u32,
 ) -> i32 {
+    // SAFETY: The shim calls `factory_preset_load` only with its live instance (`au_v2_shim.c`
+    // checks `rustCtx`); only a shared reference is formed.
     run_extern_callback_with::<P, i32>("au", "factory_preset_load", 0, || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(entry) = factory_presets::<P>().get(index as usize) else {

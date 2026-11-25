@@ -70,6 +70,8 @@ fn platform_type() -> Option<&'static CStr> {
     } else {
         return None;
     };
+    // SAFETY: The `kPlatformType*` constants are static NUL-terminated strings from the SDK
+    // bindings.
     Some(unsafe { CStr::from_ptr(t) })
 }
 
@@ -84,11 +86,15 @@ fn platform(kind: FIDString) -> Option<Platform> {
     if kind.is_null() {
         return None;
     }
+    // SAFETY: `kind` is non-null (checked above) and, per the VST3 contract, a NUL-terminated
+    // `FIDString` live for this call. The borrow does not outlive it.
     let kind = unsafe { CStr::from_ptr(kind) };
     if platform_type().is_some_and(|t| kind == t) {
         return Some(Platform::Native);
     }
     #[cfg(target_os = "linux")]
+    // SAFETY: `kPlatformTypeWaylandSurfaceID` is a static NUL-terminated string from the SDK
+    // bindings.
     if kind == unsafe { CStr::from_ptr(kPlatformTypeWaylandSurfaceID) } {
         return Some(Platform::Wayland);
     }
@@ -115,8 +121,11 @@ impl View {
         };
         wrapper.id.store(ptr.as_ptr() as usize, Ordering::Relaxed);
         host.set_current_view(ptr.as_ptr() as usize, ptr.as_ptr());
+        // SAFETY: `None` carries no pointer.
         #[cfg(target_os = "linux")]
-        host.update_run_loop_registration(None);
+        unsafe {
+            host.update_run_loop_registration(None);
+        }
         ptr.into_raw()
     }
 
@@ -177,7 +186,9 @@ impl View {
                 return false;
             };
             (
-                super::wake::linux::run_loop_of(frame.as_ptr().cast()),
+                // SAFETY: `frame` is a retained `IPlugFrame` held by the
+                // locked slot, so it is live for this call.
+                unsafe { super::wake::linux::run_loop_of(frame.as_ptr().cast()) },
                 wayland_frame_of(frame),
             )
         };
@@ -198,6 +209,9 @@ impl View {
         let backend = self.host.backend();
         self.host.attach_view(self.id());
         self.wayland_attached.store(true, Ordering::Release);
+        // SAFETY: `connection` keeps the display open and `surface` is the host's parent surface.
+        // Both are stored in `WaylandState::Attached` and torn down in `removed` only after
+        // `gui_close`, which `gui_open_wayland` requires.
         if !unsafe { backend.gui_open_wayland(connection.display().cast(), surface) } {
             self.host.detach_view(self.id());
             return false;
@@ -243,14 +257,20 @@ impl View {
             #[cfg(target_os = "linux")]
             let unknown = frame.as_ref().map(|f| f.as_ptr().cast::<FUnknown>());
             self.host.set_current_frame(self.id(), frame);
+            // SAFETY: `unknown` points at the frame just stored by
+            // `set_current_frame`, which keeps it retained across this call.
             #[cfg(target_os = "linux")]
-            self.host.update_run_loop_registration(unknown);
+            unsafe {
+                self.host.update_run_loop_registration(unknown);
+            }
         }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
+        // SAFETY: `removed` has no preconditions beyond `&self`; it detaches whatever is attached,
+        // and does nothing if the view is already detached.
         unsafe { self.removed() };
         self.set_frame(None);
         self.host.forget_view(self.id());
@@ -288,6 +308,8 @@ impl IPlugViewTrait for View {
             }
         }
         self.host.attach_view(self.id());
+        // SAFETY: `parent` is non-null and is the host's native window for this platform, which the
+        // host keeps alive until `removed`, i.e. for the editor session `gui_open` requires.
         if !unsafe { self.host.backend().gui_open(parent) } {
             self.host.detach_view(self.id());
             return kResultFalse;
@@ -331,6 +353,8 @@ impl IPlugViewTrait for View {
     }
 
     unsafe fn getSize(&self, size: *mut ViewRect) -> tresult {
+        // SAFETY: The host passes `size` as null or a writable `ViewRect`; `as_mut` maps null to
+        // `None`.
         let Some(r) = (unsafe { size.as_mut() }) else {
             return kResultFalse;
         };
@@ -345,6 +369,8 @@ impl IPlugViewTrait for View {
     }
 
     unsafe fn onSize(&self, size: *mut ViewRect) -> tresult {
+        // SAFETY: The host passes `size` as null or a readable `ViewRect`; `as_ref` maps null to
+        // `None`.
         if let Some(r) = unsafe { size.as_ref() } {
             let (w, h) = (r.right - r.left, r.bottom - r.top);
             if w > 0 && h > 0 {
@@ -371,6 +397,8 @@ impl IPlugViewTrait for View {
     }
 
     unsafe fn setFrame(&self, frame: *mut IPlugFrame) -> tresult {
+        // SAFETY: The host passes `frame` as null or a live `IPlugFrame`; `retain` takes our own
+        // reference.
         self.set_frame(unsafe { retain(frame) });
         kResultOk
     }
@@ -384,6 +412,8 @@ impl IPlugViewTrait for View {
     }
 
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
+        // SAFETY: The host passes `rect` as null or a read-write `ViewRect`; `as_mut` maps null to
+        // `None`.
         if let Some(r) = unsafe { rect.as_mut() } {
             let (w, h) = (r.right - r.left, r.bottom - r.top);
             if w > 0 && h > 0 {
@@ -420,6 +450,8 @@ impl IParameterFinderTrait for View {
         y_pos: int32,
         result_tag: *mut ParamID,
     ) -> tresult {
+        // SAFETY: The host passes `result_tag` as null or a writable `ParamID`; `as_mut` maps null
+        // to `None`.
         let Some(out) = (unsafe { result_tag.as_mut() }) else {
             return kInvalidArgument;
         };

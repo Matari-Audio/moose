@@ -330,6 +330,7 @@ impl<P: Params + ?Sized> Bridge<P> {
     /// The pointer of the input the build in progress answers: newer than
     /// [`Ui::pointer`], the one the last frame laid out, so a drag can
     /// follow it in this frame rather than the next.
+    #[must_use]
     pub fn pointer(&self) -> PointerInput {
         self.pointer
     }

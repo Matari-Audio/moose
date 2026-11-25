@@ -423,13 +423,13 @@ impl<'a, S: Sample> AudioBuffer<'a, S> {
             self.num_samples,
         );
         let new_offset = self.offset + start;
+        let self_ptr: *mut Self = self;
         // SAFETY: We construct an AudioBuffer<'a, S> and transmute to AudioBuffer<'_, S>.
         // These have identical memory layout (lifetimes are erased at runtime).
         // This is sound because:
         // 1. &mut self prevents the caller from using self while the slice exists
         // 2. The underlying channel memory lives for 'a which outlives '_
         // 3. Bounds are checked by the assert above
-        let self_ptr: *mut Self = self;
         unsafe {
             let s = &mut *self_ptr;
             std::mem::transmute::<AudioBuffer<'a, S>, AudioBuffer<'_, S>>(AudioBuffer {
@@ -668,6 +668,9 @@ impl<S: Sample> RawBufferScratch<S> {
         if S::IS_F64 == H::IS_F64 {
             return;
         }
+        // SAFETY: The caller passes the same `outputs`/`num_out`/`num_frames` as the preceding
+        // `build`, so each non-null host pointer holds `nf` writable `H` samples. `output_buffers`
+        // is plugin scratch, separate from host memory.
         unsafe {
             let nf = num_frames as usize;
             for (ch, plugin_out) in self
@@ -697,7 +700,6 @@ impl<S: Sample> RawBufferScratch<S> {
         num_frames: u32,
         supports_in_place: bool,
     ) -> AudioBuffer<'a, S> {
-        const MAX_CHANNELS_TRACKED: usize = 64;
         // Whether the plugin's chosen precision matches the host's.
         // When matched, we zero-copy host pointers into the slice
         // arrays; when not, we convert through input_copies and
@@ -705,37 +707,25 @@ impl<S: Sample> RawBufferScratch<S> {
         // IS_F64 flags mean S and H are the same type.
         let same_precision = S::IS_F64 == H::IS_F64;
 
+        // SAFETY: Per `build`'s contract, `inputs`/`outputs` hold `num_in`/`num_out` pointers, each
+        // null or valid for `num_frames` samples for `'a`. Inputs that alias an output are
+        // snapshotted or emptied, so no `&[S]` overlaps a `&mut [S]`. Equal `IS_F64` flags mean `S
+        // == H`, because `Sample` is sealed to `f32`/`f64`.
         unsafe {
             let nf = num_frames as usize;
             let num_out_u = num_out as usize;
             let num_in_u = num_in as usize;
-            debug_assert!(
-                num_out_u <= MAX_CHANNELS_TRACKED,
-                "RawBufferScratch::build: alias detection only covers up to {MAX_CHANNELS_TRACKED} \
-                 output channels; got {num_out_u}. Channels beyond the cap won't be \
-                 detected as aliased.",
-            );
-            let out_ptrs: [Option<*mut H>; MAX_CHANNELS_TRACKED] = std::array::from_fn(|ch| {
-                if ch < num_out_u {
-                    let p = *outputs.add(ch);
-                    if p.is_null() { None } else { Some(p) }
-                } else {
-                    None
-                }
-            });
+            // Every output is scanned: a missed alias would hand the plugin
+            // a `&[S]` and a `&mut [S]` over the same host memory.
             let aliases_any_output = |in_ptr: *const H| -> bool {
                 let in_start = in_ptr as usize;
                 let in_end = in_start + nf * std::mem::size_of::<H>();
-                out_ptrs
-                    .iter()
-                    .take(num_out_u.min(MAX_CHANNELS_TRACKED))
-                    .any(|o| {
-                        o.is_some_and(|op| {
-                            let o_start = op as usize;
-                            let o_end = o_start + nf * std::mem::size_of::<H>();
-                            !(in_end <= o_start || o_end <= in_start)
-                        })
-                    })
+                (0..num_out_u).any(|ch| {
+                    let op = *outputs.add(ch);
+                    let o_start = op as usize;
+                    let o_end = o_start + nf * std::mem::size_of::<H>();
+                    !op.is_null() && in_end > o_start && o_end > in_start
+                })
             };
 
             // Grow per-channel scratch slots if the bus widened or
@@ -766,10 +756,15 @@ impl<S: Sample> RawBufferScratch<S> {
                     // block-length silence, not an out-of-range empty slice.
                     std::slice::from_raw_parts(silence_ptr, nf)
                 } else if aliases_any_output(ptr) {
-                    if ch < 64 {
+                    // Only exact same-channel aliasing within the 64-bit mask can be
+                    // represented by `in_place_mask` / `in_out_mut(ch)`. Any cross-channel,
+                    // partial, or `ch >= 64` alias must snapshot.
+                    let same_channel_in_place =
+                        ch < num_out_u.min(64) && ptr == (*outputs.add(ch)).cast_const();
+                    if same_channel_in_place {
                         in_place_mask |= 1 << ch;
                     }
-                    if supports_in_place {
+                    if supports_in_place && same_channel_in_place {
                         // Plugin opted in: hand it nothing through input(ch);
                         // it reads+writes the shared buffer via in_out_mut.
                         // Same-precision reinterprets the host buffer directly
@@ -1032,6 +1027,70 @@ mod tests {
             }
         }
         assert_eq!(io, vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    /// Alias detection covers every output, not just the first 64: an input
+    /// sharing memory with output 64 must be snapshotted, never handed out as
+    /// a `&[S]` overlapping the plugin's `&mut [S]`.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn in_place_alias_beyond_64_outputs_is_detected() {
+        let mut outs = vec![vec![0.0f32; 4]; 65];
+        outs[64] = vec![1.0, 2.0, 3.0, 4.0];
+        let in_ptrs = [outs[64].as_ptr()];
+        let mut out_ptrs: Vec<*mut f32> = outs.iter_mut().map(Vec::as_mut_ptr).collect();
+        let mut scratch = RawBufferScratch::<f32>::default();
+        // SAFETY: all 65 outputs and the aliased input address 4 valid
+        // samples that outlive the buffer.
+        unsafe {
+            let mut buf = scratch.build(in_ptrs.as_ptr(), out_ptrs.as_mut_ptr(), 1, 65, 4, false);
+            for i in 0..4 {
+                buf.output(64)[i] = 9.0;
+            }
+            assert_eq!(buf.input(0), [1.0, 2.0, 3.0, 4.0]);
+        }
+        assert_eq!(outs[64], vec![9.0; 4]);
+    }
+
+    /// With `supports_in_place = true`, only exact same-channel aliases with
+    /// `ch < 64` use the zero-copy empty sentinel. A same-channel alias at
+    /// channel 64 (outside the 64-bit `in_place_mask`) and a cross-channel
+    /// alias (`input[0]` aliasing `output[64]`) must both snapshot so
+    /// `is_in_place` stays false and `input(ch)` remains readable.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn in_place_true_snapshots_channel_64_and_cross_channel_aliases() {
+        let mut outs = vec![vec![0.0f32; 4]; 65];
+        outs[0] = vec![7.0, 7.0, 7.0, 7.0];
+        outs[64] = vec![1.0, 2.0, 3.0, 4.0];
+        let ins = vec![vec![0.0f32; 4]; 65];
+        let mut in_ptrs: Vec<*const f32> = ins.iter().map(Vec::as_ptr).collect();
+        // Cross-channel alias on ch 0 -> output 64, and same-channel alias at ch 64.
+        in_ptrs[0] = outs[64].as_ptr();
+        in_ptrs[64] = outs[64].as_ptr();
+        let mut out_ptrs: Vec<*mut f32> = outs.iter_mut().map(Vec::as_mut_ptr).collect();
+        let mut scratch = RawBufferScratch::<f32>::default();
+        // SAFETY: all 65 input and output pointers address 4 valid samples that
+        // outlive the buffer.
+        unsafe {
+            let mut buf = scratch.build(in_ptrs.as_ptr(), out_ptrs.as_mut_ptr(), 65, 65, 4, true);
+            assert!(
+                !buf.is_in_place(0),
+                "cross-channel alias must not mark ch 0 in-place"
+            );
+            assert!(
+                !buf.is_in_place(64),
+                "channel 64 cannot be represented in in_place_mask"
+            );
+            for i in 0..4 {
+                buf.output(64)[i] = 9.0;
+                buf.output(0)[i] = buf.input(0)[i] * 2.0;
+            }
+            assert_eq!(buf.input(0), [1.0, 2.0, 3.0, 4.0]);
+            assert_eq!(buf.input(64), [1.0, 2.0, 3.0, 4.0]);
+        }
+        assert_eq!(outs[0], vec![2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(outs[64], vec![9.0; 4]);
     }
 
     #[test]

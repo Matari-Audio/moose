@@ -66,6 +66,8 @@ impl<Phase> Clone for HostHandle<Phase> {
 // `params.request_flush`). Callers constructing `HostHandle::any` promise the
 // host outlives every use (enforced by `HostQueue::close` / `with_open`).
 unsafe impl Send for HostHandle<Any> {}
+// SAFETY: Same as `Send`: shared use calls only `[thread-safe]` host callbacks, inside
+// `HostQueue::with_open`.
 unsafe impl Sync for HostHandle<Any> {}
 
 impl<Phase> HostHandle<Phase> {
@@ -193,6 +195,8 @@ impl HostHandle<Any> {
         let Ok(cstr) = CString::new(sanitized) else {
             return false;
         };
+        // SAFETY: `log_fn` comes from the live host's `clap_host_log` and is `[thread-safe]`.
+        // `cstr` is NUL-terminated and outlives the call.
         unsafe { log_fn(self.raw, severity, cstr.as_ptr()) };
         true
     }
@@ -211,6 +215,7 @@ impl HostHandle<Any> {
         // SAFETY: caller guarantees host and extension are live;
         // `is_main_thread` is `[thread-safe]` per CLAP `ext/thread-check.h`.
         let check = unsafe { (*ext).is_main_thread }?;
+        // SAFETY: Same live host and `[thread-safe]` callback; `self.raw` is that host.
         Some(unsafe { check(self.raw) })
     }
 
@@ -228,6 +233,7 @@ impl HostHandle<Any> {
         // SAFETY: caller guarantees host and extension are live;
         // `is_audio_thread` is `[thread-safe]` per CLAP `ext/thread-check.h`.
         let check = unsafe { (*ext).is_audio_thread }?;
+        // SAFETY: Same live host and `[thread-safe]` callback; `self.raw` is that host.
         Some(unsafe { check(self.raw) })
     }
 
@@ -240,6 +246,7 @@ impl HostHandle<Any> {
     pub(crate) unsafe fn debug_assert_main_thread(self, ext: *const clap_host_thread_check) {
         #[cfg(debug_assertions)]
         debug_assert_ne!(
+            // SAFETY: Forwards this function's own contract: the host and `ext` are live.
             unsafe { self.is_main_thread(ext) },
             Some(false),
             "CLAP [main-thread] callback invoked off the host main thread"
@@ -257,6 +264,7 @@ impl HostHandle<Any> {
     pub(crate) unsafe fn debug_assert_audio_thread(self, ext: *const clap_host_thread_check) {
         #[cfg(debug_assertions)]
         debug_assert_ne!(
+            // SAFETY: Forwards this function's own contract: the host and `ext` are live.
             unsafe { self.is_audio_thread(ext) },
             Some(false),
             "CLAP [audio-thread] callback invoked off the host audio thread"
@@ -526,6 +534,8 @@ pub(crate) struct HostParamsHandle(*const clap_host_params);
 // of the host, and `HostHandle<Any>::request_flush` invokes only the
 // `[thread-safe]` `request_flush` callback inside `HostQueue::with_open`.
 unsafe impl Send for HostParamsHandle {}
+// SAFETY: Same as `Send`: shared use calls only the `[thread-safe]` `request_flush`, inside
+// `HostQueue::with_open`.
 unsafe impl Sync for HostParamsHandle {}
 
 impl HostParamsHandle {

@@ -105,6 +105,9 @@ fn smoother_ramps_gradually() {
     let mut output = vec![0.0f32; 64];
     let inputs: Vec<&[f32]> = vec![&input];
     let mut outputs: Vec<&mut [f32]> = vec![&mut output];
+    // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at least
+    // `num_samples` long, and no input to alias an output. These are distinct local `Vec`s/arrays
+    // of exactly that length.
     let mut buffer = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
 
     let transport = TransportInfo::default();
@@ -131,6 +134,9 @@ fn smoother_ramps_gradually() {
 
     let mut second_output = vec![0.0f32; 64];
     let mut outputs2: Vec<&mut [f32]> = vec![&mut second_output];
+    // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at least
+    // `num_samples` long, and no input to alias an output. These are distinct local `Vec`s/arrays
+    // of exactly that length.
     let mut buffer2 = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs2, 64) };
     let mut output_events2 = EventList::default();
     let mut ctx2 = ProcessContext::new(&transport, 44100.0, 64, &mut output_events2)

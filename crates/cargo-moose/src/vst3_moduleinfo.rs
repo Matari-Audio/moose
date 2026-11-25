@@ -48,12 +48,15 @@ impl IBStreamTrait for JsonCaptureStream {
         if buffer.is_null() || num_bytes < 0 {
             return kInvalidArgument;
         }
+        // SAFETY: `buffer` is non-null and `num_bytes >= 0` (checked above), and the plugin passes
+        // `num_bytes` readable bytes per `IBStream`.
         let slice = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), num_bytes as usize) };
         self.bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend_from_slice(slice);
         if !num_bytes_written.is_null() {
+            // SAFETY: `num_bytes_written` is non-null (checked above) and writable per `IBStream`.
             unsafe { *num_bytes_written = num_bytes };
         }
         kResultOk
@@ -104,24 +107,35 @@ pub(crate) fn write(bundle: &Path, json: &str) -> crate::Res {
 }
 
 unsafe fn read_factory(binary: &Path, module_name: &str) -> Result<String, String> {
+    // SAFETY: `binary` is a moose-built VST3 module, the caller's contract for `read_factory`;
+    // loading it runs only moose's own initialisers.
     let lib = unsafe { libloading::Library::new(binary) }.map_err(|e| e.to_string())?;
+    // SAFETY: `GetPluginFactory` has this signature in every VST3 module.
     let get = unsafe {
         lib.get::<unsafe extern "system" fn() -> *mut IPluginFactory>(b"GetPluginFactory")
     }
     .map_err(|e| e.to_string())?;
+    // SAFETY: `GetPluginFactory` returns null or an owned factory reference, which `from_raw`
+    // adopts. `lib` outlives `factory` (declared first, dropped last).
     let factory = unsafe { ComPtr::from_raw(get()) }.ok_or("GetPluginFactory returned null")?;
     let factory2 = factory
         .cast::<IPluginFactory2>()
         .ok_or("no IPluginFactory2")?;
 
+    // SAFETY: `PFactoryInfo` is plain integers and char arrays, so all-zero is a valid value.
     let mut info: PFactoryInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `factory` is live, and `info` is a writable local.
     unsafe { factory.getFactoryInfo(&raw mut info) };
     let mut classes = Vec::new();
     let mut compatibility: Option<String> = None;
+    // SAFETY: `factory` is live, and `countClasses` takes no pointers.
     for i in 0..unsafe { factory.countClasses() } {
+        // SAFETY: `PClassInfo2` is plain integers and char arrays, so all-zero is a valid value.
         let mut c: PClassInfo2 = unsafe { std::mem::zeroed() };
+        // SAFETY: `factory2` is live, and `c` is a writable local.
         if unsafe { factory2.getClassInfo2(i, &raw mut c) } == kResultOk {
             if compatibility.is_none() && text(&c.category) == COMPATIBILITY_CATEGORY {
+                // SAFETY: `factory` is live and `c.cid` is a 16-byte class id from that factory.
                 compatibility = unsafe { read_compatibility_json(&factory, &c.cid) };
             }
             classes.push(c);
@@ -144,6 +158,7 @@ unsafe fn read_compatibility_json(
     cid: &[c_char; 16],
 ) -> Option<String> {
     let mut obj = std::ptr::null_mut();
+    // SAFETY: `factory` is live, `cid` and the IID are 16-byte ids, and `obj` is a writable local.
     let rc = unsafe {
         factory.createInstance(
             cid.as_ptr(),
@@ -154,11 +169,14 @@ unsafe fn read_compatibility_json(
     if rc != kResultOk || obj.is_null() {
         return None;
     }
+    // SAFETY: `createInstance` succeeded with a non-null `obj`, an owned `IPluginCompatibility`
+    // reference that `from_raw` adopts.
     let compat = unsafe { ComPtr::from_raw(obj.cast::<IPluginCompatibility>()) }?;
     let stream = ComWrapper::new(JsonCaptureStream {
         bytes: Mutex::new(Vec::new()),
     });
     let stream_ptr = stream.to_com_ptr::<IBStream>()?;
+    // SAFETY: `compat` and `stream_ptr` are live for the call.
     if unsafe { compat.getCompatibilityJSON(stream_ptr.as_ptr()) } != kResultOk {
         return None;
     }
@@ -431,6 +449,7 @@ mod tests {
 
     #[test]
     fn render_includes_compatibility_array_when_present() {
+        // SAFETY: `PFactoryInfo` is plain integers and char arrays, so all-zero is a valid value.
         let info: PFactoryInfo = unsafe { std::mem::zeroed() };
         let compat = r#"[{"New":"00112233445566778899AABBCCDDEEFF","Old":["FFEEDDCCBBAA99887766554433221100"]}]"#;
         let with = render("Demo", &info, &[], Some(compat));

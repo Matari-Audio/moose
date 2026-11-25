@@ -60,6 +60,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
 ) -> bool {
     // Author `init` runs here; firewall it so a panic can't unwind across
     // the C ABI (false = "init failed", the host then discards the plugin).
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `init` runs once on the main thread before
+    // any other callback.
     run_extern_callback_with::<P, bool>("CLAP", "init", false, || unsafe {
         // `init` runs once on the main thread before the host publishes the
         // instance to any audio thread, so an exclusive `&mut` to the whole
@@ -154,6 +157,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_init<P: PluginExport>(
 }
 
 pub(crate) unsafe extern "C" fn clap_plugin_destroy<P: PluginExport>(plugin: *const clap_plugin) {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `destroy` is the last call, so taking back
+    // the box from `create` here frees it exactly once.
     unsafe {
         // Wrap the drop in `catch_unwind`. Dropping the
         // `ClapPluginData` cascades into the editor's `Drop`,
@@ -205,6 +211,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_activate<P: PluginExport>(
     max_frames_count: u32,
 ) -> bool {
     // Author `reset` runs here; firewall it (false = "activate failed").
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `activate` runs on the main thread while
+    // the audio thread is idle.
     run_extern_callback_with::<P, bool>("CLAP", "activate", false, || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.host.debug_assert_main_thread(data.host_thread_check);
@@ -329,6 +338,9 @@ pub(crate) unsafe extern "C" fn clap_plugin_deactivate<P: PluginExport>(
 ) {
     // Draining a stranded `pending_state` runs the author's `load_state`;
     // firewall it so a panic can't unwind across the C ABI.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`. `deactivate` runs on the main thread after
+    // the last `process`.
     run_extern_callback_with::<P, ()>("CLAP", "deactivate", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.host.debug_assert_main_thread(data.host_thread_check);
@@ -393,6 +405,8 @@ pub(crate) unsafe extern "C" fn clap_plugin_stop_processing<P: PluginExport>(
 pub(crate) unsafe extern "C" fn clap_plugin_reset<P: PluginExport>(plugin: *const clap_plugin) {
     // Author `reset` runs here; firewall it so a panic can't unwind across
     // the C ABI.
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     run_extern_callback_with::<P, ()>("CLAP", "reset", (), || unsafe {
         let data = data_from_plugin::<P>(plugin);
         // CLAP `reset` is [audio-thread]: strictly wait-free entry so a
@@ -607,6 +621,8 @@ fn resolve_host_undo<P: PluginExport>(
 pub(crate) unsafe extern "C" fn clap_plugin_on_main_thread<P: PluginExport>(
     plugin: *const clap_plugin,
 ) {
+    // SAFETY: The host calls this with the live `clap_plugin` from `create_plugin_instance`, so
+    // `data_from_plugin` yields its `ClapPluginData<P>`.
     unsafe {
         let data = data_from_plugin::<P>(plugin);
         data.host.debug_assert_main_thread(data.host_thread_check);

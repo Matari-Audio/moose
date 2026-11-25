@@ -522,47 +522,72 @@ mod tests {
         assert_eq!(desc.num_legacy_chunk_ids, 1);
         assert!(!desc.legacy_chunk_ids.is_null());
         assert_eq!(
+            // SAFETY: `legacy_chunk_ids` is non-null (asserted) and points to
+            // `num_legacy_chunk_ids` (1) leaked ids.
             unsafe { *desc.legacy_chunk_ids },
             u32::from_be_bytes(*b"Juce")
         );
 
         let cbs = callbacks::<TestPlugin>();
+        // SAFETY: A null sink is accepted, and `create_with_sink` has no other precondition.
         let ctx = unsafe { (cbs.create_with_sink)(std::ptr::null()) };
         assert!(!ctx.is_null());
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         assert_eq!(unsafe { (cbs.param_count)(ctx) }, 5);
         let mut ids = [0u32; 8];
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `ids` has room for the 8 ids requested.
         assert_eq!(unsafe { (cbs.param_ids)(ctx, ids.as_mut_ptr(), 8) }, 5);
         assert_eq!(&ids[..5], &[1, 2, 3, 4, 5]);
 
         let mut info = MooseAaxParamInfo::default();
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `info` is a local out slot.
         assert_eq!(unsafe { (cbs.param_info_by_id)(ctx, 1, &raw mut info) }, 1);
         assert_eq!(info.range_type, MOOSE_AAX_RANGE_LINEAR);
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `info` is a local out slot.
         assert_eq!(unsafe { (cbs.param_info_by_id)(ctx, 2, &raw mut info) }, 1);
         assert_eq!(info.range_type, MOOSE_AAX_RANGE_LOG);
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `info` is a local out slot.
         assert_eq!(unsafe { (cbs.param_info_by_id)(ctx, 3, &raw mut info) }, 1);
         assert_eq!(info.range_type, MOOSE_AAX_RANGE_DISCRETE);
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `info` is a local out slot.
         assert_eq!(unsafe { (cbs.param_info_by_id)(ctx, 4, &raw mut info) }, 1);
         assert_eq!(info.range_type, MOOSE_AAX_RANGE_CUSTOM);
 
         let mut buf = [0 as std::os::raw::c_char; 64];
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `buf` holds the 64 bytes passed.
         let written = unsafe { (cbs.param_format)(ctx, 1, 1.25, buf.as_mut_ptr(), 64) };
         assert!(written > 0);
+        // SAFETY: `param_format` NUL-terminated `buf` within its 64 bytes.
         let formatted = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
         assert!(formatted.contains("1.25"));
 
         let text = CString::new("1.5").unwrap();
         let mut parsed = 0.0;
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. `text` is NUL-terminated and `parsed` is a local out slot.
             unsafe { (cbs.param_parse)(ctx, 1, text.as_ptr(), &raw mut parsed) },
             1
         );
         assert!((parsed - 1.5).abs() < 1e-6);
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         let norm = unsafe { (cbs.param_normalize)(ctx, 4, 0.25) };
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         let plain = unsafe { (cbs.param_denormalize)(ctx, 4, norm) };
         assert!((plain - 0.25).abs() < 1e-6);
 
+        // SAFETY: `ctx` was created above and is destroyed exactly once.
         unsafe { (cbs.destroy)(ctx) };
     }
 
@@ -576,16 +601,22 @@ mod tests {
         }
 
         unsafe extern "C" fn on_latency(ud: *mut c_void, samples: u32) {
+            // SAFETY: `ud` is the boxed `SinkLog` registered as `user_data`; it outlives the
+            // instance.
             unsafe { &*ud.cast::<SinkLog>() }
                 .latency
                 .store(samples, Ordering::SeqCst);
         }
         unsafe extern "C" fn on_dirty(ud: *mut c_void) {
+            // SAFETY: `ud` is the boxed `SinkLog` registered as `user_data`; it outlives the
+            // instance.
             unsafe { &*ud.cast::<SinkLog>() }
                 .dirty_count
                 .fetch_add(1, Ordering::SeqCst);
         }
         unsafe extern "C" fn on_release(ud: *mut c_void) {
+            // SAFETY: `ud` is the boxed `SinkLog`, still alive when the instance releases it in
+            // `destroy`.
             unsafe { &*ud.cast::<SinkLog>() }
                 .released
                 .fetch_add(1, Ordering::SeqCst);
@@ -603,9 +634,16 @@ mod tests {
         };
 
         let cbs = callbacks::<TestPlugin>();
+        // SAFETY: `sink` is a full-size local and `log` (its `user_data`) outlives the instance.
         let ctx = unsafe { (cbs.create_with_sink)(&raw const sink) };
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.reset)(ctx, 48_000.0, 128) };
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         assert_eq!(unsafe { (cbs.latency_samples)(ctx) }, 64);
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. The test thread stands in for the host UI thread.
         unsafe { (cbs.drain_host_queue)(ctx) };
         assert_eq!(log.latency.load(Ordering::SeqCst), 64);
 
@@ -616,7 +654,11 @@ mod tests {
         let inputs = [in_l.as_ptr(), in_r.as_ptr()];
         let mut outputs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
 
+        // SAFETY: `ctx` is the live instance created above; parameter writes are atomic.
         unsafe { (cbs.param_set)(ctx, 3, 2.0) };
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. Both pointer arrays hold 2 channels of 32-sample local
+        // buffers, within the 128-frame reset; events and transport are null with zero counts.
         let status = unsafe {
             (cbs.process_native)(
                 ctx,
@@ -636,11 +678,17 @@ mod tests {
         assert_eq!(status, MOOSE_AAX_EVENT_END);
         assert!((out_l[0] - 0.5).abs() < 1e-6);
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. The test thread stands in for the host UI thread.
         unsafe { (cbs.drain_host_queue)(ctx) };
         assert_eq!(log.latency.load(Ordering::SeqCst), 256);
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         assert_eq!(unsafe { (cbs.latency_samples)(ctx) }, 256);
 
         // Signal MARK_DIRTY on the instance HostQueue and verify TimerWakeup drain delivers state_dirty.
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. Only a shared reference to the instance is formed.
         unsafe {
             let inst = &*ctx.cast::<crate::instance::AaxInstance<TestPlugin>>();
             inst.host_queue.signal(HostSignal::MARK_DIRTY);
@@ -648,15 +696,19 @@ mod tests {
         }
         assert_eq!(log.dirty_count.load(Ordering::SeqCst), 1);
 
+        // SAFETY: `ctx` is destroyed exactly once; `log` is dropped only after its release callback
+        // ran.
         unsafe { (cbs.destroy)(ctx) };
         assert_eq!(log.released.load(Ordering::SeqCst), 1);
         drop(log);
 
         let instances: Vec<*mut c_void> = (0..120)
+            // SAFETY: A null sink is accepted, and `create_with_sink` has no other precondition.
             .map(|_| unsafe { (cbs.create_with_sink)(std::ptr::null()) })
             .collect();
         for &c in &instances {
             assert!(!c.is_null());
+            // SAFETY: Each `c` is a distinct live instance from above, destroyed exactly once.
             unsafe { (cbs.destroy)(c) };
         }
     }
@@ -664,37 +716,61 @@ mod tests {
     #[test]
     fn state_round_trip_foreign_migration_and_midi_sysex_echo() {
         let cbs = callbacks::<TestPlugin>();
+        // SAFETY: A null sink is accepted, and `create_with_sink` has no other precondition.
         let ctx = unsafe { (cbs.create_with_sink)(std::ptr::null()) };
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.reset)(ctx, 48_000.0, 128) };
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.param_set)(ctx, 1, 1.75) };
         let mut ptr: *mut u8 = std::ptr::null_mut();
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. `ptr` is a local out slot.
         let len = unsafe { (cbs.state_save)(ctx, &raw mut ptr) };
         assert!(len > 0 && !ptr.is_null());
+        // SAFETY: `state_save` returned a non-null buffer of `len` bytes, copied here before it is
+        // freed.
         let saved = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
+        // SAFETY: `ptr`/`len` are the unmodified `state_save` buffer, freed once.
         unsafe { (cbs.state_free)(ptr, len) };
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.param_set)(ctx, 1, 0.25) };
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. `saved` holds the bytes passed.
             unsafe { (cbs.state_load)(ctx, saved.as_ptr(), u32::try_from(saved.len()).unwrap()) },
             1
         );
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         assert!((unsafe { (cbs.param_get)(ctx, 1) } - 1.75).abs() < 1e-5);
 
         let garbage = b"not-a-valid-moose-state";
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. `garbage` holds the bytes passed.
             unsafe {
                 (cbs.state_load)(ctx, garbage.as_ptr(), u32::try_from(garbage.len()).unwrap())
             },
             0
         );
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         assert!((unsafe { (cbs.param_get)(ctx, 1) } - 1.75).abs() < 1e-5);
 
         let legacy_chunk_id = u32::from_be_bytes(*b"LGCY");
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. The literal holds the 3 bytes passed.
             unsafe { (cbs.state_load_foreign)(ctx, legacy_chunk_id, b"OLD".as_ptr(), 3) },
             1
         );
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         assert!((unsafe { (cbs.param_get)(ctx, 1) } - 1.5).abs() < 1e-5);
 
         let sysex_payload = [0x7E_u8, 0x7F, 0x06, 0x01];
@@ -721,6 +797,9 @@ mod tests {
         let inputs = [in_l.as_ptr(), in_r.as_ptr()];
         let mut outputs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. Both pointer arrays hold 2 channels of 32-sample buffers, and
+        // `in_events` holds the 2 events passed (its `SysEx` points to `sysex_payload`, 4 bytes).
         let st = unsafe {
             (cbs.process_native)(
                 ctx,
@@ -739,9 +818,13 @@ mod tests {
         };
         assert_eq!(st, MOOSE_AAX_EVENT_END);
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.begin_output_events)(ctx, 32) };
         let mut out_ev = MooseAaxNativeEvent::default();
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. `out_ev` is a local out slot.
             unsafe { (cbs.next_output_event)(ctx, &raw mut out_ev) },
             MOOSE_AAX_EVENT_EMITTED
         );
@@ -750,19 +833,27 @@ mod tests {
         assert_eq!(&out_ev.midi[..3], &[0x90, 60, 100]);
 
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. `out_ev` is a local out slot.
             unsafe { (cbs.next_output_event)(ctx, &raw mut out_ev) },
             MOOSE_AAX_EVENT_EMITTED
         );
         assert_eq!(out_ev.kind, MOOSE_AAX_NATIVE_EVENT_SYSEX);
         assert_eq!(out_ev.sample_offset, 5);
         assert_eq!(
+            // SAFETY: `out_ev.sysex` points to `data_len` bytes in the instance's output list,
+            // untouched until `finish_output_events`.
             unsafe { std::slice::from_raw_parts(out_ev.sysex, out_ev.data_len as usize) },
             &sysex_payload
         );
         assert_eq!(
+            // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+            // destroyed once at the end. `out_ev` is a local out slot.
             unsafe { (cbs.next_output_event)(ctx, &raw mut out_ev) },
             MOOSE_AAX_EVENT_END
         );
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.finish_output_events)(ctx, MOOSE_AAX_EVENT_EMITTED) };
 
         let over_in_l = [0.0f32; 256];
@@ -771,6 +862,9 @@ mod tests {
         let mut over_out_r = [1.0f32; 256];
         let over_inputs = [over_in_l.as_ptr(), over_in_r.as_ptr()];
         let mut over_outputs = [over_out_l.as_mut_ptr(), over_out_r.as_mut_ptr()];
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. The 256-frame buffers exceed the 128-frame reset on purpose;
+        // the callback must reject them and only zero the outputs.
         let bad = unsafe {
             (cbs.process_native)(
                 ctx,
@@ -791,6 +885,7 @@ mod tests {
         assert!(over_out_l.iter().all(|&s| s == 0.0));
         assert!(over_out_r.iter().all(|&s| s == 0.0));
 
+        // SAFETY: `ctx` was created above and is destroyed exactly once.
         unsafe { (cbs.destroy)(ctx) };
     }
 
@@ -803,10 +898,16 @@ mod tests {
     fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
         let cbs = callbacks::<TestPlugin>();
         let sink = MooseAaxHostSink::default();
+        // SAFETY: `sink` is a valid empty local; `create_with_sink` copies it.
         let ctx = unsafe { (cbs.create_with_sink)(&raw const sink) };
         assert!(!ctx.is_null());
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end.
         unsafe { (cbs.reset)(ctx, 48_000.0, 64) };
 
+        // SAFETY: `ctx` is the live instance created by `create_with_sink` in this test and is
+        // destroyed once at the end. Only a shared reference is formed; the plugin cell guard is
+        // dropped before `destroy`.
         let inst = unsafe { &*ctx.cast::<crate::instance::AaxInstance<TestPlugin>>() };
         let ctx_addr = ctx as usize;
         let held = inst.plugin.enter();
@@ -819,6 +920,9 @@ mod tests {
             let mut out_r = [1.0f32; 16];
             let in_ptrs = [in_l.as_ptr(), in_r.as_ptr()];
             let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            // SAFETY: `ctx` stays live: the main thread holds the plugin guard and joins this
+            // thread before `destroy`. The pointer arrays reference this thread's 16-sample stereo
+            // locals.
             let status = unsafe {
                 (cbs.process_native)(
                     ctx,
@@ -845,6 +949,8 @@ mod tests {
         assert!(out_r.iter().all(|&s| s == 0.0));
 
         drop(held);
+        // SAFETY: `ctx` was created above and is destroyed exactly once, after the render thread
+        // joined.
         unsafe { (cbs.destroy)(ctx) };
     }
 }

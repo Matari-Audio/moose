@@ -30,6 +30,9 @@ impl<P: PluginExport> Vst3Instance<P> {
         let inputs: *const *const H = args.inputs.as_ptr().cast();
         let outputs: *mut *mut H = args.outputs.as_mut_ptr().cast();
 
+        // SAFETY: The caller guarantees every non-null channel pointer in `args` is valid for
+        // `num_frames` samples of `H` and stays exclusive for this call. Each dereference below
+        // stays inside `num_input_channels`/`num_output_channels` and `num_frames`.
         let ok = run_audio_block_latched::<P, ()>(&self.panic_latch, "VST3", || unsafe {
             let num_frames = nf;
 
@@ -191,6 +194,8 @@ impl<P: PluginExport> Vst3Instance<P> {
         .is_some();
 
         if !ok {
+            // SAFETY: Same contract: each non-null output channel holds `nf` writable samples, so
+            // zeroing them stays in bounds.
             unsafe {
                 for ch in 0..num_output_channels as usize {
                     let ptr = *outputs.add(ch);

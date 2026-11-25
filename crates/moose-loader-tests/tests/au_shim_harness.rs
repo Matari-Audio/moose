@@ -457,6 +457,8 @@ struct FakeAuUnit {
 
 impl FakeAuUnit {
     fn open() -> Self {
+        // SAFETY: The factory bridge accepts a null description and returns the shim's
+        // `AudioComponentPlugInInterface`, opened here and closed in `Drop`.
         unsafe {
             let iface = moose_au_v2_factory_bridge(ptr::null());
             assert!(!iface.is_null(), "factory returned null");
@@ -468,10 +470,15 @@ impl FakeAuUnit {
     }
 
     unsafe fn lookup(&self, sel: i16) -> *const c_void {
+        // SAFETY: `self.iface` is the live interface from `open`, and `Lookup` is always set by the
+        // shim.
         unsafe { ((*self.iface).lookup.expect("Lookup"))(sel) }
     }
 
     fn initialize(&self) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_INITIALIZE));
@@ -480,6 +487,9 @@ impl FakeAuUnit {
     }
 
     fn uninitialize(&self) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_UNINITIALIZE));
@@ -488,6 +498,9 @@ impl FakeAuUnit {
     }
 
     fn reset(&self) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_RESET));
@@ -496,6 +509,9 @@ impl FakeAuUnit {
     }
 
     fn get_property_info(&self, prop: u32, scope: u32, elem: u32) -> Result<(u32, bool), i32> {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut u32, *mut bool) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_GET_PROPERTY_INFO));
@@ -518,6 +534,10 @@ impl FakeAuUnit {
     }
 
     fn get_property<T: Copy>(&self, prop: u32, scope: u32, elem: u32, init: T) -> Result<T, i32> {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. `init` is a `T: Copy` local of the property's
+        // size.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut c_void, *mut u32) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_GET_PROPERTY));
@@ -536,6 +556,10 @@ impl FakeAuUnit {
     }
 
     fn set_property<T>(&self, prop: u32, scope: u32, elem: u32, val: &T) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. `val` is borrowed for the call, and the size
+        // passed is `size_of::<T>()`.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const c_void, u32) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_SET_PROPERTY));
@@ -551,6 +575,9 @@ impl FakeAuUnit {
     }
 
     fn add_property_listener(&self, prop: u32, cb: PropertyListener, ud: *mut c_void) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. The listener and `ud` stay valid until removed.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, PropertyListener, *mut c_void) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_ADD_PROPERTY_LISTENER));
@@ -559,6 +586,9 @@ impl FakeAuUnit {
     }
 
     fn remove_property_listener(&self, prop: u32, cb: PropertyListener) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, PropertyListener) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_REMOVE_PROPERTY_LISTENER));
@@ -572,6 +602,9 @@ impl FakeAuUnit {
         cb: PropertyListener,
         ud: *mut c_void,
     ) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, PropertyListener, *mut c_void) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_REMOVE_PROPERTY_LISTENER_WITH_DATA));
@@ -580,6 +613,9 @@ impl FakeAuUnit {
     }
 
     fn add_render_notify(&self, cb: RenderNotify, ud: *mut c_void) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. The callback and `ud` stay valid until removed.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, RenderNotify, *mut c_void) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_ADD_RENDER_NOTIFY));
@@ -588,6 +624,9 @@ impl FakeAuUnit {
     }
 
     fn set_parameter(&self, id: u32, value: f32) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, f32, u32) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_SET_PARAMETER));
@@ -596,6 +635,9 @@ impl FakeAuUnit {
     }
 
     fn get_parameter(&self, id: u32) -> f32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut f32) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_GET_PARAMETER));
@@ -607,6 +649,10 @@ impl FakeAuUnit {
     }
 
     fn schedule_parameters(&self, events: &[AudioUnitParameterEvent]) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. `events` is borrowed for the call with its
+        // length.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, *const AudioUnitParameterEvent, u32) -> i32 =
                 std::mem::transmute(self.lookup(K_SEL_SCHEDULE_PARAMETERS));
@@ -615,6 +661,10 @@ impl FakeAuUnit {
     }
 
     fn render(&self, frames: u32, out_l: &mut [f32], out_r: &mut [f32]) -> i32 {
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. The buffer list points at `out_l`/`out_r`,
+        // which hold `frames` samples and outlive the call.
         unsafe {
             let f: unsafe extern "C" fn(
                 *mut c_void,
@@ -669,12 +719,15 @@ impl FakeAuUnit {
             comp: *mut c_void,
             rust_ctx: *mut c_void,
         }
+        // SAFETY: The shim's interface struct begins with the same fields as `Prefix`
+        // (`au_v2_shim.c`), and `self.iface` is live.
         unsafe { (*self.iface.cast::<Prefix>()).rust_ctx }
     }
 }
 
 impl Drop for FakeAuUnit {
     fn drop(&mut self) {
+        // SAFETY: `self.iface` was opened in `open` and is closed exactly once here.
         unsafe {
             if let Some(close_fn) = (*self.iface).close {
                 let _ = close_fn(self.iface.cast());
@@ -690,6 +743,8 @@ fn register_harness_plugin() -> &'static AuPluginDescriptor {
 fn register_harness_plugin_for<P: PluginExport>() -> &'static AuPluginDescriptor {
     static NAME: &[u8] = b"AU Harness\0";
     static VENDOR: &[u8] = b"Moose\0";
+    // SAFETY: The test-only registration reset runs under `HARNESS_LOCK`, and the descriptor
+    // strings are `'static`.
     unsafe {
         moose_au_test_reset_registration();
         let desc = Box::leak(Box::new(AuPluginDescriptor {
@@ -727,6 +782,7 @@ fn register_harness_plugin_for<P: PluginExport>() -> &'static AuPluginDescriptor
 fn au_v2_loader_rejects_a_version_only_table_before_open_reads_the_tail() {
     let _guard = HARNESS_LOCK.lock().unwrap();
     let descriptor = register_harness_plugin();
+    // SAFETY: The test-only registration reset runs under `HARNESS_LOCK`.
     unsafe {
         moose_au_test_reset_registration();
         for bad_version in [0_u32, moose_au::ffi::MOOSE_AU_ABI_VERSION - 1] {
@@ -751,6 +807,7 @@ fn au_v2_property_listener_removal_uses_the_selected_identity() {
     let unit = FakeAuUnit::open();
 
     unsafe extern "C" fn listener(ud: *mut c_void, _: *mut c_void, _: u32, _: u32, _: u32) {
+        // SAFETY: `ud` is the live `AtomicU32` registered with this listener.
         unsafe { &*ud.cast::<AtomicU32>() }.fetch_add(1, Ordering::Relaxed);
     }
     let first = AtomicU32::new(0);
@@ -828,6 +885,7 @@ fn au_v2_render_notify_removal_waits_for_its_refcon() {
         _: u32,
         _: *mut AudioBufferList2,
     ) -> i32 {
+        // SAFETY: `ud` is the live `Callback` registered with this render notify.
         let cb = unsafe { &*ud.cast::<Callback>() };
         if cb.calls.fetch_add(1, Ordering::Relaxed) == 0 {
             cb.entered.wait();
@@ -845,6 +903,8 @@ fn au_v2_render_notify_removal_waits_for_its_refcon() {
 
     let iface = unit.iface as usize;
     let remove: unsafe extern "C" fn(*mut c_void, RenderNotify, *mut c_void) -> i32 =
+        // SAFETY: `Lookup` returns the remove-render-notify entry point, whose C signature this
+        // `fn` type matches.
         unsafe { std::mem::transmute(unit.lookup(K_SEL_REMOVE_RENDER_NOTIFY)) };
     std::thread::scope(|scope| {
         let render = scope.spawn(move || {
@@ -858,6 +918,8 @@ fn au_v2_render_notify_removal_waits_for_its_refcon() {
         let (finished, done) = mpsc::channel();
         let removing = scope.spawn(move || {
             starting.send(()).unwrap();
+            // SAFETY: The unit stays open across the scope, and `notify`/`ud` are the pair that was
+            // registered.
             let result = unsafe { remove(iface as *mut c_void, notify, ud as *mut c_void) };
             finished.send(result).unwrap();
         });
@@ -899,11 +961,17 @@ fn au_v2_render_thread_set_parameter_preserves_the_requested_offset() {
         _: u32,
         _: *mut AudioBufferList2,
     ) -> i32 {
+        // SAFETY: The shim passes a valid `flags` pointer to render notifies.
         if unsafe { *flags } & K_RENDER_PRE != 0 {
+            // SAFETY: `ud` is the live `Write` registered with this notify.
             let write = unsafe { &*ud.cast::<Write>() };
             let unit = std::mem::ManuallyDrop::new(FakeAuUnit { iface: write.iface });
             let set: unsafe extern "C" fn(*mut c_void, u32, u32, u32, f32, u32) -> i32 =
+                // SAFETY: `Lookup` returns the set-parameter entry point, whose C signature this
+                // `fn` type matches.
                 unsafe { std::mem::transmute(unit.lookup(K_SEL_SET_PARAMETER)) };
+            // SAFETY: `unit.iface` is live (the outer `FakeAuUnit` owns it; `ManuallyDrop` stops a
+            // second close).
             let status = unsafe { set(unit.iface.cast(), 0, K_SCOPE_GLOBAL, 0, 1.0, 16) };
             write.status.store(status, Ordering::Relaxed);
             write
@@ -973,6 +1041,7 @@ fn au_v2_shim_tail_cap_latency_and_all_host_signals() {
     register_harness_plugin();
     REPORTED_LATENCY.store(441, Ordering::Relaxed);
     REPORTED_TAIL.store(u32::MAX, Ordering::Relaxed);
+    // SAFETY: The fake event recorder is reset under `HARNESS_LOCK`.
     unsafe { fake_au_reset_events() };
 
     let unit = FakeAuUnit::open();
@@ -1013,6 +1082,7 @@ fn au_v2_shim_tail_cap_latency_and_all_host_signals() {
         scope: u32,
         _elem: u32,
     ) {
+        // SAFETY: `ud` is the live log `Mutex` registered with this listener.
         let log = unsafe { &*ud.cast::<Mutex<Vec<(u32, u32)>>>() };
         log.lock().unwrap().push((prop, scope));
     }
@@ -1045,9 +1115,11 @@ fn au_v2_shim_tail_cap_latency_and_all_host_signals() {
     assert_eq!(unit.render(32, &mut out_l, &mut out_r), 0);
 
     // Pump the Rust HostQueue drain into the real C `MooseAuHostSink` callbacks.
+    // SAFETY: `unit.rust_ctx()` is the live `AuInstance<ExportHarness>` behind the open unit.
     unsafe { moose_au::drain_host_queue_for_test::<ExportHarness>(unit.rust_ctx()) };
 
     let mut recorded = [FakeAuRecordedEvent::default(); 64];
+    // SAFETY: `recorded` holds 64 writable `FakeAuRecordedEvent`s.
     let n = unsafe { fake_au_take_events(recorded.as_mut_ptr(), 64) } as usize;
     let prop_events: Vec<u32> = recorded[..n]
         .iter()
@@ -1114,12 +1186,15 @@ fn au_v2_shim_context_name_live_catalog_ramps_midi_and_class_info() {
     info = unit
         .get_property(K_PROP_PARAMETER_INFO, K_SCOPE_GLOBAL, 0, info)
         .expect("ParameterInfo");
+    // SAFETY: `info.name` is a fixed char array that the shim NUL-terminates.
     let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }
         .to_str()
         .unwrap();
     assert_eq!(name, "Gain");
     assert_eq!(info.clump_id, 1);
     if !info.cf_name_string.is_null() {
+        // SAFETY: `cf_name_string` is non-null and owned by the caller per
+        // `kAudioUnitParameterFlag_CFNameRelease`, so it is released once.
         unsafe { CFRelease(info.cf_name_string) };
     }
 
@@ -1137,22 +1212,29 @@ fn au_v2_shim_context_name_live_catalog_ramps_midi_and_class_info() {
         .expect("ParameterClumpName");
     assert!(!clump.out_name.is_null());
     let mut clump_buf = [0 as c_char; 64];
+    // SAFETY: `clump.out_name` is a non-null `CFString` we own, and `clump_buf` holds 64 writable
+    // bytes.
     assert!(unsafe { CFStringGetCString(clump.out_name, clump_buf.as_mut_ptr(), 64, 0x0800_0100) });
     assert_eq!(
+        // SAFETY: `CFStringGetCString` succeeded, so `clump_buf` is NUL-terminated.
         unsafe { CStr::from_ptr(clump_buf.as_ptr()) }
             .to_str()
             .unwrap(),
         "Amp"
     );
+    // SAFETY: Releases the clump name we own, exactly once.
     unsafe { CFRelease(clump.out_name) };
 
     // 2. ContextName -> MainThreadHooks::track_info_changed.
     let track_c = CString::new("Lead Vox").unwrap();
+    // SAFETY: `track_c` is NUL-terminated, the default allocator is null, and `0x0800_0100` is
+    // UTF-8.
     let cf_track = unsafe { CFStringCreateWithCString(ptr::null(), track_c.as_ptr(), 0x0800_0100) };
     assert_eq!(
         unit.set_property(K_PROP_CONTEXT_NAME, K_SCOPE_GLOBAL, 0, &cf_track),
         0
     );
+    // SAFETY: Releases the `CFString` this test created, exactly once.
     unsafe {
         CFRelease(cf_track);
         moose_au::drain_host_queue_for_test::<ExportHarness>(unit.rust_ctx());
@@ -1166,6 +1248,10 @@ fn au_v2_shim_context_name_live_catalog_ramps_midi_and_class_info() {
     let iface_addr = unit.iface as usize;
     let sender = std::thread::spawn(move || {
         let iface = iface_addr as *mut AudioComponentPlugInInterface;
+        // SAFETY: The shim's `Lookup` returns this selector's entry point, whose C signature
+        // (`au_v2_shim.c`) this `fn` type matches. `self.iface` is the unit from `open`, live until
+        // `Drop`, and every out-pointer is a local. The unit stays open until the sender thread is
+        // joined.
         unsafe {
             let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> i32 =
                 std::mem::transmute(((*iface).lookup.unwrap())(K_SEL_MIDI_EVENT));
@@ -1226,6 +1312,7 @@ fn au_v2_shim_context_name_live_catalog_ramps_midi_and_class_info() {
         unit.set_property(K_PROP_CLASS_INFO, K_SCOPE_GLOBAL, 0, &saved_dict),
         0
     );
+    // SAFETY: Releases the saved `CFDictionary` we own, exactly once.
     unsafe { CFRelease(saved_dict) };
     assert!((unit.get_parameter(0) - 1.75).abs() < 1e-5);
     assert!((unit.get_parameter(1) - 0.25).abs() < 1e-5);
@@ -1245,6 +1332,8 @@ fn au_block_split_renders_boundaries_and_retains_an_auv3_ramp() {
         let mut right = [0.0; 64];
         let inputs = [ptr::null(), ptr::null()];
         let mut outputs = [left.as_mut_ptr(), right.as_mut_ptr()];
+        // SAFETY: The context is live, and every non-null channel pointer addresses a local buffer
+        // of the block length.
         let status = unsafe {
             (callbacks.process_native_v13)(
                 unit.rust_ctx(),
@@ -1357,25 +1446,32 @@ fn au_v2_render_set_parameter_overflow_falls_back_instead_of_dropping() {
         assert_eq!(audio_unit.render(32, &mut out_l, &mut out_r), 0);
 
         let set_at: unsafe extern "C" fn(*mut c_void, u32, u32, u32, f32, u32) -> i32 =
+            // SAFETY: `Lookup` returns the set-parameter entry point, whose C signature this `fn`
+            // type matches.
             unsafe { std::mem::transmute(audio_unit.lookup(K_SEL_SET_PARAMETER)) };
         let midi_event: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> i32 =
+            // SAFETY: `Lookup` returns the MIDI-event entry point, whose C signature this `fn` type
+            // matches.
             unsafe { std::mem::transmute(audio_unit.lookup(K_SEL_MIDI_EVENT)) };
 
         // Queue a full 256-event MIDI burst alongside a valid earlier parameter
         // (param 0 -> 0.5 at offset 16).
         for i in 0..256u32 {
             assert_eq!(
+                // SAFETY: `audio_unit.iface` is the live open unit.
                 unsafe { midi_event(audio_unit.iface.cast(), 0x90, 24 + (i % 64), 100, 0) },
                 0
             );
         }
         assert_eq!(
+            // SAFETY: `audio_unit.iface` is the live open unit.
             unsafe { set_at(audio_unit.iface.cast(), 0, K_SCOPE_GLOBAL, 0, 0.5, 16) },
             0
         );
         // Fill the remaining 511 slots with distinct dummy IDs.
         for dummy_id in 10_000u32..(10_000 + 511) {
             assert_eq!(
+                // SAFETY: `audio_unit.iface` is the live open unit.
                 unsafe {
                     set_at(
                         audio_unit.iface.cast(),
@@ -1392,10 +1488,12 @@ fn au_v2_render_set_parameter_overflow_falls_back_instead_of_dropping() {
         // Coalesce an existing queued ID (param 0 -> 0.6 at offset 16) and send
         // a 513th distinct ID (param 1 -> 0.75) that overflows into fallback.
         assert_eq!(
+            // SAFETY: `audio_unit.iface` is the live open unit.
             unsafe { set_at(audio_unit.iface.cast(), 0, K_SCOPE_GLOBAL, 0, 0.6, 16) },
             0
         );
         assert_eq!(
+            // SAFETY: `audio_unit.iface` is the live open unit.
             unsafe { set_at(audio_unit.iface.cast(), 1, K_SCOPE_GLOBAL, 0, 0.75, 1) },
             0
         );

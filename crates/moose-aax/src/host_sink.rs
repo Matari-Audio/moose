@@ -41,6 +41,8 @@ pub(crate) struct AaxHostSink(MooseAaxHostSink);
 // UI/main thread inside `drain_host_queue` / editor hooks, and released once
 // on Drop after `HostQueue::close()`.
 unsafe impl Send for AaxHostSink {}
+// SAFETY: Shared access only calls the host callbacks from the UI/main thread (gestures off that
+// thread are queued), so concurrent `&AaxHostSink` never reaches `user_data` from two threads.
 unsafe impl Sync for AaxHostSink {}
 
 impl AaxHostSink {
@@ -57,6 +59,8 @@ impl AaxHostSink {
         if raw.is_null() {
             return Self::empty();
         }
+        // SAFETY: `raw` is non-null, and `size` is the first field at offset 0, which the caller
+        // guarantees is readable.
         let declared = unsafe { (*raw).size as usize };
         if declared < std::mem::size_of::<u32>() * 2 {
             return Self::empty();
@@ -67,6 +71,8 @@ impl AaxHostSink {
                 let end = std::mem::offset_of!(MooseAaxHostSink, $field)
                     + std::mem::size_of_val(&copy.$field);
                 if declared >= end {
+                    // SAFETY: `declared >= end` proves the field lies inside the caller's readable
+                    // prefix, and `addr_of!` reads it without referencing the whole struct.
                     copy.$field = unsafe { std::ptr::addr_of!((*raw).$field).read() };
                 }
             }};
@@ -91,48 +97,64 @@ impl AaxHostSink {
 
     pub(crate) unsafe fn touch_param(&self, param_id: u32) {
         if let Some(f) = self.0.touch_param {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop` (not yet, since `&self` is live); called on the host UI thread.
             unsafe { f(self.0.user_data, param_id) };
         }
     }
 
     pub(crate) unsafe fn set_param_normalized(&self, param_id: u32, normalized: f64) {
         if let Some(f) = self.0.set_param_normalized {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data, param_id, normalized) };
         }
     }
 
     pub(crate) unsafe fn release_param(&self, param_id: u32) {
         if let Some(f) = self.0.release_param {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data, param_id) };
         }
     }
 
     pub(crate) unsafe fn latency_changed(&self, samples: u32) {
         if let Some(f) = self.0.latency_changed {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data, samples) };
         }
     }
 
     pub(crate) unsafe fn state_dirty(&self) {
         if let Some(f) = self.0.state_dirty {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data) };
         }
     }
 
     pub(crate) unsafe fn param_values_changed(&self) {
         if let Some(f) = self.0.param_values_changed {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data) };
         }
     }
 
     pub(crate) unsafe fn param_presentation_changed(&self) {
         if let Some(f) = self.0.param_presentation_changed {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data) };
         }
     }
 
     pub(crate) unsafe fn request_resize(&self, width: u32, height: u32) -> bool {
         if let Some(f) = self.0.request_resize {
+            // SAFETY: Host-supplied callback and `user_data`, valid until `release_user_data` runs
+            // in `Drop`; called on the host UI thread.
             unsafe { f(self.0.user_data, width, height) != 0 }
         } else {
             false
@@ -145,6 +167,9 @@ impl Drop for AaxHostSink {
         if let Some(release) = self.0.release_user_data.take() {
             let ud = self.0.user_data;
             self.0.user_data = std::ptr::null_mut();
+            // SAFETY: `release` was `take()`n and `user_data` nulled, so it runs exactly once.
+            // `AaxHostSink` is the last `AaxInstance` field, so nothing else can reach `user_data`
+            // any more.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 release(ud);
             }));
@@ -172,6 +197,8 @@ impl<P: PluginExport> AaxHost<P> {
     /// # Safety
     /// `ctx` must be a live `AaxInstance<P>` pointer.
     unsafe fn new(ctx: *mut c_void) -> Self {
+        // SAFETY: The caller guarantees `ctx` is a live `AaxInstance<P>`; the fields are cloned out
+        // and the reference is not kept.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         Self {
             ctx: AaxCtx(ctx),
@@ -187,6 +214,8 @@ impl<P: PluginExport> AaxHost<P> {
 
     fn push_gesture(&self, gesture: EditorGesture) {
         let _ = self.queue.with_open(|| {
+            // SAFETY: Inside `with_open`, so `cb_destroy` (which closes the queue before freeing)
+            // has not freed the instance.
             let inst = unsafe { &*self.ctx.as_ptr().cast::<AaxInstance<P>>() };
             if let EditorGesture::SetParam(id, _) = gesture
                 && inst.params_arc.parameter_affects_presentation(id)
@@ -231,6 +260,7 @@ impl<P: PluginExport> EditorBridge for AaxHost<P> {
         }
         self.queue
             .with_open(|| {
+                // SAFETY: Inside `with_open`, so the instance has not been freed.
                 let inst = unsafe { &*self.ctx.as_ptr().cast::<AaxInstance<P>>() };
                 if !inst.is_ui_thread() {
                     inst.pending_resize
@@ -240,6 +270,8 @@ impl<P: PluginExport> EditorBridge for AaxHost<P> {
                 if let Some(mut gui) = inst.gui.try_enter() {
                     let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
                     if resized && let Some((aw, ah)) = gui.editor.as_ref().map(|e| e.size()) {
+                        // SAFETY: UI thread (checked above) inside `with_open`, so `user_data` has
+                        // not been released.
                         return unsafe { inst.host_sink.request_resize(aw, ah) };
                     }
                     resized
@@ -306,7 +338,9 @@ impl<P: PluginExport> HostContext for AaxHost<P> {
 /// # Safety
 /// `ctx` must be a live `AaxInstance<P>` pointer.
 pub(crate) unsafe fn editor_context<P: PluginExport>(ctx: *mut c_void) -> PluginContext {
+    // SAFETY: The caller guarantees `ctx` is a live `AaxInstance<P>`.
     let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
+    // SAFETY: Same live `ctx`; `AaxHost` only dereferences it later inside `with_open`.
     let host: Arc<dyn HostContext> = Arc::new(unsafe { AaxHost::<P>::new(ctx) });
     PluginContext::from_host(host, Arc::clone(&inst.params_arc) as Arc<dyn Params>)
         .with_tasks(inst.task_spawner.clone())
@@ -331,11 +365,15 @@ pub(crate) fn drain_editor_gestures<P: PluginExport>(inst: &AaxInstance<P>) {
             return;
         }
         match gesture {
+            // SAFETY: Called on the UI thread (the drain, or an editor gesture that checked
+            // `is_ui_thread`) with the queue open, so `user_data` has not been released.
             EditorGesture::BeginEdit(id) => unsafe { inst.host_sink.touch_param(id) },
+            // SAFETY: UI thread with the queue open, so `user_data` has not been released.
             EditorGesture::SetParam(id, normalized) => unsafe {
                 inst.host_sink
                     .set_param_normalized(id, f64::from(normalized));
             },
+            // SAFETY: UI thread with the queue open, so `user_data` has not been released.
             EditorGesture::EndEdit(id) => unsafe { inst.host_sink.release_param(id) },
         }
     }
@@ -354,6 +392,8 @@ fn apply_pending_resize<P: PluginExport>(inst: &AaxInstance<P>) {
     if let Some(mut gui) = inst.gui.try_enter() {
         let resized = gui.editor.as_mut().is_some_and(|e| e.set_size(w, h));
         if resized && let Some((aw, ah)) = gui.editor.as_ref().map(|e| e.size()) {
+            // SAFETY: UI-thread drain with the queue open (checked above), so `user_data` has not
+            // been released.
             let _ = unsafe { inst.host_sink.request_resize(aw, ah) };
         }
     } else {
@@ -378,12 +418,15 @@ impl<P: PluginExport> HostSink for AaxSink<'_, P> {
         }
         // Any #[persist] field mutation dirties the AAX chunk and optionally
         // touches a mirror parameter if the plugin bound one.
+        // SAFETY: UI-thread drain with the queue open (checked above), so `user_data` has not been
+        // released.
         unsafe { self.inst.host_sink.state_dirty() };
         if let Some((id, value)) = self.inst.params_arc.take_persist_change()
             && value.is_finite()
             && (0.0..=1.0).contains(&value)
             && self.inst.params_arc.get_normalized(id).is_some()
         {
+            // SAFETY: `self.ctx` is the instance being drained inside `with_open`, so it is live.
             let context = unsafe { editor_context::<P>(self.ctx) };
             context.automate(id, value);
         }
@@ -397,6 +440,8 @@ impl<P: PluginExport> HostSink for AaxSink<'_, P> {
         // slots. The queued signal still carries a submission obligation.
         let _ = self.inst.delay.commit_latency();
         let samples = self.inst.delay.latency();
+        // SAFETY: UI-thread drain with the queue open (checked above), so `user_data` has not been
+        // released.
         unsafe { self.inst.host_sink.latency_changed(samples) };
     }
 
@@ -411,6 +456,8 @@ impl<P: PluginExport> HostSink for AaxSink<'_, P> {
         if self.inst.host_queue.is_closed() {
             return;
         }
+        // SAFETY: UI-thread drain with the queue open (checked above), so `user_data` has not been
+        // released.
         unsafe { self.inst.host_sink.state_dirty() };
     }
 
@@ -434,10 +481,13 @@ impl<P: PluginExport> HostSink for AaxSink<'_, P> {
 /// host UI/main thread.
 pub(crate) unsafe fn run_host_drain<P: PluginExport>(ctx: *mut c_void) {
     let queue = {
+        // SAFETY: The caller guarantees `ctx` is live; the queue `Arc` is cloned out so the drain
+        // can gate on it.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         Arc::clone(&inst.host_queue)
     };
     let _ = queue.with_open(|| {
+        // SAFETY: Inside `with_open`, so `cb_destroy` has not freed the instance.
         let inst = unsafe { &*ctx.cast::<AaxInstance<P>>() };
         inst.record_ui_thread();
         // SAFETY: AAX invokes `TimerWakeup` strictly on the host UI/main thread.
@@ -455,9 +505,11 @@ pub(crate) unsafe fn run_host_drain<P: PluginExport>(ctx: *mut c_void) {
             inst.sync_catalog();
         }
         if sink.presentation && !inst.host_queue.is_closed() {
+            // SAFETY: UI-thread drain with the queue still open (checked just above).
             unsafe { inst.host_sink.param_presentation_changed() };
         }
         if sink.param_values && !inst.host_queue.is_closed() {
+            // SAFETY: UI-thread drain with the queue still open (checked just above).
             unsafe { inst.host_sink.param_values_changed() };
         }
         drain_editor_gestures(inst);

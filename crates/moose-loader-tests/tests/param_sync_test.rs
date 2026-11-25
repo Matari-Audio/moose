@@ -95,6 +95,9 @@ fn plain_param_not_double_denormalized() {
     let mut output = vec![0.0f32; 512];
     let inputs: Vec<&[f32]> = vec![&input];
     let mut outputs: Vec<&mut [f32]> = vec![&mut output];
+    // SAFETY: `from_slices` requires every slice to be valid for the buffer lifetime and at least
+    // `num_samples` long, and no input to alias an output. These are distinct local `Vec`s/arrays
+    // of exactly that length.
     let mut buffer = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 512) };
 
     // ParamChange with PLAIN value -27.0 dB (this is what VST3/CLAP wrappers send).

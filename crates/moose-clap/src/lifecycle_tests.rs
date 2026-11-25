@@ -323,10 +323,14 @@ unsafe extern "C" fn no_extension(_: *const clap_host, _: *const c_char) -> *con
 #[test]
 fn active_latency_change_requests_restart_without_changed_callback() {
     unsafe extern "C" fn restart(host: *const clap_host) {
+        // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live `calls`
+        // array.
         (unsafe { &*(*host).host_data.cast::<[AtomicU32; 2]>() })[0]
             .fetch_add(1, Ordering::Relaxed);
     }
     unsafe extern "C" fn changed(host: *const clap_host) {
+        // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live `calls`
+        // array.
         (unsafe { &*(*host).host_data.cast::<[AtomicU32; 2]>() })[1]
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -334,12 +338,16 @@ fn active_latency_change_requests_restart_without_changed_callback() {
         static LATENCY: clap_host_latency = clap_host_latency {
             changed: Some(changed),
         };
+        // SAFETY: The plugin queries extensions with NUL-terminated static ids.
         if unsafe { CStr::from_ptr(id) } == CLAP_EXT_LATENCY {
             (&raw const LATENCY).cast()
         } else {
             ptr::null()
         }
     }
+    // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+    // filled in below. The host, plugin and buffers are locals that outlive every call the plugin
+    // makes through them.
     unsafe {
         let calls = [AtomicU32::new(0), AtomicU32::new(0)];
         let mut host: clap_host = std::mem::zeroed();
@@ -393,10 +401,14 @@ fn active_latency_change_requests_restart_without_changed_callback() {
 fn active_tail_change_notifies_clap_tail_without_requesting_restart() {
     use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail, clap_plugin_tail};
     unsafe extern "C" fn restart(host: *const clap_host) {
+        // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live `calls`
+        // array.
         (unsafe { &*(*host).host_data.cast::<[AtomicU32; 2]>() })[0]
             .fetch_add(1, Ordering::Relaxed);
     }
     unsafe extern "C" fn tail_changed(host: *const clap_host) {
+        // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live `calls`
+        // array.
         (unsafe { &*(*host).host_data.cast::<[AtomicU32; 2]>() })[1]
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -404,6 +416,7 @@ fn active_tail_change_notifies_clap_tail_without_requesting_restart() {
         static TAIL: clap_host_tail = clap_host_tail {
             changed: Some(tail_changed),
         };
+        // SAFETY: The plugin queries extensions with NUL-terminated static ids.
         if unsafe { CStr::from_ptr(id) } == CLAP_EXT_TAIL {
             (&raw const TAIL).cast()
         } else {
@@ -418,6 +431,9 @@ fn active_tail_change_notifies_clap_tail_without_requesting_restart() {
     }
     let _reset = ResetTail;
     PROBE_TAIL.set(128);
+    // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+    // filled in below. The host, plugin and buffers are locals that outlive every call the plugin
+    // makes through them.
     unsafe {
         let calls = [AtomicU32::new(0), AtomicU32::new(0)];
         let mut host: clap_host = std::mem::zeroed();
@@ -513,6 +529,9 @@ fn active_tail_change_notifies_clap_tail_without_requesting_restart() {
 
 #[test]
 fn note_ports_advertise_mpe_only_on_input_when_enabled() {
+    // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+    // filled in below. The host, plugin and buffers are locals that outlive every call the plugin
+    // makes through them.
     unsafe {
         let mut host: clap_host = std::mem::zeroed();
         host.clap_version = clap_sys::version::CLAP_VERSION;
@@ -544,11 +563,18 @@ fn zero_frame_process_applies_params_and_requests_presentation_refresh() {
         1
     }
     unsafe extern "C" fn get(events: *const clap_input_events, _: u32) -> *const clap_event_header {
+        // SAFETY: `events` is the test's input list, whose `ctx` holds the single event header it
+        // serves.
         unsafe { (*events).ctx.cast() }
     }
     unsafe extern "C" fn callback(host: *const clap_host) {
+        // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live `calls`
+        // counter.
         unsafe { &*(*host).host_data.cast::<AtomicU32>() }.fetch_add(1, Ordering::Relaxed);
     }
+    // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+    // filled in below. The host, plugin and buffers are locals that outlive every call the plugin
+    // makes through them.
     unsafe {
         let calls = AtomicU32::new(0);
         let mut host: clap_host = std::mem::zeroed();
@@ -681,6 +707,9 @@ static REMOTE_TABLE: clap_plugin_remote_controls = clap_plugin_remote_controls {
 #[test]
 fn custom_extension_queries_real_instances_and_rejects_busy() {
     with_probe(|first| {
+        // SAFETY: `with_probe` hands the closure a live, initialised plugin instance that is
+        // destroyed only after the closure returns. Every host pointer passed below is a local or
+        // static that outlives its call.
         with_probe(|second| unsafe {
             let query = (*first).get_extension.unwrap();
             assert!(query(first, ptr::null()).is_null());
@@ -1018,6 +1047,9 @@ fn process_panic_latches_until_reactivation() {
 
 #[test]
 fn configurable_ports_pick_a_declared_layout_and_activation_reaches_routing() {
+    // SAFETY: `with_probe` hands the closure a live, initialised plugin instance that is destroyed
+    // only after the closure returns. Every host pointer passed below is a local or static that
+    // outlives its call.
     with_probe(|plugin| unsafe {
         let get = (*plugin).get_extension.unwrap();
         let ports = &*get(plugin, CLAP_EXT_CONFIGURABLE_AUDIO_PORTS.as_ptr())
@@ -1111,6 +1143,8 @@ fn two_byte_clap_midi_events_preserve_length_and_round_trip_exact_replay() {
     use moose_core::events::{ExactEventBody, LosslessEventRef};
 
     unsafe extern "C" fn in_size(list: *const clap_input_events) -> u32 {
+        // SAFETY: `list` is the test's input list, whose `ctx` points at a live `[clap_event_midi;
+        // 2]`.
         let slice = unsafe { &*(*list).ctx.cast::<[clap_event_midi; 2]>() };
         len_u32(slice.len())
     }
@@ -1118,6 +1152,8 @@ fn two_byte_clap_midi_events_preserve_length_and_round_trip_exact_replay() {
         list: *const clap_input_events,
         index: u32,
     ) -> *const clap_event_header {
+        // SAFETY: `list` is the test's input list, whose `ctx` points at a live `[clap_event_midi;
+        // 2]`; the plugin asks only for `index < 2`.
         let slice = unsafe { &*(*list).ctx.cast::<[clap_event_midi; 2]>() };
         &raw const slice[index as usize].header
     }
@@ -1125,12 +1161,20 @@ fn two_byte_clap_midi_events_preserve_length_and_round_trip_exact_replay() {
         list: *const clap_output_events,
         header: *const clap_event_header,
     ) -> bool {
+        // SAFETY: `list` is the test's output list, whose `ctx` is the unique live `Vec`; nothing
+        // else touches it during `process`.
         let pushed = unsafe { &mut *(*list).ctx.cast::<Vec<clap_event_midi>>() };
+        // SAFETY: The plugin pushes a valid event header.
         assert_eq!(unsafe { (*header).type_ }, CLAP_EVENT_MIDI);
+        // SAFETY: The type was just checked to be `CLAP_EVENT_MIDI`, so the header begins a
+        // `clap_event_midi`.
         pushed.push(unsafe { *header.cast::<clap_event_midi>() });
         true
     }
 
+    // SAFETY: `with_probe` hands the closure a live, initialised plugin instance that is destroyed
+    // only after the closure returns. Every host pointer passed below is a local or static that
+    // outlives its call.
     with_probe(|plugin| unsafe {
         let data = data_from_plugin::<Probe>(plugin);
         let mut audio = data.audio.enter();
@@ -1289,6 +1333,9 @@ impl PluginRuntime for PanickingPresentationPlugin {
 
 #[test]
 fn params_get_info_catches_panic_in_parameter_presentation() {
+    // SAFETY: The zeroed `clap_host` is a valid all-null vtable (every callback is `Option`),
+    // filled in below. The host, plugin and buffers are locals that outlive every call the plugin
+    // makes through them.
     unsafe {
         let mut host: clap_host = std::mem::zeroed();
         host.clap_version = clap_sys::version::CLAP_VERSION;
@@ -1315,6 +1362,9 @@ fn params_get_info_catches_panic_in_parameter_presentation() {
 
 #[test]
 fn audio_ports_config_select_and_list_rescan_clear_cached_ports_inactive() {
+    // SAFETY: `with_probe` hands the closure a live, initialised plugin instance that is destroyed
+    // only after the closure returns. Every host pointer passed below is a local or static that
+    // outlives its call.
     with_probe(|plugin| unsafe {
         let get = (*plugin).get_extension.unwrap();
         let activation = &*get(plugin, CLAP_EXT_AUDIO_PORTS_ACTIVATION.as_ptr())
@@ -1408,6 +1458,9 @@ fn preset_load_enforces_bounded_file_read_and_rejects_oversized_files() {
     use moose_params::Params;
     use std::ffi::CString;
 
+    // SAFETY: `with_probe` hands the closure a live, initialised plugin instance that is destroyed
+    // only after the closure returns. Every host pointer passed below is a local or static that
+    // outlives its call.
     with_probe(|plugin| unsafe {
         let data = data_from_plugin::<Probe>(plugin);
         let dir =
@@ -1472,6 +1525,9 @@ fn preset_load_enforces_bounded_file_read_and_rejects_oversized_files() {
 
 #[test]
 fn process_is_wait_free_and_silences_when_plugin_cell_is_contended() {
+    // SAFETY: `with_probe` hands the closure a live, initialised plugin instance that is destroyed
+    // only after the closure returns. Every host pointer passed below is a local or static that
+    // outlives its call.
     with_probe(|plugin| unsafe {
         assert!((*plugin).activate.unwrap()(plugin, 48_000.0, 1, 64));
         assert!((*plugin).start_processing.unwrap()(plugin));

@@ -16,6 +16,7 @@ impl Default for HostCalls {
     }
 }
 unsafe extern "C" fn mark_dirty(host: *const clap_host) {
+    // SAFETY: `host` is the test's `clap_host`, whose `host_data` points at the live `HostCalls`.
     let calls = unsafe { &*((*host).host_data.cast::<HostCalls>()) };
     assert_eq!(std::thread::current().id(), calls.main);
     calls.dirty.fetch_add(1, Ordering::Relaxed);
@@ -24,6 +25,7 @@ unsafe extern "C" fn extension(_: *const clap_host, id: *const c_char) -> *const
     static STATE: clap_host_state = clap_host_state {
         mark_dirty: Some(mark_dirty),
     };
+    // SAFETY: The plugin queries extensions with NUL-terminated static ids.
     if unsafe { CStr::from_ptr(id) } == CLAP_EXT_STATE {
         (&raw const STATE).cast()
     } else {

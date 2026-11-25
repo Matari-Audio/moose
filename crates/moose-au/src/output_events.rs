@@ -97,6 +97,7 @@ pub(crate) fn try_encode_au_midi(event: &Event) -> Option<AuMidiEvent> {
 pub(crate) unsafe extern "C" fn cb_latency_samples<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
+    // SAFETY: `ctx` is null-checked and otherwise the shim's live instance; only an atomic is read.
     unsafe {
         if ctx.is_null() {
             return 0;
@@ -110,6 +111,7 @@ pub(crate) unsafe extern "C" fn cb_latency_samples<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_tail_samples<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
+    // SAFETY: `ctx` is null-checked and otherwise the shim's live instance; only an atomic is read.
     unsafe {
         if ctx.is_null() {
             return 0;
@@ -121,6 +123,8 @@ pub(crate) unsafe extern "C" fn cb_tail_samples<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_output_event_count<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
+    // SAFETY: The shim calls output drains on the render thread with its live instance after a
+    // render; per-block state is reached through `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(audio) = inst.audio.try_enter() else {
@@ -140,6 +144,8 @@ pub(crate) unsafe extern "C" fn cb_output_event_at<P: PluginExport>(
     index: u32,
     out: *mut AuMidiEvent,
 ) {
+    // SAFETY: Render-thread drain with the shim's live instance; `out` is the shim's `AuMidiEvent`
+    // slot for this index, written at most once.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {
@@ -349,6 +355,8 @@ pub(crate) unsafe extern "C" fn cb_output_ump_count<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     protocol: u32,
 ) -> u32 {
+    // SAFETY: Render-thread drain with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(audio) = inst.audio.try_enter() else {
@@ -370,6 +378,8 @@ pub(crate) unsafe extern "C" fn cb_output_ump_at<P: PluginExport>(
     index: u32,
     out: *mut AuUmpEvent,
 ) {
+    // SAFETY: Render-thread drain with the shim's live instance; `out` is the shim's `AuUmpEvent`
+    // slot for this index, written at most once.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {
@@ -407,6 +417,8 @@ pub(crate) unsafe extern "C" fn cb_au_push_sysex_input<P: PluginExport>(
 ) {
     // Firewalled like the other extern boundaries: a panic here (unlike
     // before) must not unwind across the C ABI and abort the host.
+    // SAFETY: The shim passes its live instance, and `bytes` (null-checked with `len`) points to
+    // `len` bytes for this call; the bytes are copied into the `SysEx` queue before returning.
     run_extern_callback_with::<P, ()>("au", "sysex_input", (), || unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         if bytes.is_null() || len == 0 {
@@ -423,6 +435,8 @@ pub(crate) unsafe extern "C" fn cb_au_push_sysex_input_native<P: PluginExport>(
     bytes: *const u8,
     len: u32,
 ) -> u32 {
+    // SAFETY: `ctx` is null-checked and otherwise live; `bytes` is checked against `len` and holds
+    // `len` bytes for this call.
     run_extern_callback_with::<P, u32>("au", "sysex_input_native", 0, || unsafe {
         if ctx.is_null() || (bytes.is_null() && len != 0) {
             return 0;
@@ -445,6 +459,8 @@ pub(crate) unsafe extern "C" fn cb_au_push_sysex_input_native<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_output_sysex_count<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
+    // SAFETY: Render-thread drain with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(audio) = inst.audio.try_enter() else {
@@ -467,6 +483,9 @@ pub(crate) unsafe extern "C" fn cb_output_sysex_at<P: PluginExport>(
     out_bytes: *mut *const u8,
     out_len: *mut u32,
 ) {
+    // SAFETY: Render-thread drain with the shim's live instance; the three out-pointers are the
+    // shim's locals. The returned byte pointer borrows `output_events`, which stays untouched until
+    // the next render on this thread.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {
@@ -886,6 +905,8 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events<P: PluginExport>(
     num_frames: u32,
     ump_protocol: u32,
 ) {
+    // SAFETY: Render-thread call with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {
@@ -911,6 +932,8 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events_v9<P: PluginExport>(
     max_absolute_offset: u32,
     ump_time_valid: u32,
 ) {
+    // SAFETY: Render-thread call with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {
@@ -936,6 +959,8 @@ pub(crate) unsafe extern "C" fn cb_begin_output_events_v14<P: PluginExport>(
     max_absolute_offset: u32,
     ump_time_valid: u32,
 ) {
+    // SAFETY: Render-thread call with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {
@@ -957,6 +982,7 @@ pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     out: *mut AuNativeEvent,
 ) -> u32 {
+    // SAFETY: `out` is null-checked; `ctx` is the shim's live instance on the render thread.
     unsafe {
         if out.is_null() {
             return AU_OUTPUT_INVALID;
@@ -1008,6 +1034,8 @@ pub(crate) unsafe extern "C" fn cb_next_output_event<P: PluginExport>(
 pub(crate) unsafe extern "C" fn cb_commit_output_params<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
 ) -> u32 {
+    // SAFETY: Render-thread call with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(audio) = inst.audio.try_enter() else {
@@ -1062,6 +1090,8 @@ pub(crate) unsafe extern "C" fn cb_finish_output_events<P: PluginExport>(
     ctx: *mut std::ffi::c_void,
     status: u32,
 ) {
+    // SAFETY: Render-thread call with the shim's live instance; per-block state is reached through
+    // `try_enter`.
     unsafe {
         let inst = &*ctx.cast::<AuInstance<P>>();
         let Some(mut audio) = inst.audio.try_enter() else {

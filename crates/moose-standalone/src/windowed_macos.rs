@@ -20,6 +20,8 @@ pub unsafe fn window_of(ns_view: *mut std::ffi::c_void) -> *mut std::ffi::c_void
     if ns_view.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: Per this function's contract we are on the main thread and `ns_view` is a live
+    // `NSView`. `window` returns the hosting `NSWindow` or nil.
     let window: *mut AnyObject = unsafe { msg_send![ns_view.cast::<AnyObject>(), window] };
     window.cast()
 }
@@ -38,8 +40,12 @@ pub unsafe fn make_resizable(ns_window: *mut std::ffi::c_void) {
         return;
     }
     let window = ns_window.cast::<AnyObject>();
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `styleMask` returns an `NSUInteger`.
     let mask: u64 = unsafe { msg_send![window, styleMask] };
     let new_mask = mask | NS_WINDOW_STYLE_MASK_RESIZABLE;
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `setStyleMask:` takes an `NSUInteger`.
     let _: () = unsafe { msg_send![window, setStyleMask: new_mask] };
 }
 
@@ -67,7 +73,11 @@ pub unsafe fn pin_content_size(ns_window: *mut std::ffi::c_void, w: u32, h: u32)
         width: f64::from(w),
         height: f64::from(h),
     };
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `setContentMinSize:` takes an `NSSize`, matched by `NsSize`'s encoding.
     let _: () = unsafe { msg_send![window, setContentMinSize: size] };
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `setContentMaxSize:` takes an `NSSize`.
     let _: () = unsafe { msg_send![window, setContentMaxSize: size] };
 }
 
@@ -105,6 +115,8 @@ pub unsafe fn install_content_limits(
         width: f64::from(min.0.max(1)),
         height: f64::from(min.1.max(1)),
     };
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `setContentMinSize:` takes an `NSSize`.
     let _: () = unsafe { msg_send![window, setContentMinSize: min_size] };
     // `u32::MAX` (the trait's "unbounded") maps to a max far beyond any
     // display; AppKit treats it the same as its own FLT_MAX default.
@@ -112,6 +124,8 @@ pub unsafe fn install_content_limits(
         width: f64::from(max.0),
         height: f64::from(max.1),
     };
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `setContentMaxSize:` takes an `NSSize`.
     let _: () = unsafe { msg_send![window, setContentMaxSize: max_size] };
     if let Some((num, denom)) = aspect
         && num > 0
@@ -121,6 +135,8 @@ pub unsafe fn install_content_limits(
             width: f64::from(num),
             height: f64::from(denom),
         };
+        // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+        // `NSWindow`. `setContentAspectRatio:` takes an `NSSize`.
         let _: () = unsafe { msg_send![window, setContentAspectRatio: ratio] };
     }
 }
@@ -168,17 +184,26 @@ pub unsafe fn disable_zoom(ns_window: *mut std::ffi::c_void) {
     // a borderless window; baseview's is `Titled`, so it exists, but
     // guard anyway.
     let zoom_button: *mut AnyObject =
+        // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+        // `NSWindow`. `standardWindowButton:` takes an `NSWindowButton` and returns the button or
+        // nil.
         unsafe { msg_send![window, standardWindowButton: NS_WINDOW_ZOOM_BUTTON] };
     if !zoom_button.is_null() {
+        // SAFETY: `zoom_button` is a non-null `NSButton` owned by the live window; `setEnabled:`
+        // takes a `BOOL`.
         let _: () = unsafe { msg_send![zoom_button, setEnabled: Bool::NO] };
     }
 
     // Forbid native fullscreen so `⌃⌘F` / the View menu can't bypass
     // the disabled button. Clear any fullscreen-enabling bits first,
     // then set `FullScreenNone`.
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `collectionBehavior` returns an `NSUInteger`.
     let behavior: u64 = unsafe { msg_send![window, collectionBehavior] };
     let new_behavior =
         (behavior & !(NS_FULLSCREEN_PRIMARY | NS_FULLSCREEN_AUXILIARY)) | NS_FULLSCREEN_NONE;
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `setCollectionBehavior:` takes an `NSUInteger`.
     let _: () = unsafe { msg_send![window, setCollectionBehavior: new_behavior] };
 }
 
@@ -221,18 +246,25 @@ pub unsafe fn install_subview_centering(ns_view: *mut std::ffi::c_void) {
     // parented view with `addSubview:` synchronously). Walking *that* view's subviews finds the
     // editor's NSView reliably.
     let parent = ns_view.cast::<AnyObject>();
+    // SAFETY: Per this function's contract we are on the main thread and `ns_view` is a live
+    // `NSView`. `subviews` returns an `NSArray`.
     let subviews: *mut AnyObject = unsafe { msg_send![parent, subviews] };
     if subviews.is_null() {
         return;
     }
+    // SAFETY: `subviews` is a non-null `NSArray` owned by the live view; `count` returns an
+    // `NSUInteger`.
     let count: usize = unsafe { msg_send![subviews, count] };
     let mask =
         NSVIEW_MIN_X_MARGIN | NSVIEW_MAX_X_MARGIN | NSVIEW_MIN_Y_MARGIN | NSVIEW_MAX_Y_MARGIN;
     for i in 0..count {
+        // SAFETY: `i < count`, so `objectAtIndex:` stays in range.
         let child: *mut AnyObject = unsafe { msg_send![subviews, objectAtIndex: i] };
         if child.is_null() {
             continue;
         }
+        // SAFETY: `child` is a non-null subview of the live view; `setAutoresizingMask:` takes an
+        // `NSUInteger`.
         let _: () = unsafe { msg_send![child, setAutoresizingMask: mask] };
     }
 }
@@ -265,14 +297,18 @@ pub unsafe fn layout_child_centered(
         return;
     }
     let parent = ns_view.cast::<AnyObject>();
+    // SAFETY: Per this function's contract we are on the main thread and `ns_view` is a live
+    // `NSView`. `subviews` returns an `NSArray`.
     let subviews: *mut AnyObject = unsafe { msg_send![parent, subviews] };
     if subviews.is_null() {
         return;
     }
+    // SAFETY: `subviews` is a non-null `NSArray` owned by the live view.
     let count: usize = unsafe { msg_send![subviews, count] };
     if count == 0 {
         return;
     }
+    // SAFETY: `count > 0` (checked above), so index 0 is in range.
     let child: *mut AnyObject = unsafe { msg_send![subviews, objectAtIndex: 0usize] };
     if child.is_null() {
         return;
@@ -283,6 +319,8 @@ pub unsafe fn layout_child_centered(
     let x = ((f64::from(outer_w) - cw) / 2.0).max(0.0);
     let y = ((f64::from(outer_h) - ch) / 2.0).max(0.0);
 
+    // SAFETY: `child` is a non-null subview of the live view; `frame` returns an `NSRect`, matched
+    // by `NsRect`'s encoding.
     let current: NsRect = unsafe { msg_send![child, frame] };
     // Exact compare is fine: both sides are whole-point values we set /
     // AppKit echoes back, never accumulated arithmetic.
@@ -301,6 +339,7 @@ pub unsafe fn layout_child_centered(
             height: ch,
         },
     };
+    // SAFETY: `child` is a live subview; `setFrame:` takes an `NSRect`.
     let _: () = unsafe { msg_send![child, setFrame: frame] };
 }
 
@@ -314,6 +353,8 @@ struct NsSize {
     width: f64,
     height: f64,
 }
+// SAFETY: `NsSize` is `#[repr(C)]` with two `f64`s, exactly the layout of `CGSize` that this
+// encoding names.
 unsafe impl Encode for NsSize {
     const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
 }
@@ -324,6 +365,8 @@ struct NsPoint {
     x: f64,
     y: f64,
 }
+// SAFETY: `NsPoint` is `#[repr(C)]` with two `f64`s, exactly the layout of `CGPoint` that this
+// encoding names.
 unsafe impl Encode for NsPoint {
     const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
 }
@@ -334,6 +377,7 @@ struct NsRect {
     origin: NsPoint,
     size: NsSize,
 }
+// SAFETY: `NsRect` is `#[repr(C)]` with an `NsPoint` then an `NsSize`, exactly `CGRect`'s layout.
 unsafe impl Encode for NsRect {
     const ENCODING: Encoding = Encoding::Struct("CGRect", &[NsPoint::ENCODING, NsSize::ENCODING]);
 }
@@ -357,6 +401,8 @@ pub unsafe fn content_logical_size(ns_window: *mut std::ffi::c_void) -> Option<(
     // content view, excluding title bar / toolbar - matches what
     // the editor occupies. Native `NSRect` return; objc2's
     // `msg_send!` infers the layout from the bound type.
+    // SAFETY: Per this function's contract we are on the main thread and `ns_window` is a live
+    // `NSWindow`. `contentLayoutRect` returns an `NSRect`.
     let rect: NsRect = unsafe { msg_send![window, contentLayoutRect] };
     let w = rect.size.width.round();
     let h = rect.size.height.round();

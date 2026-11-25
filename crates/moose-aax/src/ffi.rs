@@ -84,6 +84,8 @@ pub struct MooseAaxDescriptor {
 // SAFETY: Every pointer in `MooseAaxDescriptor` references process-lifetime
 // immutable metadata allocated once at descriptor initialization.
 unsafe impl Send for MooseAaxDescriptor {}
+// SAFETY: Shared access only reads the descriptor's integers and the process-lifetime, immutable
+// arrays described above.
 unsafe impl Sync for MooseAaxDescriptor {}
 
 /// Per-parameter metadata populated from the live parameter catalog.
@@ -254,4 +256,6 @@ pub struct MooseAaxCallbacks {
 
 // SAFETY: Function pointers and integer fields only; immutable static vtable.
 unsafe impl Send for MooseAaxCallbacks {}
+// SAFETY: Shared access only reads plain function pointers and integers that never change after
+// construction.
 unsafe impl Sync for MooseAaxCallbacks {}

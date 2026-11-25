@@ -371,6 +371,9 @@ unsafe fn info_for(plugin: *const clap_plugin, id: u32) -> Option<clap_param_inf
 
 #[test]
 fn catalog_wakes_coalesce_and_publish_structure_at_once_while_inactive() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, params| unsafe {
         assert_eq!(count(plugin), 1, "free slots are not listed");
         let slot = params.slots.slot(0).expect("slot 0");
@@ -404,6 +407,9 @@ fn catalog_wakes_coalesce_and_publish_structure_at_once_while_inactive() {
 
 #[test]
 fn structure_while_active_restarts_then_publishes_at_deactivate() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, params| unsafe {
         let slot = params.slots.slot(1).expect("slot 1");
         let id = params.slots.id(slot);
@@ -456,6 +462,9 @@ fn structure_while_active_restarts_then_publishes_at_deactivate() {
 
 #[test]
 fn track_info_reaches_the_hooks_at_init_and_on_change() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, _, _| unsafe {
         let mut want = TrackInfo::new();
         want.name = Some("Drums".into());
@@ -477,6 +486,9 @@ fn track_info_reaches_the_hooks_at_init_and_on_change() {
 
 #[test]
 fn note_names_and_voice_info_come_from_the_hooks() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, _, _| unsafe {
         let get = (*plugin).get_extension.unwrap();
         let names = &*get(plugin, CLAP_EXT_NOTE_NAME.as_ptr()).cast::<clap_plugin_note_name>();
@@ -503,6 +515,9 @@ fn note_names_and_voice_info_come_from_the_hooks() {
 
 #[test]
 fn host_notices_reach_the_host_on_the_main_thread() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, _| unsafe {
         let notifier = NOTIFIER
             .with(|n| n.borrow().clone())
@@ -550,6 +565,9 @@ fn embedded_window_creation_refreshes_menu_capability() {
         fn close(&mut self) {}
     }
 
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, _| unsafe {
         let data = crate::data_from_plugin::<Plugin>(plugin);
         data.gui.enter().editor = Some(Box::new(WindowEditor(false)));
@@ -574,6 +592,9 @@ fn embedded_window_creation_refreshes_menu_capability() {
 
 #[test]
 fn menu_falls_back_for_unsupported_and_floating_windows() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, _| unsafe {
         let data = crate::data_from_plugin::<Plugin>(plugin);
         let context = editor_context::<Plugin>(plugin);
@@ -592,6 +613,9 @@ fn menu_falls_back_for_unsupported_and_floating_windows() {
 
 #[test]
 fn editor_host_requests_are_made_on_the_main_thread_in_one_callback() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, _| unsafe {
         let context = editor_context::<Plugin>(plugin);
         let callbacks = log.callbacks.load(Ordering::Relaxed);
@@ -621,6 +645,9 @@ fn editor_host_requests_are_made_on_the_main_thread_in_one_callback() {
 
 #[test]
 fn port_notice_restarts_an_active_plugin_and_rescans_once_inactive() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, log, _| unsafe {
         let notifier = NOTIFIER
             .with(|n| n.borrow().clone())
@@ -664,6 +691,9 @@ fn voice_info_is_hidden_without_hooks() {
 
 #[test]
 fn param_indication_reaches_the_hooks() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, _, _| unsafe {
         let _ = seen();
         let ext = &*(*plugin).get_extension.unwrap()(plugin, CLAP_EXT_PARAM_INDICATION.as_ptr())
@@ -721,6 +751,8 @@ fn param_indication_reaches_the_hooks() {
 #[test]
 fn param_indication_updates_editor_context_and_wakes_editor() {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns.
     with_modular(|plugin, _, _| unsafe {
         let _ = seen();
         let ctx = crate::gui::editor_context::<Plugin>(plugin);
@@ -804,6 +836,9 @@ unsafe extern "C" fn add_item(
 
 #[test]
 fn context_menu_populates_and_performs_through_the_hooks() {
+    // SAFETY: `with_modular` hands the closure a live plugin instance, initialised on this (main)
+    // thread and destroyed only after the closure returns. Every host pointer passed below is a
+    // local or static that outlives its call.
     with_modular(|plugin, _, _| unsafe {
         let _ = seen();
         let ext = &*(*plugin).get_extension.unwrap()(plugin, CLAP_EXT_CONTEXT_MENU.as_ptr())
@@ -868,6 +903,8 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
         severity: clap_log_severity,
         msg: *const std::ffi::c_char,
     ) {
+        // SAFETY: The plugin logs through `HostHandle::log`, which passes a NUL-terminated
+        // `CString`.
         let text = unsafe { CStr::from_ptr(msg) }
             .to_string_lossy()
             .into_owned();
@@ -891,6 +928,7 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
             is_main_thread: Some(is_main),
             is_audio_thread: Some(is_audio),
         };
+        // SAFETY: The plugin queries extensions with NUL-terminated static ids.
         let id = unsafe { CStr::from_ptr(id) };
         if id == CLAP_EXT_LOG {
             (&raw const LOG_EXT).cast()
@@ -917,13 +955,19 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
         request_process: None,
         request_callback: None,
     };
+    // SAFETY: `host` is a local that outlives `handle` and every call made through it.
     let handle = unsafe { crate::host_handle::HostHandle::any(&raw const host) };
+    // SAFETY: `handle` wraps the live local `host`, whose `get_extension` is set.
     let log_ext = unsafe { handle.extension::<clap_host_log>(CLAP_EXT_LOG) }.expect("log ext");
+    // SAFETY: `handle` wraps the live local `host`, whose `get_extension` is set.
     let tc_ext = unsafe { handle.extension::<clap_host_thread_check>(CLAP_EXT_THREAD_CHECK) }
         .expect("thread-check ext");
 
+    // SAFETY: `tc_ext` is the host's static thread-check extension, and `handle` is live.
     assert_eq!(unsafe { handle.is_main_thread(tc_ext) }, Some(true));
+    // SAFETY: `tc_ext` is the host's static thread-check extension, and `handle` is live.
     assert_eq!(unsafe { handle.is_audio_thread(tc_ext) }, Some(true));
+    // SAFETY: `tc_ext` is the host's static thread-check extension, and `handle` is live.
     unsafe {
         handle.debug_assert_main_thread(tc_ext);
         handle.debug_assert_audio_thread(tc_ext);
@@ -935,6 +979,8 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
     });
     assert!(latch.is_failed());
     latch.report_with(|msg| {
+        // SAFETY: `log_ext` is the host's static log extension, `handle` is live, and `msg` is a
+        // valid `&str`.
         assert!(unsafe { handle.log(log_ext, CLAP_LOG_ERROR, msg) });
     });
 
@@ -948,5 +994,6 @@ fn host_log_and_thread_check_integrate_with_host_handle() {
     );
 
     ON_MAIN.store(false, std::sync::atomic::Ordering::Release);
+    // SAFETY: `tc_ext` is the host's static thread-check extension, and `handle` is live.
     assert_eq!(unsafe { handle.is_main_thread(tc_ext) }, Some(false));
 }

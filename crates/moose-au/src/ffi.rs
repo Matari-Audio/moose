@@ -642,6 +642,8 @@ impl Default for MooseAuHostSink {
 // holds the instance open (or `release_user_data` once in `cb_destroy` after
 // `HostQueue::close()`).
 unsafe impl Send for MooseAuHostSink {}
+// SAFETY: Shared `&MooseAuHostSink` exposes only plain data; calling its function pointers is
+// `unsafe` and confined to the main thread under the conditions given for `Send` above.
 unsafe impl Sync for MooseAuHostSink {}
 
 /// Transport snapshot filled by the shim from `HostCallbackInfo` (AU v2)

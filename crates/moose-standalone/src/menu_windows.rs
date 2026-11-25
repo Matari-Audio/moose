@@ -194,6 +194,10 @@ pub fn install(
     }
     let hwnd = hwnd as HWND;
 
+    // SAFETY: `hwnd` is non-null, and Win32 validates window handles, so a bad one makes these
+    // calls fail rather than touch memory. The `MenuState` box handed to `SetWindowSubclass` stays
+    // owned by the subclass until `WM_NCDESTROY` frees it, and every string is a live `wide()`
+    // buffer.
     unsafe {
         let menu_bar = CreateMenu();
         let plugin_menu = CreatePopupMenu();
@@ -406,6 +410,10 @@ pub fn install(
 /// `(presets_popup, load_submenu)` so the subclass proc can refresh
 /// them on open. Both are null if creation failed.
 unsafe fn build_presets_menu(menu_bar: HMENU, presets: &PresetController) -> (HMENU, HMENU) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let presets_menu = CreatePopupMenu();
         if presets_menu.is_null() {
@@ -470,6 +478,10 @@ unsafe fn build_presets_menu(menu_bar: HMENU, presets: &PresetController) -> (HM
 /// the clicked item's label, so the index only has to stay unique.
 /// Entries beyond the command-ID range are dropped (logged).
 unsafe fn populate_preset_load(load_menu: HMENU, entries: &[crate::presets::PresetMenuEntry]) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let count = GetMenuItemCount(load_menu);
         for _ in 0..count {
@@ -500,6 +512,8 @@ unsafe fn populate_preset_load(load_menu: HMENU, entries: &[crate::presets::Pres
 }
 
 unsafe fn grow_window_for_menu(hwnd: HWND) {
+    // SAFETY: `hwnd` is the window the menu bar was installed on; Win32 validates it, and `rect` is
+    // a writable local.
     unsafe {
         let menu_h = GetSystemMetrics(SM_CYMENU);
         if menu_h <= 0 {
@@ -539,6 +553,10 @@ unsafe extern "system" fn subclass_proc(
     _uid: usize,
     dwrefdata: usize,
 ) -> LRESULT {
+    // SAFETY: `dwrefdata` is the `MenuState` box registered with `SetWindowSubclass`, live until
+    // the `WM_NCDESTROY` arm frees it. That arm is the window's last message, and no reference to
+    // the state survives the arm. Messages arrive on the window's own thread, so shared references
+    // never race.
     unsafe {
         let state_ptr = dwrefdata as *mut MenuState;
 
@@ -849,6 +867,10 @@ unsafe fn repopulate_device_menu(
     current: Option<&str>,
     cmd_base: u16,
 ) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         // Remove all existing items. Always delete by position 0 since
         // the menu shrinks under us as we delete.
@@ -890,6 +912,10 @@ unsafe fn repopulate_channel_menu(
     current: ChannelRoute,
     cmd_base: u16,
 ) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let count = GetMenuItemCount(popup);
         for _ in 0..count {
@@ -929,6 +955,10 @@ unsafe fn repopulate_channel_menu(
 /// `MF_CHECKED`. Index (not width) so two layouts that share a maximum
 /// width stay distinct commands.
 unsafe fn repopulate_bus_layout_menu(popup: HMENU, layouts: &[(u16, u16)], current_index: usize) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let count = GetMenuItemCount(popup);
         for _ in 0..count {
@@ -958,6 +988,10 @@ unsafe fn append_channel_item(
     label: &str,
     current_encoded: usize,
 ) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let encoded = route.encode();
         let cmd = cmd_base.wrapping_add(u16::try_from(encoded).unwrap_or(0));
@@ -980,6 +1014,10 @@ unsafe fn repopulate_midi_input_menu(
     devices: &[String],
     current: Option<&str>,
 ) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let count = GetMenuItemCount(popup);
         for _ in 0..count {
@@ -1024,6 +1062,10 @@ unsafe fn repopulate_midi_input_menu(
 /// each firing `MENU_CMD_MIDI_CHANNEL_BASE + MidiChannel::encode()`.
 /// The active channel is checked.
 unsafe fn repopulate_midi_channel_menu(popup: HMENU, current: MidiChannel) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let count = GetMenuItemCount(popup);
         for _ in 0..count {
@@ -1047,6 +1089,10 @@ unsafe fn append_midi_channel_item(
     label: &str,
     current_encoded: u8,
 ) {
+    // SAFETY: Win32 menu calls on the UI thread. Every `HMENU` passed is one this module created
+    // (and still owns) or was handed by the caller, Win32 validates handles so a stale one fails
+    // instead of touching memory, and every string pointer is a live NUL-terminated `wide()` buffer
+    // that outlives its call.
     unsafe {
         let encoded = channel.encode();
         let cmd = MENU_CMD_MIDI_CHANNEL_BASE.wrapping_add(u16::from(encoded));
@@ -1071,6 +1117,8 @@ unsafe fn append_midi_channel_item(
     clippy::cast_sign_loss
 )]
 unsafe fn get_menu_string(hmenu: HMENU, cmd_id: u32) -> Option<String> {
+    // SAFETY: `GetMenuStringW` first reports the label length with a null buffer, then writes at
+    // most `buf.len()` UTF-16 units into the local `buf`. `written` is at most that length.
     unsafe {
         // First call with a null buffer to get the required length.
         let len = GetMenuStringW(hmenu, cmd_id, std::ptr::null_mut(), 0, MF_BYCOMMAND);
