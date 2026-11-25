@@ -583,6 +583,9 @@ pub(crate) struct ParamsStructAttrs {
     pub(crate) value_format: Option<syn::Ident>,
     /// Inherent `fn(&self, u32, &str) -> Result<Option<f64>, ()>`.
     pub(crate) value_parse: Option<syn::Ident>,
+    /// `#[params(heap_init)]`: build `Params::new_arc()` directly inside
+    /// `Arc::new_uninit()` without materializing the params struct on the stack.
+    pub(crate) heap_init: bool,
 }
 
 /// Read the struct-level `#[params(...)]` keys. `id_scheme` defaults
@@ -606,6 +609,7 @@ pub(crate) fn parse_params_struct_attrs(
         function: None,
         value_format: None,
         value_parse: None,
+        heap_init: false,
     };
     for attr in attrs {
         if !attr.path().is_ident("params") {
@@ -616,6 +620,10 @@ pub(crate) fn parse_params_struct_attrs(
                 .path
                 .get_ident()
                 .map_or_else(String::new, ToString::to_string);
+            if key == "heap_init" {
+                parsed.heap_init = true;
+                return Ok(());
+            }
             let value: syn::LitStr = meta.value()?.parse()?;
             if key == "id_scheme" {
                 parsed.id_scheme = match value.value().as_str() {

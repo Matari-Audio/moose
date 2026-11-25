@@ -56,6 +56,11 @@ readme = "README.md"
 pedantic = { level = "warn", priority = -1 }
 # New in clippy 1.98 (style); `as_chunks` would churn every SIMD kernel.
 chunks_exact_to_as_chunks = "allow"
+# Stack-budget guard: never materialize >64 KiB arrays or structs on the stack
+# (host secondary threads can be 512 KiB on macOS AU / 128 KiB on musl).
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"
 
 # Workspace deps. Every internal `moose-*` entry pins
 # `version = "<workspace version>"` alongside `path = "..."`. The
@@ -86,6 +91,7 @@ moose-derive = { version = "7.0.0", path = "crates/moose-derive" }
 moose-mui = { version = "7.0.0", path = "crates/moose-mui" }
 moose-font = { version = "7.0.0", path = "crates/moose-font" }
 moose-build = { version = "7.0.0", path = "crates/moose-build" }
+moose-dsp = { version = "7.0.0", path = "crates/moose-dsp" }
 moose-shim-types = { version = "7.0.0", path = "crates/moose-shim-types" }
 moose-utils = { version = "7.0.0", path = "crates/moose-utils" }
 

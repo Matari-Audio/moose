@@ -14,6 +14,7 @@
 use proc_macro::TokenStream;
 
 mod fields;
+mod heap_init;
 mod info;
 mod param_enum;
 mod param_index;
@@ -127,4 +128,26 @@ pub fn derive_param_enum(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(State)]
 pub fn derive_state(input: TokenStream) -> TokenStream {
     state::derive_state(input)
+}
+
+/// Derive in-place heap construction (`HeapInit`) so large structs never
+/// materialize on the caller's stack.
+///
+/// Generates `impl HeapInit for T` using `Box::<Self>::new_uninit()` and
+/// `core::ptr::addr_of_mut!` writes for every field, recursing into nested
+/// `HeapInit` fields without by-value temporaries and falling back to
+/// `Default::default()` for other field types.
+///
+/// Supported attributes:
+/// - Struct: `#[heap_init(crate = path::to::heap_init)]` (defaults to `::moose::core::heap_init`)
+/// - Field: `#[heap_init(with = expr)]` — write `expr` directly into the field slot
+/// - Field: `#[heap_init(default)]` — initialize via `Default::default()`
+/// - Field: `#[heap_init(some)]` — for `Option<Box<T: HeapInit>>`, initialize as `Some(T::heap_init())`
+///
+/// # Panics
+///
+/// Panics if `syn` fails to parse the input token stream.
+#[proc_macro_derive(HeapInit, attributes(heap_init))]
+pub fn derive_heap_init(input: TokenStream) -> TokenStream {
+    heap_init::derive_heap_init(input)
 }

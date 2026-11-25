@@ -11,6 +11,7 @@ pub mod denormal;
 pub mod editor;
 pub mod events;
 pub mod export;
+pub mod heap_init;
 pub mod host_queue;
 pub mod info;
 pub mod main_thread;
@@ -49,6 +50,7 @@ pub use events::{
     RawUmp, SYSEX_POOL_PREALLOC, TransportInfo, Vst3EventMetadata,
 };
 pub use export::PluginExport;
+pub use heap_init::{HeapInit, heap_box_array_init};
 pub use info::{Automation, MidiDialect, PluginCategory, PluginInfo};
 pub use meters::MeterStore;
 pub use plugin::PluginRuntime;

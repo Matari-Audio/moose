@@ -25,12 +25,14 @@ pub mod biquad;
 #[cfg(feature = "fft")]
 pub mod fft;
 pub mod follower;
+pub mod heap_array;
 pub mod smooth;
 pub mod svf;
 pub mod time;
 pub mod window;
 
 pub use float::Float;
+pub use heap_array::HeapArray;
 
 /// Zeroes `x` when it has decayed below `floor`, so rung-out state never
 /// feeds subnormals to what follows (the audio thread runs without FTZ).

@@ -165,6 +165,17 @@ moose::plugin! { plugin: Gain, params: GainParams }
 
 Place `.preset` TOML files in a `presets/` directory next to your crate and `cargo moose install` / `package` ships them automatically as CLAP preset-discovery entries, `.vstpreset` files, and AU factory presets / `.aupreset` files. Use `cargo moose preset list | init | pull | convert | import | export` to author and round-trip presets with your DAW.
 
+## Stack Budget & Heap-In-Place Construction
+
+DAW host threads often have tight stack limits (1 MiB on Windows, 512 KiB on macOS secondary/AU threads, 128 KiB on musl Linux). In Rust, `Box::new(T::default())` builds `T` on the stack first and relies on optimizer copy-elision, which varies across dev/release profiles and feature unification. Moose provides first-class heap-in-place primitives and guards so large DSP processors and parameter stores stay under a 256 KiB host-thread stack budget:
+
+- **`moose_dsp::HeapArray<T, const N: usize>`** — heap-backed `[T; N]` built element-by-element via `from_fn` or `splat` without materializing `[T; N]` on the stack, with `Deref`/`DerefMut` to `[T; N]`.
+- **`#[derive(HeapInit)]` & `HeapInit` trait** — allocates via `Box::new_uninit()` / `Arc::new_uninit()` and initializes every field directly in place with `ptr::addr_of_mut!`, recursing into nested `HeapInit` fields (with panic-unwind drop guards, generics, `#[cfg]` fields, `#[heap_init(with = ...)]`, and `Option<Box<T>>` support).
+- **Large `#[derive(Params)]` stores** — add `#[params(heap_init)]` to generate `HeapInit` and `Params::new_arc()` directly in `Arc::new_uninit()`.
+- **Boxed plugin lifecycle** — override `Plugin::create_boxed`, `Plugin::activate_boxed`, and `Plugin::deactivate_boxed` so large processors are never moved by value across activation or teardown.
+- **Off-thread `#[persist]` decode** — override `Plugin::decode_persist_state` (runs on the host/main thread after `#[persist]` fields load) and `Plugin::apply_decoded_persist` (runs on the audio thread as a pointer/table swap, with old payloads retired off-thread).
+- **Automated stack-budget tests** — add `moose_test::assert_lifecycle_fits::<PluginShell>(256)` to prove create -> activate -> process -> save/load -> deactivate -> drop fits in a 256 KiB thread stack under both dev and `--release`, paired with `[workspace.lints.clippy]` (`large_stack_arrays = "deny"`, `large_stack_frames = "deny"`, `large_types_passed_by_value = "warn"`) and `clippy.toml` (`array-size-threshold = 65536`, `stack-size-threshold = 65536`).
+
 ## Workspace Crates
 
 - **Core & DSP:** `moose`, `moose-core`, `moose-params`, `moose-derive`, `moose-dsp`, `moose-simd`, `moose-utils`

@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 pub use moose_core as core;
+pub use moose_core::heap_init::{HeapInit, heap_box_array_init};
 /// Real-time allocation checking helpers (`allow_alloc`, `audit`). The
 /// checker itself is the opt-in `rt-paranoid` feature; install it with
 /// [`enable_rt_paranoid!`]. See the audio-testing guide.
 pub use moose_core::rt;
-pub use moose_derive::{ParamEnum, Params, State};
+pub use moose_derive::{HeapInit, ParamEnum, Params, State};
 // `moose` is renderer-agnostic. Plugins that want a GUI enable `moose`'s
 // `mui` feature (`moose::mui`) or implement `moose_core::Editor` directly.
 pub use moose_params as params;
@@ -96,6 +97,7 @@ macro_rules! enable_rt_paranoid {
 // type alias.
 mod prelude_impl {
     pub use moose_core::custom_state::{AtomicCell, State as StateTrait, StateBinding, StateField};
+    pub use moose_core::heap_init::{HeapInit, heap_box_array_init};
     pub use moose_core::main_thread::{
         AutomationState, BusDirection, HostColor, HostMapping, Midi2Controller,
         Midi2ControllerAssignment, Midi2ControllerKind, ParamIndication, ParamIndicationState,
@@ -133,7 +135,7 @@ mod prelude_impl {
         PluginCategory, PluginContext, PluginExport, PluginInfo, ProcessContext, ProcessMode,
         ProcessStatus, TransportInfo,
     };
-    pub use moose_derive::{ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
+    pub use moose_derive::{HeapInit, ParamEnum, Params, State, plugin_info, plugin_vst3_class_id};
     pub use moose_params::{
         BoolParam, DynamicParams, EnumParam, FloatParam, IntParam, MeterSlot, ParamEnum,
         ParamFlags, ParamFunction, ParamInfo, ParamRange, ParamSmoother, ParamUnit, Params,

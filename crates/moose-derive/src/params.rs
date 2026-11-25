@@ -22,7 +22,8 @@ use std::collections::HashSet;
 use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Fields};
 
-#[allow(clippy::too_many_lines)]
+// Compile-time proc-macro only (never runs in a plugin binary or DAW thread).
+#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
 pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(input).expect("Failed to parse input for Params derive");
     let struct_name = &ast.ident;
@@ -985,33 +986,172 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
             .collect();
         let me_binding = quote! { let mut me };
 
-        quote! {
-            impl #struct_name {
-                pub fn new() -> Self {
-                    #info_table
-                    #me_binding = Self {
-                        #(#param_inits,)*
-                        #(#nested_inits,)*
-                        #(#meter_inits,)*
-                        #(#skip_inits,)*
-                    };
-                    #(#offset_stmts)*
-                    <Self as ::moose::params::Params>::set_edit_epoch(
-                        &mut me,
-                        ::std::sync::Arc::new(::std::sync::atomic::AtomicU64::new(0)),
-                    );
-                    // The per-struct compile-time ID check can't see
-                    // across nested types; a parent id matching a
-                    // (rebased) nested id would silently corrupt state
-                    // round-trip. Surface it as a construction panic.
-                    <Self as ::moose::params::Params>::assert_no_id_collisions(&me);
-                    me
+        let mut param_write_stmts = Vec::new();
+        let mut heap_init_guard_disarms = Vec::new();
+        if struct_attrs.heap_init {
+            let mut g_idx: usize = 0;
+            let mut slot = 0usize;
+            while let Some(f) = param_fields.get(slot) {
+                let ident = &f.ident;
+                let guard = quote::format_ident!("__moose_param_guard_{g_idx}");
+                g_idx += 1;
+                if f.index.is_some() {
+                    let elems: Vec<_> = (slot..)
+                        .zip(&param_fields[slot..])
+                        .take_while(|(_, e)| e.ident == *ident && e.index.is_some())
+                        .map(|(s, e)| gen_field_constructor(e, s))
+                        .collect();
+                    slot += elems.len();
+                    param_write_stmts.push(quote! {
+                        let #guard = {
+                            let __field_ptr = ::core::ptr::addr_of_mut!((*__dst).#ident);
+                            ::core::ptr::write(__field_ptr, [#(#elems),*]);
+                            ::moose::core::heap_init::__private::FieldDropGuard::new(__field_ptr)
+                        };
+                    });
+                    heap_init_guard_disarms.push(quote! { ::core::mem::forget(#guard); });
+                } else {
+                    let constructor = gen_field_constructor(f, slot);
+                    param_write_stmts.push(quote! {
+                        let #guard = {
+                            let __field_ptr = ::core::ptr::addr_of_mut!((*__dst).#ident);
+                            ::core::ptr::write(__field_ptr, #constructor);
+                            ::moose::core::heap_init::__private::FieldDropGuard::new(__field_ptr)
+                        };
+                    });
+                    heap_init_guard_disarms.push(quote! { ::core::mem::forget(#guard); });
+                    slot += 1;
                 }
             }
+            for f in &nested_fields {
+                let ident = &f.ident;
+                let field_ty = &f.ty;
+                let guard = quote::format_ident!("__moose_param_guard_{g_idx}");
+                g_idx += 1;
+                param_write_stmts.push(quote! {
+                    let #guard = {
+                        let __field_ptr = ::core::ptr::addr_of_mut!((*__dst).#ident);
+                        #[allow(unused_imports)]
+                        use ::moose::core::heap_init::__private::{
+                            Tag, ViaDefault as _, ViaHeapInit as _,
+                        };
+                        let __tag = &Tag::<#field_ty>::NEW;
+                        __tag.__moose_heap_init(__field_ptr);
+                        ::moose::core::heap_init::__private::FieldDropGuard::new(__field_ptr)
+                    };
+                });
+                heap_init_guard_disarms.push(quote! { ::core::mem::forget(#guard); });
+            }
+            for m in &meter_fields {
+                let ident = &m.ident;
+                let id = m.id();
+                let guard = quote::format_ident!("__moose_param_guard_{g_idx}");
+                g_idx += 1;
+                param_write_stmts.push(quote! {
+                    let #guard = {
+                        let __field_ptr = ::core::ptr::addr_of_mut!((*__dst).#ident);
+                        ::core::ptr::write(__field_ptr, ::moose::params::MeterSlot { id: #id });
+                        ::moose::core::heap_init::__private::FieldDropGuard::new(__field_ptr)
+                    };
+                });
+                heap_init_guard_disarms.push(quote! { ::core::mem::forget(#guard); });
+            }
+            if let Fields::Named(named) = fields {
+                for field in &named.named {
+                    let Some(ident) = &field.ident else {
+                        continue;
+                    };
+                    if skip_fields.iter().any(|s| s == ident) {
+                        let field_ty = &field.ty;
+                        let guard = quote::format_ident!("__moose_param_guard_{g_idx}");
+                        g_idx += 1;
+                        param_write_stmts.push(quote! {
+                            let #guard = {
+                                let __field_ptr = ::core::ptr::addr_of_mut!((*__dst).#ident);
+                                #[allow(unused_imports)]
+                                use ::moose::core::heap_init::__private::{
+                                    Tag, ViaDefault as _, ViaHeapInit as _,
+                                };
+                                let __tag = &Tag::<#field_ty>::NEW;
+                                __tag.__moose_heap_init(__field_ptr);
+                                ::moose::core::heap_init::__private::FieldDropGuard::new(__field_ptr)
+                            };
+                        });
+                        heap_init_guard_disarms.push(quote! { ::core::mem::forget(#guard); });
+                    }
+                }
+            }
+        }
 
-            impl Default for #struct_name {
-                fn default() -> Self {
-                    Self::new()
+        if struct_attrs.heap_init {
+            quote! {
+                #[allow(
+                    unsafe_code,
+                    clippy::undocumented_unsafe_blocks,
+                    clippy::large_stack_frames,
+                    clippy::large_stack_arrays
+                )]
+                impl ::moose::core::heap_init::HeapInit for #struct_name {
+                    unsafe fn heap_init_in_place(__dst: *mut Self) {
+                        #info_table
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            #(#param_write_stmts)*
+                            #(#heap_init_guard_disarms)*
+                            let me = &mut *__dst;
+                            #(#offset_stmts)*
+                            <Self as ::moose::params::Params>::set_edit_epoch(
+                                me,
+                                ::std::sync::Arc::new(::std::sync::atomic::AtomicU64::new(0)),
+                            );
+                            <Self as ::moose::params::Params>::assert_no_id_collisions(me);
+                        }
+                    }
+                }
+
+                impl #struct_name {
+                    #[allow(clippy::large_stack_frames)]
+                    pub fn new() -> Self {
+                        *<Self as ::moose::core::heap_init::HeapInit>::heap_init()
+                    }
+                }
+
+                impl Default for #struct_name {
+                    #[allow(clippy::large_stack_frames)]
+                    fn default() -> Self {
+                        Self::new()
+                    }
+                }
+            }
+        } else {
+            quote! {
+                impl #struct_name {
+                    pub fn new() -> Self {
+                        #info_table
+                        #me_binding = Self {
+                            #(#param_inits,)*
+                            #(#nested_inits,)*
+                            #(#meter_inits,)*
+                            #(#skip_inits,)*
+                        };
+                        #(#offset_stmts)*
+                        <Self as ::moose::params::Params>::set_edit_epoch(
+                            &mut me,
+                            ::std::sync::Arc::new(::std::sync::atomic::AtomicU64::new(0)),
+                        );
+                        // The per-struct compile-time ID check can't see
+                        // across nested types; a parent id matching a
+                        // (rebased) nested id would silently corrupt state
+                        // round-trip. Surface it as a construction panic.
+                        <Self as ::moose::params::Params>::assert_no_id_collisions(&me);
+                        me
+                    }
+                }
+
+                impl Default for #struct_name {
+                    fn default() -> Self {
+                        Self::new()
+                    }
                 }
             }
         }
@@ -1708,6 +1848,19 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
     let projected_write_plain = projection_write_prefix("set_plain");
     let projected_write_normalized = projection_write_prefix("set_normalized");
 
+    let new_arc_impl = if struct_attrs.heap_init && generate_new {
+        quote! {
+            fn new_arc() -> ::std::sync::Arc<Self>
+            where
+                Self: Sized + Default,
+            {
+                <Self as ::moose::core::heap_init::HeapInit>::heap_init_arc()
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #(#attr_errors)*
 
@@ -1720,6 +1873,7 @@ pub(crate) fn derive_params(input: TokenStream) -> TokenStream {
         impl ::moose::params::__private::Sealed for #struct_name {}
 
         impl ::moose::params::Params for #struct_name {
+            #new_arc_impl
             #parameter_epoch_impl
             #projected_setters
             fn param_infos(&self) -> Vec<::moose::params::ParamInfo> {

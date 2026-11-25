@@ -150,4 +150,9 @@ mod tests {
     fn state_round_trips() {
         moose_test::assert_state_round_trip::<PluginShell>();
     }
+
+    #[test]
+    fn lifecycle_fits_stack_budget() {
+        moose_test::assert_lifecycle_fits::<PluginShell>(256);
+    }
 }

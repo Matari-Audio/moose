@@ -42,6 +42,7 @@
 #[doc(hidden)]
 pub mod __macro_deps {
     pub use moose_core;
+    pub use moose_params;
     // `moose_plugin` carries the `PluginLogicCore` blanket the
     // `export_plugin!` / `export_static!` macros need to name
     // (`<L as PluginLogicCore<Sample>>::supports_in_place()` etc.).

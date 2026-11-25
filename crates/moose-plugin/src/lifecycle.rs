@@ -110,7 +110,13 @@ pub trait Plugin<S: Sample = f32>: 'static {
     }
 
     /// Build a processor for `config`, on the host main thread. May allocate
-    /// and block. This is the only way a processor comes into being.
+    /// and block.
+    ///
+    /// Implement this for small processors (`<= 64 KiB`), or override
+    /// [`Self::activate_boxed`] for large processors (`> 64 KiB`) so
+    /// `Self::Processor` is constructed directly on the heap (e.g. via
+    /// `#[derive(HeapInit)]` and [`Self::create_boxed`]) without ever
+    /// materializing on the host thread's stack.
     ///
     /// A host re-activation the current processor still fits (same sample
     /// rate and process mode, a max block no larger than the one it was
@@ -128,10 +134,55 @@ pub trait Plugin<S: Sample = f32>: 'static {
     /// the wrapper then fails the host's activation and the plugin keeps
     /// producing silence.
     fn activate(
+        _shared: &Self::Shared,
+        _config: &AudioConfig,
+        _cx: &InitContext,
+    ) -> Result<Self::Processor, PreparationError> {
+        Err(PreparationError::NotReady)
+    }
+
+    /// Construct a fresh default processor directly on the heap via
+    /// [`moose_core::heap_init::HeapInit`] without ever placing
+    /// `Self::Processor` on the caller's stack.
+    ///
+    /// Intended for use inside [`Self::activate_boxed`]:
+    /// ```ignore
+    /// fn activate_boxed(shared: &Self::Shared, config: &AudioConfig, _cx: &InitContext)
+    ///     -> Result<Box<Self::Processor>, PreparationError>
+    /// {
+    ///     let mut proc = Self::create_boxed();
+    ///     proc.configure(shared, config);
+    ///     Ok(proc)
+    /// }
+    /// ```
+    #[must_use]
+    fn create_boxed() -> Box<Self::Processor>
+    where
+        Self::Processor: moose_core::heap_init::HeapInit,
+    {
+        <Self::Processor as moose_core::heap_init::HeapInit>::heap_init()
+    }
+
+    /// Build a boxed processor for `config` directly on the heap on the host
+    /// main thread, without returning `Self::Processor` by value on the stack.
+    ///
+    /// Large processors (`> 64 KiB`) should override this method (and
+    /// [`Self::deactivate_boxed`] if needed) instead of [`Self::activate`],
+    /// constructing the processor via [`Self::create_boxed`] /
+    /// `#[derive(HeapInit)]`.
+    ///
+    /// Default: delegates to [`Self::activate`] and boxes the result.
+    ///
+    /// # Errors
+    ///
+    /// Return a [`PreparationError`] when the configuration can't be served.
+    fn activate_boxed(
         shared: &Self::Shared,
         config: &AudioConfig,
         cx: &InitContext,
-    ) -> Result<Self::Processor, PreparationError>;
+    ) -> Result<Box<Self::Processor>, PreparationError> {
+        Self::activate(shared, config, cx).map(Box::new)
+    }
 
     /// A host re-activation the processor still fits (see
     /// [`Self::activate`]), on the host main thread: may allocate and block.
@@ -161,8 +212,22 @@ pub trait Plugin<S: Sample = f32>: 'static {
 
     /// Take the processor back, on the host main thread, before a new
     /// activation replaces it. Default: drop it.
+    ///
+    /// For large processors (`> 64 KiB`), override [`Self::deactivate_boxed`]
+    /// so teardown never unboxes `Self::Processor` onto the host thread's stack.
     fn deactivate(processor: Self::Processor) {
         drop(processor);
+    }
+
+    /// Take the boxed processor back on the host main thread before replacement
+    /// or teardown, without unboxing `Self::Processor` onto the caller's stack.
+    ///
+    /// Large processors (`> 64 KiB`) should override this (even with a simple
+    /// `drop(processor)`) when overriding [`Self::activate_boxed`].
+    /// Default: delegates to [`Self::deactivate`] (`*processor`).
+    #[allow(clippy::boxed_local)]
+    fn deactivate_boxed(processor: Box<Self::Processor>) {
+        Self::deactivate(*processor);
     }
 
     /// Latency in samples for delay compensation.
@@ -329,6 +394,45 @@ pub trait Plugin<S: Sample = f32>: 'static {
         Self::apply_decoded_state(processor, shared, decoded);
     }
 
+    /// Decode persisted (`#[persist]`) state off the audio thread into a
+    /// heap-allocated [`DecodedState`] for RT-safe swapping in
+    /// [`Self::apply_decoded_persist`].
+    ///
+    /// Because `Lifecycle<P>` keeps plugin state in `#[persist]` fields on
+    /// `Self::Shared` (leaving the custom `extra` blob empty), `decode_state`
+    /// never runs for `Plugin` implementations. Override this hook to build
+    /// large derived DSP tables heap-in-place off-thread (e.g. via
+    /// `#[derive(HeapInit)]`) from `shared` / `persist_bytes` without ever
+    /// going through the host thread's stack or allocating on the audio thread.
+    ///
+    /// # Errors
+    ///
+    /// Return [`StateLoadError`] when persisted state cannot be decoded;
+    /// parameters and persisted fields will be rolled back.
+    fn decode_persist_state(
+        shared: &Self::Shared,
+        persist_bytes: &[u8],
+        context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError> {
+        let _ = (shared, persist_bytes, context);
+        Ok(None)
+    }
+
+    /// Swap a payload decoded by [`Self::decode_persist_state`] into the active
+    /// processor inside an `RtSection` on the audio thread (zero allocations,
+    /// zero deallocations, zero locks).
+    ///
+    /// Use [`DecodedState::swap_with`] so the previous value is retired back to
+    /// the host thread to drop off the audio thread.
+    fn apply_decoded_persist(
+        processor: &mut Self::Processor,
+        shared: &Self::Shared,
+        decoded: &mut DecodedState,
+        context: StateContext,
+    ) {
+        let _ = (processor, shared, decoded, context);
+    }
+
     /// Translate foreign state (a previous framework's blob or a renamed
     /// plugin's envelope) into moose params, extra, and persist bytes.
     #[must_use]
@@ -378,6 +482,7 @@ impl<P> std::fmt::Debug for Lifecycle<P> {
 pub struct ProcessorSlot<T> {
     slot: Slot<T>,
     pending_decoded: Option<(DecodedState, StateContext)>,
+    pending_decoded_persist: Option<(DecodedState, StateContext)>,
     pending_raw: Option<(Vec<u8>, StateContext)>,
     cx: InitContext,
 }
@@ -387,6 +492,7 @@ impl<T> Default for ProcessorSlot<T> {
         Self {
             slot: Slot::default(),
             pending_decoded: None,
+            pending_decoded_persist: None,
             pending_raw: None,
             cx: InitContext::default(),
         }
@@ -445,13 +551,13 @@ fn activate_boxed<S: Sample, P: Plugin<S>>(
     audio: &AudioConfig,
     cx: &InitContext,
 ) -> Result<Box<P::Processor>, PreparationError> {
-    P::activate(shared, audio, cx).map(Box::new)
+    P::activate_boxed(shared, audio, cx)
 }
 
 #[inline(never)]
-#[allow(clippy::boxed_local)] // Intentionally unboxes inside a separate frame so `activate()` stays tiny.
+#[allow(clippy::boxed_local)]
 fn deactivate_boxed<S: Sample, P: Plugin<S>>(processor: Box<P::Processor>) {
-    P::deactivate(*processor);
+    P::deactivate_boxed(processor);
 }
 
 fn activate<S: Sample, P: Plugin<S>>(
@@ -495,6 +601,10 @@ fn activate<S: Sample, P: Plugin<S>>(
     {
         P::transfer_state(&mut old, &mut processor, shared);
         deactivate_boxed::<S, P>(old);
+    }
+    if let Some((mut pending_persist, context)) = slot.pending_decoded_persist.take() {
+        P::apply_decoded_persist(&mut processor, shared, &mut pending_persist, context);
+        P::state_changed_with_context(&mut processor, shared, context);
     }
     if let Some((mut pending, context)) = slot.pending_decoded.take() {
         P::apply_decoded_state_with_context(&mut processor, shared, &mut pending, context);
@@ -565,6 +675,7 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
         ProcessorSlot {
             slot: Slot::default(),
             pending_decoded: None,
+            pending_decoded_persist: None,
             pending_raw: None,
             cx: cx.clone(),
         }
@@ -694,6 +805,31 @@ impl<S: Sample, P: Plugin<S>> PluginLogicCore<S> for Lifecycle<P> {
                 state.pending_decoded =
                     Some((std::mem::replace(decoded, DecodedState::empty()), context));
             }
+        }
+    }
+
+    fn decode_persist_state(
+        params: &P::Shared,
+        persist: &[u8],
+        context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError> {
+        P::decode_persist_state(params, persist, context)
+    }
+
+    fn apply_decoded_persist(
+        state: &mut Self::DspState,
+        params: &P::Shared,
+        decoded: &mut DecodedState,
+        context: StateContext,
+    ) {
+        if let Some(processor) = state.processor_mut() {
+            P::apply_decoded_persist(processor, params, decoded, context);
+        } else if let Some((prev, prev_ctx)) = &mut state.pending_decoded_persist {
+            std::mem::swap(prev, decoded);
+            *prev_ctx = context;
+        } else {
+            state.pending_decoded_persist =
+                Some((std::mem::replace(decoded, DecodedState::empty()), context));
         }
     }
 

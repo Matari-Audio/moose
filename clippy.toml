@@ -1,1 +1,3 @@
 too-many-lines-threshold = 150
+array-size-threshold = 65536
+stack-size-threshold = 65536

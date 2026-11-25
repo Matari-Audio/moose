@@ -881,6 +881,12 @@ pub fn restore_plugin<P: PluginExport>(plugin: &mut P, bytes: &[u8]) -> Result<(
         resolve_named_params(&mut s, &plugin.params().param_catalog());
     }
     plugin.params().restore_state(&s.params, &s.persist);
+    if let Some(mut decoded_persist) =
+        P::decode_persist_state(plugin.params(), &s.persist, StateContext::Unknown)
+            .map_err(RestoreError::LoadState)?
+    {
+        plugin.apply_decoded_persist(&mut decoded_persist, StateContext::Unknown);
+    }
     if let Some(extra) = s.extra {
         plugin.load_state(&extra).map_err(RestoreError::LoadState)?;
     }
@@ -1288,6 +1294,7 @@ pub(crate) struct QueuedLoad {
     pub(crate) state: std::sync::Arc<DeserializedState>,
     pub(crate) backup: Option<std::sync::Arc<ParamsBackup>>,
     pub(crate) decoded: Option<DecodedState>,
+    pub(crate) decoded_persist: Option<DecodedState>,
     pub(crate) context: StateContext,
 }
 
@@ -1378,9 +1385,19 @@ impl StateLoadQueue {
     }
     pub(crate) fn push_with_backup_decoded_and_context(
         &self,
+        state: DeserializedState,
+        backup: Option<ParamsBackup>,
+        decoded: Option<DecodedState>,
+        context: StateContext,
+    ) -> std::sync::Arc<DeserializedState> {
+        self.push_with_backup_decoded_persist_and_context(state, backup, decoded, None, context)
+    }
+    pub(crate) fn push_with_backup_decoded_persist_and_context(
+        &self,
         mut state: DeserializedState,
         backup: Option<ParamsBackup>,
         decoded: Option<DecodedState>,
+        decoded_persist: Option<DecodedState>,
         context: StateContext,
     ) -> std::sync::Arc<DeserializedState> {
         self.reclaim_retired();
@@ -1396,6 +1413,7 @@ impl StateLoadQueue {
             state: std::sync::Arc::clone(&state),
             backup,
             decoded,
+            decoded_persist,
             context,
         }));
         // `> 2`: the ready slot or audio, plus the handle returned below.

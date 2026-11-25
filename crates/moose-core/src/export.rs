@@ -193,6 +193,28 @@ pub trait PluginExport: PluginRuntime + Sized {
     ///
     /// VST2 / VST3 / AU never call this - they don't need the answer
     /// at registration time.
+    /// Decode persisted (`#[persist]`) state off the audio thread into a
+    /// heap-allocated [`DecodedState`](crate::state::DecodedState) ready for an
+    /// RT-safe swap in [`PluginRuntime::apply_decoded_persist`](crate::plugin::PluginRuntime::apply_decoded_persist).
+    ///
+    /// Runs on the host thread right after `#[persist]` fields have been
+    /// applied to `params`, so `moose::Plugin` (`Lifecycle`) plugins—which store
+    /// state in `#[persist]` fields rather than an `extra` blob—can build large
+    /// derived DSP tables heap-in-place off-thread and swap them RT-safely on
+    /// the audio thread.
+    ///
+    /// # Errors
+    ///
+    /// Return [`StateLoadError`](crate::state::StateLoadError) when the
+    /// persisted state cannot be decoded; params will be rolled back.
+    fn decode_persist_state(
+        _params: &Self::Params,
+        _persist: &[u8],
+        _context: crate::state::StateContext,
+    ) -> Result<Option<crate::state::DecodedState>, crate::state::StateLoadError> {
+        Ok(None)
+    }
+
     #[must_use]
     fn has_editor_static() -> bool {
         let plugin = Self::create();

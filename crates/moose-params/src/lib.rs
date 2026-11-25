@@ -285,6 +285,20 @@ pub trait PersistFingerprintVisitor {
 /// `impl Default` alongside the trait impl, so that bound is free for
 /// derive users.
 pub trait Params: __private::Sealed + Send + Sync + 'static {
+    /// Construct a fresh parameter store directly inside an `Arc`.
+    ///
+    /// Defaults to `Arc::new(Self::default())`. Large parameter stores
+    /// (>64 KiB) can annotate `#[params(heap_init)]` on `#[derive(Params)]` to
+    /// initialize every field directly in place inside `Arc::new_uninit()`
+    /// without materializing `Self` on the host thread's stack.
+    #[must_use]
+    fn new_arc() -> std::sync::Arc<Self>
+    where
+        Self: Sized + Default,
+    {
+        std::sync::Arc::new(Self::default())
+    }
+
     /// Optional incremental persistence preparation. Return `None` without
     /// reading to keep the ordinary buffered path. `Some(Err)` rejects before
     /// any parameter changes; `Some(Ok)` must consume exactly `len` bytes and

@@ -292,6 +292,101 @@ pub fn assert_audio_alloc<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Assert that `P`'s full host lifecycle (`create` → `prepare`/`activate` →
+/// `process` one block → `save`/`load` state → re-activate/deactivate → `drop`)
+/// fits inside a `kib * 1024`-byte OS thread stack.
+///
+/// Spawns an isolated thread with `std::thread::Builder::new().stack_size(kib * 1024)`
+/// so overflowing hits that thread's guard page immediately instead of hiding
+/// behind the test runner's multi-megabyte stack. Run at `256` KiB (macOS
+/// secondary/AU thread budget with margin) under both dev and `--release`.
+///
+/// # Panics
+///
+/// Panics if `kib == 0`, thread spawning fails, `prepare` or state round-trip
+/// fails, or the lifecycle thread panics.
+pub fn assert_lifecycle_fits<P: PluginExport>(kib: usize) {
+    use moose_core::buffer::AudioBuffer;
+    use moose_core::config::AudioConfig;
+    use moose_core::events::{EventList, TransportInfo};
+    use moose_core::plugin::{PreparationConfig, PreparationFrameBound};
+    use moose_core::process::ProcessContext;
+
+    assert!(kib > 0, "stack budget `kib` must be non-zero");
+    let stack_bytes = kib
+        .checked_mul(1024)
+        .expect("stack budget kib * 1024 overflowed usize");
+
+    let handle = std::thread::Builder::new()
+        .name(format!("moose-stack-budget-{kib}k"))
+        .stack_size(stack_bytes)
+        .spawn(|| {
+            const BLOCK: usize = 256;
+
+            let mut plugin = P::create();
+            plugin.init();
+
+            let layout = P::bus_layouts().into_iter().next().unwrap_or_default();
+            let in_ch = layout.total_input_channels().max(2) as usize;
+            let out_ch = layout.total_output_channels().max(2) as usize;
+
+            let config = AudioConfig::new(48_000.0, BLOCK);
+            let prep = PreparationConfig::new(config, PreparationFrameBound::ExplicitDriver);
+            plugin
+                .prepare(&prep)
+                .expect("assert_lifecycle_fits: prepare failed");
+
+            let in_storage: Vec<Vec<P::Sample>> = (0..in_ch)
+                .map(|_| vec![P::Sample::default(); BLOCK])
+                .collect();
+            let mut out_storage: Vec<Vec<P::Sample>> = (0..out_ch)
+                .map(|_| vec![P::Sample::default(); BLOCK])
+                .collect();
+            let events = EventList::with_capacity(16);
+            let mut out_events = EventList::with_capacity(16);
+            let transport = TransportInfo::default();
+
+            let run_one_block = |plugin: &mut P,
+                                 out_storage: &mut [Vec<P::Sample>],
+                                 out_events: &mut EventList| {
+                out_events.clear();
+                let in_refs: Vec<&[P::Sample]> = in_storage.iter().map(Vec::as_slice).collect();
+                let mut out_refs: Vec<&mut [P::Sample]> =
+                    out_storage.iter_mut().map(Vec::as_mut_slice).collect();
+                // SAFETY: `in_refs` and `out_refs` borrow disjoint heap `Vec`s of length `BLOCK`.
+                let mut buf = unsafe { AudioBuffer::from_slices(&in_refs, &mut out_refs, BLOCK) };
+                let mut ctx =
+                    ProcessContext::new(&transport, config.sample_rate, BLOCK, out_events);
+                let _ = plugin.process(&mut buf, &events, &mut ctx);
+            };
+
+            run_one_block(&mut plugin, &mut out_storage, &mut out_events);
+
+            // Save & restore state (covers host-thread serialize + deserialize +
+            // `#[persist]` + `decode_persist_state` / `apply_decoded_persist`).
+            let blob = state::snapshot_plugin(&plugin);
+            state::restore_plugin(&mut plugin, &blob)
+                .expect("assert_lifecycle_fits: restore_plugin failed");
+
+            run_one_block(&mut plugin, &mut out_storage, &mut out_events);
+
+            // Re-prepare at a different sample rate to exercise `deactivate_boxed`
+            // + replacement `activate_boxed` + `transfer_state` inside the budget.
+            let config2 = AudioConfig::new(96_000.0, BLOCK);
+            let prep2 = PreparationConfig::new(config2, PreparationFrameBound::ExplicitDriver);
+            plugin
+                .prepare(&prep2)
+                .expect("assert_lifecycle_fits: re-prepare failed");
+            plugin.reset(&config2);
+            drop(plugin);
+        })
+        .expect("assert_lifecycle_fits: failed to spawn stack-budget thread");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// Assert `plugin_info`!() returns valid metadata.
 ///
 /// # Panics

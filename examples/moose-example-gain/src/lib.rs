@@ -514,4 +514,98 @@ mod tests {
         assertions::assert_nonzero(&result);
         assertions::assert_peak_below(&result, 1.0);
     }
+
+    #[test]
+    fn lifecycle_fits_stack_budget() {
+        moose_test::assert_lifecycle_fits::<PluginShell>(256);
+    }
+
+    /// Off-thread `#[persist]` decode + queued RT swap via `apply_queued_state`
+    /// must incur 0 audio-thread allocations and 0 audio-thread deallocations
+    /// under `rt-paranoid`.
+    #[test]
+    fn offthread_persist_decode_swap_is_allocation_free() {
+        use moose_core::buffer::AudioBuffer;
+        use moose_core::config::AudioConfig;
+        use moose_core::events::{EventList, TransportInfo};
+        use moose_core::export::PluginExport;
+        use moose_core::plugin::PluginRuntime;
+        use moose_core::process::ProcessContext;
+        use moose_core::state::{DeserializedState, ParamsBackup, StateContext, StateLoadQueue};
+        use moose_core::wrapper::{
+            PluginCell, apply_or_queue_state_with_context, apply_queued_state,
+        };
+
+        let mut shell = PluginShell::create();
+        shell.reset(&AudioConfig::new(48_000.0, 64));
+        let params = shell.params_arc();
+        let slot = shell.snapshot_slot();
+        let cell = PluginCell::new(shell);
+        let queue = StateLoadQueue::new(1);
+
+        // Warm one block before auditing.
+        let in_l = [0.25f32; 64];
+        let in_r = [0.25f32; 64];
+        let mut out_l = [0.0f32; 64];
+        let mut out_r = [0.0f32; 64];
+        let events = EventList::with_capacity(8);
+        let mut out_events = EventList::with_capacity(8);
+        let transport = TransportInfo::default();
+        {
+            let mut guard = cell.enter();
+            let inputs = [&in_l[..], &in_r[..]];
+            let mut outputs = [&mut out_l[..], &mut out_r[..]];
+            // SAFETY: disjoint 64-sample slices live for the `process` call.
+            let mut buf = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
+            let mut ctx = ProcessContext::new(&transport, 48_000.0, 64, &mut out_events);
+            let _ = guard.process(&mut buf, &events, &mut ctx);
+        }
+
+        // Decode + queue a persist-only load on the host thread (`can_own = false`, `extra = None`).
+        let backup = ParamsBackup::capture(&*params);
+        apply_or_queue_state_with_context(
+            &cell,
+            &*params,
+            &slot,
+            &queue,
+            DeserializedState {
+                params: Vec::new(),
+                extra: None,
+                persist: Vec::new(),
+                ..Default::default()
+            },
+            &backup,
+            false,
+            StateContext::Project,
+        )
+        .expect("host-thread persist decode + queue succeeds");
+
+        let prev_dealloc = moose::rt::check_dealloc();
+        moose::rt::set_check_dealloc(true);
+        let (applied, violations) = moose::rt::audit(|| {
+            let mut guard = cell.enter();
+            let did_apply = apply_queued_state(&mut *guard, &queue);
+            out_events.clear();
+            let inputs = [&in_l[..], &in_r[..]];
+            let mut outputs = [&mut out_l[..], &mut out_r[..]];
+            // SAFETY: disjoint 64-sample slices live for the `process` call.
+            let mut buf = unsafe { AudioBuffer::from_slices(&inputs, &mut outputs, 64) };
+            let mut ctx = ProcessContext::new(&transport, 48_000.0, 64, &mut out_events);
+            let _ = guard.process(&mut buf, &events, &mut ctx);
+            did_apply
+        });
+        moose::rt::set_check_dealloc(prev_dealloc);
+
+        // Drain retired payloads off the audio thread before asserting.
+        queue.reclaim_retired();
+
+        assert!(
+            matches!(applied, Some(Ok(()))),
+            "queued decoded persist load should apply on audio thread"
+        );
+        assert_eq!(
+            violations, 0,
+            "off-thread persist decode + RT swap must incur 0 audio-thread allocations/deallocations"
+        );
+    }
 }

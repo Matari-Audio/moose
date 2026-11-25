@@ -79,21 +79,40 @@ pub fn apply_queued_state<P: PluginExport>(
 
     let queued = queue.pop_queued()?;
     let state_ptr = std::sync::Arc::as_ptr(&queued.state) as usize;
-    if let Some(mut decoded) = queued.decoded {
+    if queued.decoded.is_some() || queued.decoded_persist.is_some() {
         let slot = plugin.snapshot_slot();
-        {
-            let _rt = crate::rt::RtSection::enter();
-            plugin.params().restore_values(&queued.state.params);
-            plugin.params().snap_smoothers();
-            plugin.apply_decoded_state_with_context(&mut decoded, queued.context);
-            queue.retire_decoded(decoded);
-            slot.mark_state_loaded();
-            queue.set_accepted_custom(state_ptr);
-            let ticket = slot.request_fresh();
-            slot.record_load_ticket(state_ptr, ticket);
-            queue.mark_applied(&queued.state, true);
+        let has_extra = queued.state.extra.is_some();
+        let mut decoded = queued.decoded;
+        let mut decoded_persist = queued.decoded_persist;
+        if decoded.is_some() || !has_extra {
+            {
+                let _rt = crate::rt::RtSection::enter();
+                plugin.params().restore_values(&queued.state.params);
+                plugin.params().snap_smoothers();
+                if let Some(mut dp) = decoded_persist.take() {
+                    plugin.apply_decoded_persist(&mut dp, queued.context);
+                    queue.retire_decoded(dp);
+                }
+                if let Some(mut dec) = decoded.take() {
+                    plugin.apply_decoded_state_with_context(&mut dec, queued.context);
+                    queue.retire_decoded(dec);
+                }
+                if has_extra {
+                    slot.mark_state_loaded();
+                    queue.set_accepted_custom(state_ptr);
+                }
+                let ticket = slot.request_fresh();
+                slot.record_load_ticket(state_ptr, ticket);
+                queue.mark_applied(&queued.state, true);
+            }
+            return Some(Ok(()));
         }
-        return Some(Ok(()));
+        // Extra bytes still use legacy `load_state`, while persist decoded off-thread.
+        if let Some(mut dp) = decoded_persist.take() {
+            let _rt = crate::rt::RtSection::enter();
+            plugin.apply_decoded_persist(&mut dp, queued.context);
+            queue.retire_decoded(dp);
+        }
     }
     let result = crate::state::try_apply_state_with_context(plugin, &queued.state, queued.context);
     if result.is_err()
@@ -195,6 +214,16 @@ pub fn apply_or_queue_state_with_context<P: PluginExport>(
     } else {
         None
     };
+    // Off-thread decode for persisted (`#[persist]`) state so `moose::Plugin`
+    // (`Lifecycle`) plugins—whose `state.extra` is `None`—can build derived DSP
+    // state heap-in-place off-thread and swap it RT-safely on the audio thread.
+    let decoded_persist = match P::decode_persist_state(params, &state.persist, context) {
+        Ok(decoded_persist) => decoded_persist,
+        Err(err) => {
+            backup.restore(params);
+            return Err(err);
+        }
+    };
     // `try_enter`: a CLAP `reset` may hold the cell on the audio thread
     // while stopped; then queue instead of panicking on an overlap.
     if can_own && let Some(mut instance) = plugin.try_enter() {
@@ -208,10 +237,21 @@ pub fn apply_or_queue_state_with_context<P: PluginExport>(
         let result = if let Some(mut decoded) = decoded {
             instance.params().restore_values(&state.params);
             instance.params().snap_smoothers();
+            if let Some(mut dp) = decoded_persist {
+                instance.apply_decoded_persist(&mut dp, context);
+            }
             instance.apply_decoded_state_with_context(&mut decoded, context);
             // `decoded` (holding the swapped-out old state) drops here on the host thread.
             Ok(())
+        } else if !has_custom_extra && let Some(mut dp) = decoded_persist {
+            instance.params().restore_values(&state.params);
+            instance.params().snap_smoothers();
+            instance.apply_decoded_persist(&mut dp, context);
+            Ok(())
         } else {
+            if let Some(mut dp) = decoded_persist {
+                instance.apply_decoded_persist(&mut dp, context);
+            }
             crate::state::try_apply_state_with_context(&mut *instance, &state, context)
         };
         if result.is_err() {
@@ -229,8 +269,13 @@ pub fn apply_or_queue_state_with_context<P: PluginExport>(
         }
         return result;
     }
-    let handle =
-        queue.push_with_backup_decoded_and_context(state, Some(backup.clone()), decoded, context);
+    let handle = queue.push_with_backup_decoded_persist_and_context(
+        state,
+        Some(backup.clone()),
+        decoded,
+        decoded_persist,
+        context,
+    );
     let audio_active = plugin.is_held_by_other_thread()
         || queue.is_audio_active_on_other_thread()
         || slot.is_audio_active_on_other_thread();
@@ -1361,7 +1406,6 @@ mod state_handshake_tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "wall-clock latency bound; Miri is ~100x slower")]
     fn sleeping_host_does_not_stall_50ms_on_load_or_save() {
         let plugin = PluginCell::new(SwapPlugin::create());
         let params = plugin.enter().params_arc();

@@ -599,4 +599,9 @@ mod tests {
             "lane 0 set to Saw should match lane 1's default Saw"
         );
     }
+
+    #[test]
+    fn lifecycle_fits_stack_budget() {
+        moose_test::assert_lifecycle_fits::<PluginShell>(256);
+    }
 }

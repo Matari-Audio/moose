@@ -437,6 +437,19 @@ pub trait PluginRuntime: Send + 'static {
         self.apply_decoded_state(decoded);
     }
 
+    /// Swap a persisted-state payload decoded off-thread by
+    /// `PluginExport::decode_persist_state` into the live processor inside an
+    /// `RtSection` (zero allocations, zero deallocations, zero locks).
+    ///
+    /// Use [`DecodedState::swap_with`](crate::state::DecodedState::swap_with) so
+    /// the displaced value stays in `decoded` and drops off the audio thread.
+    fn apply_decoded_persist(
+        &mut self,
+        _decoded: &mut crate::state::DecodedState,
+        _context: crate::state::StateContext,
+    ) {
+    }
+
     /// Processing latency in samples. Host uses this for delay compensation.
     /// Return 0 if the plugin adds no latency (default).
     fn latency(&self) -> u32 {

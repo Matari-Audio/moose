@@ -252,4 +252,9 @@ mod tests {
                 .run()
         });
     }
+
+    #[test]
+    fn lifecycle_fits_stack_budget() {
+        moose_test::assert_lifecycle_fits::<PluginShell>(256);
+    }
 }

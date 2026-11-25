@@ -81,7 +81,7 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         let snapshots = SnapshotSlot::new();
         let init_ctx =
             InitContext::new(tasks.clone()).with_snapshot(SnapshotPublisher::new(&snapshots));
-        let state = Box::new(L::init(&params, &init_ctx));
+        let state = L::init_boxed(&params, &init_ctx);
         let mut shell = Self {
             params,
             state,
@@ -342,6 +342,11 @@ impl<P: Params + Default + 'static, L: PluginLogicCore<S, Params = P> + 'static,
         L::state_changed_with_context(&mut self.state, &self.params, context);
     }
 
+    fn apply_decoded_persist(&mut self, decoded: &mut DecodedState, context: StateContext) {
+        L::apply_decoded_persist(&mut self.state, &self.params, decoded, context);
+        L::state_changed_with_context(&mut self.state, &self.params, context);
+    }
+
     fn latency(&self) -> u32 {
         L::latency(&self.state)
     }
@@ -587,6 +592,14 @@ macro_rules! export_static {
                 self.inner.apply_decoded_state_with_context(decoded, context);
             }
 
+            fn apply_decoded_persist(
+                &mut self,
+                decoded: &mut $crate::__macro_deps::moose_core::state::DecodedState,
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) {
+                self.inner.apply_decoded_persist(decoded, context);
+            }
+
             fn latency(&self) -> u32 {
                 self.inner.latency()
             }
@@ -612,7 +625,7 @@ macro_rules! export_static {
 
 
             fn create() -> Self {
-                let params = std::sync::Arc::new(<$params>::new());
+                let params = <$params as $crate::__macro_deps::moose_params::Params>::new_arc();
                 // Each `tasks: [..]` type gets its own lane (queue + mode).
                 // The bundle collapses to `None` when no types were listed,
                 // so a plugin with no tasks runs with no pool.
@@ -691,6 +704,21 @@ macro_rules! export_static {
             ) -> Vec<$crate::__macro_deps::moose_core::main_thread::Midi2ControllerAssignment> {
                 <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::midi2_controller_assignments(
                     direction,
+                )
+            }
+
+            fn decode_persist_state(
+                params: &$params,
+                persist: &[u8],
+                context: $crate::__macro_deps::moose_core::state::StateContext,
+            ) -> Result<
+                Option<$crate::__macro_deps::moose_core::state::DecodedState>,
+                $crate::__macro_deps::moose_core::state::StateLoadError,
+            > {
+                <$logic as $crate::__macro_deps::moose_plugin::PluginLogicCore<Sample>>::decode_persist_state(
+                    params,
+                    persist,
+                    context,
                 )
             }
 

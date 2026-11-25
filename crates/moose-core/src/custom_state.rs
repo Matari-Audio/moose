@@ -315,6 +315,37 @@ impl<T: StateField> StateField for Option<T> {
     }
 }
 
+impl<T: StateField> StateField for Box<T> {
+    fn write_field(&self, buf: &mut Vec<u8>) {
+        (**self).write_field(buf);
+    }
+
+    fn read_field(cursor: &mut StateCursor) -> Option<Self> {
+        T::read_field(cursor).map(Self::new)
+    }
+}
+
+impl<T: StateField, const N: usize> StateField for Box<[T; N]> {
+    fn write_field(&self, buf: &mut Vec<u8>) {
+        crate::cast::len_u32(N).write_field(buf);
+        for item in &**self {
+            item.write_field(buf);
+        }
+    }
+
+    fn read_field(cursor: &mut StateCursor) -> Option<Self> {
+        let len = u32::read_field(cursor)? as usize;
+        if len != N {
+            return None;
+        }
+        let mut vec = Vec::with_capacity(N);
+        for _ in 0..N {
+            vec.push(T::read_field(cursor)?);
+        }
+        vec.into_boxed_slice().try_into().ok()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StateBinding - typed wrapper for editor state access
 // ---------------------------------------------------------------------------

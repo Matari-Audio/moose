@@ -55,5 +55,9 @@ optional = true
 workspace = true
 optional = true
 
+[dev-dependencies]
+moose-dsp = { workspace = true }
+moose-test = { workspace = true }
+
 [lints]
 workspace = true

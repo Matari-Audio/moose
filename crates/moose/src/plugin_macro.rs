@@ -520,6 +520,14 @@ macro_rules! __plugin_hot_reload {
                 self.inner.apply_decoded_state_with_context(decoded, context);
             }
 
+            fn apply_decoded_persist(
+                &mut self,
+                decoded: &mut $crate::core::state::DecodedState,
+                context: $crate::core::state::StateContext,
+            ) {
+                self.inner.apply_decoded_persist(decoded, context);
+            }
+
             fn republish_snapshot(&mut self) {
                 self.inner.republish_snapshot();
             }

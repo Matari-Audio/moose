@@ -82,6 +82,12 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
     /// Build initial state from params.
     fn init(params: &Self::Params, cx: &InitContext) -> Self::DspState;
 
+    /// Build `Self::DspState` directly on the heap without materializing it on
+    /// the caller's stack. Default delegates to `Box::new(Self::init(params, cx))`.
+    fn init_boxed(params: &Self::Params, cx: &InitContext) -> Box<Self::DspState> {
+        Box::new(Self::init(params, cx))
+    }
+
     fn reset(state: &mut Self::DspState, params: &Self::Params, config: &AudioConfig);
 
     /// Worker/fallible-preparation logic must declare this requirement.
@@ -230,6 +236,32 @@ pub trait PluginLogicCore<S: Sample = f32>: 'static {
         _context: StateContext,
     ) {
         Self::apply_decoded_state(state, params, decoded);
+    }
+
+    /// Decode persisted (`#[persist]`) state off the audio thread into a
+    /// heap-allocated [`DecodedState`] for RT-safe swapping in
+    /// [`Self::apply_decoded_persist`].
+    ///
+    /// # Errors
+    /// Returns `Err(StateLoadError)` when persisted state cannot be decoded.
+    fn decode_persist_state(
+        params: &Self::Params,
+        persist: &[u8],
+        context: StateContext,
+    ) -> Result<Option<DecodedState>, StateLoadError> {
+        let _ = (params, persist, context);
+        Ok(None)
+    }
+
+    /// Swap a persisted-state payload decoded by [`Self::decode_persist_state`]
+    /// into `state` on the audio thread (zero-alloc, RT-safe).
+    fn apply_decoded_persist(
+        state: &mut Self::DspState,
+        params: &Self::Params,
+        decoded: &mut DecodedState,
+        context: StateContext,
+    ) {
+        let _ = (state, params, decoded, context);
     }
 
     fn state_changed(state: &mut Self::DspState, params: &Self::Params) {

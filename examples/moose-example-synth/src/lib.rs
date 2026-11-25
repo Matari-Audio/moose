@@ -562,4 +562,9 @@ mod tests {
     fn empty_state_no_crash() {
         moose_test::assert_empty_state_no_crash::<PluginShell>();
     }
+
+    #[test]
+    fn lifecycle_fits_stack_budget() {
+        moose_test::assert_lifecycle_fits::<PluginShell>(256);
+    }
 }
