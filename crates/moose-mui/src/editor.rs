@@ -154,6 +154,7 @@ pub struct MuiEditor<P: Params> {
     win32_parent: Option<Box<dyn FnMut(Option<isize>) + Send>>,
     pointer: Option<window::PointerHook>,
     wheel: window::WheelPolicy,
+    poll: Option<std::time::Duration>,
     #[cfg(target_os = "linux")]
     x11_hook: Option<window::X11WindowHook>,
     #[cfg(target_os = "linux")]
@@ -227,6 +228,7 @@ impl<P: Params> MuiEditor<P> {
             win32_parent: None,
             pointer: None,
             wheel: window::WheelPolicy::default(),
+            poll: None,
             #[cfg(target_os = "linux")]
             x11_hook: None,
             #[cfg(target_os = "linux")]
@@ -317,6 +319,16 @@ impl<P: Params> MuiEditor<P> {
         self
     }
 
+    /// Poll [`MuiEditor::changed`] at least this often while the window is
+    /// open, for model state that moves without waking the editor. A poll
+    /// that finds nothing changed builds and draws nothing, unlike a
+    /// repaint deadline (`Ui::repaint_in`), which rebuilds the tree each time.
+    #[must_use]
+    pub fn poll(mut self, interval: std::time::Duration) -> Self {
+        self.poll = Some(interval);
+        self
+    }
+
     /// Finish app-owned persistence on close and drop.
     #[must_use]
     pub fn on_close(self, f: impl FnMut() + Send + 'static) -> Self {
@@ -359,6 +371,7 @@ impl<P: Params> MuiEditor<P> {
             self.requests.on_pointer(Arc::clone(pointer));
         }
         self.requests.set_wheel_policy(self.wheel);
+        self.requests.set_poll_interval(self.poll);
         self.wake_pending.store(false, Ordering::Release);
         #[cfg(target_os = "linux")]
         if let Some(hook) = &self.x11_hook {
