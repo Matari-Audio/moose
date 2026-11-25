@@ -338,6 +338,10 @@ mod host_identity_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "current_exe reads /proc/self/exe, which miri isolation forbids"
+    )]
     fn from_process_names_the_running_executable() {
         let host = HostIdentity::from_process(HostFormat::Au);
         assert_eq!(host.format, HostFormat::Au);
