@@ -146,9 +146,40 @@ impl<P: Params> View for Session<P> {
 /// That only works when the plugin cdylib unwinds: build it with the
 /// workspace's `plugin` profile (`cargo build --profile plugin`), never plain
 /// `--release`, whose `panic = "abort"` makes every UI panic abort the DAW.
+/// Thread-safe, coalesced wakeup handle for a [`MuiEditor`] window.
+///
+/// Calling [`EditorWaker::wake`] nudges the currently open window to redraw via
+/// [`Requests::redraw`] at most once per frame (coalesced via an atomic flag),
+/// and is a cheap no-op while the editor window is closed.
+#[derive(Clone, Debug)]
+pub struct EditorWaker {
+    requests: Arc<Mutex<std::sync::Weak<Requests>>>,
+    pending: Arc<AtomicBool>,
+}
+
+impl EditorWaker {
+    /// Request an immediate redraw of the editor window if one is open and no
+    /// wake is already pending.
+    pub fn wake(&self) {
+        if !self.pending.swap(true, Ordering::SeqCst) {
+            let requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .upgrade();
+            if let Some(requests) = requests {
+                requests.redraw();
+            } else {
+                self.pending.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
 pub struct MuiEditor<P: Params> {
     shared: Arc<Mutex<Shared<Session<P>>>>,
     requests: Arc<Requests>,
+    active_requests: Arc<Mutex<std::sync::Weak<Requests>>>,
     wake_pending: Arc<AtomicBool>,
     keys: Option<window::KeyHook>,
     win32_parent: Option<Box<dyn FnMut(Option<isize>) + Send>>,
@@ -220,9 +251,12 @@ impl<P: Params> MuiEditor<P> {
             wake_pending: Arc::clone(&wake_pending),
             last_zoom: std::sync::atomic::AtomicU64::new(1.0f64.to_bits()),
         };
+        let requests: Arc<Requests> = Arc::default();
+        let active_requests = Arc::new(Mutex::new(Arc::downgrade(&requests)));
         Self {
             shared: Arc::new(Mutex::new(Shared { ui, view: session })),
-            requests: Arc::default(),
+            requests,
+            active_requests,
             wake_pending,
             keys: None,
             win32_parent: None,
@@ -364,6 +398,10 @@ impl<P: Params> MuiEditor<P> {
 
     fn reset_requests(&mut self) {
         self.requests = Arc::default();
+        *self
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&self.requests);
         if let Some(keys) = &self.keys {
             self.requests.on_key(Arc::clone(keys));
         }
@@ -404,17 +442,24 @@ impl<P: Params> MuiEditor<P> {
         self
     }
 
+    /// Returns a thread-safe coalesced wakeup handle for this editor.
+    ///
+    /// Background workers can call [`EditorWaker::wake`] after publishing new
+    /// UI state to trigger an immediate redraw without waiting for [`Self::poll`].
+    #[must_use]
+    pub fn waker(&self) -> EditorWaker {
+        EditorWaker {
+            requests: Arc::clone(&self.active_requests),
+            pending: Arc::clone(&self.wake_pending),
+        }
+    }
+
     /// Install a coalesced 0 Hz wakeup callback on the attached host context
     /// so host automation, modulation, and `param-indication` updates nudge
     /// [`Requests::redraw`] without polling.
     fn install_host_waker(&self, context: &PluginContext) {
-        let requests = Arc::clone(&self.requests);
-        let pending = Arc::clone(&self.wake_pending);
-        context.set_editor_waker(Some(Arc::new(move || {
-            if !pending.swap(true, Ordering::SeqCst) {
-                requests.redraw();
-            }
-        })));
+        let waker = self.waker();
+        context.set_editor_waker(Some(Arc::new(move || waker.wake())));
     }
 
     fn has_window(&self) -> bool {
@@ -525,6 +570,11 @@ impl<P: Params> MuiEditor<P> {
     }
 
     fn close_window(&mut self) {
+        *self
+            .active_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Weak::new();
+        self.wake_pending.store(false, Ordering::Release);
         #[cfg(target_os = "linux")]
         {
             if self.floating.is_some() || self.embedded.is_some() {

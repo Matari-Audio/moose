@@ -14,7 +14,7 @@ mod editor;
 mod platform;
 
 pub use bridge::{Bridge, widget_id};
-pub use editor::MuiEditor;
+pub use editor::{EditorWaker, MuiEditor};
 /// The MUI toolkit itself, so a plugin can `use moose_mui::mui::prelude::*`
 /// without naming the git dependency.
 pub use mui;
