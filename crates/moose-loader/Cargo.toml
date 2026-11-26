@@ -1,9 +1,9 @@
 [package]
 name = "moose-loader"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
 description = "Hot-reloadable plugin logic for moose (native ABI, dylib loading)"
 
 [dependencies]
@@ -12,7 +12,7 @@ log = "0.4"
 # direct dep so the file-fingerprint path uses the SIMD-accelerated
 # implementation (~30× faster than a hand-rolled table-free CRC32).
 crc32fast = "1.5"
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-params = { workspace = true }
 # `moose-plugin` carries the `Plugin` / `PluginLogicCore` traits the
 # macro-generated wrappers reference. Always required.
@@ -39,5 +39,10 @@ default = []
 shell = ["dep:libloading", "dep:parking_lot"]
 hot-debug = []
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

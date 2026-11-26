@@ -1,14 +1,14 @@
 [package]
 name = "moose-vst3"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "VST3 format wrapper for moose, on the official VST3 SDK bindings"
 
 [dependencies]
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-params = { workspace = true }
 # Wait-free bounded queue for the host/editor → audio state-load
 # handoff so the audio thread is the only one that ever holds
@@ -19,8 +19,13 @@ vst3 = "0.3.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"
 
 [dev-dependencies]
 moose-derive = { workspace = true }

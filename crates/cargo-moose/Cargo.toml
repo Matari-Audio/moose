@@ -1,10 +1,10 @@
 [package]
 name = "cargo-moose"
-version.workspace = true
+version = "7.0.0"
 edition = "2024"
 # The Truce License (LicenseRef-TruceLicense-1.0), same as the
 # workspace - dual Apache-2.0 / MIT plus the framework rider in LICENSE.
-license.workspace = true
+license = "LicenseRef-TruceLicense-1.0"
 description = "Build tool for moose audio plugins (CLAP, VST3, AU v2, AU v3, and a standalone host binary)"
 repository = "https://github.com/Matari-Audio/moose"
 keywords = ["audio", "plugin", "vst", "clap", "midi"]
@@ -23,7 +23,7 @@ name = "cargo-moose"
 path = "src/main.rs"
 
 [dependencies]
-thiserror = { workspace = true }
+thiserror = { version = "2" }
 toml = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 # Substitution engine for `cargo moose new` scaffolds. Single dep on
@@ -36,7 +36,7 @@ tinytemplate = "1.2"
 png = "0.18"
 moose-shim-types = { workspace = true }
 moose-build = { workspace = true }
-moose-utils = { workspace = true }
+moose-utils = { version = "7.0.0", path = "../moose-utils" }
 base64 = { workspace = true }
 # `cargo moose preset`: decode host-saved `.aupreset` files (Logic
 # writes binary plists) and read/write preset packs.
@@ -55,11 +55,16 @@ version = "0.3.0"
 # `UpdateResource` / `EndUpdateResource` directly - same shell-out-free
 # pattern as the mt.exe-driven manifest embed sitting next to it.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 hound = "3"
 serde_json = "1"
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

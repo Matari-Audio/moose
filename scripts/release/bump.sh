@@ -11,7 +11,7 @@
 #
 #   bump.sh --edit-only <bump>   # rewrite files only, no commit
 #
-# Edits both version strings in `Cargo.toml`, refreshes `Cargo.lock`,
+# Edits every version string in the Cargo.toml files, refreshes `Cargo.lock`,
 # and commits the result on whatever branch you're currently on. No
 # branch creation, no fetch, no push, no PR — that's `bump-pr.sh`'s
 # job.
@@ -62,13 +62,15 @@ fi
 # Read current version + compute new -----------------------------------------
 
 echo "→ reading current version"
+# The version lives in each crate (the monorepo's one workspace has no per-project
+# [workspace.package]); crates/moose is the one every other crate releases with.
 CURRENT="$(awk -F\" '
-    /^\[workspace\.package\]/ { p = 1 }
+    /^\[package\]/ { p = 1 }
     p && /^version = / { print $2; exit }
-' Cargo.toml)"
+' crates/moose/Cargo.toml)"
 
 if [[ -z "$CURRENT" ]]; then
-    echo "Error: could not read [workspace.package].version" >&2
+    echo "Error: could not read crates/moose/Cargo.toml [package].version" >&2
     exit 1
 fi
 
@@ -111,8 +113,10 @@ sed_inplace() {
 # `[workspace.dependencies]` (load-bearing for crates.io publish,
 # since cargo strips `path` and embeds the registry version). The
 # global sed catches all of them — release.sh re-verifies the lot.
-echo "→ editing Cargo.toml"
-sed_inplace "s/\"$CURRENT\"/\"$NEW\"/g" Cargo.toml
+echo "→ editing every Cargo.toml"
+git ls-files -z -- 'Cargo.toml' '*/Cargo.toml' | while IFS= read -r -d '' manifest; do
+    sed_inplace "s/\"$CURRENT\"/\"$NEW\"/g" "$manifest"
+done
 
 # Refresh Cargo.lock ----------------------------------------------------------
 
@@ -128,7 +132,7 @@ if (( EDIT_ONLY )); then
 fi
 
 echo "→ committing on $(git rev-parse --abbrev-ref HEAD)"
-git add Cargo.toml Cargo.lock
+git add -u -- Cargo.toml Cargo.lock '*/Cargo.toml'
 git commit -m "Release v$NEW"
 
 echo

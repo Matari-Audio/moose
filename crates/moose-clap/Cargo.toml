@@ -1,10 +1,10 @@
 [package]
 name = "moose-clap"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "CLAP format wrapper for moose"
 
 [features]
@@ -15,7 +15,7 @@ clap-draft = []
 rt-paranoid = ["moose-core/rt-paranoid"]
 
 [dependencies]
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-params = { workspace = true }
 clap-sys = "0.5"
 log = "0.4"
@@ -31,8 +31,13 @@ crossbeam-queue = "0.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"
 
 [dev-dependencies]
 moose-derive = { workspace = true }

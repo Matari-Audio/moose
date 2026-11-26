@@ -116,13 +116,15 @@ is_github_release_present() {
 
 echo "→ reading + verifying versions in Cargo.toml"
 
+# The version lives in each crate (the monorepo's one workspace has no per-project
+# [workspace.package]); crates/moose is the one every other crate releases with.
 WS_VERSION="$(awk -F\" '
-    /^\[workspace\.package\]/ { p = 1 }
+    /^\[package\]/ { p = 1 }
     p && /^version = / { print $2; exit }
-' Cargo.toml)"
+' crates/moose/Cargo.toml)"
 
 if [[ -z "$WS_VERSION" ]]; then
-    echo "Error: could not read [workspace.package].version" >&2
+    echo "Error: could not read crates/moose/Cargo.toml [package].version" >&2
     exit 1
 fi
 

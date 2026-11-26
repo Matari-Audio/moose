@@ -1,10 +1,10 @@
 [package]
 name = "moose-core"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "Core types for the moose audio plugin framework"
 
 [features]
@@ -28,7 +28,7 @@ backtrace = { version = "0.3", optional = true }
 # inheriting `moose-core`'s `moose-params` + `png` publish chain.
 # `moose-core` re-exports both at the crate root for backwards-compat
 # with existing `moose_core::cast::*` and `moose_core::slugify` callers.
-moose-utils = { workspace = true }
+moose-utils = { version = "7.0.0", path = "../moose-utils" }
 png = "0.18"
 # `HostNotice` (main_thread): independent host-notice flags.
 bitflags = "2"
@@ -48,7 +48,12 @@ loom = { version = "0.7", optional = true }
 
 # `pin_current_module` (tasks) pins the plugin DLL via GetModuleHandleExW.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"

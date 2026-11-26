@@ -1,10 +1,10 @@
 [package]
 name = "moose-au"
-version.workspace = true
-repository.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "7.0.0"
+repository = "https://github.com/Matari-Audio/moose"
+edition = "2024"
+license = "LicenseRef-TruceLicense-1.0"
+rust-version = "1.92"
 description = "Audio Unit v3 format wrapper for moose"
 
 # Declaring a cdylib crate-type here (in addition to the default rlib)
@@ -18,7 +18,7 @@ description = "Audio Unit v3 format wrapper for moose"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-moose-core = { workspace = true }
+moose-core = { version = "7.0.0", path = "../moose-core" }
 moose-params = { workspace = true }
 # Wait-free bounded queue for the host/editor → audio state-load
 # handoff so the audio thread is the only one that ever holds
@@ -37,5 +37,10 @@ moose-derive = { workspace = true }
 moose-test-fixtures = { workspace = true }
 moose-shim-types = { workspace = true }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "warn"
