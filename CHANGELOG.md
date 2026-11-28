@@ -4,6 +4,12 @@ Notable changes per release.
 
 ## Unreleased
 
+- **`cargo-moose`: x86_64 release builds default to `x86-64-v2`, not `v3`.**
+  AVX2/FMA/BMI2 codegen faulted with `STATUS_ILLEGAL_INSTRUCTION` while DAWs
+  scanned plugins on pre-Haswell CPUs (Sandy/Ivy Bridge, Westmere Xeons).
+  `v2` (SSE4.2 + POPCNT) runs on all of them. Code compiled only under
+  `cfg(target_feature = "avx2")` (`wide`'s 256-bit lanes, for one) now takes
+  its SSE path; dispatch AVX2 at runtime or pass `--target-cpu v3`.
 - **Host identity (`HostIdentity`).** `InitContext::host()` and
   `PreparationConfig::host` carry `HostIdentity { format: HostFormat, name,
   version }`. CLAP reads `clap_host.name`/`version`; VST3 asks

@@ -41,7 +41,7 @@ cargo moose package
 
 `Cargo.toml` configures `[profile.dev]` with `debug = "line-tables-only"` and `[profile.dev.package."*"]` with `opt-level = 1` / `debug = 0`: your own crates rebuild quickly, and dependencies are lightly optimized so DSP and GUI stay responsive in `--debug` builds (at the cost of a slightly slower first build).
 
-`cargo moose` `--debug` builds, `cargo test`, `cargo clippy` and rust-analyzer share one target cache, so switching between them doesn't rebuild dependencies. Release builds via `cargo moose` add `-C target-cpu=x86-64-v3` on x86_64.
+`cargo moose` `--debug` builds, `cargo test`, `cargo clippy` and rust-analyzer share one target cache, so switching between them doesn't rebuild dependencies. Release builds via `cargo moose` add `-C target-cpu=x86-64-v2` on x86_64.
 
 On x86_64 Linux, Rust 1.90+ already links with the bundled `rust-lld`. On Windows, uncomment the `lld-link` snippet in `.cargo/config.toml` for faster linking.
 {{ if has_ci }}

@@ -1002,7 +1002,7 @@ mod rustflags_tests {
             );
             let mut expected = vec![encoded];
             if triple == X86 {
-                expected.extend(["-C", "target-cpu=x86-64-v3"]);
+                expected.extend(["-C", "target-cpu=x86-64-v2"]);
             }
             expected.extend(["-C", "target-feature=+crt-static"]);
             assert_eq!(p.len(), 1);
@@ -1033,7 +1033,7 @@ mod rustflags_tests {
         );
         assert_eq!(
             p["CARGO_ENCODED_RUSTFLAGS"],
-            "--cfg\x1ffeature=\"a b\"\x1f-C\x1ftarget-cpu=x86-64-v3",
+            "--cfg\x1ffeature=\"a b\"\x1f-C\x1ftarget-cpu=x86-64-v2",
         );
         assert_eq!(p.len(), 1);
     }
@@ -1044,7 +1044,7 @@ mod rustflags_tests {
             &["x86_64-unknown-linux-gnu"],
             &[("RUSTFLAGS", "-C debuginfo=1")],
         );
-        assert_eq!(p["RUSTFLAGS"], "-C debuginfo=1 -C target-cpu=x86-64-v3",);
+        assert_eq!(p["RUSTFLAGS"], "-C debuginfo=1 -C target-cpu=x86-64-v2",);
         assert_eq!(p.len(), 1);
     }
 
@@ -1057,7 +1057,7 @@ mod rustflags_tests {
                 ("RUSTFLAGS", "-C opt-level=0"),
             ],
         );
-        assert_eq!(p["CARGO_ENCODED_RUSTFLAGS"], "-C\x1ftarget-cpu=x86-64-v3",);
+        assert_eq!(p["CARGO_ENCODED_RUSTFLAGS"], "-C\x1ftarget-cpu=x86-64-v2",);
         assert_eq!(p.len(), 1);
     }
 
@@ -1065,7 +1065,7 @@ mod rustflags_tests {
     fn per_target_var_is_appended_without_a_global_override() {
         let var = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS";
         let p = plan(&["x86_64-unknown-linux-gnu"], &[(var, "-C debuginfo=1")]);
-        assert_eq!(p[var], "-C debuginfo=1 -C target-cpu=x86-64-v3");
+        assert_eq!(p[var], "-C debuginfo=1 -C target-cpu=x86-64-v2");
         assert!(!p.contains_key("RUSTFLAGS"));
         assert!(plan(&["aarch64-apple-darwin"], &[("RUSTFLAGS", "-D warnings")]).is_empty());
     }

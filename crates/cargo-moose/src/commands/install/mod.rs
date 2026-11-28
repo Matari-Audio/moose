@@ -387,8 +387,8 @@ Windows defaults to system scope (the directory every commercial host
 scans); pass --user for the per-user `%LOCALAPPDATA%\\Programs\\Common\\VST3`
 location.
 
-x86_64 builds default to `-C target-cpu=x86-64-v3` (AVX2 + FMA + BMI2)
-so `wide`'s compile-time SIMD dispatch picks the wider path. aarch64
+x86_64 builds default to `-C target-cpu=x86-64-v2` (SSE4.2 + POPCNT);
+`--target-cpu v3` requires AVX2 on every user's machine. aarch64
 builds use NEON unconditionally and get no extra flag. `--debug` builds
 skip the default so they share plain cargo's target cache. Override
 with `--target-cpu`.
