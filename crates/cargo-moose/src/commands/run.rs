@@ -333,8 +333,8 @@ feature. Pass `--no-default-features` to drop the non-format defaults too.
 Anything after `--` is forwarded verbatim to the standalone binary
 (e.g. `cargo moose run -- --headless --bpm 140`).
 
-x86_64 release builds default to `-C target-cpu=x86-64-v3` (AVX2 + FMA +
-BMI2); `--debug` builds skip it so they share plain cargo's target cache;
+x86_64 release builds default to `-C target-cpu=x86-64-v2` (SSE4.2 +
+POPCNT); `--debug` builds skip it so they share plain cargo's target cache;
 override with `--target-cpu` (see `cargo moose build --help` for the
 full value list).
 

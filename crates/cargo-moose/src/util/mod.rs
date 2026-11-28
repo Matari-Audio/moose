@@ -198,15 +198,16 @@ pub(crate) fn set_debug_profile(debug: bool) {
 #[derive(Clone, Debug, Default)]
 pub(crate) enum TargetCpu {
     /// No `--target-cpu` was passed. Apply a sane per-arch default:
-    /// `x86-64-v3` on `x86_64` targets (AVX2 + FMA + BMI2); nothing
+    /// `x86-64-v2` on `x86_64` targets (SSE4.2 + POPCNT); nothing
     /// on `aarch64` (NEON is the `ARMv8` baseline) or other arches.
     ///
-    /// `x86-64-v3` matches the floor modern DAWs already require -
-    /// any host where a moose plugin actually loads already has
-    /// AVX2 - so the perf win is free in practice.
+    /// `x86-64-v3` (AVX2) faulted with `STATUS_ILLEGAL_INSTRUCTION`
+    /// during DAW scans on Sandy/Ivy Bridge and Westmere machines, which
+    /// DAWs still load. AVX2 belongs behind runtime detection
+    /// (`is_x86_feature_detected!`) or an explicit `--target-cpu v3`.
     #[default]
     Default,
-    /// `--target-cpu baseline`: drop the v3 default, pass no flag.
+    /// `--target-cpu baseline`: drop the v2 default, pass no flag.
     /// Yields rustc's base target (`x86-64` on `x86_64` = SSE2-only),
     /// for plugin authors who need maximum compatibility.
     Baseline,
@@ -248,8 +249,8 @@ pub(crate) fn parse_target_cpu_arg(raw: &str) -> TargetCpu {
 /// the flag entirely.
 ///
 /// The `Default` variant inspects the triple's arch prefix: x86 gets
-/// `x86-64-v3`, everything else gets `None`. This is why per-target
-/// resolution matters - a global `RUSTFLAGS=-C target-cpu=x86-64-v3`
+/// `x86-64-v2`, everything else gets `None`. This is why per-target
+/// resolution matters - a global `RUSTFLAGS=-C target-cpu=x86-64-v2`
 /// would error on an aarch64 slice of a universal macOS build.
 ///
 /// `Default` passes nothing for `debug` builds: injecting a flag there
@@ -268,11 +269,11 @@ pub(crate) fn resolve_target_cpu(triple: &str, profile: &str) -> Option<String> 
     }
 }
 
-/// [`TargetCpu::Default`]'s per-triple choice: `x86-64-v3` on x86
+/// [`TargetCpu::Default`]'s per-triple choice: `x86-64-v2` on x86
 /// release builds, nothing on debug builds or other arches.
 fn default_target_cpu(triple: &str, debug: bool) -> Option<String> {
     let x86 = triple.starts_with("x86_64") || triple.starts_with("i686");
-    (x86 && !debug).then(|| "x86-64-v3".to_string())
+    (x86 && !debug).then(|| "x86-64-v2".to_string())
 }
 
 /// Extra Cargo features to enable for every build in this invocation, on
@@ -1137,9 +1138,9 @@ mod tests {
 
     #[test]
     fn default_target_cpu_only_applies_to_x86_release_builds() {
-        let v3 = Some("x86-64-v3".to_string());
-        assert_eq!(default_target_cpu("x86_64-unknown-linux-gnu", false), v3);
-        assert_eq!(default_target_cpu("x86_64-pc-windows-msvc", false), v3);
+        let v2 = Some("x86-64-v2".to_string());
+        assert_eq!(default_target_cpu("x86_64-unknown-linux-gnu", false), v2);
+        assert_eq!(default_target_cpu("x86_64-pc-windows-msvc", false), v2);
         // Debug builds must match plain `cargo`'s rustflags so the dev
         // loop shares one target cache.
         assert_eq!(default_target_cpu("x86_64-unknown-linux-gnu", true), None);

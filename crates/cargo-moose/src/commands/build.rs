@@ -389,10 +389,10 @@ cargo target; bundles land in target/bundles/<triple>/. Without
 --target, the host build lands in target/bundles/ (flat layout, as
 before).
 
-x86_64 builds default to `-C target-cpu=x86-64-v3` (AVX2 + FMA +
-BMI2) so `wide`'s compile-time SIMD dispatch picks the wider path.
-Modern DAWs already require this floor, so any host that loads a
-moose plugin already has the feature set. aarch64 builds use NEON
+x86_64 builds default to `-C target-cpu=x86-64-v2` (SSE4.2 +
+POPCNT), which every CPU a current DAW loads on has; `v3` (AVX2)
+faults on Sandy/Ivy Bridge machines. Keep AVX2 behind runtime
+detection, or pass `--target-cpu v3` to require it. aarch64 builds use NEON
 unconditionally and get no extra flag. `--debug` builds skip the
 default so they share plain `cargo build`/`test`/`clippy`'s target
 cache. Override with `--target-cpu`.
